@@ -46,10 +46,19 @@ class Config:
     load_report_interval_ms: int = 100
     hierarchical_queue_capacity: int = 4096
     max_ingress_batch_requests: int = 256
-    max_ingress_drain_ms: float = 10.0
+    # 0 disables the wall-clock ingress budget. The per-drain request cap
+    # remains the fairness boundary that prevents decode starvation.
+    max_ingress_drain_ms: float = 0.0
     startup_timeout_s: float = 600.0
     quantum_timeout_s: float = 120.0
     hierarchical_execution_trace: bool = False
+    # Capture one compact timing/load record per LocalEngine quantum. Unlike
+    # hierarchical_execution_trace, this does not retain per-inner-loop
+    # Python trace objects.
+    hierarchical_quantum_diagnostics: bool = False
+    # Diagnostic-only positional result path. The default preserves the
+    # request-id dict/set/reorder implementation for controlled A/B testing.
+    hierarchical_result_fastpath: bool = False
 
     # parallel config
     attention_tp: int = 1
@@ -161,6 +170,14 @@ class Config:
             raise ValueError(
                 "scheduler_arch must be one of: legacy_global, hierarchical"
             )
+        if (
+            self.hierarchical_quantum_diagnostics
+            and self.scheduler_arch != "hierarchical"
+        ):
+            raise ValueError(
+                "hierarchical_quantum_diagnostics requires "
+                "scheduler_arch='hierarchical'"
+            )
         if self.router_policy not in {
             "round_robin",
             "least_batch",
@@ -176,8 +193,8 @@ class Config:
             raise ValueError("hierarchical_queue_capacity must be positive")
         if self.max_ingress_batch_requests <= 0:
             raise ValueError("max_ingress_batch_requests must be positive")
-        if self.max_ingress_drain_ms <= 0:
-            raise ValueError("max_ingress_drain_ms must be positive")
+        if self.max_ingress_drain_ms < 0:
+            raise ValueError("max_ingress_drain_ms must be non-negative")
         if self.startup_timeout_s <= 0:
             raise ValueError("startup_timeout_s must be positive")
         if self.quantum_timeout_s <= 0:
@@ -453,6 +470,9 @@ class Config:
             },
             "dummy_schema_version": CONTROL_DUMMY_SCHEMA_VERSION,
             "loop_count": self.loop_count,
+            "hierarchical_quantum_diagnostics": (
+                self.hierarchical_quantum_diagnostics
+            ),
             "communication_env": {
                 name: os.getenv(name) for name in communication_env_names
             },

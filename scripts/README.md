@@ -1,5 +1,45 @@
 # Scripts README
 
+## `run_2node_rate30_6min_matrix.sh`
+
+用途：
+
+- 串行运行两节点/16 卡的四组合对照：中心化与去中心化各自的 DP16、
+  DP2SP8
+- 每组固定 rate 30、投递 6 分钟，共 10,800 个请求
+- 四组统一使用 `hao_basic` SP 后端和 910,000 total-token 数据集过滤
+- 支持 dry-run 和按 stage 单独补跑
+
+检查命令：
+
+```bash
+DRY_RUN=1 scripts/run_2node_rate30_6min_matrix.sh
+```
+
+完整运行：
+
+```bash
+scripts/run_2node_rate30_6min_matrix.sh
+```
+
+详细备用记录见
+[`docs-dev/2026-07-28/rate30_6min_2node_matrix/Runbook.md`](../docs-dev/2026-07-28/rate30_6min_2node_matrix/Runbook.md)。
+
+### 默认 TPOT 口径
+
+`scripts/sp_ablation/bench_serving_overhead.py` 的默认
+`tpot_with_queue_ms` 使用统一的调度执行边界：
+
+- 中心化：C++ `SequenceMetric` 的首次 scheduled 到本地完成时间，加调度器
+  GPU 容量排队；
+- 去中心化：LocalScheduler 首次进入 `executor.run` 到本地完成时间，加
+  RequestRouter 全局 GPU 容量排队；
+- 两者都除以实际生成 token 数，不计 benchmark dispatch、RPC/command pickup
+  或非容量的 quantum 边界等待。
+
+旧的 benchmark-observed `dispatch -> completion / generated tokens` 保留为
+`dispatch_normalized_latency_ms`，不再作为默认 TPOT 或 goodput 的输入。
+
 ## `plot_run_metrics.py`
 
 用途：

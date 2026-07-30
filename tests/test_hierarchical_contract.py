@@ -115,8 +115,8 @@ def test_complete_hierarchical_topology_whitelist(
         ),
         (
             "max_ingress_drain_ms",
-            0,
-            "max_ingress_drain_ms must be positive",
+            -0.1,
+            "max_ingress_drain_ms must be non-negative",
         ),
     ],
 )
@@ -134,8 +134,9 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert config.hf_config.num_key_value_heads == 1
     assert config.kvcache_block_size == 64
     assert not config.hierarchical_execution_trace
+    assert not config.hierarchical_quantum_diagnostics
     assert config.max_ingress_batch_requests == 256
-    assert config.max_ingress_drain_ms == 10.0
+    assert config.max_ingress_drain_ms == 0.0
     assert len(config.collective_fingerprint()) == 64
 
 
@@ -334,6 +335,17 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     first = local.plan_decode(wave_id=1, quantum_id=0)
     assert first.engine_has_real
     assert first.request_master_global_rank[42] in {4, 5, 6, 7}
+    first_schedule_events = local.mark_first_forward_started(first)
+    assert len(first_schedule_events) == 1
+    assert first_schedule_events[0].request_id == 42
+    assert first_schedule_events[0].engine_id == 1
+    assert first_schedule_events[0].local_scheduler_queue_ms >= 0
+    assert first_schedule_events[0].global_capacity_queue_ms == 0
+    assert (
+        first_schedule_events[0].first_schedule_latency_ms
+        == first_schedule_events[0].local_scheduler_queue_ms
+    )
+    assert local.mark_first_forward_started(first) == ()
     first_load = local.load_snapshot(wave_id=1, quantum_id=0)
     assert len(first_load.rank_loads) == config.attention_sp
     assert tuple(load.global_rank for load in first_load.rank_loads) == (
@@ -369,6 +381,9 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert events[0].request_id == 42
     assert events[0].generated_count == 17
     assert events[0].status == "FINISHED"
+    assert events[0].first_forward_to_terminal_ms is not None
+    assert events[0].first_forward_to_terminal_ms >= 0
+    assert events[0].global_capacity_queue_ms == 0
     assert local.drain_first_token_events() == ()
     assert sequence.num_completed_tokens == 17
     assert local.last_itl_token_slots == 1
@@ -472,6 +487,44 @@ def test_local_scheduler_defers_admission_without_bootstrap_capacity():
     assert local.state_manager.num_running_tokens == 121
 
 
+def test_local_scheduler_try_admit_rolls_back_transient_infeasibility():
+    config = make_hierarchical_config(
+        attention_dp=8,
+        attention_sp=1,
+        ffn_ep=8,
+        num_kvcache_blocks=4,
+        reserved_blocks_per_req=0,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    first = AddCommand(
+        request_id=47,
+        prompt_token_ids=tuple(range(120)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+        wave_id=1,
+    )
+    second = AddCommand(
+        request_id=48,
+        prompt_token_ids=tuple(range(1000, 1064)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+        wave_id=1,
+    )
+
+    assert local.try_admit(first).accepted
+    deferred = local.try_admit(second)
+
+    assert not deferred.accepted
+    assert deferred.reason == "admission_deferred"
+    assert [
+        sequence.seq_id for sequence in local.cpp_scheduler.running(0)
+    ] == [47]
+    assert list(local.cpp_scheduler.waiting_migration) == []
+    assert local.abort(48).status == "not_found"
+
+
 def test_local_scheduler_inflight_abort_wins_before_commit():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
@@ -557,6 +610,7 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     assert local.state_manager.num_running_tokens == 61
     assert local.load_snapshot(wave_id=1, quantum_id=0).preemption_count == 1
 
+    local.mark_first_forward_started(batch)
     events = local.postprocess(batch, make_worker_results(batch))
     assert [(event.request_id, event.status) for event in events] == [
         (101, "FINISHED")
@@ -589,6 +643,7 @@ def test_real_request_id_can_match_control_dummy_internal_id():
     batch = local.plan_decode(wave_id=1, quantum_id=0)
     assert batch.engine_has_real
     assert colliding_id in batch.request_master_global_rank
+    local.mark_first_forward_started(batch)
     events = local.postprocess(batch, make_worker_results(batch))
     assert [(event.request_id, event.status) for event in events] == [
         (colliding_id, "FINISHED")

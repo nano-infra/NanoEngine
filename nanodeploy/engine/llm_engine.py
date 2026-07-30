@@ -17,6 +17,7 @@ from nanodeploy.engine.deployment_manager import DeploymentManager
 from nanodeploy.engine.hierarchical_contract import (
     AddResult,
     AddResultEvent,
+    FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
     IngressAck,
@@ -76,10 +77,11 @@ class LLMEngine:
                 router_policy=config.router_policy,
                 kvcache_block_size=config.kvcache_block_size,
             )
-            if config.router_policy == "least_cache":
-                self.router.record_loads(
-                    self.deployment.load_snapshots()
-                )
+            # LeastBatch also needs an authoritative running-count baseline
+            # before draining its global admission queue.
+            self.router.record_loads(
+                self.deployment.load_snapshots()
+            )
             self._hierarchical_sequences: dict[int, Sequence] = {}
             self._last_load_report_time = 0.0
             atexit.register(self.exit)
@@ -253,6 +255,15 @@ class LLMEngine:
             if metric.first_token_time is None:
                 metric.record_first_token()
         return events
+
+    def poll_first_schedule_events(
+        self,
+    ) -> tuple[FirstScheduleEvent, ...]:
+        if self.config.scheduler_arch != "hierarchical":
+            return ()
+        return self.router.record_first_schedule_events(
+            self.deployment.poll_first_schedule_events()
+        )
 
     @property
     def num_pending_ingress(self) -> int:
@@ -520,7 +531,9 @@ class LLMEngine:
                 for seq_id, token_ids in outputs
             )
 
-        events = self.deployment.poll_events()
+        events = self.router.record_finish_events(
+            self.deployment.poll_events()
+        )
         now = time.monotonic()
         if (
             now - self._last_load_report_time
@@ -535,8 +548,9 @@ class LLMEngine:
             self.metrics_manager.server_metric.update_running_requests(
                 sum(snapshot.running for snapshot in snapshots)
             )
+        routed_events: list[FinishEvent] = []
         for event in events:
-            self.router.finish(event)
+            routed_events.append(event)
             sequence = self._hierarchical_sequences[event.request_id]
             metric = sequence.metric
             if metric is not None:
@@ -549,7 +563,7 @@ class LLMEngine:
                     metric.record_first_token()
                 self.metrics_manager.complete_sequence(event.request_id)
             sequence.status = SequenceStatus.FINISHED
-        return events
+        return tuple(routed_events)
 
     def abort_request(self, request_id: int):
         if self.config.scheduler_arch != "hierarchical":
@@ -572,6 +586,37 @@ class LLMEngine:
                 "hierarchical mode"
             )
         return self.deployment.decode_itl_samples()
+
+    def drain_hierarchical_quantum_diagnostics(
+        self,
+    ) -> tuple[dict, ...]:
+        if self.config.scheduler_arch != "hierarchical":
+            raise RuntimeError(
+                "quantum diagnostics are only available in hierarchical mode"
+            )
+        return self.deployment.quantum_diagnostics()
+
+    def execution_boundary_metrics(self) -> dict:
+        if self.config.scheduler_arch == "hierarchical":
+            return {
+                "mode": "hierarchical",
+                "per_engine": {
+                    str(engine_id): metrics
+                    for engine_id, metrics in (
+                        self.deployment.execution_boundary_metrics().items()
+                    )
+                },
+            }
+        return {
+            "mode": "legacy_global",
+            **self.executor.execution_boundary_metrics(),
+        }
+
+    def reset_execution_boundary_metrics(self) -> None:
+        if self.config.scheduler_arch == "hierarchical":
+            self.deployment.reset_execution_boundary_metrics()
+            return
+        self.executor.reset_execution_boundary_metrics()
 
     def hierarchical_metrics(
         self,
@@ -605,6 +650,12 @@ class LLMEngine:
             "schedule_latency_ms_total",
             "coordination_latency_ms_total",
             "execute_latency_ms_total",
+            "ray_get_latency_ms_total",
+            "result_rebuild_latency_ms_total",
+            "result_rebuild_sample_count",
+            "result_index_latency_ms_total",
+            "result_validate_latency_ms_total",
+            "result_pack_latency_ms_total",
             "postprocess_latency_ms_total",
             "ingress_queue_delay_ms_total",
             "scheduler_add_ms_total",
@@ -638,12 +689,43 @@ class LLMEngine:
                 ),
             }
         )
+        admission_routing = self.router.admission_metrics()
+        metrics["admission_routing"] = admission_routing
+        metrics["global_pending_admission"] = admission_routing[
+            "global_pending"
+        ]
+        metrics["waiting_requests_total"] = (
+            metrics["waiting_requests"]
+            + metrics["global_pending_admission"]
+        )
         decode_itl_token_count = metrics["decode_itl_token_count"]
         metrics["decode_itl_ms_mean"] = (
             metrics["decode_itl_ms_weighted_total"]
             / decode_itl_token_count
             if decode_itl_token_count
             else None
+        )
+        result_rebuild_sample_count = metrics[
+            "result_rebuild_sample_count"
+        ]
+        metrics["result_rebuild_latency_ms_mean"] = (
+            metrics["result_rebuild_latency_ms_total"]
+            / result_rebuild_sample_count
+            if result_rebuild_sample_count
+            else None
+        )
+        metrics["ray_get_latency_ms_mean"] = (
+            metrics["ray_get_latency_ms_total"]
+            / result_rebuild_sample_count
+            if result_rebuild_sample_count
+            else None
+        )
+        metrics["result_rebuild_latency_ms_max"] = max(
+            snapshot.result_rebuild_latency_ms_max
+            for snapshot in snapshots
+        )
+        metrics["ray_get_latency_ms_max"] = max(
+            snapshot.ray_get_latency_ms_max for snapshot in snapshots
         )
         if include_per_engine:
             per_engine_fields = (
@@ -668,6 +750,14 @@ class LLMEngine:
                 "schedule_latency_ms_total",
                 "coordination_latency_ms_total",
                 "execute_latency_ms_total",
+                "ray_get_latency_ms_total",
+                "ray_get_latency_ms_max",
+                "result_rebuild_latency_ms_total",
+                "result_rebuild_latency_ms_max",
+                "result_rebuild_sample_count",
+                "result_index_latency_ms_total",
+                "result_validate_latency_ms_total",
+                "result_pack_latency_ms_total",
                 "postprocess_latency_ms_total",
                 "pending_ingress",
                 "pending_add_results",
@@ -688,6 +778,18 @@ class LLMEngine:
                     snapshot.decode_itl_ms_weighted_total
                     / snapshot.decode_itl_token_count
                     if snapshot.decode_itl_token_count
+                    else None
+                )
+                rebuild_samples = snapshot.result_rebuild_sample_count
+                engine_metrics["result_rebuild_latency_ms_mean"] = (
+                    snapshot.result_rebuild_latency_ms_total
+                    / rebuild_samples
+                    if rebuild_samples
+                    else None
+                )
+                engine_metrics["ray_get_latency_ms_mean"] = (
+                    snapshot.ray_get_latency_ms_total / rebuild_samples
+                    if rebuild_samples
                     else None
                 )
                 engine_metrics["rank_loads"] = [

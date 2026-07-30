@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from time import perf_counter
 from typing import Any, Iterable
 
 import ray
@@ -12,6 +13,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LocalDecodeBatch,
     WorkerDecodeResult,
 )
+from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.topology import EngineTopology
 
 
@@ -43,6 +45,22 @@ class LocalExecutor:
         )
         self.last_execution_traces: tuple[dict[str, Any], ...] = ()
         self._execution_trace_history: list[dict[str, Any]] = []
+        self.result_fastpath_enabled = bool(
+            getattr(config, "hierarchical_result_fastpath", False)
+        )
+        self.quantum_diagnostics_enabled = bool(
+            getattr(config, "hierarchical_quantum_diagnostics", False)
+        )
+        self.last_quantum_diagnostic: dict[str, Any] | None = None
+        self.ray_get_latency_ms_total = 0.0
+        self.ray_get_latency_ms_max = 0.0
+        self.result_rebuild_latency_ms_total = 0.0
+        self.result_rebuild_latency_ms_max = 0.0
+        self.result_rebuild_sample_count = 0
+        self.result_index_latency_ms_total = 0.0
+        self.result_validate_latency_ms_total = 0.0
+        self.result_pack_latency_ms_total = 0.0
+        self._execution_boundary = ExecutionBoundaryRecorder()
 
     def initialize_endpoint(self, timeout: float) -> None:
         server_info = self.endpoint.init_server_endpoint()
@@ -83,6 +101,7 @@ class LocalExecutor:
     ) -> list[WorkerDecodeResult]:
         if batch.engine_id != self.topology.engine_id:
             raise ValueError("LocalDecodeBatch belongs to another engine")
+        executor_begin = perf_counter()
         ordered_sequences = [
             batch.per_rank_sequences[global_rank]
             for global_rank in self.topology.global_ranks
@@ -128,44 +147,136 @@ class LocalExecutor:
                     enable_rpc=True,
                     send_timestamp=send_timestamp,
                     hierarchical_trace=trace_context,
+                    hierarchical_quantum_diagnostics=(
+                        self.quantum_diagnostics_enabled
+                    ),
                 )
             )
 
+        submit_latency_ms = (perf_counter() - executor_begin) * 1000
+        send_begin = perf_counter()
         self.endpoint.send_seqs(ordered_sequences, is_prefill=False)
+        send_seqs_latency_ms = (perf_counter() - send_begin) * 1000
+        ray_get_begin = perf_counter()
         raw_results = ray.get(futures, timeout=timeout)
+        ray_get_end = perf_counter()
+        recv_timestamp = time.time()
+        ray_get_latency_ms = (ray_get_end - ray_get_begin) * 1000
+        self.ray_get_latency_ms_total += ray_get_latency_ms
+        self.ray_get_latency_ms_max = max(
+            self.ray_get_latency_ms_max, ray_get_latency_ms
+        )
+        expected_result_len = (
+            2
+            + int(self.config.hierarchical_execution_trace)
+            + int(self.quantum_diagnostics_enabled)
+        )
+        if any(
+            not isinstance(raw, tuple) or len(raw) != expected_result_len
+            for raw in raw_results
+        ):
+            raise RuntimeError(
+                "hierarchical worker returned an invalid result envelope: "
+                f"expected tuple length {expected_result_len}"
+            )
+        worker_end_times = tuple(float(raw[1]) for raw in raw_results)
+        last_worker_end = max(worker_end_times)
+        boundary_metrics = {
+            "actor_submit_latency_ms": submit_latency_ms,
+            "send_seqs_latency_ms": send_seqs_latency_ms,
+            "ray_get_latency_ms": ray_get_latency_ms,
+            "executor_until_ray_get_ms": (
+                ray_get_end - executor_begin
+            )
+            * 1000,
+            "worker_observed_critical_ms": (
+                last_worker_end - send_timestamp
+            )
+            * 1000,
+            "worker_finish_to_ray_get_ms": (
+                recv_timestamp - last_worker_end
+            )
+            * 1000,
+            "worker_finish_skew_ms": (
+                last_worker_end - min(worker_end_times)
+            )
+            * 1000,
+        }
+        self._execution_boundary.record(boundary_metrics)
 
+        rebuild_begin = perf_counter()
+        result_index_latency_ms = 0.0
+        result_validate_latency_ms = 0.0
+        result_pack_latency_ms = 0.0
         results: list[WorkerDecodeResult] = []
         traces: list[dict[str, Any]] = []
+        worker_diagnostics: list[dict[str, Any]] = []
         for global_rank, raw in zip(
             self.topology.global_ranks, raw_results, strict=True
         ):
-            expected_result_len = (
-                3 if self.config.hierarchical_execution_trace else 2
-            )
-            if not isinstance(raw, tuple) or len(raw) != expected_result_len:
-                raise RuntimeError(
-                    f"hierarchical worker {global_rank} returned an invalid result"
-                )
             token_rows, _worker_end_time = raw[:2]
-            trace = raw[2] if len(raw) == 3 else None
+            extra_index = 2
+            trace = None
+            if self.config.hierarchical_execution_trace:
+                trace = raw[extra_index]
+                extra_index += 1
+            if self.quantum_diagnostics_enabled:
+                worker_diagnostic = raw[extra_index]
+                if (
+                    not isinstance(worker_diagnostic, dict)
+                    or worker_diagnostic.get("global_rank") != global_rank
+                ):
+                    raise RuntimeError(
+                        f"hierarchical worker {global_rank} returned an "
+                        "invalid quantum diagnostic"
+                    )
+                worker_diagnostics.append(dict(worker_diagnostic))
             mastered_sequences = mastered_by_rank[global_rank]
             if len(token_rows) != len(mastered_sequences):
                 raise RuntimeError(
                     f"worker {global_rank} token row mismatch: "
                     f"expected={len(mastered_sequences)}, got={len(token_rows)}"
                 )
-            token_by_request = {
-                sequence.seq_id: tuple(tokens)
+            expected = batch.expected_request_ids(global_rank)
+            index_begin = perf_counter()
+            if self.result_fastpath_enabled:
+                actual_request_ids: list[int] = []
+                sampled_token_ids: list[tuple[int, ...]] = []
                 for sequence, tokens in zip(
                     mastered_sequences, token_rows, strict=True
-                )
-                if not batch.is_control_dummy(sequence)
-            }
-            expected = batch.expected_request_ids(global_rank)
-            if set(token_by_request) != set(expected):
+                ):
+                    if batch.is_control_dummy(sequence):
+                        continue
+                    actual_request_ids.append(sequence.seq_id)
+                    sampled_token_ids.append(tuple(tokens))
+                actual_request_order = tuple(actual_request_ids)
+                packed_token_ids = tuple(sampled_token_ids)
+            else:
+                token_by_request = {
+                    sequence.seq_id: tuple(tokens)
+                    for sequence, tokens in zip(
+                        mastered_sequences, token_rows, strict=True
+                    )
+                    if not batch.is_control_dummy(sequence)
+                }
+                actual_request_order = tuple(token_by_request)
+                packed_token_ids = ()
+            result_index_latency_ms += (
+                perf_counter() - index_begin
+            ) * 1000
+
+            validate_begin = perf_counter()
+            if self.result_fastpath_enabled:
+                valid_result = actual_request_order == expected
+            else:
+                valid_result = set(actual_request_order) == set(expected)
+            result_validate_latency_ms += (
+                perf_counter() - validate_begin
+            ) * 1000
+            if not valid_result:
                 raise RuntimeError(
                     f"worker {global_rank} mastered request mismatch: "
-                    f"expected={expected}, got={tuple(token_by_request)}"
+                    f"expected={expected}, got={actual_request_order}"
                 )
             if trace is not None:
                 expected_trace_header = (
@@ -206,6 +317,12 @@ class LocalExecutor:
                         f"worker {global_rank} trace is missing inner forwards"
                     )
                 traces.append(trace)
+            pack_begin = perf_counter()
+            if not self.result_fastpath_enabled:
+                packed_token_ids = tuple(
+                    token_by_request[request_id]
+                    for request_id in expected
+                )
             results.append(
                 WorkerDecodeResult(
                     wave_id=batch.wave_id,
@@ -213,12 +330,12 @@ class LocalExecutor:
                     global_rank=global_rank,
                     forward_count=HIERARCHICAL_LOOP_COUNT,
                     mastered_request_ids=expected,
-                    sampled_token_ids=tuple(
-                        token_by_request[request_id]
-                        for request_id in expected
-                    ),
+                    sampled_token_ids=packed_token_ids,
                 )
             )
+            result_pack_latency_ms += (
+                perf_counter() - pack_begin
+            ) * 1000
 
         if traces:
             sp_branches = {
@@ -235,7 +352,65 @@ class LocalExecutor:
                 )
         self.last_execution_traces = tuple(traces)
         self._execution_trace_history.extend(traces)
+        result_rebuild_latency_ms = (perf_counter() - rebuild_begin) * 1000
+        self.result_rebuild_latency_ms_total += result_rebuild_latency_ms
+        self.result_rebuild_latency_ms_max = max(
+            self.result_rebuild_latency_ms_max,
+            result_rebuild_latency_ms,
+        )
+        self.result_rebuild_sample_count += 1
+        self.result_index_latency_ms_total += result_index_latency_ms
+        self.result_validate_latency_ms_total += (
+            result_validate_latency_ms
+        )
+        self.result_pack_latency_ms_total += result_pack_latency_ms
+        if self.quantum_diagnostics_enabled:
+            critical_worker = max(
+                worker_diagnostics,
+                key=lambda item: float(item["worker_total_ms"]),
+            )
+            gpu_loop_values = [
+                float(item["gpu_loop_ms"])
+                for item in worker_diagnostics
+                if item.get("gpu_loop_ms") is not None
+            ]
+            self.last_quantum_diagnostic = {
+                "engine_id": batch.engine_id,
+                "wave_id": batch.wave_id,
+                "quantum_id": batch.quantum_id,
+                **boundary_metrics,
+                "result_rebuild_ms": result_rebuild_latency_ms,
+                "result_index_ms": result_index_latency_ms,
+                "result_validate_ms": result_validate_latency_ms,
+                "result_pack_ms": result_pack_latency_ms,
+                "critical_worker_global_rank": int(
+                    critical_worker["global_rank"]
+                ),
+                "worker_total_ms_min": min(
+                    float(item["worker_total_ms"])
+                    for item in worker_diagnostics
+                ),
+                "worker_total_ms_max": max(
+                    float(item["worker_total_ms"])
+                    for item in worker_diagnostics
+                ),
+                "gpu_loop_ms_min": (
+                    min(gpu_loop_values) if gpu_loop_values else None
+                ),
+                "gpu_loop_ms_max": (
+                    max(gpu_loop_values) if gpu_loop_values else None
+                ),
+                "worker_rank_timings": tuple(worker_diagnostics),
+            }
+        else:
+            self.last_quantum_diagnostic = None
         return results
+
+    def execution_boundary_metrics(self) -> dict[str, float | int]:
+        return self._execution_boundary.snapshot()
+
+    def reset_execution_boundary_metrics(self) -> None:
+        self._execution_boundary.reset()
 
     def drain_execution_traces(self) -> tuple[dict[str, Any], ...]:
         traces = tuple(self._execution_trace_history)

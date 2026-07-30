@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 # Constants
 MAX_INPUT_LEN = 1024
 MAX_OUTPUT_LEN = 1024
+DEFAULT_MAX_REQUEST_TOKENS = 910_000
 SEED = 0
 
 # specific seed
@@ -52,6 +53,15 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
     parser.add_argument("--max-input-len", type=int, default=None, help="Filter out CSV rows with prompt_len >= this value.")
+    parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_TOKENS,
+        help=(
+            "Filter out CSV rows where prompt_len + output_len exceeds this "
+            f"value (default: {DEFAULT_MAX_REQUEST_TOKENS}; 0 disables)."
+        ),
+    )
     parser.add_argument(
         "--itl-log-path",
         type=str,
@@ -117,6 +127,13 @@ def parse_args():
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
                         help="Routing strategy.")
+    parser.add_argument(
+        "--sp-master-selector",
+        type=str,
+        default="LeastBatch",
+        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+        help="SP master-rank selection policy inside each scheduler.",
+    )
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],
                         help="Scheduler architecture (default: legacy_global).")
@@ -167,6 +184,16 @@ def parse_args():
         default=None,
         help="JSONL output path for --hierarchical-execution-trace.",
     )
+    parser.add_argument(
+        "--hierarchical-quantum-log-path",
+        type=str,
+        default=None,
+        help=(
+            "Write one compact timing/load JSON record per hierarchical "
+            "engine quantum. This is substantially lighter than the full "
+            "execution trace."
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -179,6 +206,8 @@ def parse_args():
         parser.error("--diagnostic-log-interval must be non-negative")
     if args.slow_add_threshold_ms < 0:
         parser.error("--slow-add-threshold-ms must be non-negative")
+    if args.max_request_tokens < 0:
+        parser.error("--max-request-tokens must be non-negative")
     if args.hierarchical_execution_trace:
         if args.scheduler_arch != "hierarchical":
             parser.error(
@@ -195,6 +224,14 @@ def parse_args():
                 "--hierarchical-trace-log-path is required with "
                 "--hierarchical-execution-trace"
             )
+    if (
+        args.hierarchical_quantum_log_path
+        and args.scheduler_arch != "hierarchical"
+    ):
+        parser.error(
+            "--hierarchical-quantum-log-path requires "
+            "--scheduler-arch hierarchical"
+        )
 
     return args
 
@@ -216,10 +253,23 @@ def get_dataset_generator(args):
     if "prompt_len" not in df.columns or "output_len" not in df.columns:
         raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
 
+    if args.max_request_tokens > 0:
+        orig_len = len(df)
+        request_tokens = df["prompt_len"] + df["output_len"]
+        df = df[request_tokens <= args.max_request_tokens].reset_index(drop=True)
+        print(
+            "Filtered by "
+            f"max_request_tokens={args.max_request_tokens} "
+            f"(prompt_len + output_len <= limit): {orig_len} -> {len(df)} rows"
+        )
+
     if args.max_input_len is not None:
         orig_len = len(df)
         df = df[df["prompt_len"] < args.max_input_len].reset_index(drop=True)
         print(f"Filtered by max_input_len={args.max_input_len}: {orig_len} -> {len(df)} rows")
+
+    if df.empty:
+        raise ValueError("CSV dataset has no rows after applying length filters")
 
     if len(df) < args.num_requests:
         print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")
@@ -264,20 +314,8 @@ def print_model_config(engine):
     print("\n" + "=" * 40)
     print("Model Configuration")
     print("=" * 40)
-    if hasattr(engine, 'config'):
-        # Assuming config is a dataclass or has __dict__
-        conf = engine.config
-        try:
-            # If it's a dataclass
-            conf_dict = asdict(conf)
-        except TypeError:
-             # Fallback if not a dataclass
-            conf_dict = conf.__dict__ if hasattr(conf, '__dict__') else {}
-            
-        for k, v in conf_dict.items():
-            print(f"{k}: {v}")
-    else:
-        print("Config not accessible directly from engine.")
+    for key, value in asdict(engine.config).items():
+        print(f"{key}: {value}")
     print("=" * 40 + "\n")
 
 
@@ -310,7 +348,7 @@ def run_warmup(engine, max_num_seqs, world_size):
     for prompt in warmup_prompts:
         seq = Sequence(token_ids=prompt, sampling_params=warmup_sampling_params)
         warmup_seqs.append(seq)
-    if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+    if engine.config.scheduler_arch == "hierarchical":
         engine.submit_requests_async(warmup_seqs)
     else:
         engine.add_request(warmup_seqs)
@@ -320,7 +358,7 @@ def run_warmup(engine, max_num_seqs, world_size):
     with tqdm(total=num_warmup_requests, desc="Warmup Requests") as pbar:
         completed = 0
         while completed < num_warmup_requests:
-            if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+            if engine.config.scheduler_arch == "hierarchical":
                 rejected_acks = [
                     ack
                     for ack in engine.poll_ingress_acks()
@@ -336,6 +374,7 @@ def run_warmup(engine, max_num_seqs, world_size):
                         "hierarchical warmup request rejected: "
                         f"ingress={rejected_acks}, add={rejected_adds}"
                     )
+                engine.poll_first_schedule_events()
                 engine.poll_first_token_events()
             if not engine.is_finished():
                 outputs, _, _, _, _ = engine.step()
@@ -470,8 +509,57 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
         "failed_requests": len(records) - len(successful),
         "e2e_ms": metric_percentiles(records, "e2e_ms"),
         "ttft_ms": metric_percentiles(records, "ttft_ms"),
+        "bootstrap_ttft_ms": metric_percentiles(
+            records, "bootstrap_ttft_ms"
+        ),
+        "model_ttft_ms": metric_percentiles(
+            records, "model_ttft_ms"
+        ),
+        "first_schedule_latency_ms": metric_percentiles(
+            records, "first_schedule_latency_ms"
+        ),
+        "global_capacity_queue_ms": metric_percentiles(
+            records, "global_capacity_queue_ms"
+        ),
+        "local_scheduler_queue_ms": metric_percentiles(
+            records, "local_scheduler_queue_ms"
+        ),
+        "first_forward_to_terminal_ms": metric_percentiles(
+            records, "first_forward_to_terminal_ms"
+        ),
+        "ttft_ms_definition": (
+            "dispatch to bootstrap-ready for authoritative hierarchical "
+            "admission or the legacy sequence metric; model first-token "
+            "latency is reported separately when observable"
+        ),
+        "model_ttft_ms_definition": (
+            "dispatch to the first model-generated token observed by the "
+            "benchmark"
+        ),
+        "first_schedule_latency_ms_definition": (
+            "known GPU-capacity-blocked time in the global admission FIFO "
+            "plus LocalScheduler enqueue to immediately before the first "
+            "executor.run; excludes initial RPC/command pickup delay and "
+            "forward execution"
+        ),
+        "first_forward_to_terminal_ms_definition": (
+            "server-side time from immediately before the request's first "
+            "executor.run until local terminal completion"
+        ),
         "tpot_with_queue_ms": metric_percentiles(
             records, "tpot_with_queue_ms"
+        ),
+        "tpot_with_queue_ms_definition": (
+            "(first-forward-to-local-terminal time plus GPU-capacity queue "
+            "time) / generated tokens; excludes dispatch, RPC/command pickup, "
+            "and non-capacity scheduler-boundary delay"
+        ),
+        "dispatch_normalized_latency_ms": metric_percentiles(
+            records, "dispatch_normalized_latency_ms"
+        ),
+        "dispatch_normalized_latency_ms_definition": (
+            "legacy benchmark-observed dispatch-to-completion time / "
+            "generated tokens"
         ),
         "dispatch_lag_ms": metric_percentiles(records, "dispatch_lag_ms"),
         "ingress_ack_latency_ms": metric_percentiles(
@@ -503,6 +591,7 @@ def run_benchmark(
     diagnostic_log_interval=0.0,
     slow_add_threshold_ms=0.0,
     hierarchical_trace_log_path=None,
+    hierarchical_quantum_log_path=None,
     request_metrics_log_path=None,
     metrics_summary_path=None,
     clock_ns=None,
@@ -536,6 +625,7 @@ def run_benchmark(
     next_idx = 0
     start_ns = clock_ns()
     start_time = start_ns / 1_000_000_000
+    start_wall_time = time.time()
     dispatched = 0
     ingress_enqueued = 0
     ingress_rejected = 0
@@ -563,6 +653,8 @@ def run_benchmark(
     previous_hierarchical = None
     previous_hierarchical_time = start_time
     trace_file = None
+    quantum_diagnostic_file = None
+    quantum_diagnostic_count = 0
     request_metrics_file = None
     request_metric_records = []
     recorded_request_ids = set()
@@ -580,6 +672,18 @@ def run_benchmark(
             metrics_summary_path = default_metrics_summary_path(
                 request_metrics_log_path
             )
+
+    if hierarchical_quantum_log_path:
+        quantum_path = Path(
+            hierarchical_quantum_log_path
+        ).expanduser()
+        quantum_path.parent.mkdir(parents=True, exist_ok=True)
+        quantum_diagnostic_file = quantum_path.open(
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        hierarchical_quantum_log_path = str(quantum_path)
 
     def _interval_ms(timing, end_key, start_key):
         end_ns = timing.get(end_key)
@@ -612,6 +716,7 @@ def run_benchmark(
         status,
         actual_output_tokens,
         observed_ns,
+        finish_event=None,
         error_message=None,
     ):
         timing = request_times[request_id]
@@ -621,18 +726,151 @@ def run_benchmark(
         arrival_e2e_ms = _interval_ms(
             timing, "completion_ns", "scheduled_ns"
         )
-        ttft_ms = _interval_ms(
+        model_ttft_ms = _interval_ms(
             timing, "first_token_ns", "dispatch_ns"
         )
-        if ttft_ms is None and seq.metric is not None:
+        bootstrap_ttft_ms = _interval_ms(
+            timing, "bootstrap_ready_ns", "dispatch_ns"
+        )
+        ttft_source = None
+        if bootstrap_ttft_ms is not None:
+            ttft_ms = bootstrap_ttft_ms
+            ttft_source = "authoritative_admission_ack"
+        elif seq.metric is not None:
             metric_ttft = seq.metric.ttft
             if metric_ttft is not None:
-                ttft_ms = round(float(metric_ttft), 6)
-        tpot_with_queue_ms = (
+                bootstrap_ttft_ms = round(float(metric_ttft), 6)
+                ttft_ms = bootstrap_ttft_ms
+                ttft_source = "sequence_metric"
+            else:
+                ttft_ms = model_ttft_ms
+                if ttft_ms is not None:
+                    ttft_source = "model_first_token_fallback"
+        else:
+            ttft_ms = model_ttft_ms
+            if ttft_ms is not None:
+                ttft_source = "model_first_token_fallback"
+        first_schedule_latency_ms = timing.get(
+            "first_schedule_latency_ms"
+        )
+        global_capacity_queue_ms = timing.get(
+            "global_capacity_queue_ms"
+        )
+        local_scheduler_queue_ms = timing.get(
+            "local_scheduler_queue_ms"
+        )
+        first_schedule_latency_source = None
+        if first_schedule_latency_ms is not None:
+            first_schedule_latency_ms = round(
+                float(first_schedule_latency_ms), 6
+            )
+            global_capacity_queue_ms = round(
+                float(global_capacity_queue_ms or 0.0), 6
+            )
+            local_scheduler_queue_ms = round(
+                float(local_scheduler_queue_ms or 0.0), 6
+            )
+            first_schedule_latency_source = (
+                "hierarchical_first_forward_event"
+            )
+        elif (
+            engine.config.scheduler_arch != "hierarchical"
+            and seq.metric is not None
+        ):
+            queueing_time_ms = seq.metric.queueing_time_ms
+            if queueing_time_ms is not None:
+                first_schedule_latency_ms = round(
+                    float(queueing_time_ms), 6
+                )
+                first_schedule_latency_source = (
+                    "sequence_metric_queueing_time"
+                )
+                global_capacity_queue_ms = first_schedule_latency_ms
+                local_scheduler_queue_ms = 0.0
+        dispatch_normalized_latency_ms = (
             round(e2e_ms / actual_output_tokens, 6)
             if e2e_ms is not None and actual_output_tokens > 0
             else None
         )
+        first_forward_to_terminal_ms = None
+        tpot_with_queue_ms = None
+        tpot_with_queue_source = None
+        if finish_event is not None:
+            first_forward_to_terminal_ms = (
+                finish_event.first_forward_to_terminal_ms
+            )
+            if first_forward_to_terminal_ms is not None:
+                first_forward_to_terminal_ms = round(
+                    float(first_forward_to_terminal_ms), 6
+                )
+
+        if status == "FINISHED" and actual_output_tokens > 0:
+            if engine.config.scheduler_arch == "hierarchical":
+                if finish_event is None:
+                    raise RuntimeError(
+                        "hierarchical FINISHED request is missing its "
+                        f"terminal event: request_id={request_id}"
+                    )
+                if first_forward_to_terminal_ms is None:
+                    raise RuntimeError(
+                        "hierarchical FINISHED request is missing "
+                        "first-forward-to-terminal timing: "
+                        f"request_id={request_id}"
+                    )
+                terminal_capacity_queue_ms = round(
+                    float(finish_event.global_capacity_queue_ms), 6
+                )
+                if (
+                    global_capacity_queue_ms is not None
+                    and abs(
+                        float(global_capacity_queue_ms)
+                        - terminal_capacity_queue_ms
+                    )
+                    > 0.001
+                ):
+                    raise RuntimeError(
+                        "first-schedule and terminal capacity queue metrics "
+                        f"disagree for request {request_id}"
+                    )
+                global_capacity_queue_ms = terminal_capacity_queue_ms
+                tpot_with_queue_ms = round(
+                    (
+                        first_forward_to_terminal_ms
+                        + global_capacity_queue_ms
+                    )
+                    / actual_output_tokens,
+                    6,
+                )
+                tpot_with_queue_source = (
+                    "hierarchical_first_forward_to_terminal"
+                )
+            else:
+                if seq.metric is None:
+                    raise RuntimeError(
+                        "centralized FINISHED request is missing its "
+                        f"sequence metric: request_id={request_id}"
+                    )
+                metric_tpot = seq.metric.avg_tpot_with_queueing
+                metric_tpot_without_queue = (
+                    seq.metric.avg_tpot_wo_queueing
+                )
+                if (
+                    metric_tpot is None
+                    or metric_tpot_without_queue is None
+                ):
+                    raise RuntimeError(
+                        "centralized FINISHED request has incomplete "
+                        f"scheduling metrics: request_id={request_id}"
+                    )
+                tpot_with_queue_ms = round(float(metric_tpot), 6)
+                first_forward_to_terminal_ms = round(
+                    float(metric_tpot_without_queue)
+                    * actual_output_tokens,
+                    6,
+                )
+                tpot_with_queue_source = (
+                    "sequence_metric_first_scheduled_to_terminal"
+                )
         return {
             "schema_version": 1,
             "request_id": int(request_id),
@@ -665,9 +903,25 @@ def run_benchmark(
                 timing, "add_result_ns", "dispatch_ns"
             ),
             "ttft_ms": ttft_ms,
+            "ttft_source": ttft_source,
+            "bootstrap_ttft_ms": bootstrap_ttft_ms,
+            "model_ttft_ms": model_ttft_ms,
+            "first_schedule_latency_ms": first_schedule_latency_ms,
+            "first_schedule_latency_source": (
+                first_schedule_latency_source
+            ),
+            "global_capacity_queue_ms": global_capacity_queue_ms,
+            "local_scheduler_queue_ms": local_scheduler_queue_ms,
+            "first_forward_to_terminal_ms": (
+                first_forward_to_terminal_ms
+            ),
             "e2e_ms": e2e_ms,
             "arrival_e2e_ms": arrival_e2e_ms,
             "tpot_with_queue_ms": tpot_with_queue_ms,
+            "tpot_with_queue_source": tpot_with_queue_source,
+            "dispatch_normalized_latency_ms": (
+                dispatch_normalized_latency_ms
+            ),
         }
 
     if hierarchical_trace_log_path:
@@ -681,6 +935,29 @@ def run_benchmark(
             encoding="utf-8",
             buffering=1,
         )
+
+    def drain_quantum_diagnostics():
+        nonlocal quantum_diagnostic_count
+        if quantum_diagnostic_file is None:
+            return 0
+        samples = engine.drain_hierarchical_quantum_diagnostics()
+        for sample in samples:
+            record = dict(sample)
+            record["benchmark_elapsed_s"] = round(
+                float(record["started_at_unix_s"]) - start_wall_time,
+                6,
+            )
+            quantum_diagnostic_file.write(
+                json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        quantum_diagnostic_file.flush()
+        quantum_diagnostic_count += len(samples)
+        return len(samples)
 
     def emit_diagnostic(*, force=False):
         nonlocal last_diag_time
@@ -710,14 +987,12 @@ def run_benchmark(
             "client_unsent": requests_to_send - next_idx,
             "completed": completed,
             "client_outstanding": accepted - completed,
-            "pending_ingress": getattr(
-                engine, "num_pending_ingress", 0
-            ),
-            "pending_add": getattr(engine, "num_pending_adds", 0),
+            "pending_ingress": engine.num_pending_ingress,
+            "pending_add": engine.num_pending_adds,
             "slow_add_count": slow_add_count,
         }
 
-        if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+        if engine.config.scheduler_arch == "hierarchical":
             hierarchical = engine.hierarchical_metrics(
                 refresh=False,
                 include_per_engine=True,
@@ -790,6 +1065,10 @@ def run_benchmark(
             payload["hierarchical"] = hierarchical
             previous_hierarchical = hierarchical
             previous_hierarchical_time = current_time
+            if quantum_diagnostic_file is not None:
+                payload["hierarchical_quantum_records_drained"] = (
+                    drain_quantum_diagnostics()
+                )
 
         if trace_file is not None:
             traces = engine.drain_execution_traces()
@@ -876,6 +1155,18 @@ def run_benchmark(
                     observed_ns = clock_ns()
                     timing = request_times[ack.request_id]
                     timing["ingress_ack_ns"] = observed_ns
+                    if (
+                        ack.enqueued
+                        and ack.admission_version is not None
+                        and "bootstrap_ready_ns" not in timing
+                    ):
+                        # Centralized-compatible hierarchical admission only
+                        # ACKs after the local planner commits placement and
+                        # appends the bootstrap token. Use that authoritative
+                        # ACK as T3 so ttft_ms matches legacy dummy-prefill
+                        # semantics. The actual model token remains available
+                        # separately as model_ttft_ms.
+                        timing["bootstrap_ready_ns"] = observed_ns
                     ingress_ack_latency_ms.append(
                         (observed_ns - timing["dispatch_ns"]) / 1_000_000
                     )
@@ -961,10 +1252,24 @@ def run_benchmark(
                             / 1_000_000
                         )
 
-                if (
-                    getattr(engine.config, "scheduler_arch", None)
-                    == "hierarchical"
-                ):
+                for event in engine.poll_first_schedule_events():
+                    timing = request_times[event.request_id]
+                    if "first_schedule_latency_ms" in timing:
+                        raise RuntimeError(
+                            "duplicate first-schedule event for request "
+                            f"{event.request_id}"
+                        )
+                    timing["first_schedule_latency_ms"] = (
+                        event.first_schedule_latency_ms
+                    )
+                    timing["global_capacity_queue_ms"] = (
+                        event.global_capacity_queue_ms
+                    )
+                    timing["local_scheduler_queue_ms"] = (
+                        event.local_scheduler_queue_ms
+                    )
+
+                if engine.config.scheduler_arch == "hierarchical":
                     finish_events = engine.poll()
                 else:
                     finish_events = []
@@ -998,6 +1303,7 @@ def run_benchmark(
                         status=event.status,
                         actual_output_tokens=event.generated_count,
                         observed_ns=observed_ns,
+                        finish_event=event,
                         error_message=(
                             None
                             if event.status == "FINISHED"
@@ -1031,8 +1337,8 @@ def run_benchmark(
                 emit_diagnostic()
                 if (
                     next_idx == requests_to_send
-                    and getattr(engine, "num_pending_ingress", 0) == 0
-                    and getattr(engine, "num_pending_adds", 0) == 0
+                    and engine.num_pending_ingress == 0
+                    and engine.num_pending_adds == 0
                     and engine.is_finished()
                 ):
                     break
@@ -1059,8 +1365,11 @@ def run_benchmark(
         emit_diagnostic(force=True)
         raise
     finally:
+        drain_quantum_diagnostics()
         if trace_file is not None:
             trace_file.close()
+        if quantum_diagnostic_file is not None:
+            quantum_diagnostic_file.close()
         if request_metrics_file is not None:
             request_metrics_file.close()
 
@@ -1084,10 +1393,7 @@ def run_benchmark(
     )
     hierarchical_itl_summary = None
     hierarchical_rank_loads = None
-    if (
-        getattr(engine.config, "scheduler_arch", None) == "hierarchical"
-        and hasattr(engine, "hierarchical_itl_samples")
-    ):
+    if engine.config.scheduler_arch == "hierarchical":
         hierarchical_itl_summary = build_hierarchical_itl_summary(
             engine.hierarchical_itl_samples()
         )
@@ -1095,10 +1401,7 @@ def run_benchmark(
             metrics_summary["hierarchical_decode_itl_ms"] = (
                 hierarchical_itl_summary
             )
-    if (
-        getattr(engine.config, "scheduler_arch", None) == "hierarchical"
-        and hasattr(engine, "hierarchical_metrics")
-    ):
+    if engine.config.scheduler_arch == "hierarchical":
         final_hierarchical = engine.hierarchical_metrics(
             refresh=True,
             include_per_engine=True,
@@ -1112,10 +1415,20 @@ def run_benchmark(
         metrics_summary["hierarchical_rank_loads"] = (
             hierarchical_rank_loads
         )
+    execution_boundary_metrics = engine.execution_boundary_metrics()
+    metrics_summary["execution_boundary_metrics"] = (
+        execution_boundary_metrics
+    )
     metrics_summary.update(
         {
             "benchmark_runtime_s": round(total_time, 6),
             "request_metrics_jsonl": request_metrics_log_path,
+            "hierarchical_quantum_diagnostics_jsonl": (
+                hierarchical_quantum_log_path
+            ),
+            "hierarchical_quantum_diagnostic_samples": (
+                quantum_diagnostic_count
+            ),
         }
     )
     if metrics_summary_path:
@@ -1151,12 +1464,11 @@ def run_benchmark(
         "scheduler_rejected": scheduler_rejected,
         "completed_requests": completed,
         "failed_requests": failed,
-        "pending_ingress": getattr(engine, "num_pending_ingress", 0),
-        "pending_add": getattr(engine, "num_pending_adds", 0),
+        "pending_ingress": engine.num_pending_ingress,
+        "pending_add": engine.num_pending_adds,
         "active_requests": (
             engine.router.active_count
-            if getattr(engine.config, "scheduler_arch", None)
-            == "hierarchical"
+            if engine.config.scheduler_arch == "hierarchical"
             else 0
         ),
         "achieved_dispatch_rate": round(
@@ -1172,11 +1484,34 @@ def run_benchmark(
         "observed_ttft_ms": latency_stats(observed_ttft_ms),
         "observed_e2e_ms": latency_stats(observed_e2e_ms),
         "ttft_ms": metrics_summary["ttft_ms"],
+        "bootstrap_ttft_ms": metrics_summary["bootstrap_ttft_ms"],
+        "model_ttft_ms": metrics_summary["model_ttft_ms"],
+        "first_schedule_latency_ms": metrics_summary[
+            "first_schedule_latency_ms"
+        ],
+        "global_capacity_queue_ms": metrics_summary[
+            "global_capacity_queue_ms"
+        ],
+        "local_scheduler_queue_ms": metrics_summary[
+            "local_scheduler_queue_ms"
+        ],
+        "first_forward_to_terminal_ms": metrics_summary[
+            "first_forward_to_terminal_ms"
+        ],
         "e2e_ms": metrics_summary["e2e_ms"],
         "tpot_with_queue_ms": metrics_summary["tpot_with_queue_ms"],
+        "dispatch_normalized_latency_ms": metrics_summary[
+            "dispatch_normalized_latency_ms"
+        ],
         "goodput": metrics_summary["goodput"],
         "request_metrics_jsonl": request_metrics_log_path,
         "metrics_summary_json": metrics_summary_path,
+        "hierarchical_quantum_diagnostics_jsonl": (
+            hierarchical_quantum_log_path
+        ),
+        "hierarchical_quantum_diagnostic_samples": (
+            quantum_diagnostic_count
+        ),
     }
     if hierarchical_itl_summary is not None:
         result["hierarchical_decode_itl_ms"] = (
@@ -1184,28 +1519,41 @@ def run_benchmark(
         )
     if hierarchical_rank_loads is not None:
         result["hierarchical_rank_loads"] = hierarchical_rank_loads
+    if execution_boundary_metrics is not None:
+        result["execution_boundary_metrics"] = execution_boundary_metrics
     print(
         "[BENCH_RESULT] "
         + json.dumps(result, sort_keys=True, separators=(",", ":")),
         flush=True,
     )
-    return total_time, seq_map
+    return total_time, seq_map, metrics_summary
 
 
-def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path=None):
+def calculate_and_print_metrics(
+    total_time,
+    seq_map,
+    requests_sent,
+    metrics_summary,
+    itl_log_path=None,
+):
     """Calculates and prints performance metrics."""
     completed_seqs = [s for s in seq_map.values() if s.metric and s.metric.completion_time]
+    total_seqs = len(completed_seqs)
     
     total_input = sum(s.metric.num_prompt_tokens for s in completed_seqs)
     total_output = sum(s.metric.num_generated_tokens for s in completed_seqs)
     
     throughput = total_output / total_time
     
-    ttft_samples = [s.metric.ttft for s in completed_seqs if s.metric.ttft]
-    avg_ttft = np.mean(ttft_samples) if ttft_samples else 0
-    
-    latency_samples = [s.metric.e2e_latency for s in completed_seqs if s.metric.e2e_latency]
-    avg_latency = np.mean(latency_samples) / 1000 if latency_samples else 0
+    ttft_stats = metrics_summary["ttft_ms"] or {}
+    model_ttft_stats = metrics_summary["model_ttft_ms"] or {}
+    e2e_stats = metrics_summary["e2e_ms"] or {}
+    tpot_wq_stats = metrics_summary["tpot_with_queue_ms"] or {}
+    dispatch_normalized_stats = (
+        metrics_summary["dispatch_normalized_latency_ms"] or {}
+    )
+    queueing_stats = metrics_summary["global_capacity_queue_ms"] or {}
+    goodput_stats = metrics_summary["goodput"]
 
     # TPOT stats (Inter-Token Latency) - Aggregate all individual token samples
     all_itl_samples = []
@@ -1223,30 +1571,6 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
             "p99": np.percentile(all_itl_samples, 99)
         }
     
-    # TPOT with queueing
-    tpot_wq_samples = [s.metric.avg_tpot_with_queueing for s in completed_seqs if s.metric.avg_tpot_with_queueing]
-    tpot_wq_stats = {}
-    if tpot_wq_samples:
-         tpot_wq_stats = {
-            "avg": np.mean(tpot_wq_samples),
-            "p50": np.percentile(tpot_wq_samples, 50),
-            "p90": np.percentile(tpot_wq_samples, 90),
-            "p95": np.percentile(tpot_wq_samples, 95),
-            "p99": np.percentile(tpot_wq_samples, 99)
-        }
-         
-    # Queueing time
-    queueing_samples = [s.metric.queueing_time_ms for s in completed_seqs if s.metric.queueing_time_ms]
-    queueing_stats = {}
-    if queueing_samples:
-        queueing_stats = {
-            "avg": np.mean(queueing_samples),
-            "p50": np.percentile(queueing_samples, 50),
-            "p90": np.percentile(queueing_samples, 90),
-            "p95": np.percentile(queueing_samples, 95),
-            "p99": np.percentile(queueing_samples, 99)
-        }
-
     decode_queue_samples = [s.metric.decode_queue_time_ms for s in completed_seqs if s.metric.decode_queue_time_ms]
     decode_queue_stats = {}
     if decode_queue_samples:
@@ -1258,12 +1582,6 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
             "p99": np.percentile(decode_queue_samples, 99)
         }
 
-    # Goodput
-    slo_threshold = 100 # ms
-    slo_success = sum(1 for s in tpot_wq_samples if s < slo_threshold)
-    total_seqs = len(completed_seqs)
-    goodput = (slo_success / total_seqs * 100) if total_seqs > 0 else 0
-
     print("\n" + "=" * 60)
     print("--- Benchmark Results ---")
     print("=" * 60)
@@ -1273,8 +1591,19 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
     print(f"Total input tokens: {total_input}")
     print(f"Total output tokens: {total_output}")
     print(f"Throughput: {throughput:.2f} tokens/s")
-    print(f"Average TTFT: {avg_ttft:.2f} ms")
-    print(f"Average E2E Latency: {avg_latency:.2f} s")
+    print(
+        "Average Bootstrap TTFT: "
+        f"{ttft_stats.get('mean', 0):.2f} ms"
+    )
+    if model_ttft_stats:
+        print(
+            "Average Model TTFT: "
+            f"{model_ttft_stats.get('mean', 0):.2f} ms"
+        )
+    print(
+        "Average E2E Latency: "
+        f"{e2e_stats.get('mean', 0) / 1000:.2f} s"
+    )
     print()
     
     if tpot_stats:
@@ -1288,11 +1617,36 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
 
     if tpot_wq_stats:
         print("--- TPOT With Queueing Time (ms/token) ---")
-        print(f"  Avg:  {tpot_wq_stats.get('avg', 0):.2f}")
+        print(
+            "  Definition: first forward to local completion plus "
+            "GPU-capacity queue"
+        )
+        print(f"  Avg:  {tpot_wq_stats.get('mean', 0):.2f}")
         print(f"  P50:  {tpot_wq_stats.get('p50', 0):.2f}")
         print(f"  P90:  {tpot_wq_stats.get('p90', 0):.2f}")
         print(f"  P95:  {tpot_wq_stats.get('p95', 0):.2f}")
         print(f"  P99:  {tpot_wq_stats.get('p99', 0):.2f}")
+        print()
+
+    if dispatch_normalized_stats:
+        print(
+            "--- Legacy Dispatch-Normalized Latency (ms/token) ---"
+        )
+        print(
+            f"  Avg:  {dispatch_normalized_stats.get('mean', 0):.2f}"
+        )
+        print(
+            f"  P50:  {dispatch_normalized_stats.get('p50', 0):.2f}"
+        )
+        print(
+            f"  P90:  {dispatch_normalized_stats.get('p90', 0):.2f}"
+        )
+        print(
+            f"  P95:  {dispatch_normalized_stats.get('p95', 0):.2f}"
+        )
+        print(
+            f"  P99:  {dispatch_normalized_stats.get('p99', 0):.2f}"
+        )
         print()
 
     # ITL with decode queue
@@ -1308,7 +1662,8 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
 
     if queueing_stats:
         print("--- Queueing Time (ms) ---")
-        print(f"  Avg:  {queueing_stats.get('avg', 0):.2f}")
+        print("  Definition: GPU-capacity queue only")
+        print(f"  Avg:  {queueing_stats.get('mean', 0):.2f}")
         print(f"  P50:  {queueing_stats.get('p50', 0):.2f}")
         print(f"  P90:  {queueing_stats.get('p90', 0):.2f}")
         print(f"  P95:  {queueing_stats.get('p95', 0):.2f}")
@@ -1325,8 +1680,14 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
         print()
 
     print("--- Goodput (SLO: TPOT with queueing < 100ms) ---")
-    print(f"  SLO Success: {slo_success}/{total_seqs}")
-    print(f"  Goodput: {goodput:.2f}%")
+    print(
+        "  SLO Success: "
+        f"{goodput_stats['successful_requests']}/"
+        f"{goodput_stats['eligible_requests']}"
+    )
+    print(
+        f"  Goodput: {goodput_stats['attainment_percent']:.2f}%"
+    )
     print("=" * 60 + "\n")
     
     if itl_log_path:
@@ -1345,7 +1706,8 @@ def main():
     print(
         f"Scheduler architecture: {args.scheduler_arch}, "
         f"Routing strategy: {args.routing_strategy}, "
-        f"Router policy: {args.router_policy}"
+        f"Router policy: {args.router_policy}, "
+        f"SP master selector: {args.sp_master_selector}"
     )
     engine = LLM(
         args.model_path,
@@ -1370,6 +1732,7 @@ def main():
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
+        sp_master_selector=args.sp_master_selector,
         scheduler_arch=args.scheduler_arch,
         router_policy=args.router_policy,
         segment_size=args.segment_size,
@@ -1391,6 +1754,12 @@ def main():
         dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
         dynamic_sp_long_request_size=args.long_request_sp_size,
         hierarchical_execution_trace=args.hierarchical_execution_trace,
+        hierarchical_quantum_diagnostics=bool(
+            args.hierarchical_quantum_log_path
+        ),
+        hierarchical_result_fastpath=(
+            os.getenv("NANODEPLOY_HIER_RESULT_FASTPATH", "0") == "1"
+        ),
     )
     
     # Print Config
@@ -1399,6 +1768,12 @@ def main():
     # Run Warmup
     world_size = args.ep
     run_warmup(engine, args.max_num_seqs, world_size)
+    engine.reset_execution_boundary_metrics()
+    if (
+        engine.config.hierarchical_quantum_diagnostics
+    ):
+        # Exclude warmup quantums from the benchmark diagnostic stream.
+        engine.drain_hierarchical_quantum_diagnostics()
 
     # Prepare Data
     request_generator = get_dataset_generator(args)
@@ -1409,7 +1784,7 @@ def main():
     )
 
     # Run Benchmark
-    total_time, seq_map = run_benchmark(
+    total_time, seq_map, metrics_summary = run_benchmark(
         engine,
         request_generator,
         arrival_times,
@@ -1417,6 +1792,9 @@ def main():
         diagnostic_log_interval=args.diagnostic_log_interval,
         slow_add_threshold_ms=args.slow_add_threshold_ms,
         hierarchical_trace_log_path=args.hierarchical_trace_log_path,
+        hierarchical_quantum_log_path=(
+            args.hierarchical_quantum_log_path
+        ),
         request_metrics_log_path=request_metrics_log_path,
         metrics_summary_path=args.metrics_summary_path,
     )
@@ -1426,6 +1804,7 @@ def main():
         total_time,
         seq_map,
         args.num_requests,
+        metrics_summary,
         itl_log_path=request_metrics_log_path,
     )
 

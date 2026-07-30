@@ -9,11 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from nanodeploy.engine.decode_coordinator import DecodeCoordinatorState
+from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AddResultEvent,
     AbortResult,
+    FirstScheduleEvent,
     FinishEvent,
     IngressAck,
     LoadSnapshot,
@@ -67,6 +69,27 @@ def route(router: RequestRouter, request_id: int) -> AddResult:
         temperature=0.1,
         ignore_eos=True,
     )
+
+
+def test_execution_boundary_recorder_reset_and_snapshot():
+    recorder = ExecutionBoundaryRecorder()
+    recorder.record({"phase_ms": 2.0, "signed_gap_ms": -1.0})
+    recorder.record({"phase_ms": 4.0, "signed_gap_ms": 3.0})
+
+    assert recorder.snapshot() == {
+        "sample_count": 2,
+        "phase_ms_total": 6.0,
+        "phase_ms_mean": 3.0,
+        "phase_ms_min": 2.0,
+        "phase_ms_max": 4.0,
+        "signed_gap_ms_total": 2.0,
+        "signed_gap_ms_mean": 1.0,
+        "signed_gap_ms_min": -1.0,
+        "signed_gap_ms_max": 3.0,
+    }
+
+    recorder.reset()
+    assert recorder.snapshot() == {"sample_count": 0}
 
 
 def load_snapshot(engine_id: int, free_blocks_min: int) -> LoadSnapshot:
@@ -124,7 +147,7 @@ def test_router_rejects_duplicate_and_wrong_owner_terminal_event():
 
 def test_router_round_robin_advances_once_per_request():
     engines = {0: FakeEngine(0), 1: FakeEngine(1)}
-    router = RequestRouter(engines)
+    router = RequestRouter(engines, router_policy="round_robin")
 
     assert route(router, 1).engine_id == 0
     assert route(router, 2).engine_id == 1
@@ -144,6 +167,7 @@ def test_router_rejects_invalid_load_policy_configuration():
 class FakeAsyncEngine(FakeEngine):
     enqueue_reasons: list[str | None] = field(default_factory=list)
     handles: list[dict] = field(default_factory=list)
+    admission_version: int = 0
 
     def enqueue_async(self, command: AddCommand):
         reason = (
@@ -164,13 +188,25 @@ class FakeAsyncEngine(FakeEngine):
         self.handles.append(handle)
         return handle
 
+    def admit_async(self, command: AddCommand):
+        handle = self.enqueue_async(command)
+        if handle["ack"].enqueued:
+            self.admission_version += 1
+            handle["ack"] = IngressAck(
+                request_id=command.request_id,
+                engine_id=self.engine_id,
+                enqueued=True,
+                admission_version=self.admission_version,
+            )
+        return handle
+
     def poll_enqueue(self, handle):
         if not handle["ready"]:
             return False, None
         return True, handle["ack"]
 
 
-def test_router_least_batch_counts_pending_and_uses_rr_for_ties():
+def test_router_least_batch_drains_global_pending_with_tentative_counts():
     engines = {
         0: FakeAsyncEngine(0),
         1: FakeAsyncEngine(1),
@@ -186,12 +222,173 @@ def test_router_least_batch_counts_pending_and_uses_rr_for_ties():
             ignore_eos=True,
         )
 
+    assert engines[0].commands == []
+    assert engines[1].commands == []
+    assert router.pending_global_count == 4
+    assert all(
+        router.owner(request_id).state == OwnerState.PENDING_GLOBAL
+        for request_id in (1, 2, 3, 4)
+    )
+
+    assert router.poll_ingress_acks() == ()
     assert [command.request_id for command in engines[0].commands] == [1, 3]
     assert [command.request_id for command in engines[1].commands] == [2, 4]
     assert all(
         router.owner(request_id).state == OwnerState.PENDING_INGRESS
         for request_id in (1, 2, 3, 4)
     )
+
+
+def test_router_least_batch_uses_live_running_plus_tentative_admissions():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(engines, router_policy="least_batch")
+    router.record_loads(
+        (
+            LoadSnapshot(0, True, 0, 3, 10, 1, 2),
+            LoadSnapshot(1, True, 0, 1, 10, 1, 2),
+        )
+    )
+
+    for request_id in (1, 2, 3):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+    assert router.poll_ingress_acks() == ()
+
+    # Start from running=[3, 1], then account for each tentative admission:
+    # request 1 -> DP1, request 2 -> DP1, request 3 -> DP0 after the
+    # tentative charges bring both projected batches to three.
+    assert [command.request_id for command in engines[0].commands] == [3]
+    assert [command.request_id for command in engines[1].commands] == [1, 2]
+
+
+def test_router_buffers_terminal_until_async_owner_commit():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(engines, router_policy="least_batch")
+    router.submit_async(
+        request_id=5,
+        prompt_token_ids=(1, 2),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert router.owner(5) == RequestOwner(
+        OwnerState.PENDING_INGRESS, 0
+    )
+    event = FinishEvent(
+        5,
+        16,
+        "FINISHED",
+        0,
+        first_forward_to_terminal_ms=750.0,
+    )
+    assert router.record_finish_events((event,)) == ()
+
+    engines[0].handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    assert router.owner(5) == RequestOwner(OwnerState.PENDING_ADD, 0)
+    assert router.record_finish_events(()) == ()
+
+    router.record_add_results((AddResultEvent(5, 0, True),))
+    terminal_events = router.record_finish_events(())
+    assert len(terminal_events) == 1
+    assert terminal_events[0].request_id == 5
+    assert terminal_events[0].first_forward_to_terminal_ms == 750.0
+    assert router.terminal_event(5) == terminal_events[0]
+    assert router.is_idle
+
+
+def test_router_retries_globally_after_all_dps_defer_admission(
+    monkeypatch,
+):
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        "nanodeploy.router.request_router.perf_counter",
+        lambda: clock["now"],
+    )
+    engines = {
+        0: FakeAsyncEngine(
+            0, enqueue_reasons=["admission_deferred"]
+        ),
+        1: FakeAsyncEngine(
+            1, enqueue_reasons=["admission_deferred"]
+        ),
+    }
+    router = RequestRouter(engines, router_policy="least_batch")
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 10))
+    )
+    router.submit_async(
+        request_id=9,
+        prompt_token_ids=(1, 2),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    engines[0].handles[0]["ready"] = True
+    assert router.poll_ingress_acks() == ()
+    clock["now"] = 10.0
+    engines[1].handles[0]["ready"] = True
+    assert router.poll_ingress_acks() == ()
+    assert router.owner(9) == RequestOwner(OwnerState.PENDING_GLOBAL)
+    assert router.pending_global_count == 1
+
+    # The unchanged load generation cannot spin on the same infeasible head.
+    assert router.poll_ingress_acks() == ()
+    assert len(engines[0].commands) == 1
+    assert len(engines[1].commands) == 1
+
+    clock["now"] = 35.0
+    router.record_loads(
+        (
+            LoadSnapshot(0, True, 0, 0, 11, 1, 3),
+            LoadSnapshot(1, True, 0, 0, 11, 1, 3),
+        )
+    )
+    assert router.poll_ingress_acks() == ()
+    assert len(engines[0].commands) == 2
+    engines[0].handles[1]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    schedule_events = router.record_first_schedule_events(
+        (FirstScheduleEvent(9, 0, local_scheduler_queue_ms=7.0),)
+    )
+    assert len(schedule_events) == 1
+    assert schedule_events[0].global_capacity_queue_ms == 25_000.0
+    assert schedule_events[0].local_scheduler_queue_ms == 7.0
+    assert schedule_events[0].first_schedule_latency_ms == 25_007.0
+    router.record_add_results((AddResultEvent(9, 0, True),))
+    terminal = router.finish(
+        FinishEvent(
+            9,
+            16,
+            "FINISHED",
+            0,
+            first_forward_to_terminal_ms=1_000.0,
+        )
+    )
+    assert terminal.first_forward_to_terminal_ms == 1_000.0
+    assert terminal.global_capacity_queue_ms == 25_000.0
+    admission_metrics = router.admission_metrics()
+    assert admission_metrics["global_retries"] == 1
+    assert admission_metrics["fallbacks"] == 1
+    assert admission_metrics["per_engine"]["0"]["attempts"] == 2
+    assert admission_metrics["per_engine"]["0"]["deferred"] == 1
+    assert admission_metrics["per_engine"]["1"]["attempts"] == 1
+    assert admission_metrics["per_engine"]["1"]["deferred"] == 1
 
 
 def test_router_least_cache_uses_padded_request_blocks_optimistically():
@@ -296,6 +493,8 @@ def test_router_async_ingress_fallback_and_add_state_transition():
         ignore_eos=True,
     )
     assert router.pending_ingress_count == 1
+    assert router.owner(40).state == OwnerState.PENDING_GLOBAL
+    assert router.poll_ingress_acks() == ()
     assert router.owner(40).engine_id == 0
 
     engines[0].handles[0]["ready"] = True
@@ -307,6 +506,27 @@ def test_router_async_ingress_fallback_and_add_state_transition():
     assert len(ack) == 1 and ack[0].enqueued
     assert router.owner(40).state == OwnerState.PENDING_ADD
     assert router.pending_add_count == 1
+    router.record_loads(
+        (
+            LoadSnapshot(0, True, 0, 0, 10, 1, 2),
+            LoadSnapshot(
+                1,
+                True,
+                0,
+                1,
+                10,
+                1,
+                2,
+                admission_version=1,
+            ),
+        )
+    )
+    assert (
+        router.admission_metrics()["per_engine"]["1"][
+            "tentative_admissions"
+        ]
+        == 0
+    )
 
     result = AddResultEvent(40, 1, True)
     assert router.record_add_results((result,)) == (result,)
@@ -323,6 +543,7 @@ def test_router_buffers_add_result_observed_before_ingress_ack():
         temperature=0.1,
         ignore_eos=True,
     )
+    assert router.poll_ingress_acks() == ()
 
     event = AddResultEvent(41, 0, True)
     assert router.record_add_results((event,)) == ()
@@ -332,7 +553,23 @@ def test_router_buffers_add_result_observed_before_ingress_ack():
     assert router.owner(41).state == OwnerState.OWNED
 
 
-def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity():
+def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
+    monkeypatch,
+):
+    fake_now = 0.0
+
+    def fake_perf_counter():
+        nonlocal fake_now
+        fake_now += 1.0
+        return fake_now
+
+    # A zero time budget must keep draining up to the request-count cap even
+    # when the synthetic clock advances far beyond the former 10 ms limit.
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_engine.perf_counter",
+        fake_perf_counter,
+    )
+
     class FakeScheduler:
         def __init__(self):
             self.commands = []
@@ -347,7 +584,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity():
         attention_dp=1,
         hierarchical_queue_capacity=2,
         max_ingress_batch_requests=256,
-        max_ingress_drain_ms=10.0,
+        max_ingress_drain_ms=0.0,
     )
     engine.engine_id = 0
     engine.scheduler = FakeScheduler()
@@ -356,8 +593,10 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity():
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set()
     engine._ingress_pending_ids = set()
+    engine._admission_pending_ids = set()
     engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
+    engine._admission_version = 0
     engine._events_lock = threading.Lock()
     engine._add_result_events = deque()
     engine._first_token_events = deque()
@@ -407,6 +646,99 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity():
         FinishEvent(52, 0, "ABORTED", 0),
     )
     assert engine._reserved_slots == 1
+
+
+def test_local_engine_central_admission_commits_only_after_local_plan():
+    class FakeScheduler:
+        def __init__(self):
+            self.batches = []
+
+        def try_admit_batch(self, commands):
+            self.batches.append(
+                tuple(command.request_id for command in commands)
+            )
+            return tuple(
+                {
+                    60: AddResult(60, True, engine_id=0),
+                    61: AddResult(
+                        61,
+                        False,
+                        engine_id=0,
+                        reason="admission_deferred",
+                    ),
+                }[command.request_id]
+                for command in commands
+            )
+
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(attention_dp=1)
+    engine.engine_id = 0
+    engine.scheduler = FakeScheduler()
+    engine._failure = None
+    engine._coordinator = None
+    engine._command_count = 0
+    engine._command_queue_delay_ms_total = 0.0
+    engine._ingress_lock = threading.Lock()
+    engine._reserved_request_ids = set()
+    engine._ingress_pending_ids = set()
+    engine._admission_pending_ids = {60, 61}
+    engine._cancelled_ingress_ids = set()
+    engine._reserved_slots = 0
+    engine._admission_version = 0
+    engine._events_lock = threading.Lock()
+    engine._add_result_events = deque()
+    engine._terminal_events = deque()
+    engine._state_cv = threading.Condition()
+    engine._wave_running = False
+    engine._wave_id = 0
+    engine._quantum_id = 0
+
+    def loop_command(request_id):
+        return SimpleNamespace(
+            kind="admit",
+            payload=AddCommand(
+                request_id=request_id,
+                prompt_token_ids=(1, 2),
+                max_tokens=16,
+                temperature=0.1,
+                ignore_eos=True,
+                wave_id=0,
+            ),
+            enqueued_at=0.0,
+            completed=threading.Event(),
+            result=None,
+            error=None,
+        )
+
+    accepted = loop_command(60)
+    deferred = loop_command(61)
+    engine._complete_admission_commands((accepted, deferred))
+    assert engine.scheduler.batches == [(60, 61)]
+    assert accepted.error is None
+    assert accepted.result == IngressAck(
+        request_id=60,
+        engine_id=0,
+        enqueued=True,
+        admission_version=1,
+    )
+    assert engine._reserved_request_ids == {60}
+    assert engine._reserved_slots == 1
+    assert engine.drain_add_results() == (
+        AddResultEvent(60, 0, True),
+    )
+    assert engine._wave_running
+
+    assert deferred.error is None
+    assert deferred.result == IngressAck(
+        request_id=61,
+        engine_id=0,
+        enqueued=False,
+        reason="admission_deferred",
+    )
+    assert engine._reserved_request_ids == {60}
+    assert engine._reserved_slots == 1
+    assert 61 not in engine._admission_pending_ids
 
 
 def test_decode_coordinator_ready_wave_and_racing_wakeup():
@@ -512,7 +844,15 @@ def test_execution_trace_validation_requires_identical_global_steps():
         validate_execution_trace_set(traces[:-1], (0, 1))
 
 
-def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
+@pytest.mark.parametrize("result_fastpath", [False, True])
+@pytest.mark.parametrize("quantum_diagnostics", [False, True])
+@pytest.mark.parametrize("execution_trace", [False, True])
+def test_local_executor_uses_keyword_only_nested_actor_calls(
+    monkeypatch,
+    result_fastpath,
+    quantum_diagnostics,
+    execution_trace,
+):
     class FakeEndpoint:
         def __init__(self, *_args, **_kwargs):
             self.connected = None
@@ -539,10 +879,51 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
     class FakeWorker:
         def __init__(self):
             self.init_rpc_endpoint = RemoteMethod(("client",))
-            self.run = RemoteMethod(([[]], 1.0))
+            result = (
+                [
+                    list(range(16)),
+                    [0] * 16,
+                ],
+                1.0,
+            )
+            if execution_trace:
+                result += (
+                    {
+                        "wave_id": 1,
+                        "quantum_id": 0,
+                        "global_rank": 0,
+                        "forward_count": 16,
+                        "real_batch_size": 1,
+                        "control_dummy_count": 1,
+                        "batch_kind": "real_or_mixed",
+                        "forwards": tuple(
+                            {
+                                "inner_loop_idx": inner_loop_idx,
+                                "use_sp_a2a": False,
+                            }
+                            for inner_loop_idx in range(16)
+                        ),
+                    },
+                )
+            if quantum_diagnostics:
+                result += (
+                    {
+                        "global_rank": 0,
+                        "recv_seqs_ms": 1.0,
+                        "prepare_update_host_ms": 2.0,
+                        "forward_host_ms": 3.0,
+                        "gpu_loop_ms": 4.0,
+                        "loop_host_ms": 5.0,
+                        "token_materialize_ms": 0.5,
+                        "worker_body_ms": 6.0,
+                        "worker_total_ms": 7.0,
+                    },
+                )
+            self.run = RemoteMethod(result)
 
     class FakeSequence:
-        seq_id = -1
+        def __init__(self, seq_id):
+            self.seq_id = seq_id
 
         @staticmethod
         def block_ctx():
@@ -552,16 +933,18 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
         engine_id = 0
         wave_id = 1
         quantum_id = 0
-        engine_has_real = False
-        per_rank_sequences = {0: [FakeSequence()]}
+        engine_has_real = True
+        real_sequence = FakeSequence(7)
+        control_dummy = FakeSequence(-1)
+        per_rank_sequences = {0: [real_sequence, control_dummy]}
 
         @staticmethod
-        def is_control_dummy(_sequence):
-            return True
+        def is_control_dummy(sequence):
+            return sequence.seq_id == -1
 
         @staticmethod
         def expected_request_ids(_global_rank):
-            return ()
+            return (7,)
 
     monkeypatch.setattr(
         "nanodeploy.engine.local_executor.RPCServerEndpoint",
@@ -573,7 +956,9 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
     )
     config = SimpleNamespace(
         optimize_decode_block_table=True,
-        hierarchical_execution_trace=False,
+        hierarchical_execution_trace=execution_trace,
+        hierarchical_quantum_diagnostics=quantum_diagnostics,
+        hierarchical_result_fastpath=result_fastpath,
     )
     topology = EngineTopology(
         engine_id=0,
@@ -586,7 +971,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
     executor = LocalExecutor(config, topology, [worker])
 
     executor.initialize_endpoint(timeout=1.0)
-    executor.run(FakeBatch(), timeout=1.0)
+    results = executor.run(FakeBatch(), timeout=1.0)
 
     assert worker.init_rpc_endpoint.calls == [
         {"server_info": ("server",)}
@@ -594,9 +979,47 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
     assert len(worker.run.calls) == 1
     run_call = dict(worker.run.calls[0])
     assert run_call.pop("send_timestamp") > 0
+    trace_context = run_call.pop("hierarchical_trace")
+    if execution_trace:
+        assert trace_context == {
+            "wave_id": 1,
+            "quantum_id": 0,
+            "global_rank": 0,
+            "real_batch_size": 1,
+            "control_dummy_count": 1,
+            "batch_kind": "real_or_mixed",
+        }
+    else:
+        assert trace_context is None
     assert run_call == {
         "dp_seqs": [],
         "is_prefill": False,
         "enable_rpc": True,
-        "hierarchical_trace": None,
+        "hierarchical_quantum_diagnostics": quantum_diagnostics,
     }
+    assert len(results) == 1
+    assert results[0].mastered_request_ids == (7,)
+    assert results[0].sampled_token_ids == (tuple(range(16)),)
+    assert executor.result_rebuild_sample_count == 1
+    assert executor.result_rebuild_latency_ms_total >= 0
+    boundary = executor.execution_boundary_metrics()
+    assert boundary["sample_count"] == 1
+    assert boundary["ray_get_latency_ms_mean"] >= 0
+    if quantum_diagnostics:
+        assert executor.last_quantum_diagnostic is not None
+        assert (
+            executor.last_quantum_diagnostic[
+                "critical_worker_global_rank"
+            ]
+            == 0
+        )
+        assert executor.last_quantum_diagnostic["gpu_loop_ms_max"] == 4.0
+        assert executor.last_quantum_diagnostic[
+            "worker_rank_timings"
+        ][0]["worker_total_ms"] == 7.0
+    else:
+        assert executor.last_quantum_diagnostic is None
+    if execution_trace:
+        assert len(executor.last_execution_traces) == 1
+    else:
+        assert executor.last_execution_traces == ()

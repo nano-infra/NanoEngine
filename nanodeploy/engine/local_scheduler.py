@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass
 from math import ceil
+from time import perf_counter
 
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
@@ -10,6 +11,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AbortResult,
+    FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
     HIERARCHICAL_LOOP_COUNT,
@@ -33,6 +35,8 @@ class LocalRequestRecord:
     state: RequestState
     original_prompt_len: int
     padded_completion_len: int
+    scheduler_enqueued_at: float
+    first_forward_started_at: float | None = None
     first_token_emitted: bool = False
     terminal_emitted: bool = False
 
@@ -310,12 +314,71 @@ class LocalScheduler:
             state=RequestState.WAITING_ADMISSION,
             original_prompt_len=validation.original_prompt_len,
             padded_completion_len=validation.padded_completion_len,
+            scheduler_enqueued_at=perf_counter(),
         )
         return AddResult(
             request_id=command.request_id,
             accepted=True,
             engine_id=self.engine_id,
         )
+
+    def _discard_waiting_request(self, request_id: int) -> None:
+        record = self._records.get(request_id)
+        if record is None:
+            return
+        if record.state != RequestState.WAITING_ADMISSION:
+            raise RuntimeError(
+                "cannot discard a non-waiting admission candidate: "
+                f"request_id={request_id}, state={record.state.value}"
+            )
+        if record.sequence in self._state_manager.running:
+            raise RuntimeError(
+                "waiting admission candidate unexpectedly entered running: "
+                f"request_id={request_id}"
+            )
+        self._scheduler.waiting_migration.remove(record.sequence)
+        self._records.pop(request_id)
+
+    def try_admit_batch(
+        self, commands: tuple[AddCommand, ...]
+    ) -> tuple[AddResult, ...]:
+        """Atomically validate, plan, and commit a local DP candidate batch.
+
+        `Scheduler.admit()` invokes the same C++ SP placement planner used by
+        the legacy centralized scheduler. Candidates that current local SP/KV
+        state cannot place are removed from the local waiting queue so the
+        global admission coordinator can try another DP or retain them
+        globally.
+        """
+        if not commands:
+            return ()
+
+        results = [self.add(command) for command in commands]
+        candidate_ids = {
+            command.request_id
+            for command, result in zip(commands, results, strict=True)
+            if result.accepted
+        }
+        if not candidate_ids:
+            return tuple(results)
+
+        admitted_ids = set(self.admit())
+        for index, (command, result) in enumerate(
+            zip(commands, results, strict=True)
+        ):
+            if not result.accepted or command.request_id in admitted_ids:
+                continue
+            self._discard_waiting_request(command.request_id)
+            results[index] = AddResult(
+                request_id=command.request_id,
+                accepted=False,
+                engine_id=self.engine_id,
+                reason="admission_deferred",
+            )
+        return tuple(results)
+
+    def try_admit(self, command: AddCommand) -> AddResult:
+        return self.try_admit_batch((command,))[0]
 
     def _defer_admission(self, sequence: Sequence) -> None:
         if sequence not in self._state_manager.running:
@@ -450,6 +513,43 @@ class LocalScheduler:
             _control_dummy_object_ids=control_dummy_object_ids,
         )
 
+    def mark_first_forward_started(
+        self, batch: LocalDecodeBatch
+    ) -> tuple[FirstScheduleEvent, ...]:
+        """Mark requests immediately before their first executor.run call."""
+        if batch.engine_id != self.engine_id:
+            raise RuntimeError(
+                "cannot start a batch owned by another LocalScheduler"
+            )
+        batch_request_ids = {
+            request_id
+            for request_ids in batch.frozen_request_order.values()
+            for request_id in request_ids
+        }
+        if batch_request_ids != self._inflight_ids:
+            raise RuntimeError(
+                "first-forward batch does not match frozen inflight requests"
+            )
+
+        started_at = perf_counter()
+        events: list[FirstScheduleEvent] = []
+        for request_id in sorted(batch_request_ids):
+            record = self._records[request_id]
+            if record.first_forward_started_at is not None:
+                continue
+            record.first_forward_started_at = started_at
+            events.append(
+                FirstScheduleEvent(
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    local_scheduler_queue_ms=max(
+                        0.0,
+                        (started_at - record.scheduler_enqueued_at) * 1000,
+                    ),
+                )
+            )
+        return tuple(events)
+
     def _finish_aborted(self, request_id: int) -> None:
         record = self._records[request_id]
         sequence = record.sequence
@@ -484,6 +584,20 @@ class LocalScheduler:
             raise RuntimeError(
                 f"duplicate terminal event for request {record.sequence.seq_id}"
             )
+        first_forward_to_terminal_ms = None
+        if record.first_forward_started_at is not None:
+            first_forward_to_terminal_ms = max(
+                0.0,
+                (
+                    perf_counter() - record.first_forward_started_at
+                )
+                * 1000,
+            )
+        elif status == "FINISHED":
+            raise RuntimeError(
+                "finished hierarchical request has no first-forward "
+                f"timestamp: request_id={record.sequence.seq_id}"
+            )
         record.terminal_emitted = True
         self._terminal_events.append(
             FinishEvent(
@@ -491,6 +605,9 @@ class LocalScheduler:
                 generated_count=record.sequence.num_completed_tokens,
                 status=status,
                 engine_id=self.engine_id,
+                first_forward_to_terminal_ms=(
+                    first_forward_to_terminal_ms
+                ),
             )
         )
 

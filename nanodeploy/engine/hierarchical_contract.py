@@ -37,6 +37,7 @@ class RequestState(str, Enum):
 
 
 class OwnerState(str, Enum):
+    PENDING_GLOBAL = "PENDING_GLOBAL"
     PENDING_INGRESS = "PENDING_INGRESS"
     PENDING_ADD = "PENDING_ADD"
     OWNED = "OWNED"
@@ -122,6 +123,10 @@ class IngressAck:
     engine_id: int
     enqueued: bool
     reason: str | None = None
+    # Monotonic LocalEngine admission commit version. A successful
+    # centralized-admission ACK carries the version that will be visible in
+    # subsequent cached load snapshots.
+    admission_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +145,23 @@ class FirstTokenEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class FirstScheduleEvent:
+    """First entry into executor.run, excluding control-plane pickup delay."""
+
+    request_id: int
+    engine_id: int
+    local_scheduler_queue_ms: float
+    global_capacity_queue_ms: float = 0.0
+
+    @property
+    def first_schedule_latency_ms(self) -> float:
+        return (
+            self.local_scheduler_queue_ms
+            + self.global_capacity_queue_ms
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AbortResult:
     request_id: int
     status: str
@@ -151,6 +173,8 @@ class FinishEvent:
     generated_count: int
     status: str
     engine_id: int
+    first_forward_to_terminal_ms: float | None = None
+    global_capacity_queue_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +212,7 @@ class LoadSnapshot:
     free_blocks_min: int
     wave_id: int
     quantum_id: int
+    admission_version: int = 0
     useful_real_batch_size: int = 0
     control_dummy_count: int = 0
     all_dummy_engine_quantums: int = 0
@@ -204,6 +229,14 @@ class LoadSnapshot:
     schedule_latency_ms_total: float = 0.0
     coordination_latency_ms_total: float = 0.0
     execute_latency_ms_total: float = 0.0
+    ray_get_latency_ms_total: float = 0.0
+    ray_get_latency_ms_max: float = 0.0
+    result_rebuild_latency_ms_total: float = 0.0
+    result_rebuild_latency_ms_max: float = 0.0
+    result_rebuild_sample_count: int = 0
+    result_index_latency_ms_total: float = 0.0
+    result_validate_latency_ms_total: float = 0.0
+    result_pack_latency_ms_total: float = 0.0
     postprocess_latency_ms_total: float = 0.0
     pending_ingress: int = 0
     pending_add_results: int = 0

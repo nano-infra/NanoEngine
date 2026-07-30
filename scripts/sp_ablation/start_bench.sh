@@ -26,6 +26,7 @@ DEFAULT_GPU_UTIL=0.9
 DEFAULT_ROUTING="LeastBatch"
 DEFAULT_SCHEDULER_ARCH="legacy_global"
 DEFAULT_ROUTER_POLICY="least_batch"
+DEFAULT_SP_MASTER_SELECTOR="LeastBatch"
 DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
@@ -38,8 +39,10 @@ DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
 DEFAULT_LONG_REQUEST_SP_SIZE=0
 DEFAULT_DIAGNOSTIC_LOG_INTERVAL=0
 DEFAULT_SLOW_ADD_THRESHOLD_MS=0
+DEFAULT_HIERARCHICAL_QUANTUM_DIAGNOSTICS=0
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
+DEFAULT_MAX_REQUEST_TOKENS=910000
 # ===================================================================
 
 # 初始化变量
@@ -62,12 +65,14 @@ GPU_UTIL="$DEFAULT_GPU_UTIL"
 ROUTING_STRATEGY="$DEFAULT_ROUTING"
 SCHEDULER_ARCH="$DEFAULT_SCHEDULER_ARCH"
 ROUTER_POLICY="${ROUTER_POLICY:-$DEFAULT_ROUTER_POLICY}"
+SP_MASTER_SELECTOR="${SP_MASTER_SELECTOR:-$DEFAULT_SP_MASTER_SELECTOR}"
 LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-$DEFAULT_FIXED_SP_SIZE}"
 SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
 CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-$DEFAULT_CUDA_GRAPH_MODE}"
 ENABLE_DYNAMIC_SP_SIZE="$DEFAULT_ENABLE_DYNAMIC_SP_SIZE"
 MAX_INPUT_LEN="$DEFAULT_MAX_INPUT_LEN"
+MAX_REQUEST_TOKENS="${MAX_REQUEST_TOKENS:-$DEFAULT_MAX_REQUEST_TOKENS}"
 ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
@@ -76,6 +81,7 @@ LONG_REQUEST_SP_SIZE="$DEFAULT_LONG_REQUEST_SP_SIZE"
 DIAGNOSTIC_LOG_INTERVAL="${DIAGNOSTIC_LOG_INTERVAL:-$DEFAULT_DIAGNOSTIC_LOG_INTERVAL}"
 SLOW_ADD_THRESHOLD_MS="${SLOW_ADD_THRESHOLD_MS:-$DEFAULT_SLOW_ADD_THRESHOLD_MS}"
 HIERARCHICAL_EXECUTION_TRACE="${HIERARCHICAL_EXECUTION_TRACE:-0}"
+HIERARCHICAL_QUANTUM_DIAGNOSTICS="${HIERARCHICAL_QUANTUM_DIAGNOSTICS:-$DEFAULT_HIERARCHICAL_QUANTUM_DIAGNOSTICS}"
 RUN_LABEL="${RUN_LABEL:-}"
 
 # 用于存储位置参数（Rates）
@@ -102,12 +108,14 @@ usage() {
     echo "  --routing-strategy <str>  Routing Strategy (default: $DEFAULT_ROUTING)"
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
     echo "  --router-policy <str>     round_robin | least_batch | least_cache (default: $DEFAULT_ROUTER_POLICY)"
+    echo "  --sp-master-selector <str> RoundRobin | LeastBatch | LeastCache (default: $DEFAULT_SP_MASTER_SELECTOR)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
     echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
+    echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
     echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
     echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
@@ -115,6 +123,7 @@ usage() {
     echo "  --diagnostic-log-interval <sec>   Structured client/scheduler snapshot interval (0 = disabled)"
     echo "  --slow-add-threshold-ms <ms>      Log slow async due-batch submissions (0 = disabled)"
     echo "  --hierarchical-execution-trace    Capture high-overhead per-rank hierarchical traces"
+    echo "  --hierarchical-quantum-diagnostics Capture lightweight per-engine quantum timing/load JSONL"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
     echo "  --disable-non-uniform-split  Disable non-uniform split (flag)"
     echo "  --help                    Show this help message"
@@ -142,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --routing-strategy) ROUTING_STRATEGY="$2"; shift 2 ;;
         --scheduler-arch)   SCHEDULER_ARCH="$2"; shift 2 ;;
         --router-policy)    ROUTER_POLICY="$2"; shift 2 ;;
+        --sp-master-selector) SP_MASTER_SELECTOR="$2"; shift 2 ;;
         --loop-count)       LOOP_COUNT="$2"; shift 2 ;;
         --fixed-sp-size)     FIXED_SP_SIZE="$2"; shift 2 ;;
         --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
@@ -149,6 +159,7 @@ while [[ $# -gt 0 ]]; do
         --run-label)        RUN_LABEL="$2"; shift 2 ;;
         --enable-dynamic-sp-size) ENABLE_DYNAMIC_SP_SIZE=1; shift ;;
         --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
+        --max-request-tokens) MAX_REQUEST_TOKENS="$2"; shift 2 ;;
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
@@ -156,6 +167,7 @@ while [[ $# -gt 0 ]]; do
         --diagnostic-log-interval) DIAGNOSTIC_LOG_INTERVAL="$2"; shift 2 ;;
         --slow-add-threshold-ms) SLOW_ADD_THRESHOLD_MS="$2"; shift 2 ;;
         --hierarchical-execution-trace) HIERARCHICAL_EXECUTION_TRACE=1; shift ;;
+        --hierarchical-quantum-diagnostics) HIERARCHICAL_QUANTUM_DIAGNOSTICS=1; shift ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
@@ -193,6 +205,11 @@ case "$ROUTER_POLICY" in
     *) echo "Error: Invalid router policy '$ROUTER_POLICY'."; exit 1 ;;
 esac
 
+case "$SP_MASTER_SELECTOR" in
+    RoundRobin|LeastBatch|LeastCache) ;;
+    *) echo "Error: Invalid SP master selector '$SP_MASTER_SELECTOR'."; exit 1 ;;
+esac
+
 case "$SP_BACKEND" in
     legacy_ll|hao_basic|nccl) ;;
     *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
@@ -214,6 +231,21 @@ if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
             exit 1
             ;;
     esac
+fi
+
+if ! [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" =~ ^[01]$ ]]; then
+    echo "Error: HIERARCHICAL_QUANTUM_DIAGNOSTICS must be 0 or 1."
+    exit 1
+fi
+
+if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 && "$SCHEDULER_ARCH" != "hierarchical" ]]; then
+    echo "Error: --hierarchical-quantum-diagnostics requires --scheduler-arch hierarchical."
+    exit 1
+fi
+
+if ! [[ "$MAX_REQUEST_TOKENS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --max-request-tokens must be a non-negative integer."
+    exit 1
 fi
 
 # ================= 准备基础信息 (Preparation) =================
@@ -246,12 +278,14 @@ echo "Strategy    : DP=$DP, SP=$SP, EP=$EP, TP=$TP, BK_SZ=$BLOCK_SIZE"
 echo "Routing     : $ROUTING_STRATEGY"
 echo "SchedArch   : $SCHEDULER_ARCH"
 echo "RouterPolicy: $ROUTER_POLICY"
+echo "SPMasterSel : $SP_MASTER_SELECTOR"
 echo "LBCandRatio : $LEASTBATCH_TOKEN_CANDIDATE_RATIO"
 echo "BatchSz     : $BATCH_SIZE"
 echo "GPU Util    : $GPU_UTIL ($MEM_TAG)"
 echo "GPU Mem     : ${GPU_MEM}GB"
 echo "Max Len     : $MAX_MODEL_LEN"
 echo "Max Input   : ${MAX_INPUT_LEN:-unlimited}"
+echo "Max Request : ${MAX_REQUEST_TOKENS:-unlimited} tokens"
 echo "Fixed SP Size: $FIXED_SP_SIZE"
 echo "SP Backend  : $SP_BACKEND"
 echo "CUDA Graph  : $CUDA_GRAPH_MODE"
@@ -263,6 +297,7 @@ echo "Long Request SP Threshold: $LONG_REQUEST_SP_THRESHOLD"
 echo "Diagnostic Log Interval: $DIAGNOSTIC_LOG_INTERVAL"
 echo "Slow Add Threshold: ${SLOW_ADD_THRESHOLD_MS}ms"
 echo "Hierarchical Execution Trace: $HIERARCHICAL_EXECUTION_TRACE"
+echo "Hierarchical Quantum Diagnostics: $HIERARCHICAL_QUANTUM_DIAGNOSTICS"
 echo "Enforce Eager: $ENFORCE_EAGER"
 echo "Model Path  : $MODEL_PATH"
 echo "Rates       : ${RATES[*]}"
@@ -270,8 +305,8 @@ echo "================================================"
 
 log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
-log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH | RouterPolicy: $ROUTER_POLICY"
-log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
+log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH | RouterPolicy: $ROUTER_POLICY | SPMasterSelector: $SP_MASTER_SELECTOR"
+log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | MaxRequestTokens=${MAX_REQUEST_TOKENS:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
 log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
@@ -281,6 +316,7 @@ log_progress "LongRequestSPThreshold=$LONG_REQUEST_SP_THRESHOLD"
 log_progress "DiagnosticLogInterval=$DIAGNOSTIC_LOG_INTERVAL"
 log_progress "SlowAddThresholdMs=$SLOW_ADD_THRESHOLD_MS"
 log_progress "HierarchicalExecutionTrace=$HIERARCHICAL_EXECUTION_TRACE"
+log_progress "HierarchicalQuantumDiagnostics=$HIERARCHICAL_QUANTUM_DIAGNOSTICS"
 log_progress "EnforceEager=$ENFORCE_EAGER"
 log_progress "GPU: ${GPU_MEM}GB, Util=$GPU_UTIL | Routing=$ROUTING_STRATEGY | Loop=$LOOP_COUNT"
 log_progress "LeastBatchTokenCandidateRatio=$LEASTBATCH_TOKEN_CANDIDATE_RATIO"
@@ -296,6 +332,7 @@ else
 fi
 
 # ================= 执行循环 (Execution Loop) =================
+OVERALL_EXIT_CODE=0
 for rate in "${RATES[@]}"; do
     TIMESTAMP=$(TZ='Asia/Shanghai' date "+%Y%m%d_%H%M%S")
 
@@ -329,6 +366,10 @@ for rate in "${RATES[@]}"; do
     if [[ -n "$MAX_INPUT_LEN" ]]; then
         maxin_tag="_maxin$(( MAX_INPUT_LEN / 1000 ))k"
     fi
+    maxreq_tag=""
+    if [[ "$MAX_REQUEST_TOKENS" -gt 0 ]]; then
+        maxreq_tag="_maxreq${MAX_REQUEST_TOKENS}"
+    fi
     # 可选标签
     extra_tags=""
     if [[ -n "$DISABLE_NON_UNIFORM_SPLIT" ]]; then
@@ -347,10 +388,13 @@ for rate in "${RATES[@]}"; do
             extra_tags="${extra_tags}_sp${LONG_REQUEST_SP_SIZE}"
         fi
     fi
+    if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
+        extra_tags="${extra_tags}_qdiag"
+    fi
     if [[ -n "$RUN_LABEL" ]]; then
         extra_tags="${extra_tags}_${RUN_LABEL}"
     fi
-    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}_${rp_short}${maxin_tag}${extra_tags}"
+    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}_${rp_short}${maxin_tag}${maxreq_tag}${extra_tags}"
 
     CURRENT_LOG_DIR="$BASE_LOG_DIR/$MODEL_NAME/$DATASET_NAME/$STRATEGY_STR"
     mkdir -p "$CURRENT_LOG_DIR"
@@ -358,12 +402,14 @@ for rate in "${RATES[@]}"; do
     LOG_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.log"
     JSON_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.jsonl"
     TRACE_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.hier_trace.jsonl"
+    QUANTUM_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.hier_quantum.jsonl"
 
     # 构建 Python 命令
     CMD=(
         python -u "$PYTHON_SCRIPT"
         --dataset csv
         --csv-path "$CSV_PATH"
+        --max-request-tokens "$MAX_REQUEST_TOKENS"
         --num-requests "$NUM_REQUESTS"
         --request-rate "$rate"
         --sp "$SP"
@@ -386,6 +432,7 @@ for rate in "${RATES[@]}"; do
         --cuda-graph-mode "$CUDA_GRAPH_MODE"
         --scheduler-arch "$SCHEDULER_ARCH"
         --router-policy "$ROUTER_POLICY"
+        --sp-master-selector "$SP_MASTER_SELECTOR"
         --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
@@ -414,6 +461,11 @@ for rate in "${RATES[@]}"; do
             --hierarchical-trace-log-path "$TRACE_FILE"
         )
     fi
+    if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
+        CMD+=(
+            --hierarchical-quantum-log-path "$QUANTUM_FILE"
+        )
+    fi
 
     # 如果设置了 max-input-len
     if [[ -n "$MAX_INPUT_LEN" ]]; then
@@ -428,6 +480,7 @@ for rate in "${RATES[@]}"; do
         echo "Model Path: $MODEL_PATH"
         echo "Dataset: $DATASET_NAME"
         echo "Max Input Len: ${MAX_INPUT_LEN:-unlimited}"
+        echo "Max Request Tokens: ${MAX_REQUEST_TOKENS:-unlimited}"
         echo "Settings: $STRATEGY_STR"
         echo ""
         echo "================= Reproduce Command ================="
@@ -449,9 +502,11 @@ for rate in "${RATES[@]}"; do
         log_progress " <- Finished Rate: $rate. Status: SUCCESS"
     else
         log_progress " <- Finished Rate: $rate. Status: FAILED (Code $EXIT_CODE)"
+        OVERALL_EXIT_CODE=$EXIT_CODE
     fi
 
     sleep 15
 done
 
 log_progress "=== BATCH FINISHED ==="
+exit "$OVERALL_EXIT_CODE"

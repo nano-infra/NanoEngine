@@ -11,6 +11,7 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from nanodeploy.config import Config
 
 from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
+from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
@@ -124,6 +125,7 @@ class RayExecutor:
 
         self.workers = []
         self.placement_groups = []
+        self._execution_boundary = ExecutionBoundaryRecorder()
         assert config.attn_world_size == config.ffn_world_size
         worker_env_vars = {}
         for env_name in ("SLIME_QP_NUM",):
@@ -244,7 +246,7 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        # start = time.perf_counter()
+        executor_begin = time.perf_counter()
         send_timestamp = time.time()
         if self.config.use_dlslime_rpc:
             # When using dlslime RPC, sequences are delivered via the endpoint.
@@ -252,7 +254,14 @@ class RayExecutor:
                 getattr(worker, "run").remote([], is_prefill, True, send_timestamp)
                 for _, worker in zip(dp_seqs, self.workers)
             ]
+            submit_latency_ms = (
+                time.perf_counter() - executor_begin
+            ) * 1000
+            send_begin = time.perf_counter()
             self.endpoint.send_seqs(dp_seqs, is_prefill)
+            send_seqs_latency_ms = (
+                time.perf_counter() - send_begin
+            ) * 1000
             # trans_type = "DLSlime"
         else:
             # When not using dlslime RPC, pass sequences directly to workers.
@@ -260,15 +269,21 @@ class RayExecutor:
                 getattr(worker, "run").remote(seqs, is_prefill, False, send_timestamp)
                 for seqs, worker in zip(dp_seqs, self.workers)
             ]
+            submit_latency_ms = (
+                time.perf_counter() - executor_begin
+            ) * 1000
+            send_seqs_latency_ms = 0.0
             # trans_type = "Ray"
 
         # duration = (time.perf_counter() - start) * 1000
         # logger.info(f"[METRIC] Use DLSlime: {self.config.use_dlslime_rpc}, Duration: {duration:.4f} ms")
 
+        ray_get_begin = time.perf_counter()
         results = ray.get(
             ray_futures,
             timeout=timeout,
         )
+        ray_get_end = time.perf_counter()
         recv_timestamp = time.time()
 
         token_ids_list = []
@@ -282,10 +297,42 @@ class RayExecutor:
         
         if worker_end_times:
             # Output Transfer Latency = Driver Recv Time - Max Worker Finish Time
-            output_transfer_latency = (recv_timestamp - max(worker_end_times)) * 1000
+            last_worker_end = max(worker_end_times)
+            output_transfer_latency = (
+                recv_timestamp - last_worker_end
+            ) * 1000
             logger.info(f"[METRIC] Output Transfer Latency: {output_transfer_latency:.4f} ms")
+            self._execution_boundary.record(
+                {
+                    "actor_submit_latency_ms": submit_latency_ms,
+                    "send_seqs_latency_ms": send_seqs_latency_ms,
+                    "ray_get_latency_ms": (
+                        ray_get_end - ray_get_begin
+                    )
+                    * 1000,
+                    "executor_until_ray_get_ms": (
+                        ray_get_end - executor_begin
+                    )
+                    * 1000,
+                    "worker_observed_critical_ms": (
+                        last_worker_end - send_timestamp
+                    )
+                    * 1000,
+                    "worker_finish_to_ray_get_ms": output_transfer_latency,
+                    "worker_finish_skew_ms": (
+                        last_worker_end - min(worker_end_times)
+                    )
+                    * 1000,
+                }
+            )
 
         return token_ids_list
+
+    def execution_boundary_metrics(self) -> dict[str, float | int]:
+        return self._execution_boundary.snapshot()
+
+    def reset_execution_boundary_metrics(self) -> None:
+        self._execution_boundary.reset()
 
     def init_rpc_endpoint(self):
         info = self.endpoint.init_server_endpoint()

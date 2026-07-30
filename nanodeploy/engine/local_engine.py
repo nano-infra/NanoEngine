@@ -5,7 +5,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from time import perf_counter
+from time import perf_counter, time as wall_time
 from typing import Any
 
 import ray
@@ -20,6 +20,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AbortResult,
     DecodeITLSample,
     EngineReady,
+    FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
     IngressAck,
@@ -47,6 +48,20 @@ class _IngressAdd:
     enqueued_at: float = field(default_factory=perf_counter)
 
 
+def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
+    return tuple(
+        {
+            "global_rank": rank_load.global_rank,
+            "sp_idx": rank_load.sp_idx,
+            "master_batch_size": rank_load.master_batch_size,
+            "active_master_requests": rank_load.active_master_requests,
+            "free_blocks": rank_load.free_blocks,
+            "total_blocks": rank_load.total_blocks,
+        }
+        for rank_load in snapshot.rank_loads
+    )
+
+
 @ray.remote(num_cpus=0.1, max_concurrency=32)
 class LocalEngineCore:
     """Single-writer LocalScheduler plus one DP-group LocalExecutor."""
@@ -69,9 +84,12 @@ class LocalEngineCore:
         self._ingress_lock = threading.Lock()
         self._reserved_request_ids: set[int] = set()
         self._ingress_pending_ids: set[int] = set()
+        self._admission_pending_ids: set[int] = set()
         self._cancelled_ingress_ids: set[int] = set()
         self._reserved_slots = 0
+        self._admission_version = 0
         self._add_result_events: deque[AddResultEvent] = deque()
+        self._first_schedule_events: deque[FirstScheduleEvent] = deque()
         self._first_token_events: deque[FirstTokenEvent] = deque()
         self._terminal_events: deque[FinishEvent] = deque()
         self._events_lock = threading.Lock()
@@ -100,6 +118,11 @@ class LocalEngineCore:
         self._decode_itl_ms_weighted_total = 0.0
         self._decode_itl_token_count = 0
         self._decode_itl_samples: list[DecodeITLSample] = []
+        self._quantum_diagnostics_enabled = bool(
+            config.hierarchical_quantum_diagnostics
+        )
+        self._quantum_diagnostics: list[dict[str, Any]] = []
+        self._quantum_diagnostics_lock = threading.Lock()
         self._cached_load_snapshot = self._build_load_snapshot()
 
     def initialize(
@@ -276,9 +299,42 @@ class LocalEngineCore:
     ) -> tuple[IngressAck, ...]:
         return tuple(self.enqueue_add(command) for command in commands)
 
+    def admit_add(self, command: AddCommand) -> IngressAck:
+        """Run local SP admission in the scheduler's single-writer loop."""
+        self._raise_if_failed()
+        if self.config.attention_dp > 1 and self._coordinator is None:
+            raise RuntimeError("LocalEngine coordinator is not initialized")
+        with self._ingress_lock:
+            if (
+                command.request_id in self._reserved_request_ids
+                or command.request_id in self._ingress_pending_ids
+                or command.request_id in self._admission_pending_ids
+            ):
+                return IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=False,
+                    reason="duplicate_request_id",
+                )
+            if (
+                self._reserved_slots + len(self._admission_pending_ids)
+                >= self.config.hierarchical_queue_capacity
+            ):
+                return IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=False,
+                    reason="queue_full",
+                )
+            self._admission_pending_ids.add(command.request_id)
+        return self._submit(_LoopCommand("admit", command))
+
     def submit_abort(self, request_id: int) -> AbortResult:
         with self._ingress_lock:
-            if request_id in self._ingress_pending_ids:
+            if (
+                request_id in self._ingress_pending_ids
+                or request_id in self._admission_pending_ids
+            ):
                 self._cancelled_ingress_ids.add(request_id)
                 return AbortResult(
                     request_id=request_id, status="abort_pending"
@@ -309,6 +365,15 @@ class LocalEngineCore:
             self._first_token_events.clear()
         return events
 
+    def drain_first_schedule_events(
+        self,
+    ) -> tuple[FirstScheduleEvent, ...]:
+        self._raise_if_failed()
+        with self._events_lock:
+            events = tuple(self._first_schedule_events)
+            self._first_schedule_events.clear()
+        return events
+
     def drain_events(self) -> tuple[FinishEvent, ...]:
         self._raise_if_failed()
         with self._events_lock:
@@ -323,6 +388,23 @@ class LocalEngineCore:
     def get_decode_itl_samples(self) -> tuple[DecodeITLSample, ...]:
         self._raise_if_failed()
         return tuple(self._decode_itl_samples)
+
+    def drain_quantum_diagnostics(self) -> tuple[dict[str, Any], ...]:
+        self._raise_if_failed()
+        if not self._quantum_diagnostics_enabled:
+            return ()
+        with self._quantum_diagnostics_lock:
+            samples = tuple(self._quantum_diagnostics)
+            self._quantum_diagnostics.clear()
+        return samples
+
+    def get_execution_boundary_metrics(self) -> dict[str, float | int]:
+        self._raise_if_failed()
+        return self.executor.execution_boundary_metrics()
+
+    def reset_execution_boundary_metrics(self) -> None:
+        self._raise_if_failed()
+        self.executor.reset_execution_boundary_metrics()
 
     def health(self) -> bool:
         self._raise_if_failed()
@@ -350,6 +432,9 @@ class LocalEngineCore:
             self._state_cv.notify_all()
 
     def _complete_command(self, command: _LoopCommand) -> None:
+        if command.kind == "admit":
+            self._complete_admission_commands((command,))
+            return
         self._command_count += 1
         self._command_queue_delay_ms_total += (
             perf_counter() - command.enqueued_at
@@ -378,13 +463,165 @@ class LocalEngineCore:
         finally:
             command.completed.set()
 
+    def _complete_admission_commands(
+        self, commands: tuple[_LoopCommand, ...]
+    ) -> None:
+        if not commands:
+            return
+        now = perf_counter()
+        self._command_count += len(commands)
+        self._command_queue_delay_ms_total += sum(
+            (now - command.enqueued_at) * 1000
+            for command in commands
+        )
+        add_commands = tuple(command.payload for command in commands)
+        try:
+            with self._ingress_lock:
+                cancelled_ids = {
+                    add_command.request_id
+                    for add_command in add_commands
+                    if add_command.request_id
+                    in self._cancelled_ingress_ids
+                }
+                self._cancelled_ingress_ids.difference_update(
+                    cancelled_ids
+                )
+            active_add_commands = tuple(
+                add_command
+                for add_command in add_commands
+                if add_command.request_id not in cancelled_ids
+            )
+            active_results = tuple(
+                self.scheduler.try_admit_batch(active_add_commands)
+            )
+            if len(active_results) != len(active_add_commands):
+                raise RuntimeError(
+                    "LocalScheduler active admission result count mismatch: "
+                    f"commands={len(active_add_commands)}, "
+                    f"results={len(active_results)}"
+                )
+            active_results_by_id = {
+                result.request_id: result for result in active_results
+            }
+            if len(active_results_by_id) != len(active_results):
+                raise RuntimeError(
+                    "LocalScheduler returned duplicate admission results"
+                )
+            results = tuple(
+                AddResult(
+                    request_id=add_command.request_id,
+                    accepted=False,
+                    engine_id=self.engine_id,
+                    reason="aborted",
+                )
+                if add_command.request_id in cancelled_ids
+                else active_results_by_id[add_command.request_id]
+                for add_command in add_commands
+            )
+            if len(results) != len(commands):
+                raise RuntimeError(
+                    "LocalScheduler admission result count mismatch: "
+                    f"commands={len(commands)}, results={len(results)}"
+                )
+
+            admission_versions: list[int | None] = []
+            accepted_events: list[AddResultEvent] = []
+            with self._ingress_lock:
+                for add_command, result in zip(
+                    add_commands, results, strict=True
+                ):
+                    if result.request_id != add_command.request_id:
+                        raise RuntimeError(
+                            "LocalScheduler admission request mismatch: "
+                            f"expected={add_command.request_id}, "
+                            f"got={result.request_id}"
+                        )
+                    self._admission_pending_ids.discard(
+                        add_command.request_id
+                    )
+                    if not result.accepted:
+                        admission_versions.append(None)
+                        continue
+                    if (
+                        add_command.request_id
+                        in self._reserved_request_ids
+                    ):
+                        raise RuntimeError(
+                            "duplicate lifecycle reservation after "
+                            f"admission: {add_command.request_id}"
+                        )
+                    self._reserved_request_ids.add(
+                        add_command.request_id
+                    )
+                    self._reserved_slots += 1
+                    self._admission_version += 1
+                    admission_versions.append(self._admission_version)
+                    accepted_events.append(
+                        AddResultEvent(
+                            request_id=add_command.request_id,
+                            engine_id=self.engine_id,
+                            accepted=True,
+                        )
+                    )
+
+            for command, add_command, result, admission_version in zip(
+                commands,
+                add_commands,
+                results,
+                admission_versions,
+                strict=True,
+            ):
+                command.result = IngressAck(
+                    request_id=add_command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=result.accepted,
+                    reason=result.reason,
+                    admission_version=admission_version,
+                )
+            if accepted_events:
+                with self._events_lock:
+                    self._add_result_events.extend(accepted_events)
+                if self.config.attention_dp == 1:
+                    with self._state_cv:
+                        if not self._wave_running:
+                            self._wave_id += 1
+                            self._quantum_id = 0
+                            self._wave_running = True
+                        self._state_cv.notify_all()
+                else:
+                    self._coordinator.first_request.remote(
+                        self.engine_id, self._wave_id
+                    )
+        except BaseException as exc:
+            for command in commands:
+                command.error = exc
+        finally:
+            with self._ingress_lock:
+                for add_command in add_commands:
+                    self._admission_pending_ids.discard(
+                        add_command.request_id
+                    )
+            for command in commands:
+                command.completed.set()
+
     def _drain_queue(self, source: queue.Queue[_LoopCommand]) -> None:
+        admission_commands: list[_LoopCommand] = []
         while True:
             try:
                 command = source.get_nowait()
             except queue.Empty:
-                return
+                break
+            if command.kind == "admit":
+                admission_commands.append(command)
+                continue
+            if admission_commands:
+                self._complete_admission_commands(
+                    tuple(admission_commands)
+                )
+                admission_commands.clear()
             self._complete_command(command)
+        if admission_commands:
+            self._complete_admission_commands(tuple(admission_commands))
 
     def _release_reservation(self, request_id: int) -> None:
         with self._ingress_lock:
@@ -393,19 +630,22 @@ class LocalEngineCore:
                 return
             self._reserved_request_ids.remove(request_id)
             self._reserved_slots -= 1
+            self._admission_version += 1
             if self._reserved_slots < 0:
                 raise RuntimeError("negative LocalEngine ingress reservation")
 
     def _drain_ingress(self) -> None:
         begin = perf_counter()
+        drain_budget_ms = self.config.max_ingress_drain_ms
         results: list[AddResultEvent] = []
         cancelled_events: list[FinishEvent] = []
         processed = 0
         while processed < self.config.max_ingress_batch_requests:
             if (
                 processed > 0
+                and drain_budget_ms > 0
                 and (perf_counter() - begin) * 1000
-                >= self.config.max_ingress_drain_ms
+                >= drain_budget_ms
             ):
                 break
             try:
@@ -473,7 +713,10 @@ class LocalEngineCore:
             quantum_id=self._quantum_id,
         )
         with self._ingress_lock:
-            pending_ingress = len(self._ingress_pending_ids)
+            pending_ingress = (
+                len(self._ingress_pending_ids)
+                + len(self._admission_pending_ids)
+            )
             reserved_slots = self._reserved_slots
         with self._events_lock:
             pending_add_results = len(self._add_result_events)
@@ -490,10 +733,35 @@ class LocalEngineCore:
                 self._coordination_latency_ms_total
             ),
             execute_latency_ms_total=self._execute_latency_ms_total,
+            ray_get_latency_ms_total=(
+                self.executor.ray_get_latency_ms_total
+            ),
+            ray_get_latency_ms_max=(
+                self.executor.ray_get_latency_ms_max
+            ),
+            result_rebuild_latency_ms_total=(
+                self.executor.result_rebuild_latency_ms_total
+            ),
+            result_rebuild_latency_ms_max=(
+                self.executor.result_rebuild_latency_ms_max
+            ),
+            result_rebuild_sample_count=(
+                self.executor.result_rebuild_sample_count
+            ),
+            result_index_latency_ms_total=(
+                self.executor.result_index_latency_ms_total
+            ),
+            result_validate_latency_ms_total=(
+                self.executor.result_validate_latency_ms_total
+            ),
+            result_pack_latency_ms_total=(
+                self.executor.result_pack_latency_ms_total
+            ),
             postprocess_latency_ms_total=self._postprocess_latency_ms_total,
             pending_ingress=pending_ingress,
             pending_add_results=pending_add_results,
             reserved_slots=reserved_slots,
+            admission_version=self._admission_version,
             ingress_queue_delay_ms_total=(
                 self._ingress_queue_delay_ms_total
             ),
@@ -505,10 +773,11 @@ class LocalEngineCore:
             decode_itl_sample_count=len(self._decode_itl_samples),
         )
 
-    def _refresh_cached_load(self) -> None:
+    def _refresh_cached_load(self) -> LoadSnapshot:
         snapshot = self._build_load_snapshot()
         with self._load_lock:
             self._cached_load_snapshot = snapshot
+        return snapshot
 
     def _consensus(self, local_unfinished: bool) -> bool:
         if self.config.attention_dp == 1:
@@ -562,6 +831,14 @@ class LocalEngineCore:
         with self._events_lock:
             self._first_token_events.extend(events)
 
+    def _publish_first_schedule_events(
+        self, events: tuple[FirstScheduleEvent, ...]
+    ) -> None:
+        if not events:
+            return
+        with self._events_lock:
+            self._first_schedule_events.extend(events)
+
     def _fail_pending_commands(self, error: RuntimeError) -> None:
         for source in (self._abort_commands, self._normal_commands):
             while True:
@@ -588,25 +865,30 @@ class LocalEngineCore:
                     wave_id = self._wave_id
                     quantum_id = self._quantum_id
 
+                quantum_begin = perf_counter()
+                quantum_started_at_unix_s = wall_time()
                 begin = perf_counter()
                 self.scheduler.admit()
-                self._admission_latency_ms_total += (
-                    perf_counter() - begin
-                ) * 1000
+                admission_latency_ms = (perf_counter() - begin) * 1000
+                self._admission_latency_ms_total += admission_latency_ms
                 self._refresh_cached_load()
                 begin = perf_counter()
                 batch = self.scheduler.plan_decode(
                     wave_id=wave_id, quantum_id=quantum_id
                 )
-                self._schedule_latency_ms_total += (
-                    perf_counter() - begin
-                ) * 1000
+                schedule_latency_ms = (perf_counter() - begin) * 1000
+                self._schedule_latency_ms_total += schedule_latency_ms
+                pre_execute_snapshot = None
+                if self._quantum_diagnostics_enabled:
+                    pre_execute_snapshot = self.scheduler.load_snapshot(
+                        wave_id=wave_id,
+                        quantum_id=quantum_id,
+                    )
                 local_unfinished = not self.scheduler.is_finished()
                 begin = perf_counter()
                 global_unfinished = self._consensus(local_unfinished)
-                self._coordination_latency_ms_total += (
-                    perf_counter() - begin
-                ) * 1000
+                coordination_latency_ms = (perf_counter() - begin) * 1000
+                self._coordination_latency_ms_total += coordination_latency_ms
                 if not global_unfinished:
                     self._pause_wave()
                     if (
@@ -619,6 +901,9 @@ class LocalEngineCore:
                         )
                     continue
 
+                self._publish_first_schedule_events(
+                    self.scheduler.mark_first_forward_started(batch)
+                )
                 begin = perf_counter()
                 worker_results = self.executor.run(
                     batch, timeout=self.config.quantum_timeout_s
@@ -630,9 +915,8 @@ class LocalEngineCore:
                 self._drain_queue(self._abort_commands)
                 begin = perf_counter()
                 events = self.scheduler.postprocess(batch, worker_results)
-                self._postprocess_latency_ms_total += (
-                    perf_counter() - begin
-                ) * 1000
+                postprocess_latency_ms = (perf_counter() - begin) * 1000
+                self._postprocess_latency_ms_total += postprocess_latency_ms
                 itl_token_count = self.scheduler.last_itl_token_slots
                 if itl_token_count > 0:
                     itl_ms = (
@@ -656,7 +940,82 @@ class LocalEngineCore:
                     self.scheduler.drain_first_token_events()
                 )
                 self._publish_events(events)
-                self._refresh_cached_load()
+                post_execute_snapshot = self._refresh_cached_load()
+                if self._quantum_diagnostics_enabled:
+                    if pre_execute_snapshot is None:
+                        raise RuntimeError(
+                            "missing pre-execute quantum diagnostic snapshot"
+                        )
+                    executor_diagnostic = (
+                        self.executor.last_quantum_diagnostic
+                    )
+                    if (
+                        executor_diagnostic is None
+                        or executor_diagnostic.get("engine_id")
+                        != self.engine_id
+                        or executor_diagnostic.get("wave_id") != wave_id
+                        or executor_diagnostic.get("quantum_id") != quantum_id
+                    ):
+                        raise RuntimeError(
+                            "LocalExecutor quantum diagnostic identity mismatch"
+                        )
+                    sample = {
+                        "schema_version": 1,
+                        "engine_id": self.engine_id,
+                        "wave_id": wave_id,
+                        "quantum_id": quantum_id,
+                        "started_at_unix_s": quantum_started_at_unix_s,
+                        "engine_has_real": batch.engine_has_real,
+                        "waiting_before": pre_execute_snapshot.waiting,
+                        "running_before": pre_execute_snapshot.running,
+                        "useful_real_batch_size": (
+                            pre_execute_snapshot.useful_real_batch_size
+                        ),
+                        "free_blocks_min_before": (
+                            pre_execute_snapshot.free_blocks_min
+                        ),
+                        "free_blocks_min_after": (
+                            post_execute_snapshot.free_blocks_min
+                        ),
+                        "rank_loads_before": _rank_load_payload(
+                            pre_execute_snapshot
+                        ),
+                        "rank_loads_after": _rank_load_payload(
+                            post_execute_snapshot
+                        ),
+                        "admission_ms": admission_latency_ms,
+                        "schedule_ms": schedule_latency_ms,
+                        "consensus_wait_ms": coordination_latency_ms,
+                        "execute_ms": execute_latency_ms,
+                        "postprocess_ms": postprocess_latency_ms,
+                        "quantum_total_ms": (
+                            perf_counter() - quantum_begin
+                        )
+                        * 1000,
+                        "itl_ms": (
+                            execute_latency_ms
+                            / HIERARCHICAL_LOOP_COUNT
+                        ),
+                        "itl_token_count": itl_token_count,
+                        "useful_decode_tokens": (
+                            post_execute_snapshot.useful_decode_tokens
+                            - pre_execute_snapshot.useful_decode_tokens
+                        ),
+                        "raw_token_slots": (
+                            post_execute_snapshot.raw_token_slots
+                            - pre_execute_snapshot.raw_token_slots
+                        ),
+                        "control_dummy_slots": (
+                            post_execute_snapshot.control_dummy_slots
+                            - pre_execute_snapshot.control_dummy_slots
+                        ),
+                        "preemption_count": (
+                            post_execute_snapshot.preemption_count
+                        ),
+                        "executor": dict(executor_diagnostic),
+                    }
+                    with self._quantum_diagnostics_lock:
+                        self._quantum_diagnostics.append(sample)
                 with self._state_cv:
                     self._quantum_id += 1
         except BaseException as exc:

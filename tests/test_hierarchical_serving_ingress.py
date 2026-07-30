@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,9 +12,11 @@ import nanodeploy
 from nanodeploy.engine.hierarchical_contract import (
     AddResultEvent,
     DecodeITLSample,
+    FirstScheduleEvent,
     FinishEvent,
     IngressAck,
 )
+from nanodeploy.metrics import MetricsManager
 from nanodeploy.sampling_params import SamplingParams
 
 
@@ -39,6 +42,8 @@ class DelayedAckEngine:
         self._pending_add: list[int] = []
         self._finish: list[int] = []
         self._active: set[int] = set()
+        self.first_forward_to_terminal_ms = 500.0
+        self.finish_global_capacity_queue_ms = 0.0
 
     @property
     def active_count(self) -> int:
@@ -82,11 +87,37 @@ class DelayedAckEngine:
     def poll_first_token_events(self):
         return ()
 
+    def poll_first_schedule_events(self):
+        return ()
+
+    def hierarchical_itl_samples(self):
+        return ()
+
+    def hierarchical_metrics(self, *, refresh, include_per_engine):
+        return {}
+
+    def execution_boundary_metrics(self):
+        return {"mode": "synthetic"}
+
     def poll(self):
         ready = tuple(self._finish)
         self._finish.clear()
         self._active.difference_update(ready)
-        return tuple(FinishEvent(request_id, 16, "FINISHED", 0) for request_id in ready)
+        return tuple(
+            FinishEvent(
+                request_id,
+                16,
+                "FINISHED",
+                0,
+                first_forward_to_terminal_ms=(
+                    self.first_forward_to_terminal_ms
+                ),
+                global_capacity_queue_ms=(
+                    self.finish_global_capacity_queue_ms
+                ),
+            )
+            for request_id in ready
+        )
 
     def is_finished(self):
         return (
@@ -97,20 +128,168 @@ class DelayedAckEngine:
         )
 
 
-def _load_benchmark_module(monkeypatch):
+class SyntheticCentralEngine:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(scheduler_arch="legacy_global")
+        self.metrics_manager = MetricsManager()
+        self._active = []
+        self._pending_ingress: list[int] = []
+        self._pending_add: list[int] = []
+
+    @property
+    def num_pending_ingress(self) -> int:
+        return len(self._pending_ingress)
+
+    @property
+    def num_pending_adds(self) -> int:
+        return len(self._pending_add)
+
+    def submit_requests_async(self, sequences):
+        request_ids = []
+        for sequence in sequences:
+            request_ids.append(sequence.seq_id)
+            sequence.metric = self.metrics_manager.create_sequence_metric(
+                sequence.seq_id, sequence.num_prompt_tokens
+            )
+            sequence.metric.record_arrival()
+            sequence.metric.record_first_scheduled()
+            self._active.append(sequence)
+            self._pending_ingress.append(sequence.seq_id)
+            self._pending_add.append(sequence.seq_id)
+        return tuple(request_ids)
+
+    def poll_ingress_acks(self):
+        ready = tuple(self._pending_ingress)
+        self._pending_ingress.clear()
+        return tuple(IngressAck(request_id, 0, True) for request_id in ready)
+
+    def poll_add_results(self):
+        ready = tuple(self._pending_add)
+        self._pending_add.clear()
+        return tuple(
+            AddResultEvent(request_id, 0, True) for request_id in ready
+        )
+
+    def poll_first_token_events(self):
+        return ()
+
+    def poll_first_schedule_events(self):
+        return ()
+
+    def step(self):
+        time.sleep(0.002)
+        outputs = []
+        for sequence in self._active:
+            sequence.metric.record_first_token()
+            sequence.metric.record_step_tokens(16, 1.0)
+            sequence.metric.record_completion()
+            outputs.append((sequence.seq_id, [0] * 16))
+        self._active.clear()
+        return outputs, 16, len(outputs), 0.0, 0.0
+
+    def is_finished(self):
+        return (
+            not self._active
+            and not self._pending_ingress
+            and not self._pending_add
+        )
+
+    def execution_boundary_metrics(self):
+        return {"mode": "synthetic_central"}
+
+
+def _load_benchmark_module(monkeypatch, script_dir="sp_ablation"):
     # Importing the benchmark should not initialize the GPU model stack in a
     # CPU-only synthetic control-plane test.
     monkeypatch.setitem(nanodeploy.__dict__, "LLM", object)
     monkeypatch.setitem(nanodeploy.__dict__, "SamplingParams", SamplingParams)
     root = Path(__file__).resolve().parents[1]
-    path = root / "scripts" / "sp_ablation" / "bench_serving_overhead.py"
+    benchmark_paths = {
+        "sp_ablation": (
+            root / "scripts" / "sp_ablation" / "bench_serving_overhead.py"
+        ),
+        "issue003": (
+            root / "scripts" / "issue003" / "bench_serving_overhead.py"
+        ),
+        "example": root / "examples" / "bench_serving.py",
+        "example_overhead": root / "examples" / "bench_serving_overhead.py",
+    }
+    path = benchmark_paths[script_dir]
     spec = importlib.util.spec_from_file_location(
-        "hierarchical_bench_serving_overhead", path
+        f"{script_dir}_bench_serving_overhead", path
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_csv_dataset_skips_requests_above_total_token_limit(
+    monkeypatch,
+    tmp_path,
+):
+    csv_path = tmp_path / "requests.csv"
+    csv_path.write_text(
+        "prompt_len,output_len\n"
+        "6,4\n"
+        "7,4\n"
+        "8,2\n",
+        encoding="utf-8",
+    )
+
+    for script_dir in (
+        "sp_ablation",
+        "issue003",
+        "example",
+        "example_overhead",
+    ):
+        benchmark = _load_benchmark_module(monkeypatch, script_dir)
+        assert benchmark.DEFAULT_MAX_REQUEST_TOKENS == 910_000
+        args = SimpleNamespace(
+            dataset="csv",
+            csv_path=str(csv_path),
+            max_input_len=None,
+            max_request_tokens=10,
+            max_model_len=100,
+            num_requests=4,
+        )
+
+        requests = list(benchmark.get_dataset_generator(args))
+
+        assert [len(prompt) for prompt, _ in requests] == [6, 8, 6, 8]
+        assert [params.max_tokens for _, params in requests] == [4, 2, 4, 2]
+        assert all(
+            len(prompt) + params.max_tokens <= args.max_request_tokens
+            for prompt, params in requests
+        )
+
+
+def test_csv_dataset_reports_when_total_token_filter_removes_every_row(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    csv_path = tmp_path / "too_long.csv"
+    csv_path.write_text(
+        "prompt_len,output_len\n"
+        "8,4\n",
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        dataset="csv",
+        csv_path=str(csv_path),
+        max_input_len=None,
+        max_request_tokens=10,
+        max_model_len=100,
+        num_requests=1,
+    )
+
+    try:
+        list(benchmark.get_dataset_generator(args))
+    except ValueError as exc:
+        assert str(exc) == "CSV dataset has no rows after applying length filters"
+    else:
+        raise AssertionError("expected an empty filtered CSV dataset to fail")
 
 
 def _load_step_plot_module():
@@ -286,7 +465,7 @@ def test_delayed_ingress_ack_does_not_throttle_fixed_rate_dispatch(
 
     request_metrics_path = tmp_path / "requests.jsonl"
     summary_path = tmp_path / "summary.json"
-    total_time, seq_map = benchmark.run_benchmark(
+    total_time, seq_map, metrics_summary = benchmark.run_benchmark(
         engine,
         iter(requests()),
         arrival_times,
@@ -337,10 +516,269 @@ def test_delayed_ingress_ack_does_not_throttle_fixed_rate_dispatch(
         31.25 <= record["tpot_with_queue_ms"] <= 31.376
         for record in records
     )
+    assert all(
+        record["tpot_with_queue_source"]
+        == "hierarchical_first_forward_to_terminal"
+        for record in records
+    )
+    assert all(
+        record["first_forward_to_terminal_ms"] == 500.0
+        for record in records
+    )
+    assert all(
+        31.25 <= record["dispatch_normalized_latency_ms"] <= 31.376
+        for record in records
+    )
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary == metrics_summary
     assert summary["total_requests"] == num_requests
     assert summary["successful_requests"] == num_requests
     assert summary["failed_requests"] == 0
     assert summary["tpot_with_queue_ms"]["p50"] == 31.25
     assert summary["goodput"]["attainment_percent"] == 100.0
+
+
+def test_authoritative_admission_ack_records_bootstrap_ttft(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    clock = FakeClock()
+
+    class AuthoritativeAckEngine(DelayedAckEngine):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._first_schedule_emitted: set[int] = set()
+            self.first_forward_to_terminal_ms = 470.0
+            self.finish_global_capacity_queue_ms = 30.0
+
+        def poll_ingress_acks(self):
+            return tuple(
+                IngressAck(
+                    request_id=ack.request_id,
+                    engine_id=ack.engine_id,
+                    enqueued=ack.enqueued,
+                    reason=ack.reason,
+                    admission_version=1,
+                )
+                for ack in super().poll_ingress_acks()
+            )
+
+        def poll_first_schedule_events(self):
+            ready = self._active.difference(
+                self._first_schedule_emitted
+            )
+            self._first_schedule_emitted.update(ready)
+            return tuple(
+                FirstScheduleEvent(
+                    request_id=request_id,
+                    engine_id=0,
+                    local_scheduler_queue_ms=12.5,
+                    global_capacity_queue_ms=30.0,
+                )
+                for request_id in ready
+            )
+
+    engine = AuthoritativeAckEngine(clock, ack_delay_ms=500)
+    request_metrics_path = tmp_path / "requests.jsonl"
+    summary_path = tmp_path / "summary.json"
+    benchmark.run_benchmark(
+        engine,
+        iter(
+            (
+                (
+                    [1, 2, 3, 4],
+                    SamplingParams(
+                        temperature=0.6,
+                        ignore_eos=True,
+                        max_tokens=16,
+                    ),
+                ),
+            )
+        ),
+        np.asarray([0.05]),
+        1,
+        request_metrics_log_path=str(request_metrics_path),
+        metrics_summary_path=str(summary_path),
+        clock_ns=clock,
+        sleep_fn=clock.sleep,
+        show_progress=False,
+    )
+
+    record = json.loads(
+        request_metrics_path.read_text(encoding="utf-8").strip()
+    )
+    assert record["ttft_source"] == "authoritative_admission_ack"
+    assert record["ttft_ms"] == 500.0
+    assert record["bootstrap_ttft_ms"] == 500.0
+    assert record["model_ttft_ms"] is None
+    assert record["first_schedule_latency_ms"] == 42.5
+    assert (
+        record["first_schedule_latency_source"]
+        == "hierarchical_first_forward_event"
+    )
+    assert record["global_capacity_queue_ms"] == 30.0
+    assert record["local_scheduler_queue_ms"] == 12.5
+    assert record["first_forward_to_terminal_ms"] == 470.0
+    assert record["tpot_with_queue_ms"] == 31.25
+    assert (
+        record["tpot_with_queue_source"]
+        == "hierarchical_first_forward_to_terminal"
+    )
+    assert record["dispatch_normalized_latency_ms"] == 31.25
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["ttft_ms"]["mean"] == 500.0
+    assert summary["bootstrap_ttft_ms"]["mean"] == 500.0
+    assert summary["model_ttft_ms"] is None
+    assert summary["first_schedule_latency_ms"]["mean"] == 42.5
+    assert summary["global_capacity_queue_ms"]["mean"] == 30.0
+    assert summary["local_scheduler_queue_ms"]["mean"] == 12.5
+    assert summary["first_forward_to_terminal_ms"]["mean"] == 470.0
+    assert summary["tpot_with_queue_ms"]["mean"] == 31.25
+    assert summary["dispatch_normalized_latency_ms"]["mean"] == 31.25
+
+
+def test_centralized_default_tpot_uses_sequence_scheduler_boundary(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    clock = FakeClock()
+    engine = SyntheticCentralEngine()
+    request_metrics_path = tmp_path / "central_requests.jsonl"
+
+    _, seq_map, metrics_summary = benchmark.run_benchmark(
+        engine,
+        iter(
+            (
+                (
+                    [1, 2, 3, 4],
+                    SamplingParams(
+                        temperature=0.6,
+                        ignore_eos=True,
+                        max_tokens=16,
+                    ),
+                ),
+            )
+        ),
+        np.asarray([0.05]),
+        1,
+        request_metrics_log_path=str(request_metrics_path),
+        clock_ns=clock,
+        sleep_fn=clock.sleep,
+        show_progress=False,
+    )
+
+    record = json.loads(
+        request_metrics_path.read_text(encoding="utf-8").strip()
+    )
+    sequence = next(iter(seq_map.values()))
+    expected_tpot = round(
+        float(sequence.metric.avg_tpot_with_queueing), 6
+    )
+    expected_execution_ms = round(
+        float(sequence.metric.avg_tpot_wo_queueing) * 16, 6
+    )
+
+    assert record["tpot_with_queue_ms"] == expected_tpot
+    assert (
+        record["tpot_with_queue_source"]
+        == "sequence_metric_first_scheduled_to_terminal"
+    )
+    assert (
+        record["first_forward_to_terminal_ms"]
+        == expected_execution_ms
+    )
+    assert record["global_capacity_queue_ms"] is not None
+    assert record["local_scheduler_queue_ms"] == 0.0
+    assert record["dispatch_normalized_latency_ms"] == 0.0
+    assert metrics_summary["tpot_with_queue_ms"]["mean"] == round(
+        expected_tpot, 3
+    )
+    benchmark.calculate_and_print_metrics(
+        1.0,
+        seq_map,
+        1,
+        metrics_summary,
+    )
+    output = capsys.readouterr().out
+    assert "first forward to local completion" in output
+    assert "Legacy Dispatch-Normalized Latency" in output
+    assert "GPU-capacity queue only" in output
+
+
+def test_benchmark_persists_compact_quantum_diagnostics(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    clock = FakeClock()
+
+    class DiagnosticEngine(DelayedAckEngine):
+        def __init__(self):
+            super().__init__(clock, ack_delay_ms=1)
+            self.quantum_samples = [
+                {
+                    "schema_version": 1,
+                    "engine_id": 0,
+                    "wave_id": 1,
+                    "quantum_id": 0,
+                    "started_at_unix_s": time.time(),
+                    "execute_ms": 800.0,
+                    "executor": {
+                        "gpu_loop_ms_max": 790.0,
+                    },
+                }
+            ]
+
+        def drain_hierarchical_quantum_diagnostics(self):
+            samples = tuple(self.quantum_samples)
+            self.quantum_samples.clear()
+            return samples
+
+    engine = DiagnosticEngine()
+
+    def requests():
+        yield (
+            [1, 2, 3, 4],
+            SamplingParams(
+                temperature=0.6,
+                ignore_eos=True,
+                max_tokens=16,
+            ),
+        )
+
+    quantum_path = tmp_path / "quantums.jsonl"
+    summary_path = tmp_path / "summary.json"
+    benchmark.run_benchmark(
+        engine,
+        iter(requests()),
+        np.asarray([0.001]),
+        1,
+        hierarchical_quantum_log_path=str(quantum_path),
+        metrics_summary_path=str(summary_path),
+        clock_ns=clock,
+        sleep_fn=clock.sleep,
+        show_progress=False,
+    )
+
+    records = [
+        json.loads(line)
+        for line in quantum_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["engine_id"] == 0
+    assert records[0]["executor"]["gpu_loop_ms_max"] == 790.0
+    assert "benchmark_elapsed_s" in records[0]
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["hierarchical_quantum_diagnostic_samples"] == 1
+    assert (
+        summary["hierarchical_quantum_diagnostics_jsonl"]
+        == str(quantum_path)
+    )

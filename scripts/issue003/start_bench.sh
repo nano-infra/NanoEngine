@@ -37,6 +37,7 @@ DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
 DEFAULT_LONG_REQUEST_SP_SIZE=0
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
+DEFAULT_MAX_REQUEST_TOKENS=910000
 # ===================================================================
 
 # 初始化变量
@@ -64,6 +65,7 @@ SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
 CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-$DEFAULT_CUDA_GRAPH_MODE}"
 ENABLE_DYNAMIC_SP_SIZE="$DEFAULT_ENABLE_DYNAMIC_SP_SIZE"
 MAX_INPUT_LEN="$DEFAULT_MAX_INPUT_LEN"
+MAX_REQUEST_TOKENS="${MAX_REQUEST_TOKENS:-$DEFAULT_MAX_REQUEST_TOKENS}"
 ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
@@ -100,6 +102,7 @@ usage() {
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
+    echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
     echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
     echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
@@ -137,6 +140,7 @@ while [[ $# -gt 0 ]]; do
         --run-label)        RUN_LABEL="$2"; shift 2 ;;
         --enable-dynamic-sp-size) ENABLE_DYNAMIC_SP_SIZE=1; shift ;;
         --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
+        --max-request-tokens) MAX_REQUEST_TOKENS="$2"; shift 2 ;;
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
@@ -183,6 +187,11 @@ case "$CUDA_GRAPH_MODE" in
     *) echo "Error: Invalid CUDA graph mode '$CUDA_GRAPH_MODE'."; exit 1 ;;
 esac
 
+if ! [[ "$MAX_REQUEST_TOKENS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --max-request-tokens must be a non-negative integer."
+    exit 1
+fi
+
 # ================= 准备基础信息 (Preparation) =================
 DATASET_NAME=$(basename "$CSV_PATH" .csv)
 MODEL_NAME=$(basename "$MODEL_PATH")
@@ -218,6 +227,7 @@ echo "GPU Util    : $GPU_UTIL ($MEM_TAG)"
 echo "GPU Mem     : ${GPU_MEM}GB"
 echo "Max Len     : $MAX_MODEL_LEN"
 echo "Max Input   : ${MAX_INPUT_LEN:-unlimited}"
+echo "Max Request : ${MAX_REQUEST_TOKENS:-unlimited} tokens"
 echo "Fixed SP Size: $FIXED_SP_SIZE"
 echo "SP Backend  : $SP_BACKEND"
 echo "CUDA Graph  : $CUDA_GRAPH_MODE"
@@ -234,7 +244,7 @@ echo "================================================"
 log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
 log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH"
-log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
+log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | MaxRequestTokens=${MAX_REQUEST_TOKENS:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
 log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
@@ -283,6 +293,10 @@ for rate in "${RATES[@]}"; do
     if [[ -n "$MAX_INPUT_LEN" ]]; then
         maxin_tag="_maxin$(( MAX_INPUT_LEN / 1000 ))k"
     fi
+    maxreq_tag=""
+    if [[ "$MAX_REQUEST_TOKENS" -gt 0 ]]; then
+        maxreq_tag="_maxreq${MAX_REQUEST_TOKENS}"
+    fi
     # 可选标签
     extra_tags=""
     if [[ -n "$DISABLE_NON_UNIFORM_SPLIT" ]]; then
@@ -304,7 +318,7 @@ for rate in "${RATES[@]}"; do
     if [[ -n "$RUN_LABEL" ]]; then
         extra_tags="${extra_tags}_${RUN_LABEL}"
     fi
-    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}${maxin_tag}${extra_tags}"
+    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}${maxin_tag}${maxreq_tag}${extra_tags}"
 
     CURRENT_LOG_DIR="$BASE_LOG_DIR/$MODEL_NAME/$DATASET_NAME/$STRATEGY_STR"
     mkdir -p "$CURRENT_LOG_DIR"
@@ -317,6 +331,7 @@ for rate in "${RATES[@]}"; do
         python "$PYTHON_SCRIPT"
         --dataset csv
         --csv-path "$CSV_PATH"
+        --max-request-tokens "$MAX_REQUEST_TOKENS"
         --num-requests "$NUM_REQUESTS"
         --request-rate "$rate"
         --sp "$SP"
@@ -372,6 +387,7 @@ for rate in "${RATES[@]}"; do
         echo "Model Path: $MODEL_PATH"
         echo "Dataset: $DATASET_NAME"
         echo "Max Input Len: ${MAX_INPUT_LEN:-unlimited}"
+        echo "Max Request Tokens: ${MAX_REQUEST_TOKENS:-unlimited}"
         echo "Settings: $STRATEGY_STR"
         echo ""
         echo "================= Reproduce Command ================="

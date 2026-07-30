@@ -858,13 +858,18 @@ class ModelRunner:
         enable_rpc: bool = False,
         send_timestamp: float = 0.0,
         hierarchical_trace: dict | None = None,
+        hierarchical_quantum_diagnostics: bool = False,
     ) -> (
         tuple[list[list[int]], float]
         | tuple[list[list[int]], float, dict]
+        | tuple[list[list[int]], float, dict, dict]
     ):
-
+        diagnostics_enabled = bool(hierarchical_quantum_diagnostics)
+        worker_begin = time.perf_counter() if diagnostics_enabled else 0.0
+        recv_begin = time.perf_counter() if diagnostics_enabled else 0.0
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
+        recv_end = time.perf_counter() if diagnostics_enabled else 0.0
 
         if hierarchical_trace is not None:
             if is_prefill:
@@ -903,6 +908,15 @@ class ModelRunner:
         ]
 
         loop_count = self.config.loop_count if not is_prefill else 1
+        prepare_update_ms = 0.0
+        forward_host_ms = 0.0
+        loop_begin = time.perf_counter() if diagnostics_enabled else 0.0
+        gpu_loop_begin = None
+        gpu_loop_end = None
+        if diagnostics_enabled and torch.cuda.is_available():
+            gpu_loop_begin = torch.cuda.Event(enable_timing=True)
+            gpu_loop_end = torch.cuda.Event(enable_timing=True)
+            gpu_loop_begin.record()
         for i in range(loop_count):
             current_time = time.time()
             
@@ -942,6 +956,9 @@ class ModelRunner:
                         f"Rank {self.rank}: ✗ Failed to start profiler: {e}", exc_info=True
                     )
 
+            prepare_begin = (
+                time.perf_counter() if diagnostics_enabled else 0.0
+            )
             if is_prefill:
                 input_ids, positions = self.prepare_prefill(dp_seqs, is_dummy)
             else:
@@ -953,19 +970,28 @@ class ModelRunner:
                     )
                 if self.log_decode_a2a_masks:
                     self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
+            if diagnostics_enabled:
+                prepare_update_ms += (
+                    time.perf_counter() - prepare_begin
+                ) * 1000
 
-            if hierarchical_trace is not None:
+            if hierarchical_trace is not None or diagnostics_enabled:
                 forward_begin = time.perf_counter()
                 logits = self.run_model(input_ids, positions, is_prefill)
                 forward_end = time.perf_counter()
-                execution_forwards.append(
-                    {
-                        "inner_loop_idx": i,
-                        "use_sp_a2a": bool(get_context().use_sp_a2a),
-                        "forward_begin": forward_begin,
-                        "forward_end": forward_end,
-                    }
-                )
+                if diagnostics_enabled:
+                    forward_host_ms += (
+                        forward_end - forward_begin
+                    ) * 1000
+                if hierarchical_trace is not None:
+                    execution_forwards.append(
+                        {
+                            "inner_loop_idx": i,
+                            "use_sp_a2a": bool(get_context().use_sp_a2a),
+                            "forward_begin": forward_begin,
+                            "forward_end": forward_end,
+                        }
+                    )
             else:
                 logits = self.run_model(input_ids, positions, is_prefill)
 
@@ -1083,15 +1109,56 @@ class ModelRunner:
             self.run_count += 1  # 每次调用计数+1
             get_context().token_ids.append(input_ids[None, ...])
 
+        if gpu_loop_end is not None:
+            gpu_loop_end.record()
+        token_materialize_begin = (
+            time.perf_counter() if diagnostics_enabled else 0.0
+        )
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
+        gpu_loop_ms = None
+        if gpu_loop_begin is not None and gpu_loop_end is not None:
+            # token materialization above already synchronizes the dependent
+            # result. Synchronizing the end event also covers work enqueued
+            # on the current stream without adding per-inner-loop barriers.
+            gpu_loop_end.synchronize()
+            gpu_loop_ms = gpu_loop_begin.elapsed_time(gpu_loop_end)
+        worker_end = time.perf_counter() if diagnostics_enabled else 0.0
+        token_materialize_ms = (
+            (worker_end - token_materialize_begin) * 1000
+            if diagnostics_enabled
+            else 0.0
+        )
         reset_context()
         worker_end_time = time.time()
+
+        diagnostic = None
+        if diagnostics_enabled:
+            diagnostic = {
+                "global_rank": int(self.rank),
+                "recv_seqs_ms": (recv_end - recv_begin) * 1000,
+                "prepare_update_host_ms": prepare_update_ms,
+                "forward_host_ms": forward_host_ms,
+                "gpu_loop_ms": gpu_loop_ms,
+                "loop_host_ms": (worker_end - loop_begin) * 1000,
+                "token_materialize_ms": token_materialize_ms,
+                "worker_body_ms": (worker_end - recv_end) * 1000,
+                "worker_total_ms": (worker_end - worker_begin) * 1000,
+            }
 
         if hierarchical_trace is not None:
             trace = dict(hierarchical_trace)
             trace["forward_count"] = loop_count
             trace["forwards"] = tuple(execution_forwards)
+            if diagnostic is not None:
+                return (
+                    loop_count_token_ids,
+                    worker_end_time,
+                    trace,
+                    diagnostic,
+                )
             return loop_count_token_ids, worker_end_time, trace
+        if diagnostic is not None:
+            return loop_count_token_ids, worker_end_time, diagnostic
         return loop_count_token_ids, worker_end_time
 
     @torch.inference_mode()

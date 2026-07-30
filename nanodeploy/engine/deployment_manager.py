@@ -24,6 +24,7 @@ from nanodeploy.engine.hierarchical_contract import (
     CoordinatorStatus,
     DecodeITLSample,
     EngineReady,
+    FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
     IngressAck,
@@ -99,6 +100,10 @@ class RayEngineTransport:
     def enqueue_async(self, command: AddCommand):
         with _without_proxy_env():
             return self.actor.enqueue_add.remote(command)
+
+    def admit_async(self, command: AddCommand):
+        with _without_proxy_env():
+            return self.actor.admit_add.remote(command)
 
     def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
         with _without_proxy_env():
@@ -404,6 +409,21 @@ class DeploymentManager:
             event for engine_events in per_engine for event in engine_events
         )
 
+    def poll_first_schedule_events(
+        self,
+    ) -> tuple[FirstScheduleEvent, ...]:
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.drain_first_schedule_events.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        return tuple(
+            event for engine_events in per_engine for event in engine_events
+        )
+
     def load_snapshots(self) -> tuple[LoadSnapshot, ...]:
         with _without_proxy_env():
             snapshots = ray.get(
@@ -440,6 +460,62 @@ class DeploymentManager:
         return tuple(
             sample for engine_samples in per_engine for sample in engine_samples
         )
+
+    def quantum_diagnostics(self) -> tuple[dict[str, Any], ...]:
+        if not self.config.hierarchical_quantum_diagnostics:
+            return ()
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.drain_quantum_diagnostics.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        samples = tuple(
+            sample
+            for engine_samples in per_engine
+            for sample in engine_samples
+        )
+        return tuple(
+            sorted(
+                samples,
+                key=lambda sample: (
+                    int(sample["wave_id"]),
+                    int(sample["quantum_id"]),
+                    int(sample["engine_id"]),
+                ),
+            )
+        )
+
+    def execution_boundary_metrics(
+        self,
+    ) -> dict[int, dict[str, float | int]]:
+        engine_items = sorted(self.engines.items())
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.get_execution_boundary_metrics.remote()
+                    for _, actor in engine_items
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        return {
+            engine_id: metrics
+            for (engine_id, _), metrics in zip(
+                engine_items, per_engine, strict=True
+            )
+        }
+
+    def reset_execution_boundary_metrics(self) -> None:
+        with _without_proxy_env():
+            ray.get(
+                [
+                    actor.reset_execution_boundary_metrics.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
 
     def close(self) -> None:
         with self._lock:

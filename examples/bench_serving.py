@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 # Constants
 MAX_INPUT_LEN = 1024
 MAX_OUTPUT_LEN = 1024
+DEFAULT_MAX_REQUEST_TOKENS = 910_000
 SEED = 0
 
 # specific seed
@@ -39,6 +40,15 @@ def parse_args():
     )
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
+    parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_TOKENS,
+        help=(
+            "Filter out CSV rows where prompt_len + output_len exceeds this "
+            f"value (default: {DEFAULT_MAX_REQUEST_TOKENS}; 0 disables)."
+        ),
+    )
     parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
     
     # Distributed / Cluster arguments
@@ -97,7 +107,9 @@ def parse_args():
             parser.error("--csv-path is required when --dataset=csv")
         if not os.path.exists(args.csv_path):
             parser.error(f"CSV file not found: {args.csv_path}")
-            
+    if args.max_request_tokens < 0:
+        parser.error("--max-request-tokens must be non-negative")
+
     return args
 
 
@@ -117,6 +129,19 @@ def get_dataset_generator(args):
 
     if "prompt_len" not in df.columns or "output_len" not in df.columns:
         raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
+
+    if args.max_request_tokens > 0:
+        orig_len = len(df)
+        request_tokens = df["prompt_len"] + df["output_len"]
+        df = df[request_tokens <= args.max_request_tokens].reset_index(drop=True)
+        print(
+            "Filtered by "
+            f"max_request_tokens={args.max_request_tokens} "
+            f"(prompt_len + output_len <= limit): {orig_len} -> {len(df)} rows"
+        )
+
+    if df.empty:
+        raise ValueError("CSV dataset has no rows after applying length filters")
 
     if len(df) < args.num_requests:
         print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")

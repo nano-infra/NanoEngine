@@ -407,11 +407,13 @@ reserved_slots =
 
 ```text
 max_ingress_batch_requests = 256
-max_ingress_drain_ms = 10
+max_ingress_drain_ms = 0
 ```
 
-event loop 优先 drain abort，再 drain ingress ADD。超过本轮 budget 的请求保留在 ingress
-queue，下一 quantum 继续处理，并记录 ingress backlog。
+`max_ingress_drain_ms = 0` 关闭 wall-clock 时间限制，event loop 优先 drain abort，
+再 drain ingress ADD，单轮仍由 `max_ingress_batch_requests` 限制为最多 256 个请求，
+避免持续 ingress 饿死 decode。设置为正数时会重新启用时间预算；超过本轮 budget
+的请求保留在 ingress queue，下一 quantum 继续处理，并记录 ingress backlog。
 
 ## 9. 正式时序
 
