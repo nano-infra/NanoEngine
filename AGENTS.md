@@ -34,6 +34,13 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
   ```
 
+- Before launching any experiment or benchmark, set `SLIME_QP_NUM=4` in the
+  driver environment so the value is propagated to newly created Ray actors:
+
+  ```bash
+  export SLIME_QP_NUM=4
+  ```
+
 - After changing C++ sources, reinstall with `pip install -v -e .` before running the full project.
 - Modify NanoDeploy code only; do not patch external dependency libraries.
 - Save useful interim reasoning or research notes under `docs-dev/` for later reference.
