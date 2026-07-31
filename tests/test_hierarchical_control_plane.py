@@ -84,9 +84,17 @@ class FakeEngine:
             reason=reason,
         )
 
-    def abort(self, request_id: int) -> AbortResult:
+    def abort(
+        self,
+        request_id: int,
+        *,
+        allow_future_ingress: bool = False,
+    ) -> AbortResult:
         self.aborts.append(request_id)
         return AbortResult(request_id=request_id, status="aborted")
+
+    def clear_ingress_abort(self, request_id: int) -> None:
+        return None
 
     def load(self) -> LoadSnapshot:
         return LoadSnapshot(
@@ -351,6 +359,27 @@ class FakeAsyncEngine(FakeEngine):
         self.handles.append(handle)
         return handle
 
+    def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
+        acks = []
+        for command in commands:
+            reason = (
+                self.enqueue_reasons.pop(0)
+                if self.enqueue_reasons
+                else None
+            )
+            self.commands.append(command)
+            acks.append(
+                IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=reason is None,
+                    reason=reason,
+                )
+            )
+        handle = {"ready": False, "acks": tuple(acks)}
+        self.handles.append(handle)
+        return handle
+
     def poll_enqueue(self, handle):
         if not handle["ready"]:
             return False, None
@@ -605,6 +634,430 @@ def test_router_capacity_planner_honors_dp_aggregated_receiver_limits():
     assert router.admission_metrics()["global_retries"] == 0
 
 
+def test_router_least_batch_v2_keeps_global_fifo_and_uses_only_kv_credit():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    config = planner_config(attention_sp=2)
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=config,
+    )
+    router.record_loads(
+        (
+            multi_rank_load_snapshot(
+                0,
+                free_blocks=(10, 10),
+                master_counts=(200, 200),
+                receiver_counts=(32, 32),
+            ),
+            multi_rank_load_snapshot(
+                1,
+                free_blocks=(8, 8),
+                master_counts=(0, 0),
+                receiver_counts=(0, 0),
+            ),
+        )
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=tuple(range(65)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    # Submission only appends to the global queue. The prompt costs
+    # ceil(65 / 4) + one SP rounding block + one decode reserve = 19,
+    # so only DP0's aggregate 20-block credit is eligible. Master/receiver
+    # limits are intentionally ignored by the frontend v2 gate.
+    assert engines[0].commands == []
+    assert engines[1].commands == []
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_GLOBAL)
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1]
+    assert engines[1].commands == []
+    assert engines[0].planned_batches == []
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
+
+
+def test_router_least_batch_v2_rejects_duplicate_in_global_flight_and_terminal():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 10),))
+
+    def submit() -> None:
+        router.submit_async(
+            request_id=1,
+            prompt_token_ids=(1,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    submit()
+    submit()
+    duplicate = router.poll_ingress_acks()
+    assert len(duplicate) == 1
+    assert duplicate[0].reason == "duplicate_request_id"
+    assert [command.request_id for command in engine.commands] == [1]
+
+    submit()
+    duplicate = router.poll_ingress_acks()
+    assert len(duplicate) == 1
+    assert duplicate[0].reason == "duplicate_request_id"
+    assert [command.request_id for command in engine.commands] == [1]
+
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    router.record_add_results((AddResultEvent(1, 0, True),))
+    router.finish(FinishEvent(1, 16, "FINISHED", 0))
+    submit()
+    duplicate = router.poll_ingress_acks()
+    assert len(duplicate) == 1
+    assert duplicate[0].reason == "duplicate_request_id"
+
+
+def test_router_least_batch_v2_does_not_bypass_unfit_fifo_head():
+    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 4), load_snapshot(1, 4))
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=tuple(range(20)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    router.submit_async(
+        request_id=2,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    # The head costs six blocks and blocks the one-token request behind it.
+    assert router.poll_ingress_acks() == ()
+    assert engines[0].commands == []
+    assert engines[1].commands == []
+    assert router.pending_global_count == 2
+    assert router.admission_metrics()["kv_gate_blocked"] == 1
+
+
+def test_router_least_batch_v2_refills_fast_flight_without_new_snapshot():
+    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=2,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 10))
+    )
+    for request_id in range(1, 6):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1, 3]
+    assert [command.request_id for command in engines[1].commands] == [2, 4]
+    assert router.pending_global_count == 1
+
+    # Completing DP0's fast receipt opens its sole flight immediately. Request
+    # 5 is issued against the still-unused credit from the same load snapshot,
+    # rather than waiting for a decode quantum/load generation.
+    engines[0].handles[0]["ready"] = True
+    acks = router.poll_ingress_acks()
+    assert [ack.request_id for ack in acks] == [1, 3]
+    assert all(ack.enqueued and ack.admission_version is None for ack in acks)
+    assert [command.request_id for command in engines[0].commands] == [1, 3, 5]
+    assert router.pending_global_count == 0
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
+    assert router.owner(5) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
+    metrics = router.admission_metrics()
+    assert metrics["pending_rpc"] == 2
+    assert metrics["pending_rpc_requests"] == 3
+    assert metrics["per_engine"]["0"]["ingress_receipts"] == 2
+    assert metrics["per_engine"]["0"]["kv_credit_remaining"] == 4
+
+
+def test_router_least_batch_v2_queue_full_waits_for_fresh_load_generation():
+    engine = FakeAsyncEngine(0, enqueue_reasons=["queue_full", None])
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 10),))
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    assert router.poll_ingress_acks() == ()
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks() == ()
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_GLOBAL)
+    assert len(engine.commands) == 1
+
+    # Re-polling the same cached snapshot cannot spin or fall back.
+    assert router.poll_ingress_acks() == ()
+    assert len(engine.commands) == 1
+
+    router.record_loads((load_snapshot(0, 10, quantum_id=3),))
+    assert router.poll_ingress_acks() == ()
+    assert len(engine.commands) == 2
+    engine.handles[1]["ready"] = True
+    ack = router.poll_ingress_acks()
+    assert len(ack) == 1 and ack[0].enqueued
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
+    metrics = router.admission_metrics()
+    assert metrics["global_retries"] == 1
+    assert metrics["per_engine"]["0"]["ingress_queue_full"] == 1
+
+
+def test_router_least_batch_v2_queue_full_does_not_block_healthy_dp():
+    engines = {
+        0: FakeAsyncEngine(0, enqueue_reasons=["queue_full"]),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=1,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 10))
+    )
+    for request_id in (1, 2, 3):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1]
+    assert [command.request_id for command in engines[1].commands] == [2]
+    engines[0].handles[0]["ready"] = True
+    engines[1].handles[0]["ready"] = True
+
+    assert [ack.request_id for ack in router.poll_ingress_acks()] == [2]
+    # DP0 is generation-blocked, while DP1 immediately retries the original
+    # FIFO head before request 3.
+    assert [command.request_id for command in engines[1].commands] == [2, 1]
+    assert [
+        pending.command.request_id for pending in router._global_pending
+    ] == [3]
+
+
+def test_router_least_batch_v2_preserves_fifo_when_dp_batches_partially_fill():
+    engines = {
+        0: FakeAsyncEngine(0, enqueue_reasons=[None, "queue_full"]),
+        1: FakeAsyncEngine(1, enqueue_reasons=["queue_full", None]),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=2,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 10))
+    )
+    for request_id in range(1, 5):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1, 3]
+    assert [command.request_id for command in engines[1].commands] == [2, 4]
+    router.submit_async(
+        request_id=5,
+        prompt_token_ids=(5,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    engines[0].handles[0]["ready"] = True
+    engines[1].handles[0]["ready"] = True
+
+    acks = router.poll_ingress_acks()
+
+    assert [ack.request_id for ack in acks] == [1, 4]
+    assert [
+        pending.command.request_id for pending in router._global_pending
+    ] == [2, 3, 5]
+
+
+def test_router_least_batch_v2_merges_retries_from_separate_dp_polls_in_fifo():
+    engines = {
+        0: FakeAsyncEngine(
+            0, enqueue_reasons=["queue_full", "queue_full"]
+        ),
+        1: FakeAsyncEngine(
+            1, enqueue_reasons=["queue_full", "queue_full"]
+        ),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=2,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 10))
+    )
+    for request_id in range(1, 5):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+    assert router.poll_ingress_acks() == ()
+
+    engines[1].handles[0]["ready"] = True
+    assert router.poll_ingress_acks() == ()
+    assert [
+        pending.command.request_id for pending in router._global_pending
+    ] == [2, 4]
+
+    engines[0].handles[0]["ready"] = True
+    assert router.poll_ingress_acks() == ()
+    assert [
+        pending.command.request_id for pending in router._global_pending
+    ] == [1, 2, 3, 4]
+
+
+def test_router_least_batch_v2_cached_load_does_not_restore_kv_credit():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=2,
+        admission_planner_config=planner_config(),
+    )
+    snapshot = load_snapshot(0, 6)
+    router.record_loads((snapshot,))
+    for request_id in range(1, 5):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1, 2]
+    router.record_loads((snapshot,))
+    assert router.admission_metrics()["per_engine"]["0"][
+        "kv_credit_remaining"
+    ] == 2
+
+    engine.handles[0]["ready"] = True
+    assert [ack.request_id for ack in router.poll_ingress_acks()] == [1, 2]
+    assert [command.request_id for command in engine.commands] == [1, 2, 3]
+    router.record_loads((snapshot,))
+    assert router.admission_metrics()["per_engine"]["0"][
+        "kv_credit_remaining"
+    ] == 0
+    engine.handles[1]["ready"] = True
+    assert [ack.request_id for ack in router.poll_ingress_acks()] == [3]
+    assert [command.request_id for command in engine.commands] == [1, 2, 3]
+
+    router.record_loads((replace(snapshot, quantum_id=3),))
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1, 2, 3]
+
+    # Even a new quantum cannot re-grant credit while the requests have not
+    # reached first schedule. Once scheduling proves that their prompt KV is
+    # reflected in snapshots, a later capacity report may replenish credit.
+    router.record_loads((load_snapshot(0, 0, quantum_id=4),))
+    router.record_first_schedule_events(
+        tuple(
+            FirstScheduleEvent(
+                request_id,
+                0,
+                local_scheduler_queue_ms=1.0,
+            )
+            for request_id in (1, 2, 3)
+        )
+    )
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1, 2, 3]
+    router.record_loads(
+        (load_snapshot(0, 6, quantum_id=5, capacity_epoch=1),)
+    )
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1, 2, 3, 4]
+
+
+def test_router_least_batch_v2_rejects_request_larger_than_empty_kv_capacity():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 250),))
+
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=2_000,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    ack = router.poll_ingress_acks()
+    assert len(ack) == 1
+    assert not ack[0].enqueued
+    assert "exceeds every LocalEngine KV capacity" in ack[0].reason
+    assert engine.commands == []
+
+
 def test_local_engine_drains_frontend_events_in_one_batch():
     actor_class = LocalEngineCore.__ray_metadata__.modified_class
     engine = object.__new__(actor_class)
@@ -717,6 +1170,44 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert terminal_events[0].request_id == 5
     assert terminal_events[0].first_forward_to_terminal_ms == 750.0
     assert router.terminal_event(5) == terminal_events[0]
+    assert router.is_idle
+
+
+def test_router_least_batch_v2_buffers_lifecycle_before_fast_receipt():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 10),))
+    router.submit_async(
+        request_id=6,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    assert router.poll_ingress_acks() == ()
+
+    add_event = AddResultEvent(6, 0, True)
+    finish_event = FinishEvent(
+        6,
+        16,
+        "FINISHED",
+        0,
+        first_forward_to_terminal_ms=500.0,
+    )
+    assert router.record_add_results((add_event,)) == ()
+    assert router.record_finish_events((finish_event,)) == ()
+
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    assert router.record_add_results(()) == (add_event,)
+    assert router.owner(6) == RequestOwner(OwnerState.OWNED, 0)
+    assert router.record_finish_events(()) == (finish_event,)
+    assert router.terminal_event(6) == finish_event
     assert router.is_idle
 
 
@@ -1027,8 +1518,8 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set()
     engine._ingress_pending_ids = set()
-    engine._admission_pending_ids = set()
     engine._cancelled_ingress_ids = set()
+    engine._admission_pending_ids = set()
     engine._reserved_slots = 0
     engine._admission_version = 0
     engine._capacity_epoch = 0
@@ -1082,6 +1573,189 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
         FinishEvent(52, 0, "ABORTED", 0),
     )
     assert engine._reserved_slots == 1
+
+
+def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
+    class RemoteRecorder:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(
+        attention_dp=2,
+        hierarchical_queue_capacity=8,
+    )
+    engine.engine_id = 0
+    engine._failure = None
+    engine._ingress_adds = queue.Queue()
+    engine._ingress_lock = threading.Lock()
+    engine._reserved_request_ids = set()
+    engine._ingress_pending_ids = set()
+    engine._cancelled_ingress_ids = set()
+    engine._reserved_slots = 0
+    engine._state_cv = threading.Condition()
+    engine._wave_id = 7
+    first_request = RemoteRecorder()
+    engine._coordinator = SimpleNamespace(first_request=first_request)
+    commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=(1,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=7,
+        )
+        for request_id in (1, 2, 3)
+    )
+
+    acks = engine.enqueue_add_batch(commands)
+
+    assert [ack.request_id for ack in acks] == [1, 2, 3]
+    assert all(ack.enqueued for ack in acks)
+    assert engine._reserved_slots == 3
+    assert engine._ingress_adds.qsize() == 3
+    assert first_request.calls == [(0, 7)]
+
+
+def test_local_engine_future_ingress_abort_tombstone_wins_enqueue_race():
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(
+        attention_dp=1,
+        hierarchical_queue_capacity=8,
+    )
+    engine.engine_id = 0
+    engine._failure = None
+    engine._ingress_adds = queue.Queue()
+    engine._ingress_lock = threading.Lock()
+    engine._reserved_request_ids = set()
+    engine._ingress_pending_ids = set()
+    engine._admission_pending_ids = set()
+    engine._cancelled_ingress_ids = set()
+    engine._reserved_slots = 0
+    engine._state_cv = threading.Condition()
+    engine._wave_id = 0
+    engine._wave_running = False
+    engine._submit = lambda *_args, **_kwargs: AbortResult(
+        request_id=77, status="not_found"
+    )
+    command = AddCommand(
+        request_id=77,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+        wave_id=0,
+    )
+
+    abort = engine.submit_abort(77, allow_future_ingress=True)
+    ack = engine.enqueue_add_batch((command,))[0]
+
+    assert abort.status == "abort_pending"
+    assert not ack.enqueued and ack.reason == "aborted"
+    assert engine._ingress_adds.empty()
+    assert engine._reserved_slots == 0
+    assert engine._cancelled_ingress_ids == set()
+
+
+def test_router_least_batch_v2_reconciles_abort_after_fast_receipt():
+    @dataclass
+    class AbortRaceEngine(FakeAsyncEngine):
+        abort_modes: list[bool] = field(default_factory=list)
+
+        def abort(
+            self,
+            request_id: int,
+            *,
+            allow_future_ingress: bool = False,
+        ) -> AbortResult:
+            self.abort_modes.append(allow_future_ingress)
+            return AbortResult(
+                request_id=request_id,
+                status=("abort_pending" if allow_future_ingress else "aborted"),
+            )
+
+    engine = AbortRaceEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 10),))
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    assert router.poll_ingress_acks() == ()
+
+    assert router.abort(1).status == "abort_pending"
+    assert engine.abort_modes == [True]
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    assert engine.abort_modes == [True, False]
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
+
+
+def test_router_least_batch_v2_does_not_retry_aborted_queue_full_receipt():
+    @dataclass
+    class AbortRaceEngine(FakeAsyncEngine):
+        cleared_ingress_aborts: list[int] = field(default_factory=list)
+
+        def abort(
+            self,
+            request_id: int,
+            *,
+            allow_future_ingress: bool = False,
+        ) -> AbortResult:
+            return AbortResult(
+                request_id=request_id,
+                status=("abort_pending" if allow_future_ingress else "aborted"),
+            )
+
+        def clear_ingress_abort(self, request_id: int) -> None:
+            self.cleared_ingress_aborts.append(request_id)
+
+    engines = {
+        0: AbortRaceEngine(0, enqueue_reasons=["queue_full"]),
+        1: AbortRaceEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 10), load_snapshot(1, 9))
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    assert router.poll_ingress_acks() == ()
+    assert router.abort(1).status == "abort_pending"
+    engines[0].handles[0]["ready"] = True
+
+    ack = router.poll_ingress_acks()
+
+    assert len(ack) == 1 and ack[0].reason == "aborted"
+    assert engines[1].commands == []
+    assert engines[0].cleared_ingress_aborts == [1]
+    assert router.owner(1) is None
+    assert router.terminal_event(1).status == "ABORTED"
+    assert router.abort(1).status == "already_terminal"
 
 
 def test_local_engine_commits_lb_plans_and_reports_state_mismatch():

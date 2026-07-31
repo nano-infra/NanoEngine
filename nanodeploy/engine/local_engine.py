@@ -264,56 +264,86 @@ class LocalEngineCore:
 
     def enqueue_add(self, command: AddCommand) -> IngressAck:
         """Reserve capacity and enqueue without touching LocalScheduler."""
+        return self.enqueue_add_batch((command,))[0]
+
+    def enqueue_add_batch(
+        self, commands: tuple[AddCommand, ...]
+    ) -> tuple[IngressAck, ...]:
+        """Reserve and enqueue one ingress batch with a single wakeup.
+
+        The receipt only means that LocalEngine owns a bounded lifecycle slot
+        and the command is visible in its ingress queue. LocalScheduler state
+        is left exclusively to the event-loop thread at the next drain point.
+        """
         self._raise_if_failed()
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
+        acks: list[IngressAck] = []
+        enqueued_any = False
         with self._ingress_lock:
-            if command.request_id in self._reserved_request_ids:
-                return IngressAck(
-                    request_id=command.request_id,
-                    engine_id=self.engine_id,
-                    enqueued=False,
-                    reason="duplicate_request_id",
+            for command in commands:
+                if command.request_id in self._cancelled_ingress_ids:
+                    self._cancelled_ingress_ids.discard(command.request_id)
+                    acks.append(
+                        IngressAck(
+                            request_id=command.request_id,
+                            engine_id=self.engine_id,
+                            enqueued=False,
+                            reason="aborted",
+                        )
+                    )
+                    continue
+                if command.request_id in self._reserved_request_ids:
+                    acks.append(
+                        IngressAck(
+                            request_id=command.request_id,
+                            engine_id=self.engine_id,
+                            enqueued=False,
+                            reason="duplicate_request_id",
+                        )
+                    )
+                    continue
+                if (
+                    self._reserved_slots
+                    >= self.config.hierarchical_queue_capacity
+                ):
+                    acks.append(
+                        IngressAck(
+                            request_id=command.request_id,
+                            engine_id=self.engine_id,
+                            enqueued=False,
+                            reason="queue_full",
+                        )
+                    )
+                    continue
+                self._reserved_request_ids.add(command.request_id)
+                self._ingress_pending_ids.add(command.request_id)
+                self._reserved_slots += 1
+                self._ingress_adds.put_nowait(_IngressAdd(command))
+                enqueued_any = True
+                acks.append(
+                    IngressAck(
+                        request_id=command.request_id,
+                        engine_id=self.engine_id,
+                        enqueued=True,
+                    )
                 )
-            if (
-                self._reserved_slots
-                >= self.config.hierarchical_queue_capacity
-            ):
-                return IngressAck(
-                    request_id=command.request_id,
-                    engine_id=self.engine_id,
-                    enqueued=False,
-                    reason="queue_full",
-                )
-            self._reserved_request_ids.add(command.request_id)
-            self._ingress_pending_ids.add(command.request_id)
-            self._reserved_slots += 1
-            self._ingress_adds.put_nowait(_IngressAdd(command))
 
         # The request is visible in ingress before any wakeup is triggered.
-        if self.config.attention_dp == 1:
+        if enqueued_any and self.config.attention_dp == 1:
             with self._state_cv:
                 if not self._wave_running:
                     self._wave_id += 1
                     self._quantum_id = 0
                     self._wave_running = True
                 self._state_cv.notify_all()
-        else:
+        elif enqueued_any:
             self._coordinator.first_request.remote(
                 self.engine_id, self._wave_id
             )
             with self._state_cv:
                 self._state_cv.notify_all()
-        return IngressAck(
-            request_id=command.request_id,
-            engine_id=self.engine_id,
-            enqueued=True,
-        )
-
-    def enqueue_add_batch(
-        self, commands: tuple[AddCommand, ...]
-    ) -> tuple[IngressAck, ...]:
-        return tuple(self.enqueue_add(command) for command in commands)
+        return tuple(acks)
 
     def admit_add(self, command: AddCommand) -> IngressAck:
         """Run local SP admission in the scheduler's single-writer loop."""
@@ -397,8 +427,24 @@ class LocalEngineCore:
             raise RuntimeError("LocalEngine admission batch result is missing")
         return tuple(ack for ack in immediate if ack is not None)
 
-    def submit_abort(self, request_id: int) -> AbortResult:
+    def submit_abort(
+        self,
+        request_id: int,
+        *,
+        allow_future_ingress: bool = False,
+    ) -> AbortResult:
         with self._ingress_lock:
+            if allow_future_ingress:
+                # A concurrent Ray actor call may reach this method before the
+                # corresponding fast enqueue RPC. Keep a bounded cancellation
+                # tombstone so that enqueue and abort have an atomic outcome
+                # under the same lock regardless of actor-call ordering.
+                self._cancelled_ingress_ids.add(request_id)
+            else:
+                # A post-receipt reconciliation call proves that the enqueue
+                # RPC has completed, so an obsolete future-ingress tombstone
+                # can no longer be needed.
+                self._cancelled_ingress_ids.discard(request_id)
             if (
                 request_id in self._ingress_pending_ids
                 or request_id in self._admission_pending_ids
@@ -407,9 +453,20 @@ class LocalEngineCore:
                 return AbortResult(
                     request_id=request_id, status="abort_pending"
                 )
-        return self._submit(
+        result = self._submit(
             _LoopCommand("abort", request_id), abort_priority=True
         )
+        if allow_future_ingress and result.status != "not_found":
+            with self._ingress_lock:
+                self._cancelled_ingress_ids.discard(request_id)
+        if allow_future_ingress and result.status == "not_found":
+            return AbortResult(request_id=request_id, status="abort_pending")
+        return result
+
+    def clear_ingress_abort(self, request_id: int) -> None:
+        """Forget a future-ingress tombstone after a negative receipt."""
+        with self._ingress_lock:
+            self._cancelled_ingress_ids.discard(request_id)
 
     def get_load(self) -> LoadSnapshot:
         return self._submit(_LoopCommand("load"))
@@ -1029,6 +1086,9 @@ class LocalEngineCore:
                 self._drain_queue(self._abort_commands)
                 self._drain_ingress()
                 self._drain_queue(self._normal_commands)
+                # Close the ingress-drain/plan gap for aborts submitted after
+                # the first priority drain but before scheduler admission.
+                self._drain_queue(self._abort_commands)
                 self._refresh_cached_load()
                 with self._state_cv:
                     if self._stop:

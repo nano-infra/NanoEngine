@@ -88,7 +88,12 @@ def parse_args():
         "--router-policy",
         type=str,
         default="least_batch",
-        choices=["round_robin", "least_batch", "least_cache"],
+        choices=[
+            "round_robin",
+            "least_batch",
+            "least_batch_v2",
+            "least_cache",
+        ],
         help="Hierarchical load-balancer policy (default: least_batch).",
     )
     

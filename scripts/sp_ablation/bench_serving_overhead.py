@@ -144,7 +144,12 @@ def parse_args():
         "--router-policy",
         type=str,
         default="least_batch",
-        choices=["round_robin", "least_batch", "least_cache"],
+        choices=[
+            "round_robin",
+            "least_batch",
+            "least_batch_v2",
+            "least_cache",
+        ],
         help="Hierarchical load-balancer policy (default: least_batch).",
     )
     
@@ -602,6 +607,15 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "time) / generated tokens; final-quantum loops beyond the actual "
             "output length are excluded"
         ),
+        "dispatch_tpot_ms": metric_percentiles(
+            records, "dispatch_tpot_ms"
+        ),
+        "dispatch_tpot_ms_definition": (
+            "(benchmark dispatch-to-observed-terminal time minus unused "
+            "final-quantum decode slots) / generated tokens; includes Router, "
+            "RPC, LocalEngine ingress, LocalScheduler queue, execution, and "
+            "frontend observation delay"
+        ),
         "dispatch_normalized_latency_ms": metric_percentiles(
             records, "dispatch_normalized_latency_ms"
         ),
@@ -635,7 +649,9 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "T0->T1: scheduled arrival to actual benchmark dispatch"
         ),
         "ingress_ack_latency_ms_definition": (
-            "T1->T3: benchmark dispatch to authoritative admission ACK"
+            "benchmark dispatch to Router-observed receipt; authoritative "
+            "admission for least_batch, fast ingress receipt for "
+            "least_batch_v2"
         ),
         "router_pending_ms_definition": (
             "RequestRouter submit to admission RPC issue, accumulated across "
@@ -643,8 +659,9 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "queue time"
         ),
         "admission_rpc_ms_definition": (
-            "frontend monotonic time across all LocalEngine admission RPC "
-            "attempts until each ACK is observed by RequestRouter"
+            "frontend monotonic time across LocalEngine control RPC attempts "
+            "until each receipt is observed; least_batch_v2 measures ingress "
+            "rather than scheduler admission"
         ),
         "local_command_queue_ms_definition": (
             "final LocalEngine admission command enqueue to single-writer "
@@ -926,6 +943,7 @@ def run_benchmark(
         final_quantum_unused_decode_ms = None
         tpot_with_queue_ms = None
         tpot_with_queue_source = None
+        dispatch_tpot_ms = None
         if finish_event is not None:
             first_forward_to_terminal_ms = (
                 finish_event.first_forward_to_terminal_ms
@@ -1056,6 +1074,21 @@ def run_benchmark(
                 tpot_with_queue_source = (
                     "sequence_metric_real_token_execution_boundary"
                 )
+        if (
+            status == "FINISHED"
+            and actual_output_tokens > 0
+            and e2e_ms is not None
+            and final_quantum_unused_decode_ms is not None
+        ):
+            dispatch_tpot_ms = round(
+                max(
+                    0.0,
+                    float(e2e_ms)
+                    - float(final_quantum_unused_decode_ms),
+                )
+                / actual_output_tokens,
+                6,
+            )
         return {
             "schema_version": 2,
             "request_id": int(request_id),
@@ -1122,6 +1155,7 @@ def run_benchmark(
             "arrival_e2e_ms": arrival_e2e_ms,
             "tpot_with_queue_ms": tpot_with_queue_ms,
             "tpot_with_queue_source": tpot_with_queue_source,
+            "dispatch_tpot_ms": dispatch_tpot_ms,
             "dispatch_normalized_latency_ms": (
                 dispatch_normalized_latency_ms
             ),
@@ -1726,6 +1760,7 @@ def run_benchmark(
         ],
         "e2e_ms": metrics_summary["e2e_ms"],
         "tpot_with_queue_ms": metrics_summary["tpot_with_queue_ms"],
+        "dispatch_tpot_ms": metrics_summary["dispatch_tpot_ms"],
         "dispatch_normalized_latency_ms": metrics_summary[
             "dispatch_normalized_latency_ms"
         ],
@@ -1775,6 +1810,7 @@ def calculate_and_print_metrics(
     model_ttft_stats = metrics_summary["model_ttft_ms"] or {}
     e2e_stats = metrics_summary["e2e_ms"] or {}
     tpot_wq_stats = metrics_summary["tpot_with_queue_ms"] or {}
+    dispatch_tpot_stats = metrics_summary["dispatch_tpot_ms"] or {}
     dispatch_normalized_stats = (
         metrics_summary["dispatch_normalized_latency_ms"] or {}
     )
@@ -1852,6 +1888,19 @@ def calculate_and_print_metrics(
         print(f"  P90:  {tpot_wq_stats.get('p90', 0):.2f}")
         print(f"  P95:  {tpot_wq_stats.get('p95', 0):.2f}")
         print(f"  P99:  {tpot_wq_stats.get('p99', 0):.2f}")
+        print()
+
+    if dispatch_tpot_stats:
+        print("--- End-to-End TPOT With All Queueing (ms/token) ---")
+        print(
+            "  Definition: dispatch-to-terminal minus unused final-quantum "
+            "slots, divided by generated tokens"
+        )
+        print(f"  Avg:  {dispatch_tpot_stats.get('mean', 0):.2f}")
+        print(f"  P50:  {dispatch_tpot_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {dispatch_tpot_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {dispatch_tpot_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {dispatch_tpot_stats.get('p99', 0):.2f}")
         print()
 
     if dispatch_normalized_stats:

@@ -141,8 +141,9 @@ class IngressAck:
     # failures remain blocked until a later snapshot advances past this epoch.
     capacity_epoch: int | None = None
     # Frontend monotonic-clock intervals. router_pending_ms covers time in
-    # RequestRouter before admission RPC attempts; admission_rpc_ms covers all
-    # attempts through the ACK observed by RequestRouter.
+    # RequestRouter before control RPC attempts. admission_rpc_ms retains its
+    # historical name: for centralized least_batch it ends at authoritative
+    # admission, while least_batch_v2 ends at the fast ingress receipt.
     router_pending_ms: float | None = None
     admission_rpc_ms: float | None = None
     # LocalEngine monotonic-clock intervals for the final admission attempt.

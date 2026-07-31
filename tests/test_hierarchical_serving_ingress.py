@@ -404,6 +404,7 @@ def test_request_metric_summary_uses_successful_request_scalars(
             "e2e_ms": 100.0,
             "ttft_ms": 20.0,
             "tpot_with_queue_ms": 10.0,
+            "dispatch_tpot_ms": 11.0,
             "dispatch_lag_ms": 1.0,
             "ingress_ack_latency_ms": 2.0,
             "add_accept_latency_ms": 3.0,
@@ -413,6 +414,7 @@ def test_request_metric_summary_uses_successful_request_scalars(
             "e2e_ms": 300.0,
             "ttft_ms": 40.0,
             "tpot_with_queue_ms": 30.0,
+            "dispatch_tpot_ms": 31.0,
             "dispatch_lag_ms": 3.0,
             "ingress_ack_latency_ms": 4.0,
             "add_accept_latency_ms": 5.0,
@@ -422,6 +424,7 @@ def test_request_metric_summary_uses_successful_request_scalars(
             "e2e_ms": 999.0,
             "ttft_ms": None,
             "tpot_with_queue_ms": None,
+            "dispatch_tpot_ms": None,
             "dispatch_lag_ms": 999.0,
             "ingress_ack_latency_ms": 999.0,
             "add_accept_latency_ms": None,
@@ -439,6 +442,10 @@ def test_request_metric_summary_uses_successful_request_scalars(
     assert summary["tpot_with_queue_ms"]["p50"] == 20.0
     assert summary["tpot_with_queue_ms"]["p90"] == 28.0
     assert summary["tpot_with_queue_ms"]["p99"] == 29.8
+    assert summary["dispatch_tpot_ms"]["mean"] == 21.0
+    assert "LocalEngine ingress" in summary[
+        "dispatch_tpot_ms_definition"
+    ]
     assert summary["goodput"] == {
         "metric": "tpot_with_queue_ms",
         "threshold_ms": 25.0,

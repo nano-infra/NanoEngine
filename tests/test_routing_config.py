@@ -42,7 +42,7 @@ def test_legacy_routing_strategy(name, expected):
 
 @pytest.mark.parametrize(
     "router_policy",
-    ["round_robin", "least_batch", "least_cache"],
+    ["round_robin", "least_batch", "least_batch_v2", "least_cache"],
 )
 def test_router_policy_config(router_policy):
     config = make_config(router_policy=router_policy)

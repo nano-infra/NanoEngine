@@ -139,8 +139,22 @@ class RayEngineTransport:
                 return False, None
             return True, tuple(ray.get(ready[0]))
 
-    def abort(self, request_id: int) -> AbortResult:
-        return self._get(self.actor.submit_abort.remote(request_id))
+    def abort(
+        self,
+        request_id: int,
+        *,
+        allow_future_ingress: bool = False,
+    ) -> AbortResult:
+        return self._get(
+            self.actor.submit_abort.remote(
+                request_id,
+                allow_future_ingress=allow_future_ingress,
+            )
+        )
+
+    def clear_ingress_abort(self, request_id: int) -> None:
+        with _without_proxy_env():
+            self.actor.clear_ingress_abort.remote(request_id)
 
     def load(self) -> LoadSnapshot:
         return self._get(self.actor.get_cached_load.remote())

@@ -31,7 +31,12 @@ def main():
         "--router-policy",
         type=str,
         default="least_batch",
-        choices=["round_robin", "least_batch", "least_cache"],
+        choices=[
+            "round_robin",
+            "least_batch",
+            "least_batch_v2",
+            "least_cache",
+        ],
         help="Hierarchical load-balancer policy (default: least_batch)",
     )
     parser.add_argument("--num-seqs", type=int, default=8)
