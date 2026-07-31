@@ -100,3 +100,41 @@ python tests/test_sequence_proxy.py
 python -m compileall -q nanodeploy examples scripts/issue003 scripts/sp_ablation
 git diff --check
 ```
+
+## Follow-up: load-balanced KV admission
+
+The first GPU A/B showed that fast transport receipts could keep refilling an
+engine without representing its accumulated LocalScheduler waiting work in the
+balancing score. The follow-up changes the v2 frontend policy as follows:
+
+- An engine is eligible when its ledger-backed aggregate KV credit can hold the
+  global FIFO head and its bounded not-yet-first-scheduled window is open.
+  Router-side queue-slot and SP-placement shadows are no longer eligibility
+  checks; LocalEngine remains authoritative for those limits.
+- Eligible engines are ordered by projected `running + waiting`. Each fresh
+  load snapshot establishes the observed waiting/pending-ingress baseline, and
+  every subsequent Router assignment immediately increments that projection.
+  Remaining KV is only an equal-load tie-break.
+- The existing per-request KV charge now also owns one unscheduled-load credit.
+  A fast ingress ACK frees the bounded transport batch flight but does not
+  release either credit. `FirstScheduleEvent`, rejection, abort, or terminal
+  cleanup releases it; first schedule also immediately attempts to refill from
+  the global FIFO.
+- The default per-engine unscheduled window is
+  `AdmissionPlannerConfig.max_num_seqs`; `RequestRouter` exposes an optional
+  override for focused tests and future tuning.
+- Outstanding request counts and blocks are maintained incrementally, avoiding
+  per-load-report scans of the full charge ledger.
+
+Focused and related CPU validation after this follow-up:
+
+```text
+python -m pytest -q \
+  tests/test_hierarchical_control_plane.py \
+  tests/test_hierarchical_contract.py \
+  tests/test_hierarchical_serving_ingress.py \
+  tests/test_routing_config.py
+# 108 passed
+```
+
+No GPU experiment was launched for this follow-up before committing it.

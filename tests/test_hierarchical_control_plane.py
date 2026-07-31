@@ -158,7 +158,9 @@ def load_snapshot(
     engine_id: int,
     free_blocks_min: int,
     *,
+    waiting: int = 0,
     running: int = 0,
+    pending_ingress: int = 0,
     quantum_id: int = 2,
     admission_version: int = 0,
     capacity_epoch: int = 0,
@@ -166,14 +168,15 @@ def load_snapshot(
     return LoadSnapshot(
         engine_id=engine_id,
         ready=True,
-        waiting=0,
+        waiting=waiting,
         running=running,
         free_blocks_min=free_blocks_min,
         wave_id=1,
         quantum_id=quantum_id,
         admission_version=admission_version,
         capacity_epoch=capacity_epoch,
-        reserved_slots=running,
+        pending_ingress=pending_ingress,
+        reserved_slots=running + waiting + pending_ingress,
         rank_loads=(
             RankLoad(
                 global_rank=engine_id,
@@ -284,6 +287,8 @@ def test_router_rejects_invalid_load_policy_configuration():
         RequestRouter(engines, router_policy="random")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="positive kvcache_block_size"):
         RequestRouter(engines, router_policy="least_cache")
+    with pytest.raises(ValueError, match="max_unscheduled_requests"):
+        RequestRouter(engines, max_unscheduled_requests=0)
 
 
 @dataclass
@@ -682,6 +687,127 @@ def test_router_least_batch_v2_keeps_global_fifo_and_uses_only_kv_credit():
     assert engines[1].commands == []
     assert engines[0].planned_batches == []
     assert router.owner(1) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
+
+
+def test_router_least_batch_v2_filters_by_kv_then_uses_projected_load():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+        2: FakeAsyncEngine(2),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_planner_config=planner_config(queue_capacity=2),
+    )
+    router.record_loads(
+        (
+            load_snapshot(0, 100, waiting=2, running=3),
+            load_snapshot(1, 10, waiting=1, running=1),
+            load_snapshot(2, 1),
+        )
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    # The request costs two blocks. DP2 has the lowest load but cannot fit it;
+    # among the eligible engines, DP1 wins on waiting+running even though DP0
+    # has substantially more KV credit. Both snapshots have exhausted the
+    # legacy queue-slot estimate; v2 deliberately leaves that authoritative
+    # check to LocalEngine rather than mirroring it in the Router.
+    assert router.poll_ingress_acks() == ()
+    assert engines[0].commands == []
+    assert [command.request_id for command in engines[1].commands] == [1]
+    assert engines[2].commands == []
+    metrics = router.admission_metrics()["per_engine"]
+    assert metrics["0"]["projected_batch"] == 5
+    assert metrics["1"]["projected_batch"] == 3
+    assert metrics["2"]["projected_batch"] == 0
+
+
+def test_router_least_batch_v2_precharges_projected_waiting():
+    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=4,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 10))
+    )
+    for request_id in range(1, 5):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    # Equal projected loads use KV only as a tie-break. Each assignment then
+    # immediately counts as waiting, so DP0's larger cache cannot attract the
+    # whole batch before a new load snapshot arrives.
+    assert [command.request_id for command in engines[0].commands] == [1, 3]
+    assert [command.request_id for command in engines[1].commands] == [2, 4]
+    metrics = router.admission_metrics()["per_engine"]
+    assert metrics["0"]["projected_waiting"] == 2
+    assert metrics["1"]["projected_waiting"] == 2
+
+
+def test_router_least_batch_v2_ack_does_not_release_compute_window():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch_v2",
+        kvcache_block_size=4,
+        admission_batch_size=4,
+        admission_planner_config=planner_config(),
+        max_unscheduled_requests=1,
+    )
+    router.record_loads((load_snapshot(0, 100),))
+    for request_id in (1, 2):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1]
+    assert router.pending_global_count == 1
+
+    engine.handles[0]["ready"] = True
+    assert [ack.request_id for ack in router.poll_ingress_acks()] == [1]
+    # A fast transport receipt frees the RPC flight, not compute credit.
+    assert [command.request_id for command in engine.commands] == [1]
+    assert router.pending_global_count == 1
+    metrics = router.admission_metrics()
+    assert metrics["per_engine"]["0"]["kv_outstanding_charges"] == 1
+    assert metrics["per_engine"]["0"][
+        "unscheduled_window_remaining"
+    ] == 0
+    assert metrics["unscheduled_gate_blocked"] >= 1
+
+    router.record_add_results((AddResultEvent(1, 0, True),))
+    router.record_first_schedule_events((FirstScheduleEvent(1, 0, 1.0),))
+    # First schedule returns the window slot and immediately dispatches the
+    # global FIFO head using the still-valid KV snapshot.
+    assert [command.request_id for command in engine.commands] == [1, 2]
+    assert router.pending_global_count == 0
+    assert router.owner(2) == RequestOwner(
+        OwnerState.PENDING_INGRESS, 0
+    )
 
 
 def test_router_least_batch_v2_rejects_duplicate_in_global_flight_and_terminal():
