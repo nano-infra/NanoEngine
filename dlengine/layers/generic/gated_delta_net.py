@@ -15,7 +15,7 @@ from dlengine.layers import get_backend
 from dlengine.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.logging import get_logger
 from dlengine.models.quant_config import QuantizationConfig
-from dlengine.utils.cuda import is_hopper
+from dlengine.utils.cuda import get_cuda_compute_capability
 
 logger = get_logger()
 
@@ -246,13 +246,16 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         # Kernel availability
-        is_hopper_gpu = is_hopper()
-        self._has_flashinfer_prefill = _HAS_FLASHINFER_GDN_PREFILL and is_hopper_gpu
+        capability = get_cuda_compute_capability()
+        sm_major = capability[0] if capability is not None else 0
+        # FlashInfer 0.6.11 supports GDN prefill on SM90 and SM100+. SM100
+        # prefill computes recurrent state in fp32; decode uses the bf16 pool.
+        self._has_flashinfer_prefill = _HAS_FLASHINFER_GDN_PREFILL and sm_major >= 9
         self._has_flashinfer_pretranspose = (
-            _HAS_FLASHINFER_GDN_PRETRANSPOSE and is_hopper_gpu
+            _HAS_FLASHINFER_GDN_PRETRANSPOSE and sm_major >= 9
         )
         self._has_flashinfer_nontranspose = (
-            _HAS_FLASHINFER_GDN_NONTRANSPOSE and is_hopper_gpu
+            _HAS_FLASHINFER_GDN_NONTRANSPOSE and sm_major == 9
         )
         # FLA is also a valid fallback on Hopper when a FlashInfer build omits
         # its optional decode kernels.
@@ -760,6 +763,8 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         if self._has_flashinfer_prefill:
             q_normed = self._l2norm(q.float(), dim=-1).to(q.dtype)
             k_normed = self._l2norm(k.float(), dim=-1).to(k.dtype)
+            if initial_state is not None:
+                initial_state = initial_state.float()
             o, final_state = chunk_gated_delta_rule(
                 q_normed,
                 k_normed,
@@ -794,6 +799,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             )
 
         if gdn_recurrent_states is not None and final_state is not None:
+            final_state = final_state.to(gdn_recurrent_states.dtype)
             if gdn_state_slots is not None:
                 gdn_recurrent_states[self.layer_idx, gdn_state_slots[:num_seqs]] = (
                     final_state
@@ -819,9 +825,9 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         if self._has_flashinfer_pretranspose and gdn_recurrent_states is not None:
             state_pool = gdn_recurrent_states[self.layer_idx]
             if gdn_state_slots is not None:
-                indices = gdn_state_slots[:bs].to(torch.int64)
+                indices = gdn_state_slots[:bs].to(torch.int32)
             else:
-                indices = torch.arange(bs, device=q.device, dtype=torch.int64)
+                indices = torch.arange(bs, device=q.device, dtype=torch.int32)
 
             o, _ = gated_delta_rule_decode_pretranspose(
                 q=q.unsqueeze(1),
@@ -864,6 +870,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             )
             o = o.squeeze(1)
             updated_state = updated_state.transpose(-1, -2)
+            updated_state = updated_state.to(gdn_recurrent_states.dtype)
             if slots is not None:
                 gdn_recurrent_states[self.layer_idx, slots] = updated_state
             else:
@@ -891,6 +898,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 state_v_first=True,
             )
             o = o.squeeze(1)
+            updated_state = updated_state.to(gdn_recurrent_states.dtype)
             if gdn_state_slots is not None:
                 gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
                     updated_state

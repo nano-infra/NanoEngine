@@ -646,6 +646,10 @@ class _FA2AttentionImpl:
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
+        self.has_flashinfer = _HAS_FLASHINFER
+        self.use_flashinfer_decode = True
+        self.use_flashinfer_prefill = True
+        self.use_fa2 = True
 
     def forward(
         self,
@@ -736,7 +740,8 @@ class _FA2AttentionImpl:
                         self.sliding_window,
                     )
                 if (
-                    _HAS_FLASHINFER
+                    self.has_flashinfer
+                    and self.use_flashinfer_prefill
                     and _flashinfer_prefill_enabled()
                     and _has_cached_prefill(context)
                 ):
@@ -777,6 +782,16 @@ class _FA2AttentionImpl:
                     self.scale,
                     sliding_window=self.sliding_window,
                 )
+            if not self.use_fa2:
+                return _sdpa_varlen_func(
+                    q,
+                    k,
+                    v,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    self.scale,
+                    sliding_window=self.sliding_window,
+                )
             o = flash_attn_varlen_func(
                 q,
                 k,
@@ -801,7 +816,8 @@ class _FA2AttentionImpl:
         if (
             k_cache.numel()
             and v_cache.numel()
-            and _HAS_FLASHINFER
+            and self.has_flashinfer
+            and self.use_flashinfer_decode
             and _flashinfer_enabled()
             and ntps == 1
         ):
@@ -825,6 +841,11 @@ class _FA2AttentionImpl:
         if not (k_cache.numel() and v_cache.numel()):
             return _sdpa_fixed_decode(q, k, v, ntps, self.scale)
 
+        if not self.use_fa2:
+            raise RuntimeError(
+                "Torch attention does not yet support paged KV decode; select "
+                "fa2 or flashinfer for serving."
+            )
         out = flash_attn_with_kvcache(
             q.reshape(bs, ntps, num_head, head_dim),
             k_cache,

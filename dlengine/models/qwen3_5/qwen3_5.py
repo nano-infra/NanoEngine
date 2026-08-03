@@ -123,7 +123,10 @@ class Qwen3_5FullAttention(nn.Module):
 
         q = self.q_norm(q.contiguous())
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        # FA4 CuTe kernels require the token dimension to be densely packed.
+        # ``v`` is a strided view into the fused QKV projection output, so make
+        # it contiguous before handing it to the attention backend.
+        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
 
         if self.rotary_dim < self.head_dim:
             q_rot = q[..., : self.rotary_dim].contiguous()
