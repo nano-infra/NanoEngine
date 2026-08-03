@@ -15,8 +15,8 @@ Design baseline:
 c3bb461bb3bd10a947e147148a14eb9b6c798dff
 ```
 
-Status: **CPU/control-plane GO; GPU/Ray deployment validation pending.** ZMQ is
-still opt-in and Ray remains the default.
+Status: **opt-in deployment GO; default promotion NO-GO pending the remaining
+comparative/failure gates.** ZMQ remains opt-in and Ray remains the default.
 
 ## Scope confirmation
 
@@ -140,17 +140,111 @@ Result: `[ok] C++ proxy containers behave as mutable views`.
 dependencies are installed as `pyzmq 27.1.0` and `msgspec 0.19.0`; no failure
 was attributed to this change.
 
-## Remaining deployment gates
+## GPU/Ray validation
 
-CPU tests cannot validate:
+Validation ran from tree `d59eb84af585696f71cd5fb4abe6314417fd7856`.
+The transport code in that tree is the implementation committed at `9618d52`;
+the intervening commit only added this review document. Both proxy families
+were unset and `SLIME_QP_NUM=4` was present in the driver environment.
 
-- IPC visibility between real strict-packed Ray actor processes;
-- the interaction of a persistent actor method with CUDA/NCCL execution;
-- real DLSlime command-before-payload timing;
-- multi-node DP2 x SP8 shutdown/failure behavior;
-- ZMQ serialization cost versus Ray under production result sizes.
+Common production-shaped configuration:
 
-The next step is a GPU/Ray smoke from commit `9618d52`, with proxies unset and
-`SLIME_QP_NUM=4`. Run identical Ray and ZMQ arms before any full 18,000-request
-A/B. Default promotion remains blocked until those results are reviewed.
+```text
+Ray: 10.102.206.14:8776
+topology: DP=2, SP=8, EP=16, TP=1 (two nodes, 16 GPUs)
+batch size: 192
+request rate: 50/s
+loop count: 16
+router: least_batch_v2 / LeastBatch master selection
+backend: hao_basic, full CUDA graph
+dataset: sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv
+```
 
+### Same-commit 512-request smoke
+
+Both arms used the same 512 inputs and enabled hierarchical quantum
+diagnostics. Both exited zero with `512/512` successes and no failure or
+rejection.
+
+| Metric | Ray | ZMQ | ZMQ minus Ray |
+| --- | ---: | ---: | ---: |
+| runtime (s) | 77.880 | 78.826 | +0.946 |
+| TPOT-with-queue mean (ms) | 46.334 | 46.513 | +0.179 |
+| TPOT-with-queue P50 (ms) | 46.649 | 46.791 | +0.142 |
+| TPOT-with-queue P90 (ms) | 47.470 | 47.551 | +0.081 |
+| TPOT-with-queue P99 (ms) | 47.650 | 48.027 | +0.377 (+0.79%) |
+| dispatch TPOT P99 (ms) | 49.243 | 49.315 | +0.072 |
+| command submit, two-engine mean (ms/quantum) | 1.402 | 0.494 | -0.907 (-64.7%) |
+| finish-to-result, two-engine mean (ms/quantum) | 0.874 | 0.382 | -0.492 (-56.3%) |
+
+The end-to-end difference is below the review's 1% P99 stop threshold. The ZMQ
+arm's executor critical path was about 7.3 ms/quantum slower in this short run,
+while both isolated control-boundary measurements improved materially. This is
+consistent with GPU/run-to-run variation rather than a ZMQ control regression;
+one short sample is not sufficient to claim an end-to-end improvement.
+
+Artifacts:
+
+```text
+bench_logs/zmq_worker_transport_smoke_d59eb84_20260803/ray/.../20260803_141734.summary.json
+bench_logs/zmq_worker_transport_smoke_d59eb84_20260803/zmq/.../20260803_141302.summary.json
+```
+
+### ZMQ 18,000-request full run
+
+At the user's direction, only the ZMQ full arm was completed. It exited zero,
+cleanly drained the long-request tail, and released its placement groups.
+
+| Metric | Result |
+| --- | ---: |
+| successful / total / failed | 18,000 / 18,000 / 0 |
+| ingress / scheduler rejected | 0 / 0 |
+| runtime | 450.284 s |
+| output throughput | 23,988.42 token/s |
+| TPOT-with-queue mean / P50 / P90 / P99 | 80.410 / 83.315 / 86.156 / 87.294 ms |
+| dispatch TPOT mean / P50 / P90 / P99 | 81.786 / 84.455 / 87.666 / 91.541 ms |
+| TTFT mean / P50 / P90 / P99 | 1955.181 / 1935.047 / 2535.211 / 3432.001 ms |
+| goodput at TPOT-with-queue < 100 ms | 18,000 / 18,000 (100%) |
+
+The full log contains no `Traceback`, `RayTaskError`, transport exception,
+protocol mismatch, timeout, or actor-death report. After normal shutdown,
+`ray status` reported `0.0/16.0 GPU`, no pending demand, and no placement-group
+reservation. No local `nanodeploy-zmq-*` IPC directory remained.
+
+The completed artifact is:
+
+```text
+bench_logs/zmq_worker_transport_ab_d59eb84_20260803/zmq/.../20260803_142551.summary.json
+```
+
+For direction only, the earlier Ray-only baseline at `c3bb461` completed the
+same 18,000-input workload in 452.184 s with TPOT-with-queue
+mean/P50/P90/P99 `81.464/84.525/87.093/87.967` ms. The ZMQ run is lower by
+`1.054/1.210/0.937/0.673` ms and is 1.899 s faster, but the hashes differ and
+the runs were not paired. These numbers therefore do not establish causality.
+
+A same-commit Ray full arm was started, then explicitly cancelled during CUDA
+graph capture when the user requested a ZMQ-only full run. It submitted no
+benchmark requests and is excluded from all comparisons. CUDA workers emitted
+signal diagnostics as they were interrupted; cleanup completed and the cluster
+returned to `0/16` GPUs.
+
+## Final review decision
+
+Real multi-process IPC visibility, persistent actor/CUDA execution, live
+DLSlime ordering, multi-node operation, production result sizes, normal
+shutdown, and a full ZMQ workload have now passed. The phase-1 ZMQ transport is
+accepted for opt-in use via:
+
+```bash
+NANODEPLOY_HIER_WORKER_TRANSPORT=zmq
+```
+
+Ray remains the default. Default promotion is still blocked on:
+
+- a completed same-commit, full-size Ray/ZMQ comparison (preferably repeated);
+- one GPU execution-trace smoke;
+- an explicit live worker-kill/fail-stop validation.
+
+This preserves the reviewed rollback path and avoids an end-to-end performance
+claim unsupported by paired full-size evidence.
