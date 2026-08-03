@@ -63,6 +63,7 @@ def _collect_dsv4_debug_env() -> dict[str, str] | None:
         "CUDA_LAUNCH_BLOCKING",
         "DLENGINE_DEBUG_SYNC",
         "DLENGINE_DEBUG_OPSYNC",
+        "DLENGINE_BLACKWELL_DEBUG_SYNC",
         "DLENGINE_CHUNKED_ALLREDUCE",
         "NCCL_DEBUG",
         "NCCL_DEBUG_SUBSYS",

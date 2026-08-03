@@ -94,17 +94,6 @@ class FlashInferDecodeGraphState:
         if wrapper is None:
             return None
 
-        if self.config.reuse_page_plan and page_plan_key is not None:
-            plan_key = (bs, page_plan_key[:bs])
-            if self.plan_keys.get(master_bs) == plan_key:
-                update_decode_last_page_len(
-                    self.last_page_len[master_bs],
-                    context_lens,
-                    bs,
-                    self.config.block_size,
-                )
-                return wrapper
-
         indptr, indices, last_page_len = paged_decode_metadata(
             block_tables, context_lens, bs, self.config.block_size
         )
@@ -127,6 +116,9 @@ class FlashInferDecodeGraphState:
                     tuple((indptr[1:] - indptr[:-1]).tolist()),
                 )
             )
+            # Equal page counts do not imply equal physical KV pages after a
+            # request slot is reused. The persistent buffers above must always
+            # be refreshed before reusing the existing wrapper plan.
             if self.plan_keys.get(master_bs) == plan_key:
                 return wrapper
             self.plan_keys[master_bs] = plan_key

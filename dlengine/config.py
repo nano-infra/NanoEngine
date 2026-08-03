@@ -81,6 +81,10 @@ class Config(BaseModel):
 
     # runner config
     enforce_eager: bool = False
+    attention_backend: Literal[
+        "auto", "fa2", "fa3", "fa4", "flashinfer", "torch"
+    ] = "auto"
+    gdn_backend: Literal["auto", "flashinfer", "fla", "torch"] = "auto"
     use_flashinfer_decode: bool = Field(
         default_factory=lambda: os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1")
         == "1"
@@ -373,7 +377,19 @@ class Config(BaseModel):
             assert self.attention_tp == 1
         else:
             assert self.kvcache_block_size % 64 == 0
-            if self.kvcache_block_size % 256 != 0:
+            is_blackwell = (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 10
+            )
+            if is_blackwell:
+                if self.kvcache_block_size != 64:
+                    logger.info(
+                        "Blackwell TRT-LLM MHA decode uses 64-token KV pages; "
+                        "adjusting kvcache_block_size from %s to 64.",
+                        self.kvcache_block_size,
+                    )
+                self.kvcache_block_size = 64
+            elif self.kvcache_block_size % 256 != 0:
                 adjusted_block_size = ((self.kvcache_block_size + 255) // 256) * 256
                 logger.warning(
                     "kvcache_block_size=%s is incompatible with flash-attn "

@@ -12,10 +12,16 @@ Usage
 
 Backend selection order
 -----------------------
-1. ``NANO_BACKEND`` environment variable (``"hopper"`` | ``"gpu_generic"``)
+1. ``NANO_BACKEND`` environment variable
+   (``"blackwell"`` | ``"hopper"`` | ``"gpu_generic"``)
 2. Auto-detect from ``torch.cuda.get_device_capability()``:
+   - compute capability 10.3    → ``"blackwell"``
    - compute capability >= 9.x  → ``"hopper"``
    - otherwise                  → ``"gpu_generic"``
+
+Attention and GDN kernels are selected independently by
+``Config.attention_backend`` and ``Config.gdn_backend``. Their ``auto`` modes
+resolve from CUDA capability and installed kernel support.
 """
 
 import os
@@ -29,6 +35,8 @@ _backend: Optional[BackendFactory] = None
 def init_backend(
     quant_config=None,
     backend_type: Optional[str] = None,
+    attention_backend: Optional[str] = None,
+    gdn_backend: Optional[str] = None,
 ) -> None:
     """Initialise the global backend factory.
 
@@ -38,12 +46,11 @@ def init_backend(
         A ``QuantizationConfig`` instance (or ``None`` for BF16).
         If ``None``, a default (no-quantization) config is created.
     backend_type:
-        Explicit backend name.  When ``None`` the backend is resolved via
+        Explicit backend name. When ``None`` the backend is resolved via
         the ``NANO_BACKEND`` env var or GPU capability auto-detection.
     """
     global _backend
 
-    # --- resolve backend type ---
     if backend_type is None:
         backend_type = os.environ.get("NANO_BACKEND")
 
@@ -52,18 +59,23 @@ def init_backend(
             import torch
 
             cap = torch.cuda.get_device_capability()
-            backend_type = "hopper" if cap[0] >= 9 else "gpu_generic"
+            if cap == (10, 3):
+                backend_type = "blackwell"
+            else:
+                backend_type = "hopper" if cap[0] >= 9 else "gpu_generic"
         except Exception:
             backend_type = "gpu_generic"
 
-    # --- default quant config ---
     if quant_config is None:
         from dlengine.models.quant_config import QuantizationConfig
 
         quant_config = QuantizationConfig()
 
-    # --- instantiate factory ---
-    if backend_type == "hopper":
+    if backend_type == "blackwell":
+        from .blackwell import BlackwellBackendFactory
+
+        _backend = BlackwellBackendFactory(quant_config)
+    elif backend_type == "hopper":
         from .hopper import HopperBackendFactory
 
         _backend = HopperBackendFactory(quant_config)
@@ -74,8 +86,15 @@ def init_backend(
     else:
         raise ValueError(
             f"Unknown backend type: {backend_type!r}. "
-            "Valid values: 'hopper', 'gpu_generic'."
+            "Valid values: 'blackwell', 'hopper', 'gpu_generic'."
         )
+
+    _backend.attention_backend = attention_backend or os.environ.get(
+        "DLENGINE_ATTENTION_BACKEND", "auto"
+    )
+    _backend.gdn_backend = gdn_backend or os.environ.get(
+        "DLENGINE_GDN_BACKEND", "auto"
+    )
 
 
 def get_backend() -> BackendFactory:

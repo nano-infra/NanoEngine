@@ -22,6 +22,9 @@ class GenericBackendFactory(BackendFactory):
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
+        self.hardware_backend = "gpu_generic"
+        self.attention_backend = "auto"
+        self.gdn_backend = "auto"
 
     # ------------------------------------------------------------------
     # Linear layers
@@ -39,7 +42,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> RowParallelLinearBase:
-        from .linear import GenericRowParallelLinear
+        from dlengine.layers.backends.torch.linear import GenericRowParallelLinear
 
         return GenericRowParallelLinear(
             input_size,
@@ -63,7 +66,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> ColumnParallelLinearBase:
-        from .linear import GenericColumnParallelLinear
+        from dlengine.layers.backends.torch.linear import GenericColumnParallelLinear
 
         return GenericColumnParallelLinear(
             input_size,
@@ -87,7 +90,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase:
-        from .linear import GenericMergedColumnParallelLinear
+        from dlengine.layers.backends.torch.linear import GenericMergedColumnParallelLinear
 
         return GenericMergedColumnParallelLinear(
             input_size,
@@ -113,7 +116,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> QKVParallelLinearBase:
-        from .linear import GenericQKVParallelLinear
+        from dlengine.layers.backends.torch.linear import GenericQKVParallelLinear
 
         return GenericQKVParallelLinear(
             hidden_size,
@@ -138,7 +141,7 @@ class GenericBackendFactory(BackendFactory):
         scale_tensor=None,
         **kwargs,
     ) -> ReplicatedLinearBase:
-        from .linear import GenericReplicatedLinear
+        from dlengine.layers.backends.torch.linear import GenericReplicatedLinear
 
         return GenericReplicatedLinear(
             input_size,
@@ -159,7 +162,7 @@ class GenericBackendFactory(BackendFactory):
         tp_size,
         **kwargs,
     ) -> DistributedRoutedExpertsBase:
-        from .experts import GenericDistributedRoutedExperts
+        from dlengine.layers.backends.torch.experts import GenericDistributedRoutedExperts
 
         kwargs.pop("quantization_config", None)
         return GenericDistributedRoutedExperts(
@@ -182,9 +185,11 @@ class GenericBackendFactory(BackendFactory):
         attention_type: str = "MLA",
         **kwargs,
     ) -> AttentionBase:
-        from .attention import GenericAttention
+        from dlengine.layers.backends import create_attention
 
-        return GenericAttention(
+        return create_attention(
+            requested=self.attention_backend,
+            hardware_backend=self.hardware_backend,
             num_heads=num_heads,
             head_dim=head_dim,
             scale=scale,
@@ -205,10 +210,11 @@ class GenericBackendFactory(BackendFactory):
         quantization_config=None,
         **kwargs,
     ) -> GatedDeltaNetBase:
-        from .gated_delta_net import GenericGatedDeltaNet
+        from dlengine.layers.backends import create_gdn
 
         quant_config = quantization_config or self.quant_config
-        return GenericGatedDeltaNet(
+        return create_gdn(
+            requested=self.gdn_backend,
             layer_idx=layer_idx,
             config=config,
             quantization_config=quant_config,

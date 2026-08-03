@@ -403,7 +403,11 @@ class ModelRunner:
         _quant_cfg_dict = getattr(hf_config, "quantization_config", None) or {}
         if not isinstance(_quant_cfg_dict, dict):
             _quant_cfg_dict = {}
-        init_backend(quant_config=_QC(**_quant_cfg_dict))
+        init_backend(
+            quant_config=_QC(**_quant_cfg_dict),
+            attention_backend=getattr(config, "attention_backend", "auto"),
+            gdn_backend=getattr(config, "gdn_backend", "auto"),
+        )
 
         model_architecture = hf_config.architectures[0]
         model_loader = architecture_loaders.get(model_architecture)

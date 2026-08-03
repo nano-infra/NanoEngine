@@ -21,6 +21,9 @@ class HopperBackendFactory(BackendFactory):
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
+        self.hardware_backend = "hopper"
+        self.attention_backend = "auto"
+        self.gdn_backend = "auto"
 
     # ------------------------------------------------------------------
     # Linear layers
@@ -38,7 +41,7 @@ class HopperBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> RowParallelLinearBase:
-        from .linear import HopperRowParallelLinear
+        from dlengine.layers.backends.deepseek.linear import HopperRowParallelLinear
 
         return HopperRowParallelLinear(
             input_size,
@@ -64,7 +67,7 @@ class HopperBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> ColumnParallelLinearBase:
-        from .linear import HopperColumnParallelLinear
+        from dlengine.layers.backends.deepseek.linear import HopperColumnParallelLinear
 
         return HopperColumnParallelLinear(
             input_size,
@@ -90,7 +93,7 @@ class HopperBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase:
-        from .linear import HopperMergedColumnParallelLinear
+        from dlengine.layers.backends.deepseek.linear import HopperMergedColumnParallelLinear
 
         return HopperMergedColumnParallelLinear(
             input_size,
@@ -118,7 +121,7 @@ class HopperBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> QKVParallelLinearBase:
-        from .linear import HopperQKVParallelLinear
+        from dlengine.layers.backends.deepseek.linear import HopperQKVParallelLinear
 
         return HopperQKVParallelLinear(
             hidden_size,
@@ -145,7 +148,7 @@ class HopperBackendFactory(BackendFactory):
         scale_tensor=None,
         **kwargs,
     ) -> ReplicatedLinearBase:
-        from .linear import HopperReplicatedLinear
+        from dlengine.layers.backends.deepseek.linear import HopperReplicatedLinear
 
         return HopperReplicatedLinear(
             input_size,
@@ -168,7 +171,7 @@ class HopperBackendFactory(BackendFactory):
         tp_size,
         **kwargs,
     ) -> DistributedRoutedExpertsBase:
-        from .experts import HopperDistributedRoutedExperts
+        from dlengine.layers.backends.deepseek.experts import HopperDistributedRoutedExperts
 
         # Pass quant config; ignore any stale quantization_config in kwargs
         kwargs.pop("quantization_config", None)
@@ -194,9 +197,11 @@ class HopperBackendFactory(BackendFactory):
         nsa_index_topk: int = 0,
         **kwargs,
     ) -> AttentionBase:
-        from .attention import HopperAttention
+        from dlengine.layers.backends import create_attention
 
-        return HopperAttention(
+        return create_attention(
+            requested=self.attention_backend,
+            hardware_backend=self.hardware_backend,
             num_heads=num_heads,
             head_dim=head_dim,
             scale=scale,
@@ -218,10 +223,11 @@ class HopperBackendFactory(BackendFactory):
         quantization_config=None,
         **kwargs,
     ) -> GatedDeltaNetBase:
-        from dlengine.layers.generic.gated_delta_net import GenericGatedDeltaNet
+        from dlengine.layers.backends import create_gdn
 
         quant_config = quantization_config or self.quant_config
-        return GenericGatedDeltaNet(
+        return create_gdn(
+            requested=self.gdn_backend,
             layer_idx=layer_idx,
             config=config,
             quantization_config=quant_config,

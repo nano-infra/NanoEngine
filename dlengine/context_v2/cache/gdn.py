@@ -4,6 +4,16 @@ import torch
 
 from dlengine.context_v2 import BaseContext
 from dlengine.logging import get_logger
+from dlengine.utils.cuda import get_cuda_compute_capability
+
+
+def _recurrent_state_dtype() -> torch.dtype:
+    """Use FlashInfer's bf16 GDN state-pool kernel on SM100+."""
+    capability = get_cuda_compute_capability()
+    if capability is not None and capability[0] >= 10:
+        return torch.bfloat16
+    return torch.float32
+
 
 logger = get_logger("dlengine")
 
@@ -75,7 +85,15 @@ def estimate_gdn_state_bytes(
     active_capacity = max_bs + max(0, cache_slots)
     num_slots = active_capacity * 2 + 1 if need_backup else active_capacity + 1
     conv_bytes = num_layers * num_slots * conv_dim * conv_kernel_size * 2
-    recurrent_bytes = num_layers * num_slots * num_v_heads * head_v_dim * head_k_dim * 4
+    state_size = torch.empty((), dtype=_recurrent_state_dtype()).element_size()
+    recurrent_bytes = (
+        num_layers
+        * num_slots
+        * num_v_heads
+        * head_v_dim
+        * head_k_dim
+        * state_size
+    )
     return conv_bytes + recurrent_bytes
 
 
@@ -121,7 +139,7 @@ def allocate_gdn_states(
         num_v_heads,
         head_v_dim,
         head_k_dim,
-        dtype=torch.float32,
+        dtype=_recurrent_state_dtype(),
         device=context.device,
     )
 
