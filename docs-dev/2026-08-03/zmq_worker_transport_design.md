@@ -2,8 +2,9 @@
 
 Date: 2026-08-03 UTC
 
-Status: `DRAFT` — implementation is blocked until the review in
-`zmq_worker_transport_review.md` reaches `GO`.
+Status: `REVIEWED` — the review in `zmq_worker_transport_review.md` reached
+`GO` for the opt-in phase-1 implementation. Default promotion remains gated on
+same-commit GPU/Ray A/B results.
 
 ## 1. Baseline and repository state
 
@@ -175,7 +176,11 @@ contract is not satisfied.
 
 Encoding uses `msgspec.msgpack`, with `pyzmq` and `msgspec` declared as direct
 project dependencies. Unlike pickle, decoding an untrusted or malformed frame
-cannot execute Python code.
+cannot execute Python code. Every protocol struct sets
+`forbid_unknown_fields=True`; both socket `MAXMSGSIZE` and a pre-decode frame
+length check reject oversized messages. The initial limits are 1 MiB for a
+command and 16 MiB for a worker response. Failure messages and tracebacks are
+truncated to 8 KiB and 64 KiB respectively before encoding.
 
 All message types include:
 
@@ -207,6 +212,14 @@ Validation occurs before payload use:
 
 Malformed, duplicate, stale, future, or wrong-rank messages are fatal protocol
 errors. They are never ignored or retried.
+
+ROUTER fan-out cannot be atomic. If a command is accepted for any subset of
+ranks and a later rank send fails, LocalExecutor does not call
+`send_seqs()`. It marks the whole LocalEngine failed and tears down all of its
+workers. Some workers may already be waiting in `recv_seqs()`; actor teardown
+is the deliberate release mechanism. The same fail-stop rule applies if
+DLSlime only partially sends the sequence payload. No partial result reaches
+scheduler postprocess.
 
 ## 8. Cross-transport ordering invariant
 
@@ -251,6 +264,12 @@ does not use independent PUSH/PULL queues without rank identities.
 The socket is created by the thread that uses it. A startup event transfers
 only success/failure state between the LocalEngine actor-method thread and its
 event-loop thread; it never transfers socket ownership.
+
+The worker DEALER uses `IMMEDIATE=1` and waits for `POLLOUT` under the same
+startup deadline before sending READY. Thus connect-before-bind is supported
+without an unbounded queued READY frame. All worker configuration methods
+complete before the persistent loop begins; once it begins, no normal Ray
+actor method is invoked on that single-concurrency ModelRunner.
 
 ### Normal shutdown
 
@@ -306,11 +325,9 @@ decision after correctness and performance gates pass.
 
 ## 12. Metrics
 
-Ray mode preserves all current fields and meanings.
+Both modes record transport-neutral fields:
 
-ZMQ mode records:
-
-- `worker_command_send_latency_ms`;
+- `worker_command_submit_latency_ms`;
 - `send_seqs_latency_ms`;
 - `worker_result_wait_latency_ms`;
 - `executor_until_worker_result_ms`;
@@ -318,10 +335,16 @@ ZMQ mode records:
 - `worker_finish_to_result_ms`;
 - `worker_finish_skew_ms`.
 
-The old `actor_submit_latency_ms`, `ray_get_latency_ms`,
-`executor_until_ray_get_ms`, and `worker_finish_to_ray_get_ms` are not populated
-with misleading ZMQ values. Aggregators already accept sparse metric names.
-Benchmark output must record the selected transport.
+Ray mode additionally preserves all existing fields and meanings as aliases:
+`actor_submit_latency_ms`, `ray_get_latency_ms`,
+`executor_until_ray_get_ms`, and `worker_finish_to_ray_get_ms`. ZMQ mode does
+not populate those Ray-specific names.
+
+`LocalExecutor`, `LoadSnapshot`, and `LLM.hierarchical_metrics()` gain
+transport-neutral result-wait total/max/mean fields. Existing Ray-specific
+aggregate fields remain present for compatibility and remain zero in ZMQ mode.
+Benchmark output records the selected transport so a zero Ray-specific counter
+cannot be mistaken for zero control latency.
 
 ## 13. Implementation slices
 
@@ -342,9 +365,9 @@ No C++ file is expected to change in phase 1.
 ### CPU/unit tests
 
 - MessagePack round trip for every message type.
-- Reject unsupported version, wrong epoch/engine/rank, invalid kind, malformed
-  bytes, oversized failure text, stale/future quantum, duplicate rank, and
-  missing rank.
+- Reject unsupported version, unknown fields, wrong epoch/engine/rank, invalid
+  kind, malformed bytes, oversized frames, oversized failure text,
+  stale/future quantum, duplicate rank, and missing rank.
 - Local IPC ROUTER/DEALER startup handshake with multiple fake workers.
 - Commands may be sent before DLSlime payload; results may arrive in arbitrary
   rank order but are returned in topology order.
@@ -429,8 +452,7 @@ Implementation may begin only after a separate review verifies:
 - partial send/result behavior and no unsafe retry;
 - persistent Ray actor concurrency and shutdown behavior;
 - health sentinel behavior;
-- bounded queues, deadlines, message sizes, and error text;
+- bounded queues, absolute deadlines, message sizes, and error text;
 - backward-compatible Ray path and metrics;
 - testability without CUDA/Ray cluster access;
 - realistic performance upside relative to the measured boundary.
-
