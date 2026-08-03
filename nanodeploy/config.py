@@ -59,6 +59,10 @@ class Config:
     # Diagnostic-only positional result path. The default preserves the
     # request-id dict/set/reorder implementation for controlled A/B testing.
     hierarchical_result_fastpath: bool = False
+    # Ray remains the lifecycle/placement plane in both modes. The ZMQ option
+    # only replaces hierarchical LocalEngine<->ModelRunner quantum control and
+    # result traffic; DLSlime continues to carry Sequence payloads.
+    hierarchical_worker_transport: Literal["ray", "zmq"] = "ray"
 
     # parallel config
     attention_tp: int = 1
@@ -169,6 +173,18 @@ class Config:
         if self.scheduler_arch not in {"legacy_global", "hierarchical"}:
             raise ValueError(
                 "scheduler_arch must be one of: legacy_global, hierarchical"
+            )
+        if self.hierarchical_worker_transport not in {"ray", "zmq"}:
+            raise ValueError(
+                "hierarchical_worker_transport must be one of: ray, zmq"
+            )
+        if (
+            self.hierarchical_worker_transport == "zmq"
+            and self.scheduler_arch != "hierarchical"
+        ):
+            raise ValueError(
+                "hierarchical_worker_transport='zmq' requires "
+                "scheduler_arch='hierarchical'"
             )
         if (
             self.hierarchical_quantum_diagnostics
@@ -473,6 +489,9 @@ class Config:
             "loop_count": self.loop_count,
             "hierarchical_quantum_diagnostics": (
                 self.hierarchical_quantum_diagnostics
+            ),
+            "hierarchical_worker_transport": (
+                self.hierarchical_worker_transport
             ),
             "communication_env": {
                 name: os.getenv(name) for name in communication_env_names

@@ -4,6 +4,7 @@ import importlib
 import queue
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from types import ModuleType, SimpleNamespace
@@ -34,6 +35,7 @@ from nanodeploy.engine.local_engine import (
     _PlannedAdmission,
 )
 from nanodeploy.engine.topology import EngineTopology
+from nanodeploy.engine.worker_transport import DecodeSuccess
 from nanodeploy.router.request_router import RequestOwner, RequestRouter
 from nanodeploy.router.admission_planner import AdmissionPlannerConfig
 
@@ -1189,6 +1191,7 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     engine = object.__new__(actor_class)
     engine.engine_id = 0
     engine._failure = None
+    engine.executor = SimpleNamespace(check_worker_liveness=lambda: None)
     engine._loop_thread = SimpleNamespace(is_alive=lambda: True)
     engine._events_lock = threading.Lock()
     engine._load_lock = threading.Lock()
@@ -1214,6 +1217,41 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     assert engine._first_schedule_events == deque()
     assert engine._first_token_events == deque()
     assert engine._terminal_events == deque()
+
+
+def test_local_engine_transport_startup_failure_releases_ready_barrier():
+    class FakeExecutor:
+        shutdown_call = None
+
+        @staticmethod
+        def activate_worker_transport(_timeout):
+            raise RuntimeError("handshake failed")
+
+        def shutdown_worker_transport(self, *, timeout, failed):
+            self.shutdown_call = (timeout, failed)
+            return ()
+
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.engine_id = 0
+    engine.config = SimpleNamespace(
+        startup_timeout_s=3.0,
+        quantum_timeout_s=4.0,
+    )
+    engine.executor = FakeExecutor()
+    engine._worker_transport_ready = threading.Event()
+    engine._failure = None
+    engine._stop = False
+    engine._state_cv = threading.Condition()
+    engine._abort_commands = queue.Queue()
+    engine._normal_commands = queue.Queue()
+
+    engine._event_loop()
+
+    assert engine._worker_transport_ready.is_set()
+    assert engine._failure == "RuntimeError: handshake failed"
+    assert engine._stop
+    assert engine.executor.shutdown_call == (4.0, True)
 
 
 def test_hierarchical_engine_is_not_finished_with_buffered_finish_events(
@@ -2276,3 +2314,157 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         assert len(executor.last_execution_traces) == 1
     else:
         assert executor.last_execution_traces == ()
+
+
+def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
+    class FakeEndpoint:
+        def __init__(self, *_args, **_kwargs):
+            self.sent = None
+
+        def send_seqs(self, sequences, *, is_prefill):
+            self.sent = (sequences, is_prefill)
+
+    class RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.result
+
+    class FakeWorker:
+        def __init__(self):
+            self.configure_zmq_worker_transport = RemoteMethod(None)
+            self.run_zmq_loop = RemoteMethod("persistent-loop")
+
+    class FakeZmqServer:
+        instance = None
+
+        def __init__(self):
+            self.deployment_epoch = "epoch"
+            self.commands = None
+            self.activated = None
+            self.closed = None
+            type(self).instance = self
+
+        @classmethod
+        def create_ipc(cls, **_kwargs):
+            return cls()
+
+        def worker_config(self, global_rank, **_kwargs):
+            return SimpleNamespace(global_rank=global_rank)
+
+        def activate(self, timeout, *, liveness_check):
+            self.activated = (timeout, liveness_check)
+
+        def send_decode_commands(self, commands, *, deadline):
+            self.commands = (dict(commands), deadline)
+
+        @staticmethod
+        def receive_decode_results(*, deadline):
+            assert deadline > 0
+            return (
+                DecodeSuccess(
+                    protocol_version=1,
+                    deployment_epoch="epoch",
+                    engine_id=0,
+                    global_rank=0,
+                    wave_id=1,
+                    quantum_id=0,
+                    token_rows=[list(range(16)), [0] * 16],
+                    worker_end_time=time.time(),
+                ),
+            )
+
+        def mark_failed(self):
+            raise AssertionError("normal ZMQ run must not fail")
+
+        def close(self, *, graceful, timeout_s):
+            self.closed = (graceful, timeout_s)
+            return ()
+
+        def cleanup_unbound(self):
+            raise AssertionError("normal ZMQ startup must not clean early")
+
+    class FakeSequence:
+        def __init__(self, seq_id):
+            self.seq_id = seq_id
+
+        @staticmethod
+        def block_ctx():
+            return SimpleNamespace(master_sp_idx=0)
+
+    class FakeBatch:
+        engine_id = 0
+        wave_id = 1
+        quantum_id = 0
+        engine_has_real = True
+        real_sequence = FakeSequence(7)
+        control_dummy = FakeSequence(-1)
+        per_rank_sequences = {0: [real_sequence, control_dummy]}
+
+        @staticmethod
+        def is_control_dummy(sequence):
+            return sequence.seq_id == -1
+
+        @staticmethod
+        def expected_request_ids(_global_rank):
+            return (7,)
+
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_executor.RPCServerEndpoint",
+        FakeEndpoint,
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_executor.ZmqWorkerServer",
+        FakeZmqServer,
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_executor.ray.get",
+        lambda refs, timeout: refs,
+    )
+    config = SimpleNamespace(
+        optimize_decode_block_table=True,
+        hierarchical_execution_trace=False,
+        hierarchical_quantum_diagnostics=False,
+        hierarchical_result_fastpath=True,
+        hierarchical_worker_transport="zmq",
+        quantum_timeout_s=2.0,
+    )
+    topology = EngineTopology(
+        engine_id=0,
+        global_dp_idx=0,
+        global_ranks=(0,),
+        attention_sp=1,
+        attention_tp=1,
+    )
+    worker = FakeWorker()
+    executor = LocalExecutor(config, topology, [worker])
+
+    executor.prepare_worker_transport(timeout=3.0)
+    executor.activate_worker_transport(timeout=3.0)
+    results = executor.run(FakeBatch(), timeout=2.0)
+    shutdown_errors = executor.shutdown_worker_transport(
+        timeout=2.0, failed=False
+    )
+
+    assert shutdown_errors == ()
+    assert worker.configure_zmq_worker_transport.calls == [
+        {"transport_config": SimpleNamespace(global_rank=0)}
+    ]
+    assert worker.run_zmq_loop.calls == [{}]
+    assert results[0].mastered_request_ids == (7,)
+    assert results[0].sampled_token_ids == (tuple(range(16)),)
+    server = FakeZmqServer.instance
+    assert server is not None
+    commands, _deadline = server.commands
+    assert tuple(commands) == (0,)
+    assert commands[0].wave_id == 1
+    assert commands[0].quantum_id == 0
+    assert executor.endpoint.sent[1] is False
+    boundary = executor.execution_boundary_metrics()
+    assert boundary["worker_result_wait_latency_ms_mean"] >= 0
+    assert "ray_get_latency_ms_mean" not in boundary
+    assert executor.ray_get_latency_ms_total == 0
+    assert executor.worker_result_wait_latency_ms_total >= 0

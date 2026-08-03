@@ -60,6 +60,22 @@ def test_router_policy_config_rejects_unknown_value():
         make_config(router_policy="random")
 
 
+def test_zmq_worker_transport_requires_hierarchical_scheduler():
+    with pytest.raises(
+        ValueError,
+        match="hierarchical_worker_transport='zmq' requires",
+    ):
+        make_config(hierarchical_worker_transport="zmq")
+
+
+def test_worker_transport_rejects_unknown_value():
+    with pytest.raises(
+        ValueError,
+        match="hierarchical_worker_transport must be one of",
+    ):
+        make_config(hierarchical_worker_transport="socket")
+
+
 def test_removed_scheduler_mode_is_not_a_config_field():
     with pytest.raises(TypeError, match="scheduler_mode"):
         Config(  # type: ignore[call-arg]

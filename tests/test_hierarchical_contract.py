@@ -143,9 +143,17 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert config.kvcache_block_size == 64
     assert not config.hierarchical_execution_trace
     assert not config.hierarchical_quantum_diagnostics
+    assert config.hierarchical_worker_transport == "ray"
     assert config.max_ingress_batch_requests == 256
     assert config.max_ingress_drain_ms == 0.0
     assert len(config.collective_fingerprint()) == 64
+
+    zmq_config = make_hierarchical_config(
+        hierarchical_worker_transport="zmq"
+    )
+    assert zmq_config.collective_fingerprint() != (
+        config.collective_fingerprint()
+    )
 
 
 def test_add_validation_rounds_completion_and_excludes_bootstrap():

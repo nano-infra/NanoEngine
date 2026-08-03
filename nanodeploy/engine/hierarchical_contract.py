@@ -302,6 +302,8 @@ class LoadSnapshot:
     execute_latency_ms_total: float = 0.0
     ray_get_latency_ms_total: float = 0.0
     ray_get_latency_ms_max: float = 0.0
+    worker_result_wait_latency_ms_total: float = 0.0
+    worker_result_wait_latency_ms_max: float = 0.0
     result_rebuild_latency_ms_total: float = 0.0
     result_rebuild_latency_ms_max: float = 0.0
     result_rebuild_sample_count: int = 0

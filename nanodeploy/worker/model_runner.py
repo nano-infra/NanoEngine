@@ -18,6 +18,12 @@ from nanodeploy._cpp import (
 from nanodeploy.config import Config
 from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.engine.worker_transport import (
+    DecodeCommand,
+    WorkerExecutionOutput,
+    WorkerZmqConfig,
+    ZmqWorkerClient,
+)
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -215,12 +221,91 @@ class ModelRunner:
         self.endpoint = RPCClientEndpoint(
             32 * 32_000_000, self.engine_local_rank
         )
+        self._zmq_worker_config: WorkerZmqConfig | None = None
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
         self.endpoint.connect(server_info)
         logger.info("client endpoint initialized")
         return client_info
+
+    def configure_zmq_worker_transport(
+        self, *, transport_config: WorkerZmqConfig
+    ) -> None:
+        if self._zmq_worker_config is not None:
+            raise RuntimeError("worker ZMQ transport is already configured")
+        expected_engine_id = self.rank // (
+            self.config.attention_sp * self.config.attention_tp
+        )
+        if transport_config.engine_id != expected_engine_id:
+            raise ValueError(
+                "worker ZMQ engine mismatch: "
+                f"expected={expected_engine_id}, "
+                f"got={transport_config.engine_id}"
+            )
+        if transport_config.global_rank != self.rank:
+            raise ValueError(
+                "worker ZMQ rank mismatch: "
+                f"expected={self.rank}, got={transport_config.global_rank}"
+            )
+        self._zmq_worker_config = transport_config
+
+    def run_zmq_loop(self) -> None:
+        transport_config = self._zmq_worker_config
+        if transport_config is None:
+            raise RuntimeError("worker ZMQ transport is not configured")
+
+        def execute(command: DecodeCommand) -> WorkerExecutionOutput:
+            trace_enabled = command.hierarchical_trace is not None
+            if trace_enabled != bool(
+                self.config.hierarchical_execution_trace
+            ):
+                raise RuntimeError(
+                    "worker ZMQ execution-trace configuration mismatch"
+                )
+            if command.hierarchical_quantum_diagnostics != bool(
+                self.config.hierarchical_quantum_diagnostics
+            ):
+                raise RuntimeError(
+                    "worker ZMQ quantum-diagnostic configuration mismatch"
+                )
+            raw = self.run(
+                dp_seqs=[],
+                is_prefill=False,
+                enable_rpc=True,
+                send_timestamp=command.send_timestamp,
+                hierarchical_trace=command.hierarchical_trace,
+                hierarchical_quantum_diagnostics=(
+                    command.hierarchical_quantum_diagnostics
+                ),
+            )
+            expected_len = (
+                2
+                + int(trace_enabled)
+                + int(command.hierarchical_quantum_diagnostics)
+            )
+            if not isinstance(raw, tuple) or len(raw) != expected_len:
+                raise RuntimeError(
+                    "worker decode returned an invalid result envelope: "
+                    f"expected tuple length {expected_len}"
+                )
+            token_rows, worker_end_time = raw[:2]
+            extra_index = 2
+            trace = None
+            diagnostic = None
+            if trace_enabled:
+                trace = raw[extra_index]
+                extra_index += 1
+            if command.hierarchical_quantum_diagnostics:
+                diagnostic = raw[extra_index]
+            return WorkerExecutionOutput(
+                token_rows=token_rows,
+                worker_end_time=float(worker_end_time),
+                hierarchical_trace=trace,
+                diagnostic=diagnostic,
+            )
+
+        ZmqWorkerClient(transport_config).run(execute)
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks

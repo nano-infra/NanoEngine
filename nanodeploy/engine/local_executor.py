@@ -15,6 +15,13 @@ from nanodeploy.engine.hierarchical_contract import (
 )
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.topology import EngineTopology
+from nanodeploy.engine.worker_transport import (
+    PROTOCOL_VERSION,
+    DecodeCommand,
+    DecodeSuccess,
+    WorkerTransportError,
+    ZmqWorkerServer,
+)
 
 
 class LocalExecutor:
@@ -51,9 +58,21 @@ class LocalExecutor:
         self.quantum_diagnostics_enabled = bool(
             getattr(config, "hierarchical_quantum_diagnostics", False)
         )
+        self.worker_transport = str(
+            getattr(config, "hierarchical_worker_transport", "ray")
+        )
+        if self.worker_transport not in {"ray", "zmq"}:
+            raise ValueError(
+                f"unsupported hierarchical worker transport "
+                f"{self.worker_transport!r}"
+            )
+        self._zmq_server: ZmqWorkerServer | None = None
+        self._worker_loop_refs: tuple[Any, ...] = ()
         self.last_quantum_diagnostic: dict[str, Any] | None = None
         self.ray_get_latency_ms_total = 0.0
         self.ray_get_latency_ms_max = 0.0
+        self.worker_result_wait_latency_ms_total = 0.0
+        self.worker_result_wait_latency_ms_max = 0.0
         self.result_rebuild_latency_ms_total = 0.0
         self.result_rebuild_latency_ms_max = 0.0
         self.result_rebuild_sample_count = 0
@@ -96,18 +115,106 @@ class LocalExecutor:
             )
         )
 
+    def prepare_worker_transport(self, timeout: float) -> None:
+        """Configure and start persistent workers before event-loop READY."""
+        if self.worker_transport == "ray":
+            return
+        if self._zmq_server is not None or self._worker_loop_refs:
+            raise RuntimeError("worker ZMQ transport is already prepared")
+        server = ZmqWorkerServer.create_ipc(
+            engine_id=self.topology.engine_id,
+            expected_ranks=self.topology.global_ranks,
+        )
+        try:
+            configs = tuple(
+                server.worker_config(
+                    global_rank,
+                    startup_timeout_s=timeout,
+                    quantum_timeout_s=self.config.quantum_timeout_s,
+                )
+                for global_rank in self.topology.global_ranks
+            )
+            ray.get(
+                [
+                    worker.configure_zmq_worker_transport.remote(
+                        transport_config=transport_config
+                    )
+                    for worker, transport_config in zip(
+                        self.workers, configs, strict=True
+                    )
+                ],
+                timeout=timeout,
+            )
+            self._worker_loop_refs = tuple(
+                worker.run_zmq_loop.remote() for worker in self.workers
+            )
+            self._zmq_server = server
+        except BaseException:
+            server.cleanup_unbound()
+            raise
+
+    def activate_worker_transport(self, timeout: float) -> None:
+        """Bind and handshake in the LocalEngine event-loop owner thread."""
+        if self.worker_transport == "ray":
+            return
+        if self._zmq_server is None or not self._worker_loop_refs:
+            raise RuntimeError("worker ZMQ transport is not prepared")
+        self._zmq_server.activate(
+            timeout,
+            liveness_check=self.check_worker_liveness,
+        )
+
+    def check_worker_liveness(self) -> None:
+        if not self._worker_loop_refs:
+            return
+        ready, _ = ray.wait(
+            list(self._worker_loop_refs), num_returns=1, timeout=0
+        )
+        if not ready:
+            return
+        try:
+            ray.get(ready)
+        except BaseException as exc:
+            raise RuntimeError(
+                "persistent hierarchical worker loop failed"
+            ) from exc
+        raise RuntimeError(
+            "persistent hierarchical worker loop exited unexpectedly"
+        )
+
+    def shutdown_worker_transport(
+        self, *, timeout: float, failed: bool
+    ) -> tuple[str, ...]:
+        if self.worker_transport == "ray" or self._zmq_server is None:
+            return ()
+        errors = self._zmq_server.close(
+            graceful=not failed,
+            timeout_s=min(timeout, 5.0),
+        )
+        if not failed and not errors and self._worker_loop_refs:
+            try:
+                ray.get(
+                    list(self._worker_loop_refs),
+                    timeout=min(timeout, 5.0),
+                )
+            except BaseException as exc:
+                errors += (f"{type(exc).__name__}: {exc}",)
+        return errors
+
     def run(
         self, batch: LocalDecodeBatch, timeout: float
     ) -> list[WorkerDecodeResult]:
         if batch.engine_id != self.topology.engine_id:
             raise ValueError("LocalDecodeBatch belongs to another engine")
         executor_begin = perf_counter()
+        deadline = time.monotonic() + timeout
         ordered_sequences = [
             batch.per_rank_sequences[global_rank]
             for global_rank in self.topology.global_ranks
         ]
         send_timestamp = time.time()
-        futures = []
+        futures: list[Any] = []
+        zmq_commands: dict[int, DecodeCommand] = {}
         mastered_by_rank: dict[int, list[Any]] = {}
         for global_rank, worker in zip(
             self.topology.global_ranks, self.workers, strict=True
@@ -138,34 +245,120 @@ class LocalExecutor:
                         else "all_control_dummy"
                     ),
                 }
-            futures.append(
-                # Keep this call keyword-only for the same nested actor-handle
-                # compatibility required by initialize_endpoint().
-                worker.run.remote(
-                    dp_seqs=[],
-                    is_prefill=False,
-                    enable_rpc=True,
+            if self.worker_transport == "ray":
+                futures.append(
+                    # Keep this call keyword-only for nested actor-handle
+                    # compatibility required by initialize_endpoint().
+                    worker.run.remote(
+                        dp_seqs=[],
+                        is_prefill=False,
+                        enable_rpc=True,
+                        send_timestamp=send_timestamp,
+                        hierarchical_trace=trace_context,
+                        hierarchical_quantum_diagnostics=(
+                            self.quantum_diagnostics_enabled
+                        ),
+                    )
+                )
+            else:
+                server = self._zmq_server
+                if server is None:
+                    raise RuntimeError("worker ZMQ transport is not active")
+                zmq_commands[global_rank] = DecodeCommand(
+                    protocol_version=PROTOCOL_VERSION,
+                    deployment_epoch=server.deployment_epoch,
+                    engine_id=self.topology.engine_id,
+                    global_rank=global_rank,
+                    wave_id=batch.wave_id,
+                    quantum_id=batch.quantum_id,
                     send_timestamp=send_timestamp,
                     hierarchical_trace=trace_context,
                     hierarchical_quantum_diagnostics=(
                         self.quantum_diagnostics_enabled
                     ),
                 )
+
+        if self.worker_transport == "zmq":
+            assert self._zmq_server is not None
+            self._zmq_server.send_decode_commands(
+                zmq_commands, deadline=deadline
             )
 
         submit_latency_ms = (perf_counter() - executor_begin) * 1000
         send_begin = perf_counter()
-        self.endpoint.send_seqs(ordered_sequences, is_prefill=False)
+        try:
+            self.endpoint.send_seqs(ordered_sequences, is_prefill=False)
+        except BaseException:
+            if self._zmq_server is not None:
+                self._zmq_server.mark_failed()
+            raise
         send_seqs_latency_ms = (perf_counter() - send_begin) * 1000
-        ray_get_begin = perf_counter()
-        raw_results = ray.get(futures, timeout=timeout)
-        ray_get_end = perf_counter()
+        result_wait_begin = perf_counter()
+        try:
+            if self.worker_transport == "ray":
+                raw_results = list(ray.get(futures, timeout=timeout))
+            else:
+                assert self._zmq_server is not None
+                zmq_results = self._zmq_server.receive_decode_results(
+                    deadline=deadline
+                )
+                raw_results = []
+                for response in zmq_results:
+                    if not isinstance(response, DecodeSuccess):
+                        raise WorkerTransportError(
+                            "worker ZMQ returned a non-success response"
+                        )
+                    if self.config.hierarchical_execution_trace:
+                        if response.hierarchical_trace is None:
+                            raise WorkerTransportError(
+                                f"worker {response.global_rank} omitted "
+                                "its execution trace"
+                            )
+                    elif response.hierarchical_trace is not None:
+                        raise WorkerTransportError(
+                            f"worker {response.global_rank} returned an "
+                            "unexpected execution trace"
+                        )
+                    if self.quantum_diagnostics_enabled:
+                        if response.diagnostic is None:
+                            raise WorkerTransportError(
+                                f"worker {response.global_rank} omitted "
+                                "its quantum diagnostic"
+                            )
+                    elif response.diagnostic is not None:
+                        raise WorkerTransportError(
+                            f"worker {response.global_rank} returned an "
+                            "unexpected quantum diagnostic"
+                        )
+                    raw: list[Any] = [
+                        response.token_rows,
+                        response.worker_end_time,
+                    ]
+                    if self.config.hierarchical_execution_trace:
+                        raw.append(response.hierarchical_trace)
+                    if self.quantum_diagnostics_enabled:
+                        raw.append(response.diagnostic)
+                    raw_results.append(tuple(raw))
+        except BaseException:
+            if self._zmq_server is not None:
+                self._zmq_server.mark_failed()
+                self.check_worker_liveness()
+            raise
+        result_wait_end = perf_counter()
         recv_timestamp = time.time()
-        ray_get_latency_ms = (ray_get_end - ray_get_begin) * 1000
-        self.ray_get_latency_ms_total += ray_get_latency_ms
-        self.ray_get_latency_ms_max = max(
-            self.ray_get_latency_ms_max, ray_get_latency_ms
+        result_wait_latency_ms = (
+            result_wait_end - result_wait_begin
+        ) * 1000
+        self.worker_result_wait_latency_ms_total += result_wait_latency_ms
+        self.worker_result_wait_latency_ms_max = max(
+            self.worker_result_wait_latency_ms_max,
+            result_wait_latency_ms,
         )
+        if self.worker_transport == "ray":
+            self.ray_get_latency_ms_total += result_wait_latency_ms
+            self.ray_get_latency_ms_max = max(
+                self.ray_get_latency_ms_max, result_wait_latency_ms
+            )
         expected_result_len = (
             2
             + int(self.config.hierarchical_execution_trace)
@@ -182,18 +375,18 @@ class LocalExecutor:
         worker_end_times = tuple(float(raw[1]) for raw in raw_results)
         last_worker_end = max(worker_end_times)
         boundary_metrics = {
-            "actor_submit_latency_ms": submit_latency_ms,
+            "worker_command_submit_latency_ms": submit_latency_ms,
             "send_seqs_latency_ms": send_seqs_latency_ms,
-            "ray_get_latency_ms": ray_get_latency_ms,
-            "executor_until_ray_get_ms": (
-                ray_get_end - executor_begin
+            "worker_result_wait_latency_ms": result_wait_latency_ms,
+            "executor_until_worker_result_ms": (
+                result_wait_end - executor_begin
             )
             * 1000,
             "worker_observed_critical_ms": (
                 last_worker_end - send_timestamp
             )
             * 1000,
-            "worker_finish_to_ray_get_ms": (
+            "worker_finish_to_result_ms": (
                 recv_timestamp - last_worker_end
             )
             * 1000,
@@ -202,6 +395,21 @@ class LocalExecutor:
             )
             * 1000,
         }
+        if self.worker_transport == "ray":
+            boundary_metrics.update(
+                {
+                    "actor_submit_latency_ms": submit_latency_ms,
+                    "ray_get_latency_ms": result_wait_latency_ms,
+                    "executor_until_ray_get_ms": (
+                        result_wait_end - executor_begin
+                    )
+                    * 1000,
+                    "worker_finish_to_ray_get_ms": (
+                        recv_timestamp - last_worker_end
+                    )
+                    * 1000,
+                }
+            )
         self._execution_boundary.record(boundary_metrics)
 
         rebuild_begin = perf_counter()

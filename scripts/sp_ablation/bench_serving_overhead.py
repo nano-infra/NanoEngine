@@ -1641,7 +1641,14 @@ def run_benchmark(
     )
     hierarchical_itl_summary = None
     hierarchical_rank_loads = None
+    hierarchical_worker_transport = None
     if engine.config.scheduler_arch == "hierarchical":
+        hierarchical_worker_transport = getattr(
+            engine.config, "hierarchical_worker_transport", "ray"
+        )
+        metrics_summary["hierarchical_worker_transport"] = (
+            hierarchical_worker_transport
+        )
         hierarchical_itl_summary = build_hierarchical_itl_summary(
             engine.hierarchical_itl_samples()
         )
@@ -1772,6 +1779,9 @@ def run_benchmark(
         ),
         "hierarchical_quantum_diagnostic_samples": (
             quantum_diagnostic_count
+        ),
+        "hierarchical_worker_transport": (
+            hierarchical_worker_transport
         ),
     }
     if hierarchical_itl_summary is not None:
@@ -2034,6 +2044,9 @@ def main():
         ),
         hierarchical_result_fastpath=(
             os.getenv("NANODEPLOY_HIER_RESULT_FASTPATH", "0") == "1"
+        ),
+        hierarchical_worker_transport=os.getenv(
+            "NANODEPLOY_HIER_WORKER_TRANSPORT", "ray"
         ),
     )
     

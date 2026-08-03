@@ -118,6 +118,7 @@ class LocalEngineCore:
         self._stop = False
         self._failure: str | None = None
         self._loop_thread: threading.Thread | None = None
+        self._worker_transport_ready = threading.Event()
         self._coordinator: Any | None = None
         self._control_group_initialized = False
         self._worker_identities: tuple[dict[str, Any], ...] = ()
@@ -219,12 +220,21 @@ class LocalEngineCore:
                 f"engine {self.engine_id} actor/worker node mismatch"
             )
 
+        self.executor.prepare_worker_transport(self.config.startup_timeout_s)
         self._loop_thread = threading.Thread(
             target=self._event_loop,
             name=f"nanodeploy-local-engine-{self.engine_id}",
             daemon=True,
         )
         self._loop_thread.start()
+        if not self._worker_transport_ready.wait(
+            timeout=self.config.startup_timeout_s
+        ):
+            raise TimeoutError(
+                f"LocalEngineCore {self.engine_id} worker transport "
+                "did not become ready"
+            )
+        self._raise_if_failed()
         return EngineReady(
             engine_id=self.engine_id,
             global_ranks=self.topology.global_ranks,
@@ -556,6 +566,7 @@ class LocalEngineCore:
 
     def health(self) -> bool:
         self._raise_if_failed()
+        self.executor.check_worker_liveness()
         if self._loop_thread is None or not self._loop_thread.is_alive():
             raise RuntimeError(
                 f"LocalEngineCore {self.engine_id} event loop is not alive"
@@ -969,6 +980,12 @@ class LocalEngineCore:
             ray_get_latency_ms_max=(
                 self.executor.ray_get_latency_ms_max
             ),
+            worker_result_wait_latency_ms_total=(
+                self.executor.worker_result_wait_latency_ms_total
+            ),
+            worker_result_wait_latency_ms_max=(
+                self.executor.worker_result_wait_latency_ms_max
+            ),
             result_rebuild_latency_ms_total=(
                 self.executor.result_rebuild_latency_ms_total
             ),
@@ -1082,6 +1099,10 @@ class LocalEngineCore:
 
     def _event_loop(self) -> None:
         try:
+            self.executor.activate_worker_transport(
+                self.config.startup_timeout_s
+            )
+            self._worker_transport_ready.set()
             while True:
                 self._drain_queue(self._abort_commands)
                 self._drain_ingress()
@@ -1265,6 +1286,12 @@ class LocalEngineCore:
             with self._state_cv:
                 self._stop = True
                 self._state_cv.notify_all()
+        finally:
+            self._worker_transport_ready.set()
+            self.executor.shutdown_worker_transport(
+                timeout=self.config.quantum_timeout_s,
+                failed=self._failure is not None,
+            )
 
     def shutdown(self) -> None:
         with self._state_cv:

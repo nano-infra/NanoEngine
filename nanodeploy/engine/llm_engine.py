@@ -725,6 +725,7 @@ class LLMEngine:
             "coordination_latency_ms_total",
             "execute_latency_ms_total",
             "ray_get_latency_ms_total",
+            "worker_result_wait_latency_ms_total",
             "result_rebuild_latency_ms_total",
             "result_rebuild_sample_count",
             "result_index_latency_ms_total",
@@ -794,12 +795,22 @@ class LLMEngine:
             if result_rebuild_sample_count
             else None
         )
+        metrics["worker_result_wait_latency_ms_mean"] = (
+            metrics["worker_result_wait_latency_ms_total"]
+            / result_rebuild_sample_count
+            if result_rebuild_sample_count
+            else None
+        )
         metrics["result_rebuild_latency_ms_max"] = max(
             snapshot.result_rebuild_latency_ms_max
             for snapshot in snapshots
         )
         metrics["ray_get_latency_ms_max"] = max(
             snapshot.ray_get_latency_ms_max for snapshot in snapshots
+        )
+        metrics["worker_result_wait_latency_ms_max"] = max(
+            snapshot.worker_result_wait_latency_ms_max
+            for snapshot in snapshots
         )
         if include_per_engine:
             per_engine_fields = (
@@ -826,6 +837,8 @@ class LLMEngine:
                 "execute_latency_ms_total",
                 "ray_get_latency_ms_total",
                 "ray_get_latency_ms_max",
+                "worker_result_wait_latency_ms_total",
+                "worker_result_wait_latency_ms_max",
                 "result_rebuild_latency_ms_total",
                 "result_rebuild_latency_ms_max",
                 "result_rebuild_sample_count",
@@ -863,6 +876,12 @@ class LLMEngine:
                 )
                 engine_metrics["ray_get_latency_ms_mean"] = (
                     snapshot.ray_get_latency_ms_total / rebuild_samples
+                    if rebuild_samples
+                    else None
+                )
+                engine_metrics["worker_result_wait_latency_ms_mean"] = (
+                    snapshot.worker_result_wait_latency_ms_total
+                    / rebuild_samples
                     if rebuild_samples
                     else None
                 )
