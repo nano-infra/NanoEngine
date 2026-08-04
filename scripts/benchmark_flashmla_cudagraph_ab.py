@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare eager and CUDA Graph FlashMLA latency on a NanoDeploy batch."""
+"""Compare eager and CUDA Graph latency of vLLM's FlashMLA operator."""
 
 import argparse
 import math
@@ -7,13 +7,18 @@ import statistics
 from collections.abc import Callable
 
 import torch
+import vllm
 
 try:
-    import flash_mla
+    from vllm.v1.attention.ops.flashmla import (
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+        is_flashmla_dense_supported,
+    )
 except ImportError as exc:
     raise ImportError(
-        "flash_mla is not importable; install FlashMLA or add its source tree "
-        "to PYTHONPATH"
+        "vLLM's FlashMLA operator is not importable. Run this script with the "
+        "Python environment and source tree used by the target vLLM build."
     ) from exc
 
 
@@ -66,9 +71,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def get_metadata(cache_seqlens: torch.Tensor):
     try:
-        return flash_mla.get_mla_metadata(cache_seqlens, 128, 1)
+        return get_mla_metadata(cache_seqlens, 128, 1)
     except TypeError:
-        return flash_mla.get_mla_metadata(
+        return get_mla_metadata(
             cache_seqlens,
             128,
             1,
@@ -99,6 +104,9 @@ def main() -> None:
     validate_args(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
+    supported, reason = is_flashmla_dense_supported()
+    if not supported:
+        raise RuntimeError(f"vLLM FlashMLA is unavailable: {reason}")
 
     torch.manual_seed(args.seed)
     block_size = 64
@@ -155,7 +163,7 @@ def main() -> None:
     softmax_scale = (192**-0.5) * (0.1 * math.log(256) + 1) ** 2
 
     def kernel():
-        return flash_mla.flash_mla_with_kvcache(
+        return flash_mla_with_kvcache(
             q,
             k_cache,
             block_table,
@@ -209,6 +217,9 @@ def main() -> None:
     single_graph_median = statistics.median(single_graph_samples)
     unrolled_graph_median = statistics.median(unrolled_graph_samples)
 
+    print(f"vllm_version: {vllm.__version__}")
+    print(f"vllm_path: {vllm.__file__}")
+    print(f"flashmla_op_module: {flash_mla_with_kvcache.__module__}")
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(f"q: {tuple(q.shape)} {q.dtype}")
     print(f"k_cache: {tuple(k_cache.shape)} {k_cache.dtype}")
