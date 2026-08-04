@@ -1030,24 +1030,30 @@ class LocalEngineCore:
     def _consensus(self, local_unfinished: bool) -> bool:
         if self.config.attention_dp == 1:
             return local_unfinished
+        unfinished = int(local_unfinished)
+        # MAX over x and -x yields the global maximum and negative minimum.
         local = torch.tensor(
-            [self._wave_id, self._quantum_id, int(local_unfinished)],
+            [
+                self._wave_id,
+                -self._wave_id,
+                self._quantum_id,
+                -self._quantum_id,
+                unfinished,
+                -unfinished,
+            ],
             dtype=torch.int64,
             device="cpu",
         )
-        minimum = local.clone()
-        maximum = local.clone()
-        dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
-        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-        if (
-            minimum[0].item() != maximum[0].item()
-            or minimum[1].item() != maximum[1].item()
-        ):
+        reduced = local.clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+        minimum = [-reduced[1].item(), -reduced[3].item(), -reduced[5].item()]
+        maximum = [reduced[0].item(), reduced[2].item(), reduced[4].item()]
+        if minimum[0] != maximum[0] or minimum[1] != maximum[1]:
             raise RuntimeError(
                 "LocalEngine leader wave/quantum mismatch: "
-                f"min={minimum.tolist()}, max={maximum.tolist()}"
+                f"min={minimum}, max={maximum}"
             )
-        return bool(maximum[2].item())
+        return bool(maximum[2])
 
     def _pause_wave(self) -> None:
         with self._state_cv:

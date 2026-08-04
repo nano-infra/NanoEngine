@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch.distributed as dist
 
 from nanodeploy.engine.decode_coordinator import DecodeCoordinatorState
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
@@ -1184,6 +1185,54 @@ def test_router_least_batch_v2_rejects_request_larger_than_empty_kv_capacity():
     assert not ack[0].enqueued
     assert "exceeds every LocalEngine KV capacity" in ack[0].reason
     assert engine.commands == []
+
+
+def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(attention_dp=2)
+    engine._wave_id = 7
+    engine._quantum_id = 11
+    calls = []
+
+    def fake_all_reduce(tensor, *, op):
+        calls.append((tensor.tolist(), op))
+        tensor.copy_(tensor.new_tensor([7, -7, 11, -11, 1, 0]))
+
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_engine.dist.all_reduce", fake_all_reduce
+    )
+
+    assert engine._consensus(local_unfinished=False)
+    assert calls == [([7, -7, 11, -11, 0, 0], dist.ReduceOp.MAX)]
+
+
+def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
+    monkeypatch,
+):
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(attention_dp=2)
+    engine._wave_id = 7
+    engine._quantum_id = 11
+    calls = 0
+
+    def fake_all_reduce(tensor, *, op):
+        nonlocal calls
+        calls += 1
+        assert op == dist.ReduceOp.MAX
+        tensor.copy_(tensor.new_tensor([8, -7, 12, -11, 1, 0]))
+
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_engine.dist.all_reduce", fake_all_reduce
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"min=\[7, 11, 0\], max=\[8, 12, 1\]",
+    ):
+        engine._consensus(local_unfinished=False)
+    assert calls == 1
 
 
 def test_local_engine_drains_frontend_events_in_one_batch():
