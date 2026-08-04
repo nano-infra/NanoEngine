@@ -31,6 +31,8 @@ def _normalize_serve_argv(argv: Sequence[str]) -> list[str]:
     i = 0
     while i < len(argv):
         arg = argv[i]
+        if arg in ("--tool-call-parser", "--reasoning-parser"):
+            arg = "--" + arg[2:].replace("-", "_")
         if arg == "--enable_monitor":
             # Check if next arg is a boolean value
             if i + 1 < len(argv) and argv[i + 1].lower() in ("true", "false"):

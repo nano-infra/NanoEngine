@@ -80,9 +80,14 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
                 f"Explicit attention backend {requested!r} only supports GQA; "
                 f"{attention_type} uses its dedicated implementation."
             )
-        if hardware_backend in ("hopper", "blackwell"):
+        if hardware_backend == "blackwell":
+            from dlengine.layers.blackwell.attention import BlackwellMLAAttention
+
+            return BlackwellMLAAttention(**kwargs)
+        if hardware_backend == "hopper":
             from dlengine.layers.hopper.attention import HopperAttention
 
+            kwargs.pop("mla_qk_nope_head_dim", None)
             return HopperAttention(**kwargs)
         from dlengine.layers.generic.attention import GenericAttention
 

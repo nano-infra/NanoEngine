@@ -61,6 +61,27 @@ fn make_scheduler_with_host_blocks() -> Scheduler {
     })
 }
 
+fn make_single_slot_linear_scheduler() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 0,
+        max_num_seqs: 1,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "hybrid".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: false,
+        cache_plan: CachePlan::new(1 << 2),
+    })
+}
+
 fn make_scheduler_with_host_prefix_cache() -> Scheduler {
     Scheduler::new(SchedulerConfig {
         engine_id: "engine".to_string(),
@@ -161,6 +182,21 @@ fn pending_migration_is_retained_but_not_runnable() {
 
         scheduler.free_to_be_migrated_ids_impl(py, vec![42]);
         assert!(scheduler.is_finished_api());
+    });
+}
+
+#[test]
+fn exhausted_linear_state_slot_keeps_request_waiting() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_single_slot_linear_scheduler();
+        add_tokens(py, &mut scheduler, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![1]);
+        add_tokens(py, &mut scheduler, 2, vec![4, 5, 6]).unwrap();
+
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert!(scheduled[0].is_empty());
+        assert_eq!(scheduler.waiting, vec![2]);
     });
 }
 

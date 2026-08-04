@@ -57,6 +57,40 @@ class AttnToFfnTransition(nn.Module):
         tp_rank = ctx.attn_tp_rank
         return hidden_states.chunk(src_tp, dim=0)[tp_rank].contiguous()
 
+    def reduce_scatter(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reduce TP-partial attention output directly into FFN row shards.
+
+        K3's attention output projection is row parallel.  Deferring its
+        all-reduce lets this operation replace ``all_reduce + chunk`` with one
+        NCCL reduce-scatter while preserving the independent FFN-EP topology.
+        """
+        ctx = get_dist_context()
+        src_tp = ctx.attn_tp_world_size
+        if src_tp <= 1:
+            return hidden_states
+        bs = hidden_states.shape[0]
+        self._original_bs = bs
+        remainder = bs % src_tp
+        if remainder:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, src_tp - remainder))
+        output = torch.empty(
+            (hidden_states.shape[0] // src_tp, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        dist.reduce_scatter_tensor(output, hidden_states.contiguous(), group=ctx.attn_tp_group)
+        return output
+
+    def local_rows(self, hidden_states: torch.Tensor) -> slice:
+        """Rows owned by this attention-TP rank after scatter/padding."""
+        ctx = get_dist_context()
+        tp = ctx.attn_tp_world_size
+        if tp <= 1:
+            return slice(0, hidden_states.shape[0])
+        padded = ((hidden_states.shape[0] + tp - 1) // tp) * tp
+        shard = padded // tp
+        start = ctx.attn_tp_rank * shard
+        return slice(start, min(start + shard, hidden_states.shape[0]))
 
 class FfnToAttnTransition(nn.Module):
     """Gather transition: FFN → Attention.

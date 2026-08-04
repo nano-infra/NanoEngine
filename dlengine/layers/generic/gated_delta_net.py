@@ -655,20 +655,22 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             if end <= start:
                 continue
             seq_qkv = qkv[start:end].unsqueeze(0).transpose(1, 2)  # [1, D, L]
+            conv_dtype = conv_weight.dtype
+            conv_input = seq_qkv.to(conv_dtype)
 
             if has_prev_state:
                 slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
                 prev = gdn_conv_states[self.layer_idx, slot, :, 1:].unsqueeze(
                     0
                 )  # [1, D, k-1]
-                padded = torch.cat([prev, seq_qkv], dim=2)  # [1, D, k-1+L]
+                padded = torch.cat([prev.to(conv_dtype), conv_input], dim=2)
                 seq_out = F.silu(
                     F.conv1d(padded, conv_weight, groups=self.conv_dim)
                 )  # [1, D, L]
             else:
-                seq_out = F.silu(self.conv1d(seq_qkv)[:, :, : end - start])
+                seq_out = F.silu(self.conv1d(conv_input)[:, :, : end - start])
 
-            qkv_out[start:end] = seq_out.squeeze(0).transpose(0, 1)
+            qkv_out[start:end] = seq_out.to(qkv.dtype).squeeze(0).transpose(0, 1)
 
         # Store conv state
         if gdn_conv_states is not None:
@@ -719,7 +721,9 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
             conv_state[:, :, -1] = qkv
             conv_weight = self.conv1d.weight.squeeze(1)
-            qkv_out = F.silu((conv_state * conv_weight.unsqueeze(0)).sum(-1))
+            qkv_out = F.silu(
+                (conv_state.to(conv_weight.dtype) * conv_weight.unsqueeze(0)).sum(-1)
+            ).to(qkv.dtype)
             if gdn_state_slots is not None:
                 gdn_conv_states[self.layer_idx, slots] = conv_state
             return qkv_out

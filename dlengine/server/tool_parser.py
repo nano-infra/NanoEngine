@@ -126,6 +126,7 @@ class ToolParser:
     # Token markers the streaming layer holds back so partial tags never leak
     # into content deltas.
     open_markers: tuple[str, ...] = ()
+    reasoning_close_marker = "</think>"
 
     def parse_full(self, text: str) -> ParsedOutput:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -246,6 +247,87 @@ class GLMXMLToolParser(ToolParser):
         )
 
 
+class KimiK3ToolParser(ToolParser):
+    """Parser for Kimi K3's XTML response, reasoning, and tool channels."""
+
+    THINK_OPEN = "<|open|>think<|sep|>"
+    THINK_CLOSE = "<|close|>think<|sep|>"
+    RESPONSE_OPEN = "<|open|>response<|sep|>"
+    RESPONSE_CLOSE = "<|close|>response<|sep|>"
+    TOOLS_OPEN = "<|open|>tools<|sep|>"
+    TOOLS_CLOSE = "<|close|>tools<|sep|>"
+    MESSAGE_CLOSE = "<|close|>message<|sep|>"
+    reasoning_close_marker = THINK_CLOSE
+    open_markers = (THINK_OPEN, TOOLS_OPEN)
+    _CALL_RE = re.compile(
+        r'<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>'
+        r'(?P<body>.*?)<\|close\|>call<\|sep\|>', re.DOTALL
+    )
+    _ARG_RE = re.compile(
+        r'<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>'
+        r'(?P<val>.*?)<\|close\|>argument<\|sep\|>', re.DOTALL
+    )
+    _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
+
+    @classmethod
+    def _attrs(cls, raw: str) -> dict[str, str]:
+        return {
+            m["k"]: m["v"].replace("&quot;", '"').replace("&amp;", "&")
+            for m in cls._ATTR_RE.finditer(raw)
+        }
+
+    @classmethod
+    def _unwrap_response(cls, text: str) -> str:
+        start = text.find(cls.RESPONSE_OPEN)
+        if start >= 0:
+            start += len(cls.RESPONSE_OPEN)
+            end = text.find(cls.RESPONSE_CLOSE, start)
+            text = text[start:] if end < 0 else text[start:end]
+        else:
+            text = text.replace(cls.RESPONSE_CLOSE, "")
+        return text.replace(cls.MESSAGE_CLOSE, "")
+
+    def parse_full(self, text: str) -> ParsedOutput:
+        reasoning = None
+        think_start = text.find(self.THINK_OPEN)
+        content_start = think_start + len(self.THINK_OPEN) if think_start >= 0 else 0
+        think_end = text.find(self.THINK_CLOSE, content_start)
+        if think_end >= 0:
+            reasoning = text[content_start:think_end].strip() or None
+            text = text[think_end + len(self.THINK_CLOSE):]
+
+        tools_start = text.find(self.TOOLS_OPEN)
+        normal = text if tools_start < 0 else text[:tools_start]
+        section = "" if tools_start < 0 else text[tools_start + len(self.TOOLS_OPEN):]
+        tools_end = section.find(self.TOOLS_CLOSE)
+        if tools_end >= 0:
+            section = section[:tools_end]
+        calls: list[ToolCall] = []
+        for match in self._CALL_RE.finditer(section):
+            name = self._attrs(match["attrs"]).get("tool")
+            if not name:
+                continue
+            arguments = {}
+            for arg in self._ARG_RE.finditer(match["body"]):
+                attrs = self._attrs(arg["attrs"])
+                key = attrs.get("key")
+                if not key:
+                    continue
+                raw = arg["val"]
+                if attrs.get("type", "string") == "string":
+                    arguments[key] = raw
+                else:
+                    try:
+                        arguments[key] = json.loads(raw)
+                    except json.JSONDecodeError:
+                        arguments[key] = raw
+            calls.append(ToolCall(function=Function(
+                name=name, arguments=json.dumps(arguments, ensure_ascii=False)
+            )))
+        content = self._unwrap_response(normal).strip()
+        return ParsedOutput(content=content or None, tool_calls=calls, reasoning=reasoning)
+
+
 _REGISTRY: dict[str, type[ToolParser]] = {
     "hermes": HermesToolParser,
     "qwen3_xml": Qwen3XMLToolParser,
@@ -254,6 +336,7 @@ _REGISTRY: dict[str, type[ToolParser]] = {
     "glm45": GLMXMLToolParser,
     "glm47": GLMXMLToolParser,
     "glm5": GLMXMLToolParser,
+    "kimi_k3": KimiK3ToolParser,
 }
 
 
@@ -283,6 +366,8 @@ def detect_parser_name(
         if "<tool_call>" in chat_template:
             return "hermes"
     ident = f"{model_path} {served_model_name}".lower()
+    if "kimi-k3" in ident or "kimi_k3" in ident:
+        return "kimi_k3"
     if "glm" in ident:
         return "glm"
     if "qwen3.5" in ident or "qwen3-coder" in ident or "qwen3_coder" in ident:

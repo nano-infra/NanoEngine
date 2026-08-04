@@ -276,6 +276,10 @@ impl PrefixCacheCoordinator {
         self.state.state_slots.ensure(seq_id)
     }
 
+    pub(crate) fn can_ensure_state_slot(&self, seq_id: u64) -> bool {
+        self.state.state_slots.can_ensure(seq_id)
+    }
+
     pub(crate) fn ensure_hisparse_slot(&mut self, seq_id: u64) -> Option<i32> {
         self.state.hisparse_slots.ensure(seq_id)
     }

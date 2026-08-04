@@ -43,7 +43,6 @@ def reset_mla_context() -> None:
 
 
 def configure_mla_cache(context) -> None:
-    assert context.attention_tp == 1
     assert context.block_size == 64, "MLA mode only support block_size=64"
     context.num_kv_heads = 1
     context.head_dim = context.kv_lora_rank + context.qk_rope_head_dim

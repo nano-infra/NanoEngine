@@ -196,6 +196,11 @@ class CacheContext(KVCacheAllocatorMixin):
 
     @property
     def num_local_kv_heads(self):
+        # MLA caches one compressed KV latent per token. Query-head tensor
+        # parallelism shards Q/W_UK/W_UV, but every rank consumes the same
+        # compressed latent, so the cache is replicated rather than divided.
+        if self.mode == "mla":
+            return 1
         return self.num_kv_heads // self.attention_tp
 
     def _primary_cache_context(self):

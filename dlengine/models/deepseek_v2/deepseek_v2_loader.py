@@ -84,6 +84,15 @@ def _handle_kv_b_proj(
     )
 
     # Split into kc (W_UK) and vc (W_UV)
+    ctx = get_dist_context()
+    if num_heads % ctx.attn_tp_world_size:
+        raise ValueError(
+            f"num_attention_heads={num_heads} is not divisible by "
+            f"attention_tp={ctx.attn_tp_world_size}"
+        )
+    local_heads = num_heads // ctx.attn_tp_world_size
+    head_start = ctx.attn_tp_rank * local_heads
+    weight_bf16 = weight_bf16.narrow(0, head_start, local_heads)
     kc_weight = weight_bf16[:, :qk_nope_head_dim, :]
     vc_weight = weight_bf16[:, qk_nope_head_dim:, :].transpose(1, 2)
 

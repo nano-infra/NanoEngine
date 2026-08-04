@@ -26,6 +26,10 @@ def qwen35_cache_plan() -> CachePlan:
     return cache_plan(flags=(CachePlanFlag.Gqa, CachePlanFlag.Gdn))
 
 
+def kimi_k3_cache_plan() -> CachePlan:
+    return cache_plan(flags=(CachePlanFlag.Mla, CachePlanFlag.Gdn))
+
+
 def deepseek_mla_cache_plan(
     *, use_indexer: bool = False, use_hisparse: bool = False
 ) -> CachePlan:
@@ -54,5 +58,6 @@ __all__ = [
     "gqa_cache_plan",
     "gqa_hisparse_cache_plan",
     "hca_csa_cache_plan",
+    "kimi_k3_cache_plan",
     "qwen35_cache_plan",
 ]

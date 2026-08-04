@@ -96,3 +96,25 @@ class SiluAndMul(nn.Module):
     def _compiled_forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = x.chunk(2, -1)
         return F.silu(a) * b
+
+
+class SituAndMul(nn.Module):
+    """SiTU-GLU used by Kimi K3."""
+
+    def __init__(self, beta: float = 4.0, linear_beta: float | None = 25.0):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = x.chunk(2, dim=-1)
+        gate_f = gate.float()
+        up_f = up.float()
+        gate_f = (
+            self.beta
+            * torch.tanh(gate_f / self.beta)
+            * torch.sigmoid(gate_f)
+        )
+        if self.linear_beta is not None:
+            up_f = self.linear_beta * torch.tanh(up_f / self.linear_beta)
+        return (gate_f * up_f).to(x.dtype)

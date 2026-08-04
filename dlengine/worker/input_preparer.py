@@ -257,11 +257,17 @@ class InputPreparer:
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
         if is_mla:
-            import flash_mla
-
             mla_num_kv_heads = 1
             context_lens_for_mla = context_lens[sp_rank, : aux.num_group_seqs]
-            new_tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            if torch.cuda.get_device_capability()[0] >= 10:
+                # FlashInfer TRTLLM-GEN MLA on Blackwell consumes page tables
+                # and sequence lengths directly; FlashMLA scheduler metadata is
+                # a Hopper-only API and is absent from CUDA 13 environments.
+                new_tile_scheduler_metadata = None
+            else:
+                import flash_mla
+
+                new_tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
         else:
             new_tile_scheduler_metadata = None
 

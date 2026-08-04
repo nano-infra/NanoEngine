@@ -103,6 +103,8 @@ class Config(BaseModel):
     # object so it reliably reaches Ray actors.
     disable_compile: bool = False
     trust_remote_code: bool = False
+    tool_call_parser: Optional[str] = None
+    reasoning_parser: Optional[str] = None
     # ``repr=False``: the HF config stores ``dtype`` as a real ``torch.dtype``
     # object, which transformers' ``to_json_string()`` (used by its ``__repr__``)
     # cannot JSON-serialize on transformers <= 4.51.x (only ``torch_dtype`` is
@@ -283,7 +285,7 @@ class Config(BaseModel):
                 raise
             with config_path.open() as f:
                 config_dict = json.load(f)
-            if config_dict.get("model_type") == "qwen3_5":
+            if config_dict.get("model_type") in ("qwen3_5", "kimi_k3"):
                 text_config = config_dict.get("text_config")
                 self.hf_config = PretrainedConfig(**config_dict)
                 if isinstance(text_config, dict):
@@ -536,6 +538,7 @@ class Config(BaseModel):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "KimiK3ForConditionalGeneration",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
