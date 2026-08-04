@@ -153,6 +153,8 @@ class OpenAIServer:
         model_path: str,
         default_max_tokens: int = 512,
         max_model_len: int = 16384,
+        num_speculative_tokens: int = 0,
+        eos_token_ids: Optional[list[int]] = None,
     ) -> None:
         self.worker = worker
         self.tokenizer = tokenizer
@@ -160,8 +162,13 @@ class OpenAIServer:
         self.model_path = model_path.rstrip("/")
         self.default_max_tokens = default_max_tokens
         self.max_model_len = int(max_model_len)
+        self.num_speculative_tokens = int(num_speculative_tokens)
+        tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+        self._eos_token_ids = {int(token) for token in (eos_token_ids or [])}
+        if tokenizer_eos is not None:
+            self._eos_token_ids.add(int(tokenizer_eos))
         self._model_aliases = self._build_model_aliases()
-        from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
+        from dlengine.tool_parser import detect_parser_name, get_tool_parser
 
         self.tool_parser_name = detect_parser_name(
             model_path,
@@ -332,11 +339,96 @@ class OpenAIServer:
         temperature = body.get("temperature")
         if temperature is None:
             temperature = 1.0
+        json_schema = self._parse_json_schema(body.get("response_format"))
+        if json_schema is not None and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "response_format constrained decoding is not yet compatible "
+                "with MTP/speculative decoding"
+            )
+        if json_schema is not None and bool(body.get("ignore_eos", False)):
+            raise ValueError("ignore_eos cannot be used with constrained decoding")
+        if (
+            json_schema is not None
+            and body.get("tools")
+            and body.get("tool_choice") != "none"
+        ):
+            raise ValueError(
+                "response_format cannot be combined with tool calling in one request"
+            )
         return SamplingParams(
             temperature=float(temperature),
             max_tokens=int(max_tokens),
             ignore_eos=bool(body.get("ignore_eos", False)),
+            json_schema=json_schema,
         )
+
+    @staticmethod
+    def _parse_json_schema(response_format: Any) -> Optional[str]:
+        """Normalize OpenAI ``response_format`` to a canonical JSON Schema."""
+        if response_format is None:
+            return None
+        if not isinstance(response_format, dict):
+            raise ValueError("response_format must be an object")
+
+        format_type = response_format.get("type")
+        if format_type in (None, "text"):
+            return None
+        if format_type == "json_object":
+            schema: Any = {"type": "object"}
+        elif format_type == "json_schema":
+            descriptor = response_format.get("json_schema")
+            if not isinstance(descriptor, dict) or "schema" not in descriptor:
+                raise ValueError(
+                    "response_format.json_schema must contain a 'schema' field"
+                )
+            schema = descriptor["schema"]
+            if not isinstance(schema, (dict, bool)):
+                raise ValueError(
+                    "response_format JSON Schema must be an object or boolean"
+                )
+        else:
+            raise ValueError(f"unsupported response_format type: {format_type!r}")
+        return json.dumps(
+            schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    def _attach_tool_constraint(
+        self,
+        sampling_params: Any,
+        tools: Any,
+        tool_choice: Any,
+        *,
+        reasoning_open: bool,
+    ) -> None:
+        """Compile request tools into the model's native StructuralTag."""
+        if not tools or tool_choice == "none":
+            return
+        if not isinstance(tools, list):
+            raise ValueError("tools must be an array")
+        if self.num_speculative_tokens > 0:
+            raise ValueError(
+                "XGrammar tool calling is not yet compatible with MTP/speculative decoding"
+            )
+        from dlengine.tool_parser import (
+            build_tool_structural_tag,
+            UnsupportedToolGrammarError,
+        )
+
+        try:
+            sampling_params.structural_tag = build_tool_structural_tag(
+                parser_name=self.tool_parser_name,
+                model_path=self.model_path,
+                served_model_name=self.served_model_name,
+                tools=tools,
+                tool_choice=tool_choice,
+                reasoning=reasoning_open,
+            )
+        except UnsupportedToolGrammarError as exc:
+            # Keep function calling available for an otherwise supported model
+            # family whose output syntax cannot be expressed by this XGrammar
+            # release. Known native formats, including Gemma 4, are handled by
+            # the builders in dlengine.tool_parser.
+            logger.warning("Tool-call constrained decoding disabled: %s", exc)
 
     @staticmethod
     def _parse_stop(body: dict) -> list[str]:
@@ -487,7 +579,17 @@ class OpenAIServer:
             if "tokens" in item:
                 tokens.extend(item["tokens"])
 
-    def _incremental_detokenize(self, gen: _Generation) -> str:
+    def _decode_generated(
+        self, token_ids: list[int], *, preserve_special_tokens: bool = False
+    ) -> str:
+        ids = [token for token in token_ids if token not in self._eos_token_ids]
+        return self.tokenizer.decode(
+            ids, skip_special_tokens=not preserve_special_tokens
+        )
+
+    def _incremental_detokenize(
+        self, gen: _Generation, *, preserve_special_tokens: bool = False
+    ) -> str:
         """Decode only the newly produced text since the last delta.
 
         Decodes a trailing slice (``[prefix_offset:]``) rather than the whole
@@ -502,11 +604,13 @@ class OpenAIServer:
         the character completes, so we never emit a broken "\ufffd".
         """
         ids = gen.token_ids
-        prefix_text = self.tokenizer.decode(
-            ids[gen.prefix_offset : gen.read_offset], skip_special_tokens=True
+        prefix_text = self._decode_generated(
+            ids[gen.prefix_offset : gen.read_offset],
+            preserve_special_tokens=preserve_special_tokens,
         )
-        new_text = self.tokenizer.decode(
-            ids[gen.prefix_offset :], skip_special_tokens=True
+        new_text = self._decode_generated(
+            ids[gen.prefix_offset :],
+            preserve_special_tokens=preserve_special_tokens,
         )
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
             delta = new_text[len(prefix_text) :]
@@ -522,6 +626,7 @@ class OpenAIServer:
         stop: Optional[list[str]] = None,
         hold_markers: Optional[list[str]] = None,
         reasoning_open: bool = False,
+        preserve_special_tokens: bool = False,
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
         """Yield ``(delta_text, generation)`` as tokens arrive.
 
@@ -564,15 +669,15 @@ class OpenAIServer:
             if "tokens" not in item:
                 continue
             gen.token_ids.extend(item["tokens"])
-            delta = self._incremental_detokenize(gen)
+            delta = self._incremental_detokenize(
+                gen, preserve_special_tokens=preserve_special_tokens
+            )
             if not delta:
                 continue
             text += delta
             if reasoning_active:
                 if drop_redundant_think_openers:
-                    emitted, need_more = _skip_redundant_think_openers(
-                        text, emitted
-                    )
+                    emitted, need_more = _skip_redundant_think_openers(text, emitted)
                     if need_more:
                         continue
                     drop_redundant_think_openers = False
@@ -641,6 +746,11 @@ class OpenAIServer:
                 yield text[emitted:], gen
             finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
         gen.finish_reason = finish_reason
+        # A response made entirely of a held tool marker produces no visible
+        # text delta. Yield the final state explicitly so streaming callers can
+        # still parse gen.token_ids into tool calls. Consumers suppress this
+        # empty synchronization delta from their wire formats.
+        yield "", gen
 
     def _abort_request(self, req: _Request) -> None:
         """Best-effort engine-side abort for a request that hit a stop string."""
@@ -786,13 +896,54 @@ def build_app(server: OpenAIServer):
         messages = body.get("messages") or []
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
+        if tools is not None and not isinstance(tools, list):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "tools must be an array",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         use_tools = bool(tools) and tool_choice != "none"
-        sampling_params = server._build_sampling_params(body)
+        try:
+            sampling_params = server._build_sampling_params(body)
+        except (TypeError, ValueError) as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
         prompt_ids, reasoning_open = server._encode_chat(
-            messages, tools=tools, tool_choice=tool_choice
+            messages,
+            tools=tools if use_tools else None,
+            tool_choice=tool_choice,
         )
+        try:
+            if use_tools:
+                server._attach_tool_constraint(
+                    sampling_params,
+                    tools,
+                    tool_choice,
+                    reasoning_open=reasoning_open,
+                )
+        except (TypeError, ValueError) as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         length_error = server.validate_request_length(prompt_ids, sampling_params)
         if length_error is not None:
             return length_error
@@ -928,7 +1079,10 @@ def build_app(server: OpenAIServer):
                         stop=stop,
                         hold_markers=hold_markers,
                         reasoning_open=reasoning_open,
+                        preserve_special_tokens=use_tools,
                     ):
+                        if not delta:
+                            continue
                         # Reasoning ("thinking") tokens go to reasoning_content;
                         # everything else is the user-visible answer.
                         if gen.in_reasoning:
@@ -952,8 +1106,8 @@ def build_app(server: OpenAIServer):
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                     final_finish_reason = gen.finish_reason
                     if use_tools:
-                        full_text = server.tokenizer.decode(
-                            gen.token_ids, skip_special_tokens=True
+                        full_text = server._decode_generated(
+                            gen.token_ids, preserve_special_tokens=True
                         )
                         parsed = server.tool_parser.parse_full(full_text)
                         tool_delta: dict[str, Any] = {}
@@ -1017,7 +1171,12 @@ def build_app(server: OpenAIServer):
         gen = _Generation()
         monitor = server._spawn_disconnect_monitor(request, req)
         try:
-            async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
+            async for delta, gen in server.stream_text(
+                req,
+                max_tokens,
+                stop=stop,
+                preserve_special_tokens=use_tools,
+            ):
                 text += delta
         except RuntimeError as e:
             return JSONResponse(
@@ -1169,7 +1328,18 @@ def build_app(server: OpenAIServer):
                     }
                 },
             )
-        sampling_params = server._build_sampling_params(body)
+        try:
+            sampling_params = server._build_sampling_params(body)
+        except (TypeError, ValueError) as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
         input_ids = body.get("input_ids")
@@ -1553,6 +1723,9 @@ def run_server(
     worker: Any = ZmqEngineWorker(engine_endpoint)
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
+    from dlengine.models.trait import resolve_eos_token_ids
+
+    eos_token_ids = resolve_eos_token_ids(config.model, tokenizer)
 
     server = OpenAIServer(
         worker=worker,
@@ -1560,6 +1733,8 @@ def run_server(
         served_model_name=served_model_name,
         model_path=config.model,
         max_model_len=config.max_model_len,
+        num_speculative_tokens=config.num_speculative_tokens,
+        eos_token_ids=eos_token_ids,
     )
     app = build_app(server)
 

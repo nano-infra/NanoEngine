@@ -41,12 +41,16 @@ def test_sampling_params_pickle_roundtrip_for_ray_actor_args():
         max_tokens=1024,
         ignore_eos=True,
         return_completion_logprobs=True,
+        json_schema='{"type":"object"}',
+        structural_tag='{"type":"structural_tag"}',
     )
     restored = pickle.loads(pickle.dumps(params))
     assert restored.temperature == 0.1
     assert restored.max_tokens == 1024
     assert restored.ignore_eos is True
     assert restored.return_completion_logprobs is True
+    assert restored.json_schema == '{"type":"object"}'
+    assert restored.structural_tag == '{"type":"structural_tag"}'
 
 
 def test_ipc_add_request_bytes_roundtrip():

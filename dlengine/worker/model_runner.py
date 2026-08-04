@@ -25,6 +25,7 @@ from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
 from dlengine.context_v2.peer import PeerAgentContext
 from dlengine.disagg.p2p import get_p2p_cache_transfer
 from dlengine.layers.sampler import Sampler
+from dlengine.layers.structured_output import StructuredOutputManager
 from dlengine.logging import get_logger, set_log_level
 from dlengine.models.registry import architecture_loaders, architecture_mtp_loaders
 from dlengine.utils.network import get_free_port, get_local_ip
@@ -478,6 +479,12 @@ class ModelRunner:
         self.weight_context = WeightContext()
         self.weight_update_engine = WeightUpdateEngine(self.model, self.weight_context)
         self.sampler = Sampler()
+        self.structured_output = None
+        self._structured_output_config = (
+            (config.model, int(hf_config.vocab_size), tuple(config.eos))
+            if get_dist_context().attn_tp_rank == 0
+            else None
+        )
         self.input_preparer = InputPreparer(config)
         self.vision_manager = VisionEmbedManager(hf_config)
         self.mtp_runner = (
@@ -493,6 +500,27 @@ class ModelRunner:
 
     def num_host_kvcache_blocks(self):
         return get_cache_context().num_host_kvcache_blocks
+
+    def _get_structured_output(self) -> StructuredOutputManager:
+        """Lazily initialize XGrammar only when a constrained request arrives."""
+        if self.structured_output is None:
+            if self._structured_output_config is None:
+                raise RuntimeError(
+                    "structured-output manager is unavailable on this rank"
+                )
+            self.structured_output = StructuredOutputManager.from_model(
+                *self._structured_output_config
+            )
+            logger.info(
+                "Initialized XGrammar structured-output manager on rank %s", self.rank
+            )
+        return self.structured_output
+
+    def free_structured_output(self, seq_ids: list[int]) -> int:
+        """Worker RPC used to release matcher state after request cancellation."""
+        if self.structured_output is not None:
+            self.structured_output.discard(seq_ids)
+        return len(seq_ids)
 
     def _get_model_cache_plan(self) -> CachePlan:
         cache_plan = getattr(self.config, "cache_plan", None)
@@ -1513,13 +1541,65 @@ class ModelRunner:
                         num_seqs, dtype=torch.float32, device=input_ids.device
                     )
                 return input_ids, logprobs
+            if is_prefill and context.sampling_seq_indices is not None:
+                sampling_rows = [
+                    int(index) for index in context.sampling_seq_indices.tolist()
+                ]
+                sample_seq_ids = [aux.seq_ids[index] for index in sampling_rows]
+                sample_schemas = [aux.json_schemas[index] for index in sampling_rows]
+                sample_structural_tags = [
+                    aux.structural_tags[index] for index in sampling_rows
+                ]
+                sample_remaining_tokens = [
+                    aux.remaining_tokens[index] for index in sampling_rows
+                ]
+            else:
+                sample_seq_ids = list(aux.seq_ids)
+                sample_schemas = list(aux.json_schemas)
+                sample_structural_tags = list(aux.structural_tags)
+                sample_remaining_tokens = list(aux.remaining_tokens)
+
+            has_constraints = StructuredOutputManager.has_constraints(
+                sample_schemas, sample_structural_tags
+            )
+            if has_constraints:
+                if self.mtp_runner is not None:
+                    raise RuntimeError(
+                        "structured-output decoding is not yet compatible with MTP"
+                    )
+                structured_output = self._get_structured_output()
+                structured_output.apply(
+                    logits,
+                    sample_seq_ids,
+                    sample_schemas,
+                    sample_structural_tags,
+                    seed_tokens=None if is_prefill else input_ids,
+                )
+
             greedy_only = not want_lp and all(
                 float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
             )
             if greedy_only:
                 if str(logits.dtype).startswith("torch.float8"):
                     logits = logits.float()
-                return logits.argmax(dim=-1), None
+                sampled = logits.argmax(dim=-1)
+                if has_constraints:
+                    structured_output.accept(
+                        sample_seq_ids,
+                        sample_schemas,
+                        sample_structural_tags,
+                        sampled,
+                    )
+                    structured_output.discard(
+                        [
+                            seq_id
+                            for seq_id, remaining in zip(
+                                sample_seq_ids, sample_remaining_tokens
+                            )
+                            if remaining <= 1
+                        ]
+                    )
+                return sampled, None
 
             temperatures = prepare_sample_from_aux(aux)
             if is_prefill and context.sampling_seq_indices is not None:
@@ -1544,6 +1624,27 @@ class ModelRunner:
                     logprobs = logprobs.float()
                 else:
                     input_ids = self.sampler(logits, temperatures)
+            if has_constraints:
+                constrained_tokens = (
+                    input_ids[context.sampling_seq_indices]
+                    if is_prefill and context.sampling_seq_indices is not None
+                    else input_ids
+                )
+                structured_output.accept(
+                    sample_seq_ids,
+                    sample_schemas,
+                    sample_structural_tags,
+                    constrained_tokens,
+                )
+                structured_output.discard(
+                    [
+                        seq_id
+                        for seq_id, remaining in zip(
+                            sample_seq_ids, sample_remaining_tokens
+                        )
+                        if remaining <= 1
+                    ]
+                )
         else:
             # Non-leader TP ranks don't sample; they return a placeholder. The
             # real token is distributed via the control plane, not a GPU
@@ -1598,6 +1699,12 @@ class ModelRunner:
         runner_in = RunnerIn.from_bytes(data)
         aux = runner_in.aux(sp_rank)
         num_seqs = aux.num_group_seqs
+        if self.mtp_runner is not None and StructuredOutputManager.has_constraints(
+            aux.json_schemas, aux.structural_tags
+        ):
+            raise RuntimeError(
+                "structured-output decoding is not yet compatible with MTP"
+            )
         if _timer is not None:
             _timer.mark("rpc_in")
 

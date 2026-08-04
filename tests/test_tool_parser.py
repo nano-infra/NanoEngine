@@ -1,7 +1,7 @@
 import json
 
 from dlengine.server.openai_server import _skip_redundant_think_openers
-from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
+from dlengine.tool_parser import detect_parser_name, get_tool_parser
 
 
 def test_glm_tool_parser_arg_key_value_format():
@@ -60,7 +60,7 @@ def test_skip_redundant_think_openers():
 
 
 def test_skip_redundant_think_openers_holds_partial_marker():
-    offset, need_more = _skip_redundant_think_openers("<think><thi", 0)
+    offset, need_more = _skip_redundant_think_openers("<think><th" + "i", 0)
 
     assert offset == len("<think>")
     assert need_more is True
@@ -90,3 +90,101 @@ def test_glm_tool_parser_routes_unterminated_repeated_think_as_reasoning():
 
     assert parsed.reasoning == "unfinished reasoning"
     assert parsed.content is None
+
+
+def test_deepseek_v31_tool_parser():
+    parsed = get_tool_parser("deepseek_v3_1").parse_full(
+        "reasoning</think>"
+        "<｜tool▁calls▁begin｜>"
+        "<｜tool▁call▁begin｜>weather<｜tool▁sep｜>"
+        '{"city":"上海"}'
+        "<｜tool▁call▁end｜>"
+        "<｜tool▁calls▁end｜>"
+    )
+
+    assert parsed.reasoning == "reasoning"
+    assert parsed.content is None
+    assert parsed.tool_calls[0].function.name == "weather"
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {"city": "上海"}
+
+
+def test_deepseek_dsml_tool_parser():
+    parsed = get_tool_parser("deepseek_v4").parse_full(
+        "<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="weather">\n'
+        '<｜DSML｜parameter name="city" string="true">上海</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>"
+    )
+
+    assert parsed.content is None
+    assert parsed.tool_calls[0].function.name == "weather"
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {
+        "city": "上海",
+        "days": 3,
+    }
+
+
+def test_detect_deepseek_parsers_from_chat_template():
+    assert detect_parser_name("model", "model", "<｜DSML｜tool_calls>") == "deepseek_v4"
+    assert (
+        detect_parser_name("model", "model", "<｜DSML｜function_calls>")
+        == "deepseek_v3_2"
+    )
+    assert (
+        detect_parser_name("model", "model", "<｜tool▁calls▁begin｜>")
+        == "deepseek_v3_1"
+    )
+
+
+def test_qwen_and_glm_parsers_unescape_xml_values():
+    qwen = get_tool_parser("qwen3_xml").parse_full(
+        "<tool_call><function=search>"
+        "<parameter=query>A &lt; B</parameter>"
+        "</function></tool_call>"
+    )
+    glm = get_tool_parser("glm").parse_full(
+        "<tool_call>search"
+        "<arg_key>query</arg_key><arg_value>A &lt; B</arg_value>"
+        "</tool_call>"
+    )
+
+    assert json.loads(qwen.tool_calls[0].function.arguments) == {"query": "A < B"}
+    assert json.loads(glm.tool_calls[0].function.arguments) == {"query": "A < B"}
+
+
+def test_gemma4_tool_parser_handles_native_strings_and_nested_values():
+    parsed = get_tool_parser("gemma4").parse_full(
+        "<|channel>thought\nneed weather<channel|>"
+        "<|tool_call>call:get-weather{"
+        'city:<|"|>Tokyo, {JP}<|"|>,'
+        "days:3,metric:true,"
+        'options:{lang:<|"|>ja<|"|>},'
+        'tags:[<|"|>current<|"|>,<|"|>alerts<|"|>]'
+        "}<tool_call|><turn|>"
+    )
+
+    assert parsed.reasoning == "need weather"
+    assert parsed.content is None
+    assert parsed.tool_calls[0].function.name == "get-weather"
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {
+        "city": "Tokyo, {JP}",
+        "days": 3,
+        "metric": True,
+        "options": {"lang": "ja"},
+        "tags": ["current", "alerts"],
+    }
+
+
+def test_gemma4_tool_parser_accepts_standard_json_arguments():
+    parsed = get_tool_parser("gemma4").parse_full(
+        '<|tool_call>call:weather{"city":"Tokyo"}<tool_call|>'
+    )
+
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {"city": "Tokyo"}
+
+
+def test_detect_gemma4_parser():
+    assert detect_parser_name("model", "model", "<|tool_call>call:") == "gemma4"
+    assert detect_parser_name("/models/gemma-4-26b-a4b-it", "model") == "gemma4"

@@ -7,6 +7,9 @@ pub(crate) fn runner_in_aux(data: &[u8], _sp_rank: usize) -> PyResult<BatchAuxDa
     Ok(BatchAuxData {
         num_group_seqs: batch.num_group_seqs(),
         temperatures: batch.temperatures,
+        json_schemas: batch.json_schemas,
+        structural_tags: batch.structural_tags,
+        remaining_tokens: batch.remaining_tokens,
         state_slots: batch.state_slots,
         compressed_block_tables: batch.compressed_block_tables,
         hisparse_slots: batch.hisparse_slots,

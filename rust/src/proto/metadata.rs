@@ -631,6 +631,12 @@ pub struct BatchAuxData {
     #[pyo3(get, set)]
     pub temperatures: Vec<f32>,
     #[pyo3(get, set)]
+    pub json_schemas: Vec<Option<String>>,
+    #[pyo3(get, set)]
+    pub structural_tags: Vec<Option<String>>,
+    #[pyo3(get, set)]
+    pub remaining_tokens: Vec<i32>,
+    #[pyo3(get, set)]
     pub state_slots: Vec<i64>,
     #[pyo3(get, set)]
     pub compressed_block_tables: std::collections::HashMap<i32, Vec<Vec<i32>>>,
@@ -648,6 +654,9 @@ impl BatchAuxData {
     #[pyo3(signature = (
         num_group_seqs = 0,
         temperatures = Vec::new(),
+        json_schemas = Vec::new(),
+        structural_tags = Vec::new(),
+        remaining_tokens = Vec::new(),
         state_slots = Vec::new(),
         compressed_block_tables = std::collections::HashMap::new(),
         hisparse_slots = Vec::new(),
@@ -657,6 +666,9 @@ impl BatchAuxData {
     fn new(
         num_group_seqs: usize,
         temperatures: Vec<f32>,
+        json_schemas: Vec<Option<String>>,
+        structural_tags: Vec<Option<String>>,
+        remaining_tokens: Vec<i32>,
         state_slots: Vec<i64>,
         compressed_block_tables: std::collections::HashMap<i32, Vec<Vec<i32>>>,
         hisparse_slots: Vec<i64>,
@@ -666,6 +678,9 @@ impl BatchAuxData {
         Self {
             num_group_seqs,
             temperatures,
+            json_schemas,
+            structural_tags,
+            remaining_tokens,
             state_slots,
             compressed_block_tables,
             hisparse_slots,

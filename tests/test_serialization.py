@@ -32,6 +32,46 @@ def test_request_to_prefill_batch_protocol():
     assert meta.positions == [0, 1, 2]
 
 
+def test_json_schema_reaches_worker_batch_aux():
+    sched = _scheduler()
+    schema = '{"type":"object"}'
+    payload = RequestIn(
+        1000,
+        [101, 102],
+        SamplingParams(json_schema=schema),
+        0,
+        None,
+    ).to_bytes()
+    sched.add_request_bytes(payload)
+
+    result = sched.schedule()
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
+    aux = RunnerIn.from_bytes(batch).aux()
+
+    assert aux.seq_ids == [1000]
+    assert aux.json_schemas == [schema]
+
+
+def test_structural_tag_reaches_worker_batch_aux():
+    sched = _scheduler()
+    structural_tag = '{"type":"structural_tag","format":{"type":"any_text"}}'
+    payload = RequestIn(
+        1001,
+        [101, 102],
+        SamplingParams(structural_tag=structural_tag),
+        0,
+        None,
+    ).to_bytes()
+    sched.add_request_bytes(payload)
+
+    result = sched.schedule()
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
+    aux = RunnerIn.from_bytes(batch).aux()
+
+    assert aux.seq_ids == [1001]
+    assert aux.structural_tags == [structural_tag]
+
+
 def test_decode_batch_and_run_result_protocol():
     sched = _scheduler()
     payload = RequestIn(12345, [1, 2, 3], SamplingParams(), 0, None).to_bytes()

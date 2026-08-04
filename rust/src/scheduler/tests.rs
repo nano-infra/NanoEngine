@@ -111,7 +111,7 @@ fn add_tokens(
     seq_id: u64,
     tokens: Vec<i32>,
 ) -> PyResult<()> {
-    let sampling = Py::new(py, SamplingParams::new(1.0, 16, false, false))?;
+    let sampling = Py::new(py, SamplingParams::new(1.0, 16, false, false, None, None))?;
     scheduler.add_request(py, seq_id, tokens, sampling, 0, None)?;
     Ok(())
 }
