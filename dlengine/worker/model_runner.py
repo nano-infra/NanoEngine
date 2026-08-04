@@ -324,7 +324,20 @@ class ModelRunner:
         torch.manual_seed(rank)
         torch.cuda.manual_seed_all(rank)
 
-        torch.cuda.set_device(0)
+        if os.getenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES") == "1":
+            device_count = torch.cuda.device_count()
+            if device_count <= 0:
+                raise RuntimeError("MegaMoE worker has no visible CUDA devices")
+            local_device = rank % device_count
+            torch.cuda.set_device(local_device)
+            logger.info(
+                "MegaMoE CUDA binding: rank=%d local_device=%d visible_devices=%d",
+                rank,
+                local_device,
+                device_count,
+            )
+        else:
+            torch.cuda.set_device(0)
 
         dist.init_process_group(
             "cpu:gloo,cuda:nccl",
@@ -933,6 +946,13 @@ class ModelRunner:
         # local path that doesn't JIT large grouped GEMMs.
         if experts is None or int(getattr(experts, "ep_size", 1)) <= 1:
             return
+        # MegaMoE uses its own packed-MXFP4 DeepGEMM kernels and is already
+        # compiled by graph/model warmup. The legacy BF16/FP8 grouped-GEMM
+        # warmup below is incompatible with its packed weights.
+        from dlengine.layers.backends.megamoe import MegaMoEExperts
+
+        if isinstance(experts, MegaMoEExperts):
+            return
 
         from dlengine.kernel.triton.hopper.fused_moe_v3 import (
             fused_moe_v3,
@@ -1136,6 +1156,7 @@ class ModelRunner:
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
+                attention_tp=config.attention_tp,
             )
         if getattr(config, "use_flashinfer_decode", False):
             reserved_state_bytes += 128 * 1024 * 1024

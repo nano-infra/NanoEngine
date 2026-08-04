@@ -313,7 +313,7 @@ class GenericRowParallelLinear(_GenericLinearMixin, RowParallelLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
             from dlengine.layers.embed_head import _chunked_all_reduce
 
             _chunked_all_reduce(y, self._tp_group)

@@ -445,7 +445,7 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
                 dist.all_reduce(y, group=self._tp_group)
             return y
         elif self.quantization_config.quant_method == "fp8":
@@ -453,7 +453,7 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
             x = x.flatten(0, -2)
             out = self._fp8_forward(x)
             out = out.unflatten(0, x_shape[:-1])
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
                 dist.all_reduce(out, group=self._tp_group)
             return out
         else:

@@ -67,13 +67,14 @@ def estimate_gdn_state_bytes(
     max_bs: int,
     need_backup: bool = False,
     cache_slots: int = 0,
+    attention_tp: int = 1,
 ) -> int:
     """Per-rank bytes the GDN conv + recurrent state buffers will occupy."""
     if not layer_types:
         return 0
     num_layers = len(layer_types)
-    num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
-    num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
+    num_k_heads = getattr(hf_config, "linear_num_key_heads", 0) // attention_tp
+    num_v_heads = getattr(hf_config, "linear_num_value_heads", 0) // attention_tp
     head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
     head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
     conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)
@@ -104,12 +105,14 @@ def allocate_gdn_states(
     max_bs: int,
     need_backup: bool = False,
     cache_slots: int = 0,
+    attention_tp: int | None = None,
 ) -> None:
     """Allocate fixed-size GDN state buffers for linear_attention layers."""
     max_bs = max_bs + max(0, cache_slots)
     num_layers = len(layer_types)
-    num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
-    num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
+    attention_tp = context.attention_tp if attention_tp is None else attention_tp
+    num_k_heads = getattr(hf_config, "linear_num_key_heads", 0) // attention_tp
+    num_v_heads = getattr(hf_config, "linear_num_value_heads", 0) // attention_tp
     head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
     head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
     conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)

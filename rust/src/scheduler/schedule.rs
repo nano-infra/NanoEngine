@@ -276,6 +276,15 @@ impl Scheduler {
                 (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
             }
         };
+        if self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) != 0
+            && !self.cache.can_ensure_state_slot(seq_id)
+        {
+            // Linear-attention state is a per-active-sequence resource. When
+            // all slots are occupied, retain this request at the head of the
+            // waiting queue until a running sequence completes instead of
+            // turning normal admission pressure into a fatal scheduler error.
+            return Ok(None);
+        }
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };

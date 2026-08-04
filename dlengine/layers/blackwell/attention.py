@@ -41,6 +41,16 @@ except ImportError as error:
 else:
     _TRTLLM_IMPORT_ERROR = None
 
+try:
+    from flashinfer.mla import (
+        trtllm_batch_decode_with_kv_cache_mla as _trtllm_mla_decode_func,
+    )
+except ImportError as error:
+    _trtllm_mla_decode_func = None
+    _TRTLLM_MLA_IMPORT_ERROR: ImportError | None = error
+else:
+    _TRTLLM_MLA_IMPORT_ERROR = None
+
 
 def _require_blackwell_attention_kernels() -> None:
     if _fa4_varlen_func is None:
@@ -256,6 +266,117 @@ class BlackwellAttentionImpl:
             sequence_lengths,
             tokens_per_seq,
         )
+
+
+class BlackwellMLAAttention(HopperAttention):
+    """FlashInfer TRTLLM-GEN decode for compressed MLA caches on Blackwell."""
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        v_head_dim,
+        attention_type: str = "MLA",
+        nsa_index_topk: int = 0,
+        mla_qk_nope_head_dim: int | None = None,
+        **kwargs,
+    ) -> None:
+        del kwargs
+        if attention_type != "MLA":
+            raise ValueError(f"BlackwellMLAAttention requires MLA, got {attention_type}")
+        if _trtllm_mla_decode_func is None:
+            message = (
+                "Blackwell MLA decode requires FlashInfer's TRTLLM-GEN MLA "
+                "kernel. No FlashMLA, torch, or naive fallback is available."
+            )
+            if _TRTLLM_MLA_IMPORT_ERROR is not None:
+                raise RuntimeError(message) from _TRTLLM_MLA_IMPORT_ERROR
+            raise RuntimeError(message)
+        if num_kv_heads != 1:
+            raise ValueError(f"MLA requires one compressed KV head, got {num_kv_heads}")
+        if head_dim <= v_head_dim:
+            raise ValueError(
+                f"Invalid MLA dimensions: cache head_dim={head_dim}, "
+                f"kv_lora_rank={v_head_dim}"
+            )
+        # Do not call HopperAttention.__init__: that constructs the legacy
+        # FlashMLA implementation. Cache tensors are injected by ModelRunner.
+        torch.nn.Module.__init__(self)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.v_head_dim = v_head_dim
+        self.qk_rope_head_dim = head_dim - v_head_dim
+        if mla_qk_nope_head_dim is None:
+            raise ValueError("Blackwell MLA requires mla_qk_nope_head_dim")
+        self.qk_nope_head_dim = mla_qk_nope_head_dim
+        self.nsa_index_topk = nsa_index_topk
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.hisparse_k_cache = self.hisparse_v_cache = torch.tensor([])
+
+    def forward(self, q, k, v, sparse_indices=None, write_kv_cache=True):
+        del v, sparse_indices
+        context = get_batch_context()
+        if context.is_prefill:
+            raise RuntimeError(
+                "BlackwellMLAAttention is decode-only; MLA prefill must use "
+                "the non-absorbed FA4 path in DeepseekV2Attention."
+            )
+        if write_kv_cache and self.k_cache.numel() and not context.is_dummy:
+            from dlengine.kernel.triton.generic.kv_store import store_kcache
+
+            store_kcache(k, self.k_cache, context.slot_mapping)
+
+        ntps = context.num_tokens_per_seq
+        batch_size = q.shape[0] // ntps
+        query = q.reshape(batch_size, ntps, self.num_heads, self.head_dim)
+        block_tables = context.block_tables[0, :batch_size]
+        seq_lens = context.context_lens[0, :batch_size]
+        kv_cache = self.k_cache
+        if kv_cache.ndim == 4 and kv_cache.shape[2] == 1:
+            kv_cache = kv_cache.squeeze(2)
+        if not block_tables.is_contiguous():
+            block_tables = block_tables.contiguous()
+        # TRTLLM-GEN groups 128 tokens when constructing its paged schedule.
+        # Therefore the page-table width must be a multiple of 128/page_size.
+        # Scheduler metadata is intentionally trimmed to the active pages, so
+        # pad only its unused tail; seq_lens remains the authoritative bound.
+        page_group = 128 // kv_cache.shape[1]
+        remainder = block_tables.shape[1] % page_group
+        if remainder:
+            padding = block_tables.new_zeros(
+                (block_tables.shape[0], page_group - remainder)
+            )
+            block_tables = torch.cat((block_tables, padding), dim=1)
+        if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
+            seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
+        out = torch.empty(
+            (*query.shape[:-1], self.v_head_dim),
+            dtype=torch.bfloat16,
+            device=query.device,
+        )
+        result = _trtllm_mla_decode_func(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=_get_trtllm_workspace(query.device),
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.v_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=block_tables.shape[1] * kv_cache.shape[1],
+            sparse_mla_top_k=0,
+            out=out,
+            bmm1_scale=self.scale,
+            bmm2_scale=1.0,
+            backend="auto",
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=True,
+        )
+        return result.reshape(-1, self.num_heads, self.v_head_dim)
 
 
 class BlackwellAttention(HopperAttention):

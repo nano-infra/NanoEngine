@@ -85,6 +85,11 @@ def _build_cache_plan_with_reason(config: Config) -> tuple[CachePlan, str]:
         _configure_hca_csa_cache_plan(plan, config)
         return plan, "hf_config.compress_ratios declares HCA/CSA compressed cache"
 
+    if arch == "KimiK3ForConditionalGeneration":
+        from dlengine.context_v2.cache.plan import kimi_k3_cache_plan
+
+        return kimi_k3_cache_plan(), "K3 combines MLA with KDA linear state"
+
     if has_gdn_component(hf_config):
         return qwen35_cache_plan(), "layer_types contains linear_attention"
 

@@ -153,6 +153,8 @@ class OpenAIServer:
         model_path: str,
         default_max_tokens: int = 512,
         max_model_len: int = 16384,
+        tool_call_parser: Optional[str] = None,
+        reasoning_parser: Optional[str] = None,
     ) -> None:
         self.worker = worker
         self.tokenizer = tokenizer
@@ -163,11 +165,13 @@ class OpenAIServer:
         self._model_aliases = self._build_model_aliases()
         from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
 
-        self.tool_parser_name = detect_parser_name(
+        detected_parser = detect_parser_name(
             model_path,
             served_model_name,
             getattr(tokenizer, "chat_template", None),
         )
+        self.tool_parser_name = tool_call_parser or detected_parser
+        self.reasoning_parser_name = reasoning_parser or self.tool_parser_name
         self.tool_parser = get_tool_parser(self.tool_parser_name)
         logger.info(f"Tool-call parser: {self.tool_parser_name}")
         # NOTE: request/metric dumping (``--dump_requests_redis``) is performed
@@ -279,10 +283,15 @@ class OpenAIServer:
         disabled the template instead appends a self-closed ``<think></think>``,
         which this correctly reports as not open.
         """
-        open_idx = prompt.rfind("<think>")
-        if open_idx == -1:
-            return False
-        return prompt.rfind("</think>") < open_idx
+        pairs = (
+            ("<think>", "</think>"),
+            ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+        )
+        for opener, closer in pairs:
+            open_idx = prompt.rfind(opener)
+            if open_idx >= 0 and prompt.rfind(closer) < open_idx:
+                return True
+        return False
 
     def _encode_chat(
         self,
@@ -298,7 +307,8 @@ class OpenAIServer:
         """
         tok = self.tokenizer
         messages = self._normalize_messages(messages)
-        if getattr(tok, "chat_template", None):
+        prompt = None
+        try:
             template_kwargs: dict[str, Any] = {}
             if tools:
                 # Qwen3/Hermes templates render tool schemas into a system
@@ -311,7 +321,9 @@ class OpenAIServer:
                 add_generation_prompt=True,
                 **template_kwargs,
             )
-        else:
+        except (ValueError, TypeError, NotImplementedError):
+            pass
+        if prompt is None:
             # Minimal fallback when the tokenizer ships no chat template.
             parts = [
                 f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
@@ -553,7 +565,7 @@ class OpenAIServer:
         # reasoning until the closing ``</think>``. While active we route the
         # text to a reasoning channel (gen.in_reasoning) instead of content.
         reasoning_active = reasoning_open
-        think_close = "</think>"
+        think_close = self.tool_parser.reasoning_close_marker
         drop_redundant_think_openers = reasoning_open
         while True:
             item = await req.aqueue.get()
@@ -563,7 +575,13 @@ class OpenAIServer:
                 raise RuntimeError(item["error"])
             if "tokens" not in item:
                 continue
-            gen.token_ids.extend(item["tokens"])
+            # A distributed step can deliver a small token bundle.  Do not let
+            # the serving-side accumulator cross the request limit even if the
+            # final engine packet contains more than the remaining allowance.
+            remaining = max_tokens - len(gen.token_ids)
+            if remaining <= 0:
+                continue
+            gen.token_ids.extend(item["tokens"][:remaining])
             delta = self._incremental_detokenize(gen)
             if not delta:
                 continue
@@ -1014,11 +1032,17 @@ def build_app(server: OpenAIServer):
 
         # Non-streaming: drain the whole generation.
         text = ""
+        reasoning_text = ""
         gen = _Generation()
         monitor = server._spawn_disconnect_monitor(request, req)
         try:
-            async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
-                text += delta
+            async for delta, gen in server.stream_text(
+                req, max_tokens, stop=stop, reasoning_open=reasoning_open
+            ):
+                if gen.in_reasoning:
+                    reasoning_text += delta
+                else:
+                    text += delta
         except RuntimeError as e:
             return JSONResponse(
                 status_code=500,
@@ -1034,8 +1058,9 @@ def build_app(server: OpenAIServer):
             "role": "assistant",
             "content": parsed.content if parsed.content is not None else "",
         }
-        if parsed.reasoning is not None:
-            message["reasoning_content"] = parsed.reasoning
+        reasoning = reasoning_text or parsed.reasoning
+        if reasoning:
+            message["reasoning_content"] = reasoning
         finish_reason = gen.finish_reason
         if use_tools and parsed.tool_calls:
             message["tool_calls"] = [tc.to_dict() for tc in parsed.tool_calls]
@@ -1491,7 +1516,7 @@ def run_server(
 ) -> None:
     """Build the engine, start the HTTP server, and optionally register to ctrl."""
     import uvicorn
-    from transformers import PreTrainedTokenizerFast
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
     from dlengine.utils.network import get_bind_host
 
@@ -1552,7 +1577,18 @@ def run_server(
     logger.info(f"Started engine process (pid={engine_proc.pid}) at {engine_endpoint}")
     worker: Any = ZmqEngineWorker(engine_endpoint)
 
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
+    model_type = getattr(config.hf_config, "model_type", "")
+    if model_type == "kimi_k3":
+        # K3's remote TikToken class overrides apply_chat_template without a
+        # ``chat_template`` attribute. Forcing PreTrainedTokenizerFast drops
+        # the thinking-effort/system preamble required by the model.
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model, trust_remote_code=True, fix_mistral_regex=True
+        )
+    else:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            config.model, fix_mistral_regex=True
+        )
 
     server = OpenAIServer(
         worker=worker,
@@ -1560,6 +1596,8 @@ def run_server(
         served_model_name=served_model_name,
         model_path=config.model,
         max_model_len=config.max_model_len,
+        tool_call_parser=config.tool_call_parser,
+        reasoning_parser=config.reasoning_parser,
     )
     app = build_app(server)
 

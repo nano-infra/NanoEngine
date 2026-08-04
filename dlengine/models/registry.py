@@ -61,6 +61,12 @@ def _qwen3_5_mtp_cls():
     return Qwen3_5MTP
 
 
+def _kimi_k3_cls():
+    from dlengine.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    return KimiK3ForConditionalGeneration
+
+
 architecture_loaders = {
     "Qwen3ForCausalLM": _qwen3_cls,
     "Qwen3MoeForCausalLM": _qwen3_moe_cls,
@@ -73,6 +79,7 @@ architecture_loaders = {
     "Qwen3_5MoeForConditionalGeneration": _qwen3_5_moe_cls,
     "Gemma4ForCausalLM": _gemma4_cls,
     "Gemma4ForConditionalGeneration": _gemma4_cls,
+    "KimiK3ForConditionalGeneration": _kimi_k3_cls,
 }
 
 architecture_mtp_loaders = {

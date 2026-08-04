@@ -48,6 +48,10 @@ impl SlotPool {
     pub(crate) fn num_slots(&self) -> i32 {
         self.num_slots
     }
+
+    pub(crate) fn can_ensure(&self, seq_id: u64) -> bool {
+        self.seq_slots.contains_key(&seq_id) || !self.free_slots.is_empty()
+    }
 }
 
 #[cfg(test)]

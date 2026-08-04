@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -202,8 +203,8 @@ def _pp_recv_indexer_state(
 
 
 # Varlen attention func for non-absorbed MLA prefill, resolved once.
-# FA3 (``flash_attn_interface``) supports arbitrary head dims (incl. 256/256)
-# and is preferred; ``flash_mla``'s varlen kernel only covers standard MLA
+# FA4 (Blackwell) and FA3 (Hopper) support arbitrary head dims (incl. 256/256).
+# ``flash_mla``'s varlen kernel only covers standard MLA
 # dims and returns NaN for unsupported shapes. ``False`` means "not yet
 # resolved" so the lookup happens lazily on first attention call.
 _PREFILL_VARLEN_FUNC = False
@@ -214,18 +215,29 @@ def _get_prefill_varlen_func():
     """Return ``(func, is_fa3)`` for non-absorbed MLA prefill, or ``(None, False)``."""
     global _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
     if _PREFILL_VARLEN_FUNC is False:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            try:
+                from flash_attn.cute import flash_attn_varlen_func
+
+                _PREFILL_VARLEN_FUNC = flash_attn_varlen_func
+                # This flag means arbitrary native head dims are supported.
+                _PREFILL_VARLEN_IS_FA3 = True
+            except (ImportError, OSError):
+                pass
+        if _PREFILL_VARLEN_FUNC is not False:
+            return _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
         try:
             from flash_attn_interface import flash_attn_varlen_func
 
             _PREFILL_VARLEN_FUNC = flash_attn_varlen_func
             _PREFILL_VARLEN_IS_FA3 = True
-        except ModuleNotFoundError:
+        except (ImportError, OSError):
             try:
                 from flash_mla import flash_attn_varlen_func
 
                 _PREFILL_VARLEN_FUNC = flash_attn_varlen_func
                 _PREFILL_VARLEN_IS_FA3 = False
-            except ModuleNotFoundError:
+            except (ImportError, OSError):
                 _PREFILL_VARLEN_FUNC = None
                 _PREFILL_VARLEN_IS_FA3 = False
     return _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
@@ -810,13 +822,22 @@ class DeepseekV2Attention(nn.Module):
         quantization_config: QuantizationConfig | None = None,
         layer_idx: int = 0,
         cache_layer_idx: int | None = None,
+        skip_rope: bool = False,
     ):
         super().__init__()
+        self.skip_rope = skip_rope
         self.layer_idx = layer_idx
         self.config = config
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.total_num_heads = config.num_attention_heads
+        attn_tp = get_dist_context().attn_tp_world_size
+        if self.total_num_heads % attn_tp:
+            raise ValueError(
+                f"num_attention_heads={self.total_num_heads} is not divisible "
+                f"by attention_tp={attn_tp}"
+            )
+        self.num_heads = self.total_num_heads // attn_tp
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         self.v_head_dim = config.v_head_dim
@@ -825,7 +846,7 @@ class DeepseekV2Attention(nn.Module):
         self.index_topk = int(getattr(config, "index_topk", 0) or 0)
         self.enable_mla_reference_fallback = getattr(
             config, "enable_mla_reference_fallback", False
-        )
+        ) or os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") == "1"
         # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
         num_key_value_heads = 1
         self.is_v32 = hasattr(config, "index_topk")
@@ -837,13 +858,11 @@ class DeepseekV2Attention(nn.Module):
                 ColumnParallelLinearBase
             ) = get_backend().get_column_parallel_linear(
                 self.hidden_size,
-                self.num_heads * self.q_head_dim,
+                self.total_num_heads * self.q_head_dim,
                 tp_group=get_dist_context().attn_tp_group,
             )
         else:
-            self.q_a_proj: (
-                ColumnParallelLinearBase
-            ) = get_backend().get_column_parallel_linear(
+            self.q_a_proj = get_backend().get_replicated_linear(
                 self.hidden_size,
                 config.q_lora_rank,
                 bias=config.attention_bias,
@@ -854,13 +873,13 @@ class DeepseekV2Attention(nn.Module):
                 ColumnParallelLinearBase
             ) = get_backend().get_column_parallel_linear(
                 config.q_lora_rank,
-                self.num_heads * self.q_head_dim,
+                self.total_num_heads * self.q_head_dim,
                 bias=False,
                 tp_group=get_dist_context().attn_tp_group,
             )
-        self.kv_a_proj_with_mqa: (
-            ColumnParallelLinearBase
-        ) = get_backend().get_column_parallel_linear(
+        # MLA's compressed KV is shared by all query-head TP ranks. Sharding
+        # this projection would split the latent/cache dimension incorrectly.
+        self.kv_a_proj_with_mqa = get_backend().get_replicated_linear(
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
@@ -918,12 +937,13 @@ class DeepseekV2Attention(nn.Module):
             v_head_dim=config.kv_lora_rank,
             attention_type="MLA",
             nsa_index_topk=getattr(config, "index_topk", 0),
+            mla_qk_nope_head_dim=config.qk_nope_head_dim,
         )
 
         self.vc = DeepseekV2BMM(self.num_heads, config.kv_lora_rank, self.v_head_dim)
 
         self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
-            self.num_heads * self.v_head_dim,
+            self.total_num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
             tp_group=get_dist_context().attn_tp_group,
@@ -1019,6 +1039,8 @@ class DeepseekV2Attention(nn.Module):
         return key_states, value_states, k_pe
 
     def _flash_mla_decode_supported(self) -> bool:
+        if os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") == "1":
+            return False
         return (self.kv_lora_rank + self.qk_rope_head_dim) in (512, 576)
 
     def _unsupported_mla_message(self) -> str:
@@ -1100,13 +1122,16 @@ class DeepseekV2Attention(nn.Module):
         bs = total_tokens // ntps
 
         q_full, _q_nope, q_pe = self._q_proj_raw(hidden_states, num_heads)
-        q_pe = _interleaved_to_half(q_pe)
-        k_pe_3d = _interleaved_to_half(k_pe.unsqueeze(1))
-        q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
-        q_full[..., self.qk_nope_head_dim :] = q_pe
+        k_pe_3d = k_pe.unsqueeze(1)
+        if not self.skip_rope:
+            q_pe = _interleaved_to_half(q_pe)
+            k_pe_3d = _interleaved_to_half(k_pe_3d)
+            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            q_full[..., self.qk_nope_head_dim :] = q_pe
 
         key_states_3d = key_states.unsqueeze(1)
-        key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
+        if not self.skip_rope:
+            key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
 
         k_cache = self.attn_fwd.k_cache
         if k_cache.dtype == torch.float8_e4m3fn:
@@ -1195,16 +1220,17 @@ class DeepseekV2Attention(nn.Module):
 
             # Convert PE dims from interleaved to half format before RoPE
             # (DeepseekV3 uses rope_interleave=True; projections produce interleaved layout)
-            q_pe = _interleaved_to_half(q_pe)
             k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
-            k_pe_3d = _interleaved_to_half(k_pe_3d)
-            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
-            # write RoPE'd q_pe back
-            q_full[..., self.qk_nope_head_dim :] = q_pe
+            if not self.skip_rope:
+                q_pe = _interleaved_to_half(q_pe)
+                k_pe_3d = _interleaved_to_half(k_pe_3d)
+                q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+                q_full[..., self.qk_nope_head_dim :] = q_pe
 
             # Also write RoPE'd k_pe into key_states for KV cache storage
             key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
-            key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
+            if not self.skip_rope:
+                key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
 
             # Store compressed KV (576 dims) into cache for future decode
             k_cache = self.attn_fwd.k_cache
@@ -1551,12 +1577,14 @@ class DeepseekV2Attention(nn.Module):
 
             key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
             # Convert PE dims from interleaved to half format before RoPE
-            q_pe = _interleaved_to_half(q_pe)
             k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
-            k_pe_3d = _interleaved_to_half(k_pe_3d)
-            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            if not self.skip_rope:
+                q_pe = _interleaved_to_half(q_pe)
+                k_pe_3d = _interleaved_to_half(k_pe_3d)
+                q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
             query_states[..., self.kv_lora_rank :] = q_pe
-            key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
+            if not self.skip_rope:
+                key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
 
             # Run NSA Indexer (V3.2 only) — compute topk block indices
             sparse_indices = None

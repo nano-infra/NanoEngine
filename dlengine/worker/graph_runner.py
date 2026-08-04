@@ -118,6 +118,9 @@ class DecodeGraphRunner:
             self._flash_mla = flash_mla
         self._sched_metas: dict[int, object] = {}
         self._sparse_sched_metas: dict[int, object] = {}
+        self._uses_flash_mla_sched = (
+            (is_mla or is_dsv4) and torch.cuda.get_device_capability()[0] < 10
+        )
 
         # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
         self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0
@@ -308,10 +311,10 @@ class DecodeGraphRunner:
             # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
             sched_meta = None
             sparse_sched_meta = None
-            if self._is_mla or self._is_dsv4:
+            if self._uses_flash_mla_sched:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 g.sched_metas[master_bs] = sched_meta
-            if self._has_indexer:
+            if self._has_indexer and self._uses_flash_mla_sched:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 g.sparse_sched_metas[master_bs] = sparse_sched_meta
                 # Indexer needs non-zero context_lens during warmup so that
@@ -399,7 +402,7 @@ class DecodeGraphRunner:
             # graph.  dense_decode_fwd only launches it when the metadata
             # tensor is None; after warmup it is non-None, so without this
             # reset the graph would replay with stale scheduling data.
-            if self._is_mla or self._is_dsv4:
+            if self._uses_flash_mla_sched:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 g.sched_metas[master_bs] = sched_meta
                 get_hca_context().tile_scheduler_metadata = sched_meta
@@ -413,7 +416,7 @@ class DecodeGraphRunner:
                 for m in model.modules():
                     if isinstance(m, DeepseekV4Attention):
                         m._dsv4_sched_metas.pop(master_bs, None)
-            if self._has_indexer:
+            if self._has_indexer and self._uses_flash_mla_sched:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 g.sparse_sched_metas[master_bs] = sparse_sched_meta
                 get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
@@ -561,6 +564,9 @@ class LazyVerifyGraphRunner:
             self._flash_mla = flash_mla
         self._sched_metas: dict[int, object] = {}
         self._sparse_sched_metas: dict[int, object] = {}
+        self._uses_flash_mla_sched = (
+            is_mla and torch.cuda.get_device_capability()[0] < 10
+        )
 
         # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
         self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0
@@ -593,10 +599,10 @@ class LazyVerifyGraphRunner:
             # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
             sched_meta = None
             sparse_sched_meta = None
-            if self._is_mla:
+            if self._uses_flash_mla_sched:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[bs] = sched_meta
-            if self._has_indexer:
+            if self._has_indexer and self._uses_flash_mla_sched:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
                 self._context_lens[:, :bs] = 1
@@ -627,11 +633,11 @@ class LazyVerifyGraphRunner:
 
             # Fresh FlashMLASchedMeta so scheduling kernel is captured
             # (see DecodeGraphRunner.capture for full explanation).
-            if self._is_mla:
+            if self._uses_flash_mla_sched:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[bs] = sched_meta
                 get_hca_context().tile_scheduler_metadata = sched_meta
-            if self._has_indexer:
+            if self._has_indexer and self._uses_flash_mla_sched:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
                 get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta

@@ -574,9 +574,13 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
     monitor = server._spawn_disconnect_monitor(request, req)
     try:
         async for delta, gen in server.stream_text(
-            req, sampling_params.max_tokens, stop=stop
+            req,
+            sampling_params.max_tokens,
+            stop=stop,
+            reasoning_open=reasoning_open,
         ):
-            text += delta
+            if not gen.in_reasoning:
+                text += delta
     except RuntimeError as e:
         return JSONResponse(
             status_code=500,

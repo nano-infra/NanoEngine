@@ -101,6 +101,17 @@ class RayExecutor:
 
         self.workers = []
         self.placement_groups = []
+        architecture = (getattr(config.hf_config, "architectures", None) or [""])[0]
+        self.worker_runtime_env = None
+        if architecture == "KimiK3ForConditionalGeneration":
+            # DeepGEMM MegaMoE uses PyTorch symmetric memory, whose ranks must
+            # share one CUDA ordinal namespace. Ray's normal one-visible-GPU
+            # isolation makes every rank's distinct physical device cuda:0.
+            self.worker_runtime_env = {
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                }
+            }
         self.worker_debug_env = _collect_dsv4_debug_env()
         if self.worker_debug_env:
             logger.info(
@@ -159,7 +170,7 @@ class RayExecutor:
         # Create every worker first with distributed initialization deferred;
         # rank 0's actual placement determines the rendezvous address.
         for rank in range(self.config.world_size):
-            worker = ModelRunner.remote(
+            worker = ModelRunner.options(runtime_env=self.worker_runtime_env).remote(
                 self.config,
                 rank,
                 defer_dist_init=True,
@@ -233,7 +244,10 @@ class RayExecutor:
             self.placement_groups.append(pg)
 
             for rank in range(start_rank, end_rank):
-                worker = ModelRunner.options(placement_group=pg).remote(
+                worker = ModelRunner.options(
+                    placement_group=pg,
+                    runtime_env=self.worker_runtime_env,
+                ).remote(
                     self.config,
                     rank,
                     defer_dist_init=True,

@@ -5,6 +5,26 @@ class QuantizationConfig:
     def __init__(self, **kwargs):
         self.quant_method = kwargs.get("quant_method", None)
         self.fmt = kwargs.get("fmt", None)
+        self.compression_format = kwargs.get("format", None)
+        self.is_mxfp4 = self.compression_format in {
+            "mxfp4-pack-quantized",
+            "mxfp4-quantized",
+        } or self.quant_method in {"mxfp4", "nvfp4"}
+        if self.is_mxfp4:
+            # Compressed-tensors describes the checkpoint container, not the
+            # dense GEMM datatype. K3 ignores attention/shared/dense linears;
+            # those remain BF16 while the experts backend consumes MXFP4.
+            if self.quant_method == "compressed-tensors":
+                self.quant_method = None
+            self.weight_group_size = self._get_mxfp4_group_size(kwargs)
+            if self.weight_group_size != 32:
+                raise ValueError(
+                    "MXFP4 requires a weight group size of 32; "
+                    f"checkpoint declares {self.weight_group_size}"
+                )
+
+        # Kimi-K3 MXFP4 stores two E2M1 values per byte and one E8M0
+        # scale per group. Native backends must opt into it explicitly.
 
         # configuration for block-wise quantization
         self.block_size = kwargs.get("weight_block_size", list())
@@ -27,3 +47,12 @@ class QuantizationConfig:
             if self.fmt is None or self.fmt == "e4m3":
                 return torch.float8_e4m3fn
         raise AttributeError(f"Unsupported dtype: {self.quant_method=}, {self.fmt=}")
+
+    @staticmethod
+    def _get_mxfp4_group_size(config: dict) -> int:
+        groups = config.get("config_groups") or {}
+        for group in groups.values():
+            weights = group.get("weights") or {}
+            if "group_size" in weights:
+                return int(weights["group_size"])
+        return 32

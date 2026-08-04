@@ -76,6 +76,7 @@ class KVCacheAllocatorMixin:
         max_bs: int,
         need_backup: bool = False,
         cache_slots: int = 0,
+        attention_tp: int = 1,
     ) -> int:
         return estimate_gdn_state_bytes(
             hf_config,
@@ -83,6 +84,7 @@ class KVCacheAllocatorMixin:
             max_bs,
             need_backup=need_backup,
             cache_slots=cache_slots,
+            attention_tp=attention_tp,
         )
 
     def allocate_gdn_states(

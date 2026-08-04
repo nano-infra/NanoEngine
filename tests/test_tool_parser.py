@@ -4,6 +4,34 @@ from dlengine.server.openai_server import _skip_redundant_think_openers
 from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
 
 
+def test_kimi_k3_xtml_reasoning_response_and_tools():
+    parsed = get_tool_parser("kimi_k3").parse_full(
+        '<|open|>think<|sep|>reason<|close|>think<|sep|>'
+        '<|open|>response<|sep|>answer<|close|>response<|sep|>'
+        '<|open|>tools<|sep|>'
+        '<|open|>call tool="weather" index="1"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>北京'
+        '<|close|>argument<|sep|>'
+        '<|open|>argument key="days" type="integer"<|sep|>2'
+        '<|close|>argument<|sep|>'
+        '<|close|>call<|sep|><|close|>tools<|sep|>'
+    )
+    assert parsed.reasoning == "reason"
+    assert parsed.content == "answer"
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].function.name == "weather"
+    assert parsed.tool_calls[0].function.arguments == '{"city": "北京", "days": 2}'
+
+
+def test_kimi_k3_parser_auto_detection():
+    assert detect_parser_name("/models/Kimi-K3", "Kimi-K3") == "kimi_k3"
+
+
+def test_kimi_k3_parser_exposes_reasoning_close_marker():
+    parser = get_tool_parser("kimi_k3")
+    assert parser.reasoning_close_marker == "<|close|>think<|sep|>"
+
+
 def test_glm_tool_parser_arg_key_value_format():
     parser = get_tool_parser("glm")
     parsed = parser.parse_full(
