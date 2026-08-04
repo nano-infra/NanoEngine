@@ -16,6 +16,8 @@ dlslime-ctrl so a router (e.g. DLRouter) can discover it.
 
 Endpoints:
 - ``GET  /health``
+- ``POST /start_profiler``
+- ``POST /stop_profiler``
 - ``GET  /v1/models``
 - ``POST /v1/completions``
 - ``POST /v1/chat/completions``  (streaming + non-streaming)
@@ -588,9 +590,7 @@ class OpenAIServer:
             text += delta
             if reasoning_active:
                 if drop_redundant_think_openers:
-                    emitted, need_more = _skip_redundant_think_openers(
-                        text, emitted
-                    )
+                    emitted, need_more = _skip_redundant_think_openers(text, emitted)
                     if need_more:
                         continue
                     drop_redundant_think_openers = False
@@ -739,6 +739,49 @@ def build_app(server: OpenAIServer):
             scheduler.metrics_prometheus(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
+
+    @app.post("/start_profiler")
+    async def start_profiler(request: Request) -> JSONResponse:  # noqa: ANN202
+        try:
+            raw_body = await request.body()
+            body = json.loads(raw_body) if raw_body else {}
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be an object")
+            trace_name = body.get("trace_name")
+            if trace_name is not None and not isinstance(trace_name, str):
+                raise ValueError("trace_name must be a string")
+            result = await server.worker.start_profiler(trace_name)
+            return JSONResponse(
+                status_code=200 if result.get("ok") else 400,
+                content=result,
+            )
+        except (ValueError, json.JSONDecodeError) as e:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"ok": False, "error": "profiler start timed out"},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to start profiler")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+    @app.post("/stop_profiler")
+    async def stop_profiler() -> JSONResponse:  # noqa: ANN202
+        try:
+            result = await server.worker.stop_profiler()
+            return JSONResponse(
+                status_code=200 if result.get("ok") else 500,
+                content=result,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"ok": False, "error": "profiler stop timed out"},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to stop profiler")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
     @app.get("/v1/models")
     async def models() -> JSONResponse:  # noqa: ANN202

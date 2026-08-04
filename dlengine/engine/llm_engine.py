@@ -1,4 +1,6 @@
 import atexit
+import re
+from datetime import datetime
 from typing import Set
 
 from dlengine.config import Config
@@ -8,6 +10,7 @@ from dlengine.metrics.dump import EngineMetricDumper
 from dlengine.models.trait import load_tokenizer_and_eos
 
 logger = get_logger()
+_TRACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _build_executor(config: Config):
@@ -88,6 +91,35 @@ class LLMEngine:
 
     def get_attn_world_size(self):
         return self.config.attn_world_size
+
+    def start_profiler(self, trace_name: str | None = None) -> dict:
+        if trace_name is None:
+            trace_name = datetime.now().strftime("profile-%Y%m%d-%H%M%S")
+        if not _TRACE_NAME_RE.fullmatch(trace_name):
+            raise ValueError(
+                "trace_name must be 1-64 characters and contain only "
+                "letters, numbers, '.', '_' or '-'"
+            )
+        workers = self.executor.collective_rpc("start_profiler", (trace_name,))
+        statuses = {worker["status"] for worker in workers}
+        trace_names = {
+            worker["trace_name"]
+            for worker in workers
+            if worker.get("trace_name") is not None
+        }
+        return {
+            "status": statuses.pop() if len(statuses) == 1 else "mixed",
+            "trace_name": (trace_names.pop() if len(trace_names) == 1 else trace_name),
+            "workers": workers,
+        }
+
+    def stop_profiler(self) -> dict:
+        workers = self.executor.collective_rpc("stop_profiler")
+        statuses = {worker["status"] for worker in workers}
+        return {
+            "status": statuses.pop() if len(statuses) == 1 else "mixed",
+            "workers": workers,
+        }
 
     def update_weights(self, named_tensors: dict[str, "torch.Tensor"]) -> list[dict]:
         """Apply HF-named full tensors to the live model on every worker.

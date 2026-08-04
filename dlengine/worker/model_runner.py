@@ -2,6 +2,7 @@ import os
 import threading
 import time as _time
 from dataclasses import dataclass
+from pathlib import Path
 
 import ray
 import torch
@@ -368,45 +369,7 @@ class ModelRunner:
 
         self.run_count = 0
         self.profiler = None
-        if getattr(config, "enable_profiler", False):
-            self.profiler_start_step = getattr(config, "profiler_start_step", 10)
-            self.profiler_steps = getattr(config, "profiling_step", 10)
-            # Number of forward iterations bundled into one profiler.step()
-            # boundary. Default 2 -- amortises per-step bookkeeping overhead
-            # so the captured trace better reflects steady-state cost.
-            # Total forwards captured = profiler_steps * forward_per_step.
-            self.profiler_forward_per_step = max(
-                1, getattr(config, "profiler_forward_per_step", 2)
-            )
-            self.profiler_end_step = (
-                self.profiler_start_step
-                + self.profiler_steps * self.profiler_forward_per_step
-            )
-            profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
-
-            os.makedirs(profiler_dir, exist_ok=True)
-
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                schedule=None,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    dir_name=profiler_dir,
-                    worker_name=f"{self.engine_id}_rank_{rank}",
-                    use_gzip=False,
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-            )
-            logger.info(
-                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, "
-                f"{self.profiler_steps} step boundaries × "
-                f"{self.profiler_forward_per_step} forwards/step "
-                f"(end at {self.profiler_end_step})."
-            )
+        self.profiler_trace_dir = None
 
         # Initialise the hardware backend before constructing the model so that
         # all layer factories are available when model __init__ runs.
@@ -500,6 +463,99 @@ class ModelRunner:
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         self.preallocate_kvcache()
+
+    def _create_profiler(self, trace_dir: str):
+        os.makedirs(trace_dir, exist_ok=True)
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=None,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                dir_name=trace_dir,
+                worker_name=f"{self.engine_id}_rank_{self.rank}",
+                use_gzip=False,
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+
+    def start_profiler(self, trace_name: str) -> dict:
+        """Start a manually delimited CPU/CUDA profiler session."""
+        if self.profiler is not None:
+            return {
+                "rank": self.rank,
+                "status": "already_running",
+                "trace_name": (
+                    Path(self.profiler_trace_dir).name
+                    if self.profiler_trace_dir
+                    else None
+                ),
+                "trace_dir": self.profiler_trace_dir,
+                "run_count": self.run_count,
+            }
+
+        trace_dir = str(
+            (Path(self.config.profiler_dir).expanduser().resolve() / trace_name)
+        )
+        profiler = self._create_profiler(trace_dir)
+        profiler.start()
+        self.profiler = profiler
+        self.profiler_trace_dir = trace_dir
+        logger.info(
+            "Rank %s: Runtime profiler started at step %s; trace_dir=%s",
+            self.rank,
+            self.run_count,
+            trace_dir,
+        )
+        return {
+            "rank": self.rank,
+            "status": "started",
+            "trace_name": trace_name,
+            "trace_dir": trace_dir,
+            "run_count": self.run_count,
+        }
+
+    def stop_profiler(self) -> dict:
+        """Stop the active profiler and report trace files visible to this worker."""
+        if self.profiler is None:
+            return {
+                "rank": self.rank,
+                "status": "not_running",
+                "trace_dir": self.profiler_trace_dir,
+                "run_count": self.run_count,
+                "trace_files": [],
+            }
+
+        trace_dir = self.profiler_trace_dir
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+        self.profiler.stop()
+        self.profiler = None
+        trace_files = (
+            sorted(str(path) for path in Path(trace_dir).glob("**/*") if path.is_file())
+            if trace_dir
+            else []
+        )
+        logger.info(
+            "Rank %s: Runtime profiler stopped at step %s; files=%s",
+            self.rank,
+            self.run_count,
+            len(trace_files),
+        )
+        return {
+            "rank": self.rank,
+            "status": "stopped",
+            "trace_dir": trace_dir,
+            "run_count": self.run_count,
+            "trace_files": trace_files,
+        }
+
+    def _advance_profiler(self) -> None:
+        if self.profiler is not None:
+            self.profiler.step()
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -1637,11 +1693,6 @@ class ModelRunner:
         if is_prefill and self.mtp_runner is not None:
             self.mtp_runner.reset_lazy_verify_state()
 
-        # --- Profiler start ---
-        if self.profiler and self.run_count == self.profiler_start_step:
-            self.profiler.start()
-            logger.info(f"Rank {self.rank}: Profiler started at step {self.run_count}")
-
         # --- Prepare inputs ---
         has_lazy_verify = False
         if is_prefill:
@@ -1763,6 +1814,7 @@ class ModelRunner:
         # engine reads tokens from the last stage only, so return a benign
         # placeholder here.
         if logits is None:
+            self._advance_profiler()
             reset_runtime_contexts()
             self.run_count += 1
             self._fwd_timer = None
@@ -1792,19 +1844,7 @@ class ModelRunner:
             )
 
         # --- Profiler step ---
-        if self.profiler and self.run_count >= self.profiler_start_step:
-            if self.run_count < self.profiler_end_step:
-                # Bundle ``profiler_forward_per_step`` forwards into one
-                # profiler.step() boundary so per-step bookkeeping doesn't
-                # dominate the trace at small per-iter latencies.
-                rel = self.run_count - self.profiler_start_step
-                if (rel + 1) % self.profiler_forward_per_step == 0:
-                    self.profiler.step()
-            if self.run_count == self.profiler_end_step - 1:
-                self.profiler.stop()
-                logger.info(
-                    f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
-                )
+        self._advance_profiler()
 
         self.run_count += 1
         batch_out = get_batch_out_context()
