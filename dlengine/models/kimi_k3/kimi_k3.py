@@ -251,7 +251,7 @@ class KimiDecoderLayer(nn.Module):
             self.self_attention_res_proj = get_backend().get_replicated_linear(config.hidden_size, 1)
             self.mlp_res_proj = get_backend().get_replicated_linear(config.hidden_size, 1)
         # SP-MoE: shard TP-replicated rows before MegaMoE and gather afterward.
-        self.attn_to_ffn = AttnToFfnTransition()
+        self.attn_to_ffn = AttnToFfnTransition(use_k3_sp=True)
         self.ffn_to_attn = FfnToAttnTransition(self.attn_to_ffn)
         if self.use_res and get_dist_context().attn_tp_world_size > 1:
             # K3 residual aggregation is token-local, so reduce-scatter the
