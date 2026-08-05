@@ -215,7 +215,7 @@ class KimiMoE(nn.Module):
         else:
             shared = self.shared_experts(x)
         routed = self.experts(
-            latent, ids, weights.to(x.dtype), is_prefill=get_batch_context().is_prefill
+            latent, ids, weights, is_prefill=get_batch_context().is_prefill
         )
         routed = self.routed_expert_up_proj(self.routed_expert_norm(routed))
         if shared_event is not None:

@@ -11,18 +11,11 @@
 // attention/kda_prefill.cu duplicates a different set (MMA / ldmatrix) but is
 // built without a sglang include path and cannot consume this header.
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
 
 #include <cstdint>
 
 namespace ptx {
-
-// Inline-PTX `.shared` instructions take a 32-bit byte offset in the shared
-// window, not a generic 64-bit pointer.
-template <typename T>
-static SGL_DEVICE uint32_t to_shared(T* ptr) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-}
 
 // ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
 //
