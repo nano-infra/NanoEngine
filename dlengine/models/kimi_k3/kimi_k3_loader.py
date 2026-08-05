@@ -112,6 +112,12 @@ def load_weights(model, weights) -> None:
         prepare_front = getattr(module, "prepare_fused_front", None)
         if callable(prepare_front):
             prepare_front()
+        prepare_gate_up = getattr(module, "prepare_fused_gate_up", None)
+        if callable(prepare_gate_up):
+            prepare_gate_up()
+        prepare_kda = getattr(module, "prepare_fused_decode_projections", None)
+        if callable(prepare_kda):
+            prepare_kda()
     # Merged front parameters now view the consolidated allocations. Release
     # the superseded gate/down storage before KV-cache capacity is profiled.
     if torch.cuda.is_available():

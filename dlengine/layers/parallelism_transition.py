@@ -114,9 +114,12 @@ class FfnToAttnTransition(nn.Module):
         dst_tp = ctx.attn_tp_world_size
         if dst_tp <= 1:
             return hidden_states
-        gathered = [torch.empty_like(hidden_states) for _ in range(dst_tp)]
-        dist.all_gather(gathered, hidden_states, group=ctx.attn_tp_group)
-        out = torch.cat(gathered, dim=0)
+        out = torch.empty(
+            (hidden_states.shape[0] * dst_tp, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        dist.all_gather_into_tensor(out, hidden_states.contiguous(), group=ctx.attn_tp_group)
 
         # Strip padding if AttnToFfnTransition padded the batch
         if self._scatter_layer is not None and self._scatter_layer._original_bs > 0:

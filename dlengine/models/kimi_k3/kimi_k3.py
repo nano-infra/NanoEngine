@@ -37,9 +37,22 @@ class KimiMLP(nn.Module):
             self.up_proj = backend.get_column_parallel_linear(hidden, intermediate, tp_group=group)
             self.down_proj = backend.get_row_parallel_linear(intermediate, hidden, tp_group=group)
         self.act = SituAndMul(4.0, 25.0)
+        self.register_buffer("fused_gate_up_weight", None, persistent=False)
+
+    def prepare_fused_gate_up(self) -> None:
+        weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0).contiguous()
+        split = self.gate_proj.weight.shape[0]
+        self.fused_gate_up_weight = weight
+        self.gate_proj.weight.data = weight[:split]
+        self.up_proj.weight.data = weight[split:]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act(torch.cat((self.gate_proj(x), self.up_proj(x)), -1)))
+        if self.fused_gate_up_weight is None:
+            raise RuntimeError("K3 gate/up weights were not fused after loading")
+        from dlengine.kernel.cutedsl_bf16_gemm import blackwell_bf16_linear
+
+        gate_up = blackwell_bf16_linear(x, self.fused_gate_up_weight)
+        return self.down_proj(self.act(gate_up))
 
 
 class KimiMLAAttention(DeepseekV2Attention):
@@ -58,7 +71,11 @@ class KimiMLAAttention(DeepseekV2Attention):
         def gated_o_proj(x, *args, **kwargs):
             gate_input, self._gate_input = self._gate_input, None
             if gate_input is not None:
-                x = x * torch.sigmoid(self.g_proj(gate_input))
+                from dlengine.kernel.triton.generic.sigmoid_mul import (
+                    sigmoid_mul_triton,
+                )
+
+                x = sigmoid_mul_triton(x, self.g_proj(gate_input))
             return inner(x, *args, **kwargs)
 
         self.o_proj.forward = gated_o_proj
@@ -77,7 +94,7 @@ class AttentionResidual:
     def _combined_score_weight(proj, norm):
         cached = getattr(proj, "_k3_residual_score_weight", None)
         if cached is None:
-            cached = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+            cached = (norm.weight.float() * proj.weight.squeeze().float()).to(norm.weight.dtype).contiguous()
             proj._k3_residual_score_weight = cached
         return cached
 
@@ -93,26 +110,31 @@ class AttentionResidual:
                 prefix = F.pad(prefix, (0, 0, 0, delta.shape[0] - prefix.shape[0]))
         prefix = delta if prefix is None else prefix + delta
         if self.valid:
-            from dlengine.kernel.triton.kimi_k3 import fused_attention_residual
+            from dlengine.kernel.jit.sgl.attn_res import (
+                fused_attention_residual_tma,
+            )
 
-            prefix_out = fused_attention_residual(
+            output = fused_attention_residual_tma(
                 prefix,
                 bank,
                 self.valid,
                 self._combined_score_weight(proj, score_norm),
+                out_norm.weight,
                 score_norm.eps,
+                write_prefix=write and rows is None,
             )
         else:
-            prefix_out = prefix
+            output = out_norm(prefix)
         if write:
-            if rows is None:
-                self.bank[:, self.valid].copy_(prefix)
-            else:
-                target = self.bank[rows, self.valid]
-                if target.shape[0]:
-                    target.copy_(prefix[: target.shape[0]])
+            if self.valid == 0 or rows is not None:
+                if rows is None:
+                    self.bank[:, self.valid].copy_(prefix)
+                else:
+                    target = self.bank[rows, self.valid]
+                    if target.shape[0]:
+                        target.copy_(prefix[: target.shape[0]])
             self.valid += 1
-        return out_norm(prefix_out), prefix
+        return output, prefix
 
 
 class KimiMoE(nn.Module):
@@ -168,14 +190,17 @@ class KimiMoE(nn.Module):
     def forward(self, x: torch.Tensor, prefix: Optional[torch.Tensor] = None):
         if self.fused_front_weight is None:
             raise RuntimeError("K3 fused MoE front was not prepared after weight loading")
-        front = torch.mm(x, self.fused_front_weight.t(), out_dtype=torch.float32)
-        scores = torch.sigmoid(front[:, : self.num_experts])
-        choice = scores + self.e_score_correction_bias
-        ids = torch.topk(choice, self.top_k, dim=-1, sorted=False).indices
-        weights = scores.gather(1, ids)
-        if getattr(self.experts, "routed_scaling_factor", 1.0) == 1.0:
-            weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
-        latent = front[:, self.num_experts :].to(x.dtype)
+        from dlengine.kernel.jit.sgl.moe_front import fused_front
+
+        renormalize = getattr(self.experts, "routed_scaling_factor", 1.0) == 1.0
+        weights, ids, latent = fused_front(
+            x,
+            self.fused_front_weight,
+            self.e_score_correction_bias,
+            self.latent,
+            self.top_k,
+            renormalize,
+        )
 
         shared = None
         shared_event = None
@@ -195,6 +220,11 @@ class KimiMoE(nn.Module):
         routed = self.routed_expert_up_proj(self.routed_expert_norm(routed))
         if shared_event is not None:
             torch.cuda.current_stream(x.device).wait_event(shared_event)
+        if prefix is not None:
+            from dlengine.kernel.jit.sgl.add3 import add3, covered
+
+            if covered(routed, shared, prefix):
+                return add3(routed, shared, prefix)
         out = routed + shared
         return out if prefix is None else out + prefix
 

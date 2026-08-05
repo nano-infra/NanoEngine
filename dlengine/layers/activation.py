@@ -107,14 +107,6 @@ class SituAndMul(nn.Module):
         self.linear_beta = None if linear_beta is None else float(linear_beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = x.chunk(2, dim=-1)
-        gate_f = gate.float()
-        up_f = up.float()
-        gate_f = (
-            self.beta
-            * torch.tanh(gate_f / self.beta)
-            * torch.sigmoid(gate_f)
-        )
-        if self.linear_beta is not None:
-            up_f = self.linear_beta * torch.tanh(up_f / self.linear_beta)
-        return (gate_f * up_f).to(x.dtype)
+        from dlengine.kernel.triton.generic.situ import situ_and_mul_triton
+
+        return situ_and_mul_triton(x, self.beta, self.linear_beta)

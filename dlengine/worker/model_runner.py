@@ -450,7 +450,6 @@ class ModelRunner:
             )
 
         dist.barrier()
-
         self.weight_context = WeightContext()
         self.weight_update_engine = WeightUpdateEngine(self.model, self.weight_context)
         self.sampler = Sampler()

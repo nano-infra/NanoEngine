@@ -31,6 +31,7 @@ class BatchContext(BaseContext):
     gdn_conv_states: torch.Tensor | None = None
     gdn_recurrent_states: torch.Tensor | None = None
     gdn_state_slots: torch.Tensor | None = None
+    gdn_state_slots_i32: torch.Tensor | None = None
     dsv4_state_slots: torch.Tensor | None = None
     dsv4_compressed_block_tables: dict[int, torch.Tensor] | None = None
     hisparse_slots: torch.Tensor | None = None
@@ -90,6 +91,13 @@ def set_batch_context(
     decode_page_plan_key: tuple[int, ...] | None = None,
 ) -> BatchContext:
     global _CONTEXT
+    gdn_state_slots_i32 = None
+    if gdn_state_slots is not None:
+        gdn_state_slots_i32 = (
+            gdn_state_slots
+            if gdn_state_slots.dtype == torch.int32
+            else gdn_state_slots.to(torch.int32)
+        )
     _CONTEXT = BatchContext(
         is_prefill=is_prefill,
         max_bs=max_bs,
@@ -110,6 +118,7 @@ def set_batch_context(
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,
+        gdn_state_slots_i32=gdn_state_slots_i32,
         dsv4_state_slots=dsv4_state_slots,
         dsv4_compressed_block_tables=dsv4_compressed_block_tables,
         hisparse_slots=hisparse_slots,

@@ -108,12 +108,17 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    cuda_arch_define = f"-DSGL_CUDA_ARCH={major * 100 + minor * 10}"
+
     return load_inline(
         "dlengine_sgl_jit_" + "_".join(str(arg) for arg in args),
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
+        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS
+        + [cuda_arch_define]
+        + extra_cuda_cflags,
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
@@ -135,7 +140,6 @@ def cache_once(fn: F) -> F:
         return result_map[key]
 
     return wrapper  # type: ignore[return-value]
-
 
 @cache_once
 def is_arch_support_pdl() -> bool:

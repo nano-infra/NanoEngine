@@ -131,7 +131,7 @@ class DecodeGraphRunner:
         if cache_ctx.gdn_conv_states is not None:
             self._dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
             self._gdn_state_slots = torch.full(
-                (max_bs,), self._dummy_gdn_slot, dtype=torch.int64
+                (max_bs,), self._dummy_gdn_slot, dtype=torch.int32
             )
 
         # DSv4 compressor state slots (parallel to gdn_state_slots)
@@ -576,7 +576,7 @@ class LazyVerifyGraphRunner:
         if cache_ctx.gdn_conv_states is not None:
             self._dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
             self._gdn_state_slots = torch.full(
-                (max_bs,), self._dummy_gdn_slot, dtype=torch.int64
+                (max_bs,), self._dummy_gdn_slot, dtype=torch.int32
             )
 
         self._is_mla = is_mla
