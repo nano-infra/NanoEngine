@@ -88,7 +88,7 @@ class InputPreparer:
                     s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
                     for s in aux.state_slots
                 ],
-                dtype=torch.int64,
+                dtype=torch.int32,
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
@@ -136,7 +136,7 @@ class InputPreparer:
                     for j in range(n):
                         rows[state_slot][j] = seq_ids[j]
                 built[ratio] = torch.tensor(
-                    rows, dtype=torch.int32, pin_memory=True
+                    rows, dtype=torch.int64, pin_memory=True
                 ).cuda(non_blocking=True)
             if built:
                 dsv4_compressed_block_tables = built
@@ -280,7 +280,7 @@ class InputPreparer:
                     s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
                     for s in aux.state_slots
                 ],
-                dtype=torch.int64,
+                dtype=torch.int32,
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
@@ -319,7 +319,7 @@ class InputPreparer:
                     for j in range(n):
                         rows[state_slot][j] = seq_ids[j]
                 built[ratio] = torch.tensor(
-                    rows, dtype=torch.int32, pin_memory=True
+                    rows, dtype=torch.int64, pin_memory=True
                 ).cuda(non_blocking=True)
             if built:
                 dsv4_compressed_block_tables = built

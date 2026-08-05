@@ -288,10 +288,6 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
             group_size=32,
             use_fp4_acts=False,
         )
-        if num_tokens < self.max_tokens_per_rank:
-            buf.topk_idx[num_tokens:].fill_(-1)
-            buf.topk_weights[num_tokens:].zero_()
-
         output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         deep_gemm.fp8_fp4_mega_moe(
             output,

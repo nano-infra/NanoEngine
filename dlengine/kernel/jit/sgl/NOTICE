@@ -4,6 +4,14 @@ project, licensed under the Apache License, Version 2.0.
   Upstream:   https://github.com/sgl-project/sglang
   Source:     python/sglang/jit_kernel/  (utils.py, deepseek_v4.py)
               python/sglang/jit_kernel/csrc/deepseek_v4/ (rope.cuh, rmsnorm.cuh)
+              python/sglang/kernels/jit/csrc/distributed/
+              python/sglang/kernels/jit/csrc/kimi_k3/attn_res/
+              python/sglang/kernels/jit/csrc/kimi_k3/comm/
+              python/sglang/kernels/ops/kimi_k3/sp_collective.py
+              python/sglang/kernels/ops/kimi_k3/configs/sp_collective/
+              python/sglang/kernels/jit/csrc/moe/
+              python/sglang/kernels/jit/csrc/gemm/tiny_gemm.cuh
+              python/sglang/kernels/jit/csrc/elementwise/add3.cuh
               python/sglang/jit_kernel/include/sgl_kernel/ (headers)
   Authors:    SGLang contributors
 
@@ -12,5 +20,8 @@ Modifications by DLEngine:
                      vendored layout.
   - deepseek_v4.py:  reduced to ``fused_rope`` and ``rmsnorm_self`` only;
                      references to ``sglang.srt.debug_utils`` removed.
+  - attn_res.py, moe_front.py, tiny_gemm.py, add3.py, communicator.py, and
+    sp_collective.py: wrappers adapted to the NanoDeploy tensor layouts,
+    distributed context, and JIT loader.
 
 The full Apache-2.0 license text is in the sibling LICENSE file.

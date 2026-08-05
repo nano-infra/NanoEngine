@@ -19,10 +19,9 @@ class SigmoidRMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + self.eps)
-        return (xf.to(dtype) * self.weight * torch.sigmoid(gate.float()).to(dtype))
+        from dlengine.kernel.triton.generic.k3_output_norm import k3_output_norm
+
+        return k3_output_norm(x, gate, self.weight, self.eps)
 
 
 class FlashInferKDA(GenericGatedDeltaNet):
@@ -118,37 +117,103 @@ class FlashInferKDA(GenericGatedDeltaNet):
             self.head_v_dim, float(config.rms_norm_eps)
         )
         self._conv1d_prefill_padded_ws = None
+        self.register_buffer("fused_a_beta_weight", None, persistent=False)
+        self.register_buffer("fused_qkvg_weight", None, persistent=False)
+
+    def prepare_fused_decode_projections(self) -> None:
+        qkvg = torch.cat((
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight,
+            self.g_proj.weight,
+        ), dim=0).contiguous()
+        offset = 0
+        for proj, size in ((self.q_proj, self.key_dim), (self.k_proj, self.key_dim), (self.v_proj, self.value_dim), (self.g_proj, self.key_dim)):
+            proj.weight.data = qkvg[offset : offset + size]
+            offset += size
+        self.fused_qkvg_weight = qkvg
+
+        width = self.head_k_dim + self.num_v_heads
+        padded = (width + 15) // 16 * 16
+        weight = self.f_a_proj.weight.new_zeros((padded, self.hidden_size))
+        weight[: self.head_k_dim].copy_(self.f_a_proj.weight)
+        weight[self.head_k_dim : width].copy_(self.b_proj.weight)
+        self.fused_a_beta_weight = weight
+        self.f_a_proj.weight.data = weight[: self.head_k_dim]
+        self.b_proj.weight.data = weight[self.head_k_dim : width]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_batch_context()
         total_tokens = hidden_states.shape[0]
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        gate = self.g_proj(hidden_states)
-        beta = self.b_proj(hidden_states)
-        forget = self.f_b_proj(self.f_a_proj(hidden_states))
+        if context.is_prefill:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+            gate = self.g_proj(hidden_states)
+            beta = self.b_proj(hidden_states)
+            forget = self.f_b_proj(self.f_a_proj(hidden_states))
+        else:
+            if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
+                raise RuntimeError("K3 decode projection weights were not fused after loading")
+            from dlengine.kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm
+            from dlengine.kernel.jit.sgl.tiny_gemm import (
+                tiny_k_gemm_bf16,
+                tiny_n_gemm_bf16,
+            )
+
+            qkvg = cutedsl_bf16_gemm(hidden_states, self.fused_qkvg_weight.detach())
+            q, k, v, gate = qkvg.split(
+                (self.key_dim, self.key_dim, self.value_dim, self.key_dim), dim=-1
+            )
+            mixed_qkv = qkvg[:, : self.conv_dim]
+            fused_a_beta = tiny_n_gemm_bf16(
+                hidden_states, self.fused_a_beta_weight, max_m=8
+            )
+            beta = fused_a_beta[
+                :, self.head_k_dim : self.head_k_dim + self.num_v_heads
+            ]
+            forget = tiny_k_gemm_bf16(
+                fused_a_beta[:, : self.head_k_dim],
+                self.f_b_proj.weight,
+                max_m=8,
+            )
+
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
-        qkv = self._apply_conv1d(torch.cat((q, k, v), dim=-1), context)
+        if context.is_prefill:
+            mixed_qkv = torch.cat((q, k, v), dim=-1)
+        if context.is_prefill:
+            qkv = self._apply_conv1d(mixed_qkv, context)
+        else:
+            from dlengine.kernel.triton.generic.k3_causal_conv import (
+                k3_causal_conv_update,
+            )
+
+            conv_pool = context.gdn_conv_states[self.layer_idx]
+            qkv = k3_causal_conv_update(
+                mixed_qkv,
+                conv_pool,
+                self.conv1d.weight.squeeze(1),
+                context.gdn_state_slots_i32[:total_tokens],
+            )
         q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
         q = q.view(total_tokens, self.num_k_heads, self.head_k_dim)
         k = k.view(total_tokens, self.num_k_heads, self.head_k_dim)
         v = v.view(total_tokens, self.num_v_heads, self.head_v_dim)
         raw_g = forget.view(total_tokens, self.num_v_heads, self.head_k_dim)
         beta_logits = beta.view(total_tokens, self.num_v_heads)
-        beta = beta.float().sigmoid().view(total_tokens, self.num_v_heads)
 
         states = context.gdn_recurrent_states
-        slots = context.gdn_state_slots
+        slots = context.gdn_state_slots_i32
         if states is None or slots is None:
             raise RuntimeError("K3 KDA requires allocated linear-attention state slots")
         pool = states[self.layer_idx]
         if context.is_prefill:
+            beta = beta_logits.float().sigmoid()
             cu = context.cu_seqlens_q.to(torch.int32)
             batch = cu.numel() - 1
-            indices = slots[:batch].to(torch.int32)
+            indices = slots[:batch]
             # FlashInfer recurrent_kda is decode-only in this release. K3's
             # safe gate is handled by Triton chunk_kda (the Blackwell CuTe
             # chunk kernel does not support lower_bound yet).
@@ -169,7 +234,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             out = out.squeeze(0)
         else:
             batch = total_tokens
-            indices = slots[:batch].to(torch.int32)
+            indices = slots[:batch]
             from dlengine.kernel.triton.fla.fused_recurrent import (
                 fused_recurrent_kda_packed_decode,
             )
@@ -178,11 +243,9 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 device=q.device, dtype=q.dtype,
             )
             fused_recurrent_kda_packed_decode(
-                mixed_qkv=torch.cat(
-                    (q.flatten(1), k.flatten(1), v.flatten(1)), dim=-1
-                ).contiguous(),
+                mixed_qkv=qkv,
                 a=raw_g.flatten(1).contiguous(),
-                b=beta_logits.contiguous(),
+                b=beta_logits,
                 A_log=self.A_log.reshape(-1).float().contiguous(),
                 dt_bias=self.dt_bias.reshape(-1).float().contiguous(),
                 scale=self.head_k_dim ** -0.5,

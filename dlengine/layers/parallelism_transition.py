@@ -35,9 +35,14 @@ class AttnToFfnTransition(nn.Module):
     When attn_tp <= 1 the layer is a no-op.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, use_k3_sp: bool = False) -> None:
         super().__init__()
         self._original_bs: int = 0
+        self._k3_sp = None
+        if use_k3_sp and torch.cuda.is_available():
+            from dlengine.kernel.jit.sgl.communicator import get_k3_sp_communicator
+
+            self._k3_sp = get_k3_sp_communicator()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_dist_context()
@@ -78,7 +83,29 @@ class AttnToFfnTransition(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        dist.reduce_scatter_tensor(output, hidden_states.contiguous(), group=ctx.attn_tp_group)
+        if self._k3_sp is not None:
+            from dlengine.kernel.jit.sgl import sp_collective
+
+            dispatch = sp_collective.get_dispatch(
+                "reduce_scatter",
+                src_tp,
+                hidden_states.shape[-1],
+                hidden_states.shape[0],
+                hidden_states.device,
+            )
+            if dispatch is not None and dispatch.strategy == "push":
+                sp_collective.register_comm(
+                    self._k3_sp.obj, pull_sem_mc_ptr=self._k3_sp.pull_sem_mc_ptr
+                )
+                return sp_collective.reduce_scatter_res(
+                    src_tp,
+                    hidden_states.contiguous(),
+                    output,
+                    tuning=dispatch.tuning,
+                )
+        dist.reduce_scatter_tensor(
+            output, hidden_states.contiguous(), group=ctx.attn_tp_group
+        )
         return output
 
     def local_rows(self, hidden_states: torch.Tensor) -> slice:
@@ -91,6 +118,7 @@ class AttnToFfnTransition(nn.Module):
         shard = padded // tp
         start = ctx.attn_tp_rank * shard
         return slice(start, min(start + shard, hidden_states.shape[0]))
+
 
 class FfnToAttnTransition(nn.Module):
     """Gather transition: FFN → Attention.
@@ -108,15 +136,58 @@ class FfnToAttnTransition(nn.Module):
     def __init__(self, scatter_layer: "AttnToFfnTransition | None" = None) -> None:
         super().__init__()
         self._scatter_layer = scatter_layer
+        self._k3_sp = scatter_layer._k3_sp if scatter_layer is not None else None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_dist_context()
         dst_tp = ctx.attn_tp_world_size
         if dst_tp <= 1:
             return hidden_states
-        gathered = [torch.empty_like(hidden_states) for _ in range(dst_tp)]
-        dist.all_gather(gathered, hidden_states, group=ctx.attn_tp_group)
-        out = torch.cat(gathered, dim=0)
+        out = torch.empty(
+            (hidden_states.shape[0] * dst_tp, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        gathered = False
+        if self._k3_sp is not None:
+            from dlengine.kernel.jit.sgl import sp_collective
+
+            dispatch = sp_collective.get_dispatch(
+                "all_gather",
+                dst_tp,
+                hidden_states.shape[-1],
+                out.shape[0],
+                hidden_states.device,
+            )
+            if dispatch is not None:
+                sp_collective.register_comm(
+                    self._k3_sp.obj, pull_sem_mc_ptr=self._k3_sp.pull_sem_mc_ptr
+                )
+                if dispatch.strategy == "push":
+                    out = sp_collective.all_gather(
+                        dst_tp,
+                        hidden_states.contiguous(),
+                        out,
+                        ws_mc_base=self._k3_sp.mc_base_ptr,
+                        tuning=dispatch.tuning,
+                    )
+                    gathered = True
+                elif dispatch.strategy == "direct":
+                    out, mc_ptr = self._k3_sp.symmetric_buffer(
+                        "sp_all_gather", out.shape[0], out.shape[1], out.dtype
+                    )
+                    out = sp_collective.all_gather_direct(
+                        dst_tp,
+                        hidden_states.contiguous(),
+                        out,
+                        output_mc_ptr=mc_ptr,
+                        tuning=dispatch.tuning,
+                    )
+                    gathered = True
+        if not gathered:
+            dist.all_gather_into_tensor(
+                out, hidden_states.contiguous(), group=ctx.attn_tp_group
+            )
 
         # Strip padding if AttnToFfnTransition padded the batch
         if self._scatter_layer is not None and self._scatter_layer._original_bs > 0:

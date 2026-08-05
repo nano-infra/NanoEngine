@@ -24,6 +24,7 @@ def _rms_norm_gated_kernel(
     hidden_size,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    GATE_SWISH: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
@@ -39,7 +40,10 @@ def _rms_norm_gated_kernel(
     gate = tl.load(
         gate_ptr + row_idx * stride_gate_row + cols, mask=mask, other=0.0
     ).to(tl.float32)
-    gate = gate * tl.sigmoid(gate)
+    if GATE_SWISH:
+        gate = gate * tl.sigmoid(gate)
+    else:
+        gate = tl.sigmoid(gate)
 
     out = x * inv_rms * weight * gate
     tl.store(out_ptr + row_idx * stride_out_row + cols, out, mask=mask)
@@ -114,7 +118,57 @@ def rms_norm_gated_triton(
         hidden_size,
         eps,
         BLOCK_SIZE=block_size,
+        GATE_SWISH=True,
         num_warps=num_warps,
+        num_stages=4,
+    )
+    return out.reshape_as(x)
+
+
+def sigmoid_rms_norm_gated_triton(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """K3 output norm: RMSNorm(x) * weight * sigmoid(gate)."""
+    if not x.is_cuda or not gate.is_cuda or not weight.is_cuda:
+        raise RuntimeError("sigmoid gated RMSNorm requires CUDA tensors")
+    if x.device != gate.device or x.device != weight.device:
+        raise ValueError("x, gate, and weight must be on the same device")
+    if x.shape != gate.shape:
+        raise ValueError(
+            f"x and gate must have identical shapes, got {x.shape} and {gate.shape}"
+        )
+    hidden_size = x.shape[-1]
+    if hidden_size != weight.numel():
+        raise ValueError(
+            f"weight must contain {hidden_size} elements, got {weight.numel()}"
+        )
+    if hidden_size > MAX_FUSED_HIDDEN_SIZE:
+        raise ValueError(
+            f"hidden size {hidden_size} exceeds fused limit {MAX_FUSED_HIDDEN_SIZE}"
+        )
+    if x.numel() == 0:
+        return torch.empty_like(x)
+
+    x_2d = x.contiguous().reshape(-1, hidden_size)
+    gate_2d = gate.contiguous().reshape(-1, hidden_size)
+    weight_1d = weight.contiguous().reshape(-1)
+    out = torch.empty_like(x_2d)
+    _rms_norm_gated_kernel[(x_2d.shape[0],)](
+        x_2d,
+        gate_2d,
+        weight_1d,
+        out,
+        x_2d.stride(0),
+        gate_2d.stride(0),
+        out.stride(0),
+        hidden_size,
+        eps,
+        BLOCK_SIZE=_next_power_of_2(hidden_size),
+        GATE_SWISH=False,
+        num_warps=_num_warps(hidden_size),
         num_stages=4,
     )
     return out.reshape_as(x)

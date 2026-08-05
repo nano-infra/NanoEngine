@@ -24,6 +24,13 @@ from dlengine.layers.base_backend import (
 from dlengine.models.quant_config import QuantizationConfig
 
 
+def _bf16_linear(x, weight, bias=None):
+    # Capability- and shape-gated: Hopper and unsupported shapes retain PyTorch.
+    from dlengine.kernel.cutedsl_bf16_gemm import blackwell_bf16_linear
+
+    return blackwell_bf16_linear(x, weight, bias)
+
+
 def _divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
@@ -178,7 +185,7 @@ class HopperReplicatedLinear(_HopperLinearMixin, ReplicatedLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
-            return F.linear(x, self.weight, self.bias)
+            return _bf16_linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             return self._fp8_forward(x)
         else:
@@ -234,7 +241,7 @@ class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
-            return F.linear(x, self.weight, self.bias)
+            return _bf16_linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             return self._fp8_forward(x)
         else:
@@ -306,7 +313,7 @@ class HopperMergedColumnParallelLinear(
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
-            return F.linear(x, self.weight, self.bias)
+            return _bf16_linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             return self._fp8_forward(x)
         else:
@@ -388,7 +395,7 @@ class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
-            return F.linear(x, self.weight, self.bias)
+            return _bf16_linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             return self._fp8_forward(x)
         else:
@@ -444,7 +451,7 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.quantization_config.quant_method:
-            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+            y = _bf16_linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
             if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
                 dist.all_reduce(y, group=self._tp_group)
             return y
