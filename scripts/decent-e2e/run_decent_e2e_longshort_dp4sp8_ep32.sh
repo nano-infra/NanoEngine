@@ -17,7 +17,7 @@ VALIDATE_RUN_PY="$SCRIPT_DIR/validate_run.py"
 RAY_ADDR="${RAY_ADDR:-10.102.234.33:7789}"
 MASTER_ADDR="${MASTER_ADDR:-10.102.234.33:27799}"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/chenjiefei/models/deepseek-v3}"
+MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3}"
 ISSUE001_DATASET="${ISSUE001_DATASET:-/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv}"
 ISSUE005_DATASET="${ISSUE005_DATASET:-/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv}"
 
@@ -196,6 +196,10 @@ write_effective_config() {
     printf "cuda_graph_mode\t%s\n" "$CUDA_GRAPH_MODE"
     printf "worker_transport\t%s\n" "$NANODEPLOY_HIER_WORKER_TRANSPORT"
     printf "slime_qp_num\t%s\n" "$SLIME_QP_NUM"
+    printf "deepep_sms\t%s\n" "$DEEPEP_SMS"
+    printf "deepep_max_tokens_per_rank\t%s\n" "$DEEPEP_MAX_TOKENS_PER_RANK"
+    printf "deepep_enable_mnnvl\t%s\n" "$DEEPEP_ENABLE_MNNVL"
+    printf "deepep_mode\t%s\n" "$DEEPEP_MODE"
     printf "diagnostic_log_interval\t%s\n" "$DIAGNOSTIC_LOG_INTERVAL"
     printf "slow_add_threshold_ms\t%s\n" "$SLOW_ADD_THRESHOLD_MS"
 }
@@ -209,8 +213,10 @@ record_summary() {
 print_command() {
     local stage_log_dir="$1"
     shift
-    printf "SLIME_QP_NUM=%q NANODEPLOY_HIER_WORKER_TRANSPORT=%q BASE_LOG_DIR=%q " \
-        "$SLIME_QP_NUM" "$NANODEPLOY_HIER_WORKER_TRANSPORT" "$stage_log_dir"
+    printf "SLIME_QP_NUM=%q DEEPEP_SMS=%q DEEPEP_MAX_TOKENS_PER_RANK=%q DEEPEP_ENABLE_MNNVL=%q DEEPEP_MODE=%q NANODEPLOY_HIER_WORKER_TRANSPORT=%q BASE_LOG_DIR=%q " \
+        "$SLIME_QP_NUM" "$DEEPEP_SMS" "$DEEPEP_MAX_TOKENS_PER_RANK" \
+        "$DEEPEP_ENABLE_MNNVL" "$DEEPEP_MODE" \
+        "$NANODEPLOY_HIER_WORKER_TRANSPORT" "$stage_log_dir"
     printf "%q " "$@"
     printf "\n"
 }
@@ -435,6 +441,10 @@ esac
 # July RayExecutor to all ModelRunner actors.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 export SLIME_QP_NUM=4
+export DEEPEP_SMS="${DEEPEP_SMS:-16}"
+export DEEPEP_MAX_TOKENS_PER_RANK="${DEEPEP_MAX_TOKENS_PER_RANK:-$BATCH_SIZE}"
+export DEEPEP_ENABLE_MNNVL="${DEEPEP_ENABLE_MNNVL:-0}"
+export DEEPEP_MODE=auto
 export NANODEPLOY_HIER_RESULT_FASTPATH=0
 export NANODEPLOY_LOG_DECODE_STEP_DETAIL=0
 export PYTHONUNBUFFERED=1
@@ -489,7 +499,7 @@ log "TOPOLOGY=DP${DP_SIZE}xSP${SP_SIZE}xTP${TP_SIZE}=EP${EP_SIZE} (4 nodes x 8 G
 log "WORKLOAD=duration:${DURATION_SECONDS}s batch:${BATCH_SIZE} max_model:${MAX_MODEL_LEN} max_input:${MAX_INPUT_LEN} max_request:${MAX_REQUEST_TOKENS}"
 log "ENGINE=max_batched_tokens:${MAX_NUM_BATCHED_TOKENS} kv_block:${KV_CACHE_BLOCK_SIZE} max_recv:${MAX_NUM_RECV_SEQS} loop:${LOOP_COUNT}"
 log "POLICY=hierarchical/${ROUTER_POLICY} routing:${ROUTING_STRATEGY} sp_master:${SP_MASTER_SELECTOR} dynamic:long_short_sp8 threshold:${LONG_REQUEST_SP_THRESHOLD} long_sp:${LONG_REQUEST_SP_SIZE}"
-log "BACKEND=${SP_BACKEND}/${CUDA_GRAPH_MODE} worker_transport:${NANODEPLOY_HIER_WORKER_TRANSPORT} SLIME_QP_NUM:${SLIME_QP_NUM}"
+log "BACKEND=${SP_BACKEND}/${CUDA_GRAPH_MODE} worker_transport:${NANODEPLOY_HIER_WORKER_TRANSPORT} SLIME_QP_NUM:${SLIME_QP_NUM} DEEPEP_SMS:${DEEPEP_SMS} DEEPEP_MAX_TOKENS_PER_RANK:${DEEPEP_MAX_TOKENS_PER_RANK} DEEPEP_ENABLE_MNNVL:${DEEPEP_ENABLE_MNNVL} DEEPEP_MODE:${DEEPEP_MODE}"
 log "DATASETS=${DATASET_KEYS[*]} ISSUE001_RATES=${ISSUE001_RATES} ISSUE005_RATES=${ISSUE005_RATES} TOTAL_RUNS=$TOTAL_RUNS"
 log "DRY_RUN=$DRY_RUN RESUME=$RESUME FORCE_RERUN=$FORCE_RERUN CONTINUE_ON_ERROR=$CONTINUE_ON_ERROR MAX_RETRIES=$MAX_RETRIES"
 

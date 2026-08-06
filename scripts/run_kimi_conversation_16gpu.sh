@@ -12,7 +12,7 @@ START_BENCH_SH="$ROOT_DIR/scripts/issue003/start_bench.sh"
 RAY_ADDR="${RAY_ADDR:-10.102.97.33:7799}"
 MASTER_ADDR="${MASTER_ADDR:-10.102.97.33:29500}"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/models/models--moonshotai--Kimi-K2-Instruct-0905/snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73}"
+MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/Kimi-K2-Instruct-0905}"
 DATASET_PATH="${DATASET_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/kimi/processed_conversation.csv}"
 
 SEG="${SEG:-65536}"
@@ -54,6 +54,15 @@ CHAIN_SUMMARY="$CHAIN_LOG_DIR/chain_summary.tsv"
 LOG_SEARCH_ROOT="${LOG_SEARCH_ROOT:-$(dirname "$CHAIN_LOG_DIR")}"
 RESUME_SKIP_SUCCESS="${RESUME_SKIP_SUCCESS:-1}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
+
+# Decode-only DeepEP settings. Ray traffic must bypass HTTP proxies, and these
+# values are propagated to every ModelRunner actor by RayExecutor.
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+export SLIME_QP_NUM=4
+export DEEPEP_SMS="${DEEPEP_SMS:-16}"
+export DEEPEP_MAX_TOKENS_PER_RANK="${DEEPEP_MAX_TOKENS_PER_RANK:-$BATCH_SIZE}"
+export DEEPEP_ENABLE_MNNVL="${DEEPEP_ENABLE_MNNVL:-0}"
+export DEEPEP_MODE=auto
 
 mkdir -p "$CHAIN_LOG_DIR"
 
@@ -512,6 +521,7 @@ main() {
     log "MODEL=$MODEL_PATH"
     log "DATASET=$DATASET_PATH"
     log "BATCH_SIZE=$BATCH_SIZE GPU_UTIL=$GPU_UTIL GPU_MEM=$GPU_MEM LOOP_COUNT=$LOOP_COUNT ENFORCE_EAGER=$ENFORCE_EAGER"
+    log "DECODE_BACKEND=SLIME_QP_NUM:$SLIME_QP_NUM DEEPEP_SMS:$DEEPEP_SMS DEEPEP_MAX_TOKENS_PER_RANK:$DEEPEP_MAX_TOKENS_PER_RANK DEEPEP_ENABLE_MNNVL:$DEEPEP_ENABLE_MNNVL DEEPEP_MODE:$DEEPEP_MODE"
     log "DP2SP8=dynamic_sp:$DP2SP8_ENABLE_DYNAMIC_SP_SIZE strategy:$DP2SP8_DYNAMIC_SP_SIZE_STRATEGY thresholds:${DP2SP8_LONG_REQUEST_SP_THRESHOLDS}"
     log "DP16=dynamic_sp:$DP16_ENABLE_DYNAMIC_SP_SIZE strategy:$DP16_DYNAMIC_SP_SIZE_STRATEGY threshold:$DP16_LONG_REQUEST_SP_THRESHOLD"
     log "RATES=start:$STEP10_START_RATE step:$STEP10_STEP_RATE max:$STEP10_MAX_RATE | STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"

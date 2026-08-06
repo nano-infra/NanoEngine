@@ -1,7 +1,7 @@
 # NanoDeploy decode-only 后端升级方案
 
 日期：2026-08-06
-状态：待实施
+状态：已实施（CPU 回归通过，GPU 验证待执行）
 目标版本：dlBLAS v0.0.7、DeepGEMM v2.1.1.post3、DeepEP v1.2.1
 
 ## 1. 目标与固定前提
@@ -183,15 +183,15 @@ CUDA Graph 捕获前也不额外清理。初始 buffer 是干净的，连续 low
 ```python
 if self._deepep_enabled and not self._deepep_destroyed:
     destroyed = DeepEPBuffer.destroy()
-    if not destroyed:
-        raise RuntimeError("DeepEP buffer was not explicitly destroyed")
     self._deepep_destroyed = True
     dist.barrier(group=get_dist_context().cuda_world_group)
 
 dist.destroy_process_group()
 ```
 
-要求销毁逻辑幂等，避免正常退出路径被重复调用时二次销毁 runtime。
+要求销毁逻辑幂等，避免正常退出路径被重复调用时二次销毁 runtime。若 actor
+尚未执行首个 MoE forward，dlBLAS 不会创建 shared buffer，此时 `destroy()` 返回
+`False` 是正常的“无 runtime 可销毁”，不应把无请求的正常退出误报为失败。
 
 硬 `ray.kill()` 或进程崩溃无法保证执行 Python 清理；显式销毁主要覆盖正常 shutdown 和可控异常退出路径。
 
