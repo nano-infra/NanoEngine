@@ -48,6 +48,25 @@ def main():
     parser.add_argument("--sp", type=int, default=8)
     parser.add_argument("--ep", type=int, default=8)
     parser.add_argument(
+        "--sp-backend",
+        type=str,
+        default="legacy_ll",
+        choices=["legacy_ll", "hao_basic", "nccl", "nccl_compact"],
+    )
+    parser.add_argument(
+        "--sp-size-policy",
+        type=str,
+        default="legacy",
+        choices=["legacy", "long_short"],
+        help=(
+            "SP-size policy. long_short uses SP=1 at or below the threshold "
+            "and the configured --sp size above it."
+        ),
+    )
+    parser.add_argument("--segment-size", type=int, default=65536)
+    parser.add_argument("--long-request-sp-threshold", type=int, default=100000)
+    parser.add_argument("--enable-non-uniform-split", action="store_true")
+    parser.add_argument(
         "--model-path",
         type=str,
         default="/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
@@ -95,6 +114,10 @@ def main():
     if loop_count is None:
         loop_count = 16 if args.scheduler_arch == "hierarchical" else 48
 
+    use_long_short = args.sp_size_policy == "long_short"
+    if use_long_short and args.sp <= 1:
+        parser.error("--sp-size-policy long_short requires --sp greater than 1")
+
     decode = LLM(
         path,
         enforce_eager=args.enforce_eager,
@@ -128,12 +151,22 @@ def main():
         routing_strategy=args.routing_strategy,
         router_policy=args.router_policy,
         hierarchical_execution_trace=args.hierarchical_execution_trace,
+        sp_backend=args.sp_backend,
+        segment_size=args.segment_size,
+        enable_dynamic_sp_size=use_long_short,
+        dynamic_sp_size_strategy=(
+            "long_short_sp8" if use_long_short else "legacy"
+        ),
+        dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
+        enable_non_uniform_split=args.enable_non_uniform_split,
     )
 
     print(
         f"Starting with scheduler_arch={args.scheduler_arch}, "
         f"routing_strategy={args.routing_strategy}, "
-        f"router_policy={args.router_policy}, loop_count={loop_count}"
+        f"router_policy={args.router_policy}, loop_count={loop_count}, "
+        f"sp_backend={args.sp_backend}, "
+        f"sp_size_policy={args.sp_size_policy}"
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)
