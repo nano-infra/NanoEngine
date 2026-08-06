@@ -1,7 +1,7 @@
 # NanoDeploy decode-only 后端升级方案
 
 日期：2026-08-06
-状态：已实施（CPU 回归通过，GPU 验证待执行）
+状态：已实施（CPU 回归和单节点 DP8/EP8 GPU smoke 通过；CUDA Graph 与生产拓扑待验证）
 目标版本：dlBLAS v0.0.7、DeepGEMM v2.1.1.post3、DeepEP v1.2.1
 
 ## 1. 目标与固定前提
