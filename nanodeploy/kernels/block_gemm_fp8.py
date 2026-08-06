@@ -142,11 +142,11 @@ def deep_gemm_fp8(
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     """Deepgemm fp8."""
-    from deep_gemm import gemm_fp8_fp8_bf16_nt
+    from deep_gemm import fp8_gemm_nt
 
     M, _ = A.shape
     N, _ = B.shape
     assert out_dtype == torch.bfloat16, "DeepGemm requires bf16 output."
     C = A.new_empty(M, N, dtype=out_dtype)
-    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
+    fp8_gemm_nt((A, A_scale), (B, B_scale), C)
     return C
