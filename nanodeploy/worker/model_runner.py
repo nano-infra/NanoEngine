@@ -36,6 +36,11 @@ from nanodeploy.worker.distributed import (
     get_local_ip,
     set_dist_context,
 )
+from nanodeploy.worker.decode_backend_compat import (
+    resolve_decode_deepep_config,
+    validate_decode_backend_compat,
+    validate_deepseek_decode_contract,
+)
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
@@ -78,6 +83,9 @@ class ModelRunner:
         self.log_decode_a2a_masks = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
         )
+        self._deepep_enabled = False
+        self._deepep_destroyed = False
+        self._exited = False
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -114,9 +122,7 @@ class ModelRunner:
         ep_size = get_dist_context().ffn_ep_world_size
 
         if ep_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 16
+            self._configure_decode_deepep(ep_size)
             dist.barrier(group=get_dist_context().cuda_world_group)
 
         if sp_size > 1:
@@ -222,6 +228,114 @@ class ModelRunner:
             32 * 32_000_000, self.engine_local_rank
         )
         self._zmq_worker_config: WorkerZmqConfig | None = None
+
+    def _configure_decode_deepep(self, ep_size: int) -> None:
+        versions: dict[str, str] = {}
+        effective = None
+        setup_error = None
+        try:
+            import deep_ep
+            from dlblas.layers.moe.token_dispatcher import DeepEPBuffer
+
+            effective = resolve_decode_deepep_config(
+                self.config.max_num_seqs
+            )
+            os.environ.update(effective.worker_env())
+            os.environ["DEEPEP_MODE"] = effective.mode
+
+            versions = validate_decode_backend_compat(self.rank)
+            validate_deepseek_decode_contract(self.config.hf_config, ep_size)
+            deep_ep.Buffer.set_num_sms(effective.num_sms)
+            if not DeepEPBuffer.set_explicitly_destroy():
+                raise RuntimeError(
+                    "could not enable explicit DeepEP destruction before "
+                    "model construction"
+                )
+        except Exception as exc:
+            setup_error = f"{type(exc).__name__}: {exc}"
+
+        local_report = {
+            "rank": self.rank,
+            "versions": versions,
+            "deepep": (
+                effective.fingerprint_payload()
+                if effective is not None
+                else None
+            ),
+            "error": setup_error,
+        }
+        reports: list[dict[str, object] | None] = [
+            None
+        ] * get_dist_context().cpu_world_size
+        dist.all_gather_object(
+            reports,
+            local_report,
+            group=get_dist_context().cpu_world_group,
+        )
+        if any(report is None for report in reports):
+            raise RuntimeError(
+                f"rank {self.rank} received an incomplete decode backend report"
+            )
+        complete_reports = [report for report in reports if report is not None]
+        failures = [
+            report
+            for report in complete_reports
+            if report["error"] is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                "decode backend compatibility failed across ranks: "
+                + "; ".join(
+                    f"rank {report['rank']}: {report['error']}"
+                    for report in failures
+                )
+            )
+        reference = {
+            "versions": complete_reports[0]["versions"],
+            "deepep": complete_reports[0]["deepep"],
+        }
+        mismatches = [
+            report
+            for report in complete_reports[1:]
+            if {
+                "versions": report["versions"],
+                "deepep": report["deepep"],
+            }
+            != reference
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "decode backend versions or DeepEP settings differ across ranks: "
+                f"{complete_reports}"
+            )
+
+        assert effective is not None
+
+        num_experts = int(
+            getattr(self.config.hf_config, "n_routed_experts", ep_size)
+        )
+        local_experts = num_experts // ep_size
+        num_qps_per_rank = max(effective.num_sms, local_experts)
+        self._deepep_enabled = True
+        self._deepep_config = effective
+        logger.info(
+            "Rank %d decode backend: dlblas=%s deep_gemm=%s deep_ep=%s "
+            "ep_size=%d local_experts=%d DEEPEP_SMS=%d "
+            "DEEPEP_MAX_TOKENS_PER_RANK=%d DEEPEP_ENABLE_MNNVL=%d "
+            "DEEPEP_MODE=%s num_qps_per_rank=%d SLIME_QP_NUM=%s",
+            self.rank,
+            versions["dlblas"],
+            versions["deep_gemm"],
+            versions["deep_ep"],
+            ep_size,
+            local_experts,
+            effective.num_sms,
+            effective.max_tokens_per_rank,
+            int(effective.enable_mnnvl),
+            effective.mode,
+            num_qps_per_rank,
+            os.getenv("SLIME_QP_NUM", "<unset>"),
+        )
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
@@ -359,13 +473,62 @@ class ModelRunner:
         return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
 
     def exit(self):
+        if self._exited:
+            return
         if not self.enforce_eager:
             if self.cuda_graph_mode == "piecewise":
-                del self.piecewise_graphs, self.piecewise_graph_vars, self.graph_pool
+                graph_attributes = (
+                    "piecewise_graphs",
+                    "piecewise_graph_vars",
+                    "graph_pool",
+                )
             else:
-                del self.local_graphs, self.sp_graphs, self.sp_graph_map, self.graph_pool
+                graph_attributes = (
+                    "local_graphs",
+                    "sp_graphs",
+                    "sp_graph_map",
+                    "graph_pool",
+                )
+            for name in graph_attributes:
+                if hasattr(self, name):
+                    delattr(self, name)
+
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        cleanup_error: BaseException | None = None
+        if self._deepep_enabled and not self._deepep_destroyed:
+            from dlblas.layers.moe.token_dispatcher import DeepEPBuffer
+
+            try:
+                destroyed = DeepEPBuffer.destroy()
+                if destroyed:
+                    logger.info("Rank %d explicitly destroyed DeepEP", self.rank)
+                else:
+                    logger.info(
+                        "Rank %d DeepEP buffer was not initialized; "
+                        "no runtime needed destruction",
+                        self.rank,
+                    )
+                self._deepep_destroyed = True
+            except BaseException as exc:
+                cleanup_error = exc
+
+        if dist.is_initialized():
+            if self._deepep_enabled:
+                try:
+                    dist.barrier(group=get_dist_context().cuda_world_group)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            try:
+                dist.destroy_process_group()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        self._exited = True
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"rank {self.rank} failed to cleanly shut down DeepEP"
+            ) from cleanup_error
 
     def warmup_model(self):
         torch.cuda.empty_cache()

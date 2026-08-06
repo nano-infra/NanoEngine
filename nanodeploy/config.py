@@ -15,6 +15,9 @@ from nanodeploy.engine.topology import (
     HierarchicalTopology,
     build_hierarchical_topology,
 )
+from nanodeploy.worker.decode_backend_compat import (
+    resolve_decode_deepep_config,
+)
 
 
 DEEPSEEK_V3_BUCKET_POLICY = (
@@ -453,6 +456,11 @@ class Config:
             "NCCL_IB_DISABLE",
             "SLIME_QP_NUM",
         )
+        deepep_config = (
+            resolve_decode_deepep_config(self.max_num_seqs)
+            if self.ffn_ep > 1
+            else None
+        )
         payload = {
             "model": os.path.realpath(self.model),
             "dtype": str(hf_dtype),
@@ -496,6 +504,11 @@ class Config:
             "communication_env": {
                 name: os.getenv(name) for name in communication_env_names
             },
+            "deepep": (
+                deepep_config.fingerprint_payload()
+                if deepep_config is not None
+                else None
+            ),
             "hierarchical_control_address": (
                 self.hierarchical_control_address
                 or f"derived-from:{self.master_address}"

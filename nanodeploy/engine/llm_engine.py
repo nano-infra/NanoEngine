@@ -128,6 +128,7 @@ class LLMEngine:
             self.deployment.close()
             return
         if self.executor is not None:
+            self.executor.shutdown()
             del self.executor
             self.executor = None
 

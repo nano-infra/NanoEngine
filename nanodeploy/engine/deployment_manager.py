@@ -36,7 +36,11 @@ from nanodeploy.engine.local_engine import LocalEngineCore
 from nanodeploy.engine.ray_executor import (
     get_available_nodes_with_master_first,
 )
+from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
+from nanodeploy.worker.decode_backend_compat import (
+    build_decode_backend_worker_env,
+)
 
 
 _PROXY_ENV_NAMES = (
@@ -48,6 +52,7 @@ _PROXY_ENV_NAMES = (
     "ALL_PROXY",
 )
 _PROXY_ENV_LOCK = threading.RLock()
+logger = get_logger()
 
 
 @contextlib.contextmanager
@@ -191,7 +196,11 @@ class DeploymentManager:
     def _runtime_env(self) -> dict[str, dict[str, str]]:
         # Actor creation happens inside _without_proxy_env(), so proxy variables
         # are absent rather than inherited with empty string values.
-        env_vars: dict[str, str] = {}
+        env_vars = (
+            build_decode_backend_worker_env(self.config.max_num_seqs)
+            if self.config.ffn_ep > 1
+            else {}
+        )
         if "SLIME_QP_NUM" in os.environ:
             env_vars["SLIME_QP_NUM"] = os.environ["SLIME_QP_NUM"]
         return {"env_vars": env_vars}
@@ -627,6 +636,21 @@ class DeploymentManager:
                         )
                     except BaseException:
                         pass
+                all_workers = [
+                    worker
+                    for workers in self.workers_by_engine.values()
+                    for worker in workers
+                ]
+                if all_workers:
+                    try:
+                        ray.get(
+                            [worker.exit.remote() for worker in all_workers],
+                            timeout=self.config.quantum_timeout_s,
+                        )
+                    except BaseException as exc:
+                        logger.warning(
+                            "Graceful ModelRunner shutdown failed: %s", exc
+                        )
                 for actor in self.engines.values():
                     try:
                         ray.kill(actor, no_restart=True)

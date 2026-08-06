@@ -15,6 +15,9 @@ from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
+from nanodeploy.worker.decode_backend_compat import (
+    build_decode_backend_worker_env,
+)
 
 
 logger = get_logger()
@@ -118,6 +121,7 @@ class RayExecutor:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.lock = threading.Lock()
+        self._closed = False
 
         # 1. 初始化 Ray 连接
         with self.lock:
@@ -127,7 +131,11 @@ class RayExecutor:
         self.placement_groups = []
         self._execution_boundary = ExecutionBoundaryRecorder()
         assert config.attn_world_size == config.ffn_world_size
-        worker_env_vars = {}
+        worker_env_vars = (
+            build_decode_backend_worker_env(config.max_num_seqs)
+            if config.ffn_ep > 1
+            else {}
+        )
         for env_name in ("SLIME_QP_NUM",):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
@@ -188,16 +196,28 @@ class RayExecutor:
 
         logger.info("All workers scheduled successfully.")
 
-    def __del__(self):
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if hasattr(self, "workers") and self.workers:
             logger.info(f"Terminating {len(self.workers)} workers...")
+            if ray.is_initialized():
+                try:
+                    self.collective_rpc(
+                        "exit", timeout=self.config.quantum_timeout_s
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Graceful ModelRunner shutdown failed: %s", exc
+                    )
             for worker in self.workers:
                 try:
                     ray.kill(worker)
                     logger.debug(f"Worker {worker} terminated successfully.")
                 except Exception as e:
                     logger.warning(f"Failed to terminate worker {worker}: {e}")
-            del self.workers
+            self.workers = []
 
         if hasattr(self, "placement_groups") and self.placement_groups:
             for pg in self.placement_groups:
@@ -205,8 +225,15 @@ class RayExecutor:
                     remove_placement_group(pg)
                 except Exception as e:
                     logger.error(f"Warning: Failed to remove Placement Group: {e}")
+            self.placement_groups = []
 
         logger.debug("Ray Executor deconstructed")
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def collective_rpc(
         self,
