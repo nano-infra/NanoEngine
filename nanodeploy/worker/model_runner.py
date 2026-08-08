@@ -41,6 +41,10 @@ from nanodeploy.worker.decode_backend_compat import (
     validate_decode_backend_compat,
     validate_deepseek_decode_contract,
 )
+from nanodeploy.worker.ep_context import (
+    destroy_ep_context,
+    set_ep_context,
+)
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
@@ -232,11 +236,9 @@ class ModelRunner:
     def _configure_decode_deepep(self, ep_size: int) -> None:
         versions: dict[str, str] = {}
         effective = None
+        buffer_settings = None
         setup_error = None
         try:
-            import deep_ep
-            from dlblas.layers.moe.token_dispatcher import DeepEPBuffer
-
             effective = resolve_decode_deepep_config(
                 self.config.max_num_seqs
             )
@@ -245,12 +247,29 @@ class ModelRunner:
 
             versions = validate_decode_backend_compat(self.rank)
             validate_deepseek_decode_contract(self.config.hf_config, ep_size)
-            deep_ep.Buffer.set_num_sms(effective.num_sms)
-            if not DeepEPBuffer.set_explicitly_destroy():
-                raise RuntimeError(
-                    "could not enable explicit DeepEP destruction before "
-                    "model construction"
+            num_experts = int(
+                getattr(self.config.hf_config, "n_routed_experts", None)
+                or getattr(self.config.hf_config, "num_experts", ep_size)
+            )
+            if num_experts <= 0 or num_experts % ep_size != 0:
+                raise ValueError(
+                    f"num_experts={num_experts} must be positive and "
+                    f"divisible by ep_size={ep_size}"
                 )
+            hidden_size = int(self.config.hf_config.hidden_size)
+            if hidden_size <= 0:
+                raise ValueError(
+                    f"hidden_size must be positive; got {hidden_size}"
+                )
+            local_experts = num_experts // ep_size
+            buffer_settings = {
+                "num_experts": num_experts,
+                "local_experts": local_experts,
+                "hidden_size": hidden_size,
+                "num_qps_per_rank": max(
+                    effective.num_sms, local_experts
+                ),
+            }
         except Exception as exc:
             setup_error = f"{type(exc).__name__}: {exc}"
 
@@ -262,6 +281,7 @@ class ModelRunner:
                 if effective is not None
                 else None
             ),
+            "buffer": buffer_settings,
             "error": setup_error,
         }
         reports: list[dict[str, object] | None] = [
@@ -293,6 +313,7 @@ class ModelRunner:
         reference = {
             "versions": complete_reports[0]["versions"],
             "deepep": complete_reports[0]["deepep"],
+            "buffer": complete_reports[0]["buffer"],
         }
         mismatches = [
             report
@@ -300,6 +321,7 @@ class ModelRunner:
             if {
                 "versions": report["versions"],
                 "deepep": report["deepep"],
+                "buffer": report["buffer"],
             }
             != reference
         ]
@@ -310,30 +332,40 @@ class ModelRunner:
             )
 
         assert effective is not None
-
-        num_experts = int(
-            getattr(self.config.hf_config, "n_routed_experts", ep_size)
+        assert buffer_settings is not None
+        ep_context = set_ep_context(
+            ep_group=get_dist_context().ffn_ep_group,
+            ep_size=ep_size,
+            num_experts=buffer_settings["num_experts"],
+            hidden_size=buffer_settings["hidden_size"],
+            max_tokens_per_rank=effective.max_tokens_per_rank,
+            num_sms=effective.num_sms,
+            allow_mnnvl=effective.enable_mnnvl,
+            nvshmem_qp_depth=effective.nvshmem_qp_depth,
         )
-        local_experts = num_experts // ep_size
-        num_qps_per_rank = max(effective.num_sms, local_experts)
         self._deepep_enabled = True
         self._deepep_config = effective
         logger.info(
-            "Rank %d decode backend: dlblas=%s deep_gemm=%s deep_ep=%s "
+            "Rank %d decode backend: deep_gemm=%s deep_ep=%s "
             "ep_size=%d local_experts=%d DEEPEP_SMS=%d "
             "DEEPEP_MAX_TOKENS_PER_RANK=%d DEEPEP_ENABLE_MNNVL=%d "
-            "DEEPEP_MODE=%s num_qps_per_rank=%d SLIME_QP_NUM=%s",
+            "DEEPEP_MODE=%s NVSHMEM_QP_DEPTH=%d num_qps_per_rank=%d "
+            "num_nvl_bytes=%d num_rdma_bytes=%d topk_idx_t=%s "
+            "SLIME_QP_NUM=%s",
             self.rank,
-            versions["dlblas"],
             versions["deep_gemm"],
             versions["deep_ep"],
             ep_size,
-            local_experts,
+            ep_context.num_local_experts,
             effective.num_sms,
             effective.max_tokens_per_rank,
             int(effective.enable_mnnvl),
             effective.mode,
-            num_qps_per_rank,
+            effective.nvshmem_qp_depth,
+            ep_context.num_qps_per_rank,
+            ep_context.num_nvl_bytes,
+            ep_context.num_rdma_bytes,
+            ep_context.topk_idx_t,
             os.getenv("SLIME_QP_NUM", "<unset>"),
         )
 
@@ -496,15 +528,13 @@ class ModelRunner:
         torch.cuda.synchronize()
         cleanup_error: BaseException | None = None
         if self._deepep_enabled and not self._deepep_destroyed:
-            from dlblas.layers.moe.token_dispatcher import DeepEPBuffer
-
             try:
-                destroyed = DeepEPBuffer.destroy()
+                destroyed = destroy_ep_context()
                 if destroyed:
                     logger.info("Rank %d explicitly destroyed DeepEP", self.rank)
                 else:
                     logger.info(
-                        "Rank %d DeepEP buffer was not initialized; "
+                        "Rank %d DeepEP buffer was already destroyed; "
                         "no runtime needed destruction",
                         self.rank,
                     )
