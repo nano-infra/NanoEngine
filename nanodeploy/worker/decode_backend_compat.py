@@ -12,24 +12,60 @@ DEEPEP_ENV_NAMES = (
     "DEEPEP_SMS",
     "DEEPEP_MAX_TOKENS_PER_RANK",
     "DEEPEP_ENABLE_MNNVL",
+    "NVSHMEM_QP_DEPTH",
 )
 
 DECODE_WORKER_PASSTHROUGH_ENV_NAMES = (
     "DG_PRINT_CONFIGS",
     "DG_JIT_DEBUG",
-    "DLBLAS_MOE_GEMM_DEBUG",
-    "DLBLAS_MOE_GEMM_DEBUG_RANKS",
-    "DLBLAS_MOE_GEMM_DEBUG_LAYERS",
-    "DLBLAS_MOE_GEMM_DEBUG_GEMMS",
-    "DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS",
-    "DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS",
+    "NANODEPLOY_MOE_GEMM_DEBUG",
+    "NANODEPLOY_MOE_GEMM_DEBUG_RANKS",
+    "NANODEPLOY_MOE_GEMM_DEBUG_LAYERS",
+    "NANODEPLOY_MOE_GEMM_DEBUG_GEMMS",
+    "NANODEPLOY_MOE_GEMM_DEBUG_MAX_CALLS",
+    "NANODEPLOY_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS",
 )
 
 EXPECTED_BACKEND_VERSIONS = {
-    "dlblas": "0.0.7",
-    "deep_gemm": "2.1.1+c9f8b34",
-    "deep_ep": "1.2.1+9af0e0d",
+    "deep_gemm": "2.3.0+477618c",
+    "deep_ep": "1.2.1+73b6ea4",
 }
+
+DEEP_GEMM_REQUIRED_SYMBOLS = (
+    "ceil_div",
+    "fp8_gemm_nt",
+    "get_m_alignment_for_contiguous_layout",
+    "get_mk_alignment_for_contiguous_layout",
+    "m_grouped_fp8_gemm_nt_contiguous",
+    "m_grouped_fp8_gemm_nt_masked",
+    "fp8_m_grouped_gemm_nt_masked",
+    "set_num_sms",
+    "transform_sf_into_required_layout",
+)
+
+DEEP_EP_REQUIRED_SYMBOLS = (
+    "Buffer",
+    "Config",
+    "EventOverlap",
+    "topk_idx_t",
+)
+
+DEEP_EP_BUFFER_REQUIRED_SYMBOLS = (
+    "set_num_sms",
+    "capture",
+    "destroy",
+    "get_low_latency_rdma_size_hint",
+    "get_dispatch_config",
+    "get_combine_config",
+    "get_dispatch_layout",
+    "dispatch",
+    "combine",
+    "clean_low_latency_buffer",
+    "low_latency_dispatch",
+    "low_latency_combine",
+)
+
+DEFAULT_NVSHMEM_QP_DEPTH = 1024
 
 
 @dataclass(frozen=True)
@@ -37,6 +73,7 @@ class DecodeDeepEPConfig:
     num_sms: int
     max_tokens_per_rank: int
     enable_mnnvl: bool
+    nvshmem_qp_depth: int
     mode: str = "auto"
 
     def worker_env(self) -> dict[str, str]:
@@ -44,6 +81,7 @@ class DecodeDeepEPConfig:
             "DEEPEP_SMS": str(self.num_sms),
             "DEEPEP_MAX_TOKENS_PER_RANK": str(self.max_tokens_per_rank),
             "DEEPEP_ENABLE_MNNVL": "1" if self.enable_mnnvl else "0",
+            "NVSHMEM_QP_DEPTH": str(self.nvshmem_qp_depth),
         }
 
     def fingerprint_payload(self) -> dict[str, str]:
@@ -55,6 +93,36 @@ def _parse_integer(name: str, raw_value: str) -> int:
         return int(raw_value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer; got {raw_value!r}") from exc
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+def _resolve_nvshmem_qp_depth(
+    max_tokens_per_rank: int, source: Mapping[str, str]
+) -> int:
+    minimum_depth = 2 * (max_tokens_per_rank + 1)
+    raw_depth = source.get("NVSHMEM_QP_DEPTH")
+    if raw_depth is None:
+        return max(
+            DEFAULT_NVSHMEM_QP_DEPTH,
+            _next_power_of_two(minimum_depth),
+        )
+
+    depth = _parse_integer("NVSHMEM_QP_DEPTH", raw_depth)
+    if depth <= 0:
+        raise ValueError(
+            f"NVSHMEM_QP_DEPTH must be a positive integer; got {depth}"
+        )
+    if depth < minimum_depth:
+        raise ValueError(
+            "NVSHMEM_QP_DEPTH must be at least "
+            "2 * (DEEPEP_MAX_TOKENS_PER_RANK + 1); "
+            f"got {depth} < {minimum_depth} for "
+            f"max_tokens_per_rank={max_tokens_per_rank}"
+        )
+    return depth
 
 
 def resolve_decode_deepep_config(
@@ -95,10 +163,14 @@ def resolve_decode_deepep_config(
             f"got {enable_mnnvl_value}"
         )
 
+    nvshmem_qp_depth = _resolve_nvshmem_qp_depth(
+        max_tokens_per_rank, source
+    )
+
     mode = source.get("DEEPEP_MODE", "auto").strip().lower()
     if mode != "auto":
         raise ValueError(
-            "decode-only dlBLAS v0.0.7 requires DEEPEP_MODE=auto; "
+            "native DeepEP decode backend requires DEEPEP_MODE=auto; "
             f"got {mode!r}"
         )
 
@@ -106,6 +178,7 @@ def resolve_decode_deepep_config(
         num_sms=num_sms,
         max_tokens_per_rank=max_tokens_per_rank,
         enable_mnnvl=bool(enable_mnnvl_value),
+        nvshmem_qp_depth=nvshmem_qp_depth,
     )
 
 
@@ -153,11 +226,7 @@ def validate_decode_backend_compat(
     ]
 
     modules: dict[str, ModuleType] = {}
-    for name in (
-        "deep_gemm",
-        "deep_ep",
-        "dlblas.layers.moe.token_dispatcher",
-    ):
+    for name in EXPECTED_BACKEND_VERSIONS:
         try:
             modules[name] = module_importer(name)
         except Exception as exc:
@@ -165,45 +234,24 @@ def validate_decode_backend_compat(
 
     deep_gemm = modules.get("deep_gemm")
     if deep_gemm is not None:
-        missing = _missing_symbols(
-            deep_gemm,
-            ("fp8_gemm_nt", "m_grouped_fp8_gemm_nt_masked"),
-        )
+        missing = _missing_symbols(deep_gemm, DEEP_GEMM_REQUIRED_SYMBOLS)
         if missing:
             errors.append(f"deep_gemm missing symbols: {', '.join(missing)}")
 
     deep_ep = modules.get("deep_ep")
     if deep_ep is not None:
+        missing = _missing_symbols(deep_ep, DEEP_EP_REQUIRED_SYMBOLS)
+        if missing:
+            errors.append(f"deep_ep missing symbols: {', '.join(missing)}")
+
         buffer_type = getattr(deep_ep, "Buffer", None)
-        if buffer_type is None:
-            errors.append("deep_ep missing symbol: Buffer")
-        else:
+        if buffer_type is not None:
             missing = _missing_symbols(
-                buffer_type,
-                (
-                    "set_num_sms",
-                    "destroy",
-                    "low_latency_dispatch",
-                    "low_latency_combine",
-                ),
+                buffer_type, DEEP_EP_BUFFER_REQUIRED_SYMBOLS
             )
             if missing:
                 errors.append(
                     f"deep_ep.Buffer missing symbols: {', '.join(missing)}"
-                )
-
-    dispatcher_module = modules.get("dlblas.layers.moe.token_dispatcher")
-    if dispatcher_module is not None:
-        buffer_type = getattr(dispatcher_module, "DeepEPBuffer", None)
-        if buffer_type is None:
-            errors.append("dlBLAS missing symbol: DeepEPBuffer")
-        else:
-            missing = _missing_symbols(
-                buffer_type, ("set_explicitly_destroy", "destroy")
-            )
-            if missing:
-                errors.append(
-                    f"dlBLAS DeepEPBuffer missing symbols: {', '.join(missing)}"
                 )
 
     if errors:
