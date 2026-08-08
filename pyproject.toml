@@ -27,7 +27,6 @@ dependencies = [
     "msgspec>=0.18.0",
     "xxhash",
     "dlslime>=0.0.1.post9",
-    "dlblas==0.0.7",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

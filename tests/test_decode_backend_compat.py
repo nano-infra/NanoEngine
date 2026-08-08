@@ -101,7 +101,7 @@ def test_backend_version_mismatch_reports_rank_and_versions(
         _validate_with(versions, _backend_modules())
 
 
-def test_backend_validation_never_imports_dlblas():
+def test_backend_validation_imports_only_native_modules():
     modules = _backend_modules()
     imported = []
 
@@ -282,23 +282,6 @@ def test_worker_env_passes_through_gemm_debug_settings():
         "NVSHMEM_QP_DEPTH": "1024",
         **environ,
     }
-
-
-def test_worker_env_does_not_pass_through_legacy_dlblas_debug_settings():
-    legacy_env = {
-        "DLBLAS_MOE_GEMM_DEBUG": "1",
-        "DLBLAS_MOE_GEMM_DEBUG_RANKS": "0,8",
-    }
-
-    worker_env = build_decode_backend_worker_env(32, legacy_env)
-
-    assert worker_env == {
-        "DEEPEP_SMS": "16",
-        "DEEPEP_MAX_TOKENS_PER_RANK": "32",
-        "DEEPEP_ENABLE_MNNVL": "0",
-        "NVSHMEM_QP_DEPTH": "1024",
-    }
-
 
 @pytest.mark.skipif(
     not (DEEPSEEK_MODEL / "config.json").is_file(),

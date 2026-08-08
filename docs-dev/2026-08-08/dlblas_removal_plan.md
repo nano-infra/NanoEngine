@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：计划完成，依赖源码已更新；NanoDeploy 尚未开始改代码、重装依赖或执行 GPU 验证
+状态：native backend 代码迁移和 CPU/mock 验证已完成；GPU 验证按用户要求留待换机后执行
 
 主路径：DeepSeek-V3 / Kimi-K2 decode（两者共用 `DeepseekV2ForCausalLM` 和
 `DeepseekV2MoE`）
@@ -24,16 +24,15 @@ DeepEP 原目录中的未跟踪旧扩展
 `stash@{0}`，说明为 `pre-73b6ea4-stale-extension`。这样不会把旧 native 扩展误当成
 新源码的构建结果。
 
-注意：这里只更新了源码 checkout。当前 Python 环境的安装元数据仍是：
+目标源码已构建为本地 wheel 并安装。当前 Python 环境的安装元数据是：
 
 ```text
-deep_ep   1.2.1+9af0e0d
-deep_gemm 2.1.1+c9f8b34
-dlblas    0.0.7
+deep_ep   1.2.1+73b6ea4
+deep_gemm 2.3.0+477618c
 ```
 
-在 NanoDeploy 代码适配完成前不重装依赖，避免新 native API 与旧 NanoDeploy/dlBLAS
-路径混用。当前构建环境满足 vLLM 参考脚本给出的 DeepGEMM CUDA 12.8+ 前提：
+两者均由 wheel 非 editable 安装；DeepEP 构建时使用
+`NVSHMEM_DIR=/sgl-workspace/nvshmem/install`。当前构建环境满足 vLLM 参考脚本给出的 DeepGEMM CUDA 12.8+ 前提：
 PyTorch 为 `2.8.0+cu128`，`nvcc` 为 12.9；现有 NVSHMEM 安装位于
 `/sgl-workspace/nvshmem/install`，host library 为 3.4.5。
 
@@ -375,6 +374,10 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 性能验收在功能/数值通过后进行，至少对比旧 dlBLAS 基线的 dispatch、gate-up GEMM、
 activation quant、down GEMM、combine 分段时间和整体 decode tok/s。
+
+截至 2026-08-08，本机只执行了版本/符号验收、Python 编译检查、shell 语法检查和
+CPU/mock pytest；未启动 CUDA kernel、Ray 实验或 benchmark。GPU 矩阵将在换机后按
+用户指示继续。
 
 ## 9. 主要风险与控制
 

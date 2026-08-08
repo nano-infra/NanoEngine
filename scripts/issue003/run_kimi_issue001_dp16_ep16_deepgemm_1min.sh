@@ -14,7 +14,6 @@ RAY_ADDR="${RAY_ADDR:-10.102.252.174:7799}"
 MASTER_ADDR="${MASTER_ADDR:-10.102.252.174:29500}"
 MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/Kimi-K2-Instruct-0905}"
 DATASET_PATH="${DATASET_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv}"
-DLBLAS_ROOT="${DLBLAS_ROOT:-/mnt/nvme1n1/ml_research/linbinbin1/dlBLAS-aug}"
 
 REQUEST_RATE="${REQUEST_RATE:-5}"
 SEND_DURATION_SEC="${SEND_DURATION_SEC:-60}"
@@ -75,7 +74,7 @@ mkdir -p "$BENCH_LOG_DIR"
 
 export PATH="/usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH:-}"
 export LD_LIBRARY_PATH="$REPO_ROOT/build/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/build/lib:$DLBLAS_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/build/lib${PYTHONPATH:+:$PYTHONPATH}"
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
@@ -98,12 +97,12 @@ export DG_JIT_DEBUG="${DG_JIT_DEBUG:-0}"
 # Trace the per-call masked grouped GEMM inputs in first-seen order. Sampling is
 # disabled to keep the log focused on shape metadata. Set MAX_CALLS above zero
 # to cap the number of records per rank/layer/GEMM when a smaller log is needed.
-export DLBLAS_MOE_GEMM_DEBUG="${DLBLAS_MOE_GEMM_DEBUG:-1}"
-export DLBLAS_MOE_GEMM_DEBUG_RANKS="${DLBLAS_MOE_GEMM_DEBUG_RANKS:-all}"
-export DLBLAS_MOE_GEMM_DEBUG_LAYERS="${DLBLAS_MOE_GEMM_DEBUG_LAYERS:-1}"
-export DLBLAS_MOE_GEMM_DEBUG_GEMMS="${DLBLAS_MOE_GEMM_DEBUG_GEMMS:-gate_up}"
-export DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS="${DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS:-0}"
-export DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS="${DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS:-0}"
+export NANODEPLOY_MOE_GEMM_DEBUG="${NANODEPLOY_MOE_GEMM_DEBUG:-1}"
+export NANODEPLOY_MOE_GEMM_DEBUG_RANKS="${NANODEPLOY_MOE_GEMM_DEBUG_RANKS:-all}"
+export NANODEPLOY_MOE_GEMM_DEBUG_LAYERS="${NANODEPLOY_MOE_GEMM_DEBUG_LAYERS:-1}"
+export NANODEPLOY_MOE_GEMM_DEBUG_GEMMS="${NANODEPLOY_MOE_GEMM_DEBUG_GEMMS:-gate_up}"
+export NANODEPLOY_MOE_GEMM_DEBUG_MAX_CALLS="${NANODEPLOY_MOE_GEMM_DEBUG_MAX_CALLS:-0}"
+export NANODEPLOY_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS="${NANODEPLOY_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS:-0}"
 
 # Ray Client and GCS traffic must bypass HTTP proxies.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
@@ -146,12 +145,12 @@ cmd=(
     printf 'TOPOLOGY=dp%q_sp%q_tp%q_ep16\n' "$DP_SIZE" "$SP_SIZE" "$TP_SIZE"
     printf 'DG_PRINT_CONFIGS=%q\n' "$DG_PRINT_CONFIGS"
     printf 'DG_JIT_DEBUG=%q\n' "$DG_JIT_DEBUG"
-    printf 'DLBLAS_MOE_GEMM_DEBUG=%q\n' "$DLBLAS_MOE_GEMM_DEBUG"
-    printf 'DLBLAS_MOE_GEMM_DEBUG_RANKS=%q\n' "$DLBLAS_MOE_GEMM_DEBUG_RANKS"
-    printf 'DLBLAS_MOE_GEMM_DEBUG_LAYERS=%q\n' "$DLBLAS_MOE_GEMM_DEBUG_LAYERS"
-    printf 'DLBLAS_MOE_GEMM_DEBUG_GEMMS=%q\n' "$DLBLAS_MOE_GEMM_DEBUG_GEMMS"
-    printf 'DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS=%q\n' "$DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS"
-    printf 'DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS=%q\n' "$DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG_RANKS=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG_RANKS"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG_LAYERS=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG_LAYERS"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG_GEMMS=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG_GEMMS"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG_MAX_CALLS=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG_MAX_CALLS"
+    printf 'NANODEPLOY_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS=%q\n' "$NANODEPLOY_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS"
     printf 'BASE_LOG_DIR=%q' "$BENCH_LOG_DIR"
     printf ' %q' "${cmd[@]}"
     printf '\n'
@@ -175,7 +174,7 @@ if [[ -f "$BENCH_LOG_DIR/run_progress.log" ]] \
 fi
 
 grep -F 'GEMM type:' "$RUN_LOG" > "$DEEPGEMM_CONFIG_LOG" || true
-sed -n 's/^.*\[DLBLAS_MOE_GEMM_INPUT\] //p' "$RUN_LOG" > "$MOE_INPUT_LOG"
+sed -n 's/^.*\[NANODEPLOY_MOE_GEMM_INPUT\] //p' "$RUN_LOG" > "$MOE_INPUT_LOG"
 
 config_count="$(wc -l < "$DEEPGEMM_CONFIG_LOG")"
 input_count="$(wc -l < "$MOE_INPUT_LOG")"
