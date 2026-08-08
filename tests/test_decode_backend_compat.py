@@ -145,6 +145,8 @@ def test_worker_env_contains_effective_deepep_defaults():
 
 def test_worker_env_passes_through_gemm_debug_settings():
     environ = {
+        "DG_PRINT_CONFIGS": "1",
+        "DG_JIT_DEBUG": "0",
         "DLBLAS_MOE_GEMM_DEBUG": "1",
         "DLBLAS_MOE_GEMM_DEBUG_RANKS": "0,8",
         "DLBLAS_MOE_GEMM_DEBUG_LAYERS": "1",
