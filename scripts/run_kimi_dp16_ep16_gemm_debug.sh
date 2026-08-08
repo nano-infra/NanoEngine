@@ -22,6 +22,7 @@ RAY_ADDRESS="${RAY_ADDRESS:-10.102.252.174:7789}"
 
 NUM_SEQS="${NUM_SEQS:-512}"
 SEQ_LEN="${SEQ_LEN:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 MAX_NUM_SEND_SEQS="${MAX_NUM_SEND_SEQS:-32}"
 MAX_NUM_RECV_SEQS="${MAX_NUM_RECV_SEQS:-34}"
@@ -75,7 +76,7 @@ cmd=(
   python3 -u "$REPO_ROOT/examples/dummy_prefill.py"
   --num-seqs "$NUM_SEQS"
   --seq-len "$SEQ_LEN"
-  --max-tokens 1
+  --max-tokens "$MAX_TOKENS"
   --max-num-seqs "$MAX_NUM_SEQS"
   --dp 16
   --sp 1
@@ -87,7 +88,6 @@ cmd=(
   --max-num-recv-seqs "$MAX_NUM_RECV_SEQS"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --loop-count 1
-  --num-steps 1
   --max-model-len "$MAX_MODEL_LEN"
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --routing-strategy LeastBatch
