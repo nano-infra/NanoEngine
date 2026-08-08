@@ -121,7 +121,10 @@ def quant_fp8(
 
 def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn):
     """Quant fp8 tma."""
-    from deep_gemm import ceil_div, get_m_alignment_for_contiguous_layout
+    from .deep_gemm_backend import (
+        ceil_div,
+        get_m_alignment_for_contiguous_layout,
+    )
 
     assert A.dim() == 2
     M, K = A.shape
@@ -142,7 +145,7 @@ def deep_gemm_fp8(
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     """Deepgemm fp8."""
-    from deep_gemm import fp8_gemm_nt
+    from .deep_gemm_backend import fp8_gemm_nt
 
     M, _ = A.shape
     N, _ = B.shape

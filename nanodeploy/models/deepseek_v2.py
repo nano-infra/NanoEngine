@@ -4,7 +4,6 @@ from typing import Any, Iterable, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from dlblas.layers.moe.ep_moe import build_deepep_moe
 from lmdeploy.pytorch.nn import build_rotary_embedding, RopeType
 from lmdeploy.pytorch.nn.rotary_embedding import YarnParameters
 from nanodeploy.layers.activation import SiluAndMul
@@ -16,6 +15,7 @@ from nanodeploy.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from nanodeploy.layers.deepep_moe import build_deepep_moe
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.context import get_context

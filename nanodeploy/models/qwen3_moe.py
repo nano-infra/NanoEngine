@@ -4,8 +4,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from dlblas.layers.moe.ep_moe import build_deepep_moe
-
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -15,6 +13,7 @@ from nanodeploy.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from nanodeploy.layers.deepep_moe import build_deepep_moe
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
