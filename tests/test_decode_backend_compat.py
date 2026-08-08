@@ -143,6 +143,26 @@ def test_worker_env_contains_effective_deepep_defaults():
     }
 
 
+def test_worker_env_passes_through_gemm_debug_settings():
+    environ = {
+        "DLBLAS_MOE_GEMM_DEBUG": "1",
+        "DLBLAS_MOE_GEMM_DEBUG_RANKS": "0,8",
+        "DLBLAS_MOE_GEMM_DEBUG_LAYERS": "1",
+        "DLBLAS_MOE_GEMM_DEBUG_GEMMS": "gate_up",
+        "DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS": "2",
+        "DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS": "8",
+    }
+
+    worker_env = build_decode_backend_worker_env(32, environ)
+
+    assert worker_env == {
+        "DEEPEP_SMS": "16",
+        "DEEPEP_MAX_TOKENS_PER_RANK": "32",
+        "DEEPEP_ENABLE_MNNVL": "0",
+        **environ,
+    }
+
+
 @pytest.mark.skipif(
     not (DEEPSEEK_MODEL / "config.json").is_file(),
     reason=f"DeepSeek-V3 config not found at {DEEPSEEK_MODEL}",

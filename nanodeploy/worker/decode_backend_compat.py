@@ -14,6 +14,15 @@ DEEPEP_ENV_NAMES = (
     "DEEPEP_ENABLE_MNNVL",
 )
 
+DECODE_WORKER_PASSTHROUGH_ENV_NAMES = (
+    "DLBLAS_MOE_GEMM_DEBUG",
+    "DLBLAS_MOE_GEMM_DEBUG_RANKS",
+    "DLBLAS_MOE_GEMM_DEBUG_LAYERS",
+    "DLBLAS_MOE_GEMM_DEBUG_GEMMS",
+    "DLBLAS_MOE_GEMM_DEBUG_MAX_CALLS",
+    "DLBLAS_MOE_GEMM_DEBUG_SAMPLE_ELEMENTS",
+)
+
 EXPECTED_BACKEND_VERSIONS = {
     "dlblas": "0.0.7",
     "deep_gemm": "2.1.1+c9f8b34",
@@ -102,7 +111,12 @@ def build_decode_backend_worker_env(
     max_num_seqs: int,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    return resolve_decode_deepep_config(max_num_seqs, environ).worker_env()
+    source = os.environ if environ is None else environ
+    worker_env = resolve_decode_deepep_config(max_num_seqs, source).worker_env()
+    for name in DECODE_WORKER_PASSTHROUGH_ENV_NAMES:
+        if name in source:
+            worker_env[name] = source[name]
+    return worker_env
 
 
 def _read_version(

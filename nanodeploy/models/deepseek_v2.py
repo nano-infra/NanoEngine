@@ -67,11 +67,15 @@ class DeepseekV2MoE(nn.Module):
     """Deepseek v2 MoE."""
 
     def __init__(
-        self, config: DeepseekV3Config, quantization_config: QuantizationConfig
+        self,
+        config: DeepseekV3Config,
+        quantization_config: QuantizationConfig,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
         self.quantization_config = quantization_config
+        self.layer_idx = layer_idx
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -162,7 +166,7 @@ class DeepseekV2MoE(nn.Module):
                 block_size=self.quantization_config.block_size[0],
                 top_k=self.top_k,
                 out_dtype=torch.bfloat16,
-                layer_idx=0,
+                layer_idx=self.layer_idx,
                 chunk_size=16 * 1024,
             )
         self.shared_experts = None
@@ -192,7 +196,7 @@ class DeepseekV2MoE(nn.Module):
             block_size=self.quantization_config.block_size[0],
             top_k=self.top_k,
             out_dtype=torch.bfloat16,
-            layer_idx=0,
+            layer_idx=self.layer_idx,
             chunk_size=16 * 1024,
         )
         return fusedmoe
@@ -337,7 +341,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
         ):
             self.mlp = DeepseekV2MoE(
-                config=config, quantization_config=quantization_config
+                config=config,
+                quantization_config=quantization_config,
+                layer_idx=layer_idx,
             )
         else:
             self.mlp = DeepseekV2MLP(
