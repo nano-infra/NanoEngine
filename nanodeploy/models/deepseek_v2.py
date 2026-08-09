@@ -81,8 +81,6 @@ class DeepseekV2MoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
-        self.distribution = "uniform"
-
         # Use optimized Linear layer for gate
         # For gate, we don't need quantization, so use standard Linear
         # but we can optimize it by using F.linear directly in forward
@@ -227,28 +225,36 @@ class DeepseekV2MoE(nn.Module):
             # F.linear is more efficient than nn.Linear forward for inference
             router_logits = F.linear(hidden_states, self.gate.weight, None)
 
-            # Optimized softmax: use torch.softmax instead of F.softmax with dtype conversion
-            # This avoids unnecessary type conversion and is more efficient
-            # torch.softmax automatically handles numerical stability
-            routing_weights = torch.softmax(router_logits, dim=-1)
-            
-            # Optimized topk: use sorted=False for better performance when order doesn't matter
-            # In decode phase, we typically don't need sorted results
-            sorted_topk = context.is_prefill if hasattr(context, 'is_prefill') else True
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1, sorted=sorted_topk
-            )
-
-            if self.distribution == "uniform":
-                # Uniform random sampling
+            runner_config = get_runner_config()
+            routing_strategy = runner_config.moe_routing_simulation_strategy
+            if routing_strategy == "uniform_random":
                 selected_experts = torch.randint(
                     low=0,
                     high=self.num_experts,
                     size=(hidden_states.shape[0], self.top_k),
-                    dtype=selected_experts.dtype,
+                    dtype=torch.int64,
                     device=hidden_states.device,
                 )
-            elif get_runner_config().perfect_eplb:
+                routing_weights = torch.ones(
+                    (hidden_states.shape[0], self.top_k),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            else:
+                routing_weights = torch.softmax(router_logits, dim=-1)
+                sorted_topk = (
+                    context.is_prefill
+                    if hasattr(context, "is_prefill")
+                    else True
+                )
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights,
+                    self.top_k,
+                    dim=-1,
+                    sorted=sorted_topk,
+                )
+
+            if routing_strategy == "perfect_eplb":
                 ep_size = get_dist_context().ffn_ep_world_size
                 selected_experts = compute_topk_ids(
                     selected_experts, ep_size, self.num_experts

@@ -350,12 +350,30 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             moe = self.fusedmoe_build(not context.is_prefill)
             router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
+            runner_config = get_runner_config()
+            routing_strategy = runner_config.moe_routing_simulation_strategy
+            if routing_strategy == "uniform_random":
+                selected_experts = torch.randint(
+                    low=0,
+                    high=self.num_experts,
+                    size=(hidden_states.shape[0], self.top_k),
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+                routing_weights = torch.ones(
+                    (hidden_states.shape[0], self.top_k),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            else:
+                routing_weights = F.softmax(
+                    router_logits, dim=1, dtype=torch.float
+                )
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
+                )
 
-            if get_runner_config().perfect_eplb:
+            if routing_strategy == "perfect_eplb":
                 ep_size = get_dist_context().ffn_ep_world_size
                 selected_experts = compute_topk_ids(
                     selected_experts, ep_size, self.num_experts

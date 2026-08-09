@@ -42,6 +42,19 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=4)
+    parser.add_argument(
+        "--moe-routing-simulation-strategy",
+        type=str,
+        default="model",
+        choices=["model", "uniform_random", "perfect_eplb"],
+        help="MoE routing behavior used by the decode model.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Shared worker RNG seed used by uniform_random routing.",
+    )
     parser.add_argument("--long-len", type=int, default=0)
     parser.add_argument("--max-num-seqs", type=int, default=128)
     parser.add_argument("--dp", type=int, default=1)
@@ -132,7 +145,10 @@ def main():
         ray_address=args.ray_address,
         dummy_prefill=True,
         dummy_weight=True,
-        perfect_eplb=True,
+        moe_routing_simulation_strategy=(
+            args.moe_routing_simulation_strategy
+        ),
+        seed=args.seed,
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,

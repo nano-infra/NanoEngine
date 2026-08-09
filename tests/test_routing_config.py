@@ -60,6 +60,43 @@ def test_router_policy_config_rejects_unknown_value():
         make_config(router_policy="random")
 
 
+def test_uniform_random_moe_routing_config():
+    config = make_config(
+        moe_routing_simulation_strategy="uniform_random",
+        seed=0,
+    )
+
+    assert config.moe_routing_simulation_strategy == "uniform_random"
+    assert config.seed == 0
+
+
+def test_legacy_perfect_eplb_maps_to_explicit_strategy():
+    config = make_config(perfect_eplb=True)
+
+    assert config.moe_routing_simulation_strategy == "perfect_eplb"
+
+
+def test_uniform_random_rejects_legacy_perfect_eplb():
+    with pytest.raises(ValueError, match="perfect_eplb=True conflicts"):
+        make_config(
+            perfect_eplb=True,
+            moe_routing_simulation_strategy="uniform_random",
+        )
+
+
+def test_moe_routing_seed_changes_collective_fingerprint():
+    baseline = make_config(
+        moe_routing_simulation_strategy="uniform_random",
+        seed=0,
+    )
+    changed = make_config(
+        moe_routing_simulation_strategy="uniform_random",
+        seed=1,
+    )
+
+    assert baseline.collective_fingerprint() != changed.collective_fingerprint()
+
+
 def test_zmq_worker_transport_requires_hierarchical_scheduler():
     with pytest.raises(
         ValueError,

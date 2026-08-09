@@ -90,6 +90,10 @@ class Config:
     dummy_prefill: bool | None = False
     dummy_weight: bool | None = False
     perfect_eplb: bool | None = False
+    moe_routing_simulation_strategy: Literal[
+        "model", "uniform_random", "perfect_eplb"
+    ] = "model"
+    seed: int = 0
 
     # dist config
     master_address: str = "127.0.0.1:6006"
@@ -173,6 +177,25 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        valid_moe_routing_strategies = {
+            "model",
+            "uniform_random",
+            "perfect_eplb",
+        }
+        if self.moe_routing_simulation_strategy not in valid_moe_routing_strategies:
+            raise ValueError(
+                "moe_routing_simulation_strategy must be one of: "
+                "model, uniform_random, perfect_eplb"
+            )
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError("seed must be an integer")
+        if self.perfect_eplb:
+            if self.moe_routing_simulation_strategy == "uniform_random":
+                raise ValueError(
+                    "perfect_eplb=True conflicts with "
+                    "moe_routing_simulation_strategy='uniform_random'"
+                )
+            self.moe_routing_simulation_strategy = "perfect_eplb"
         if self.scheduler_arch not in {"legacy_global", "hierarchical"}:
             raise ValueError(
                 "scheduler_arch must be one of: legacy_global, hierarchical"
@@ -485,7 +508,11 @@ class Config:
                 self.num_kvcache_blocks,
                 self.max_model_len,
             ],
-            "eplb": self.perfect_eplb,
+            "moe_routing": {
+                "strategy": self.moe_routing_simulation_strategy,
+                "seed": self.seed,
+                "legacy_perfect_eplb": self.perfect_eplb,
+            },
             "dynamic_sp": {
                 "enabled": self.enable_dynamic_sp_size,
                 "new_scheduler": self.use_new_decode_dynamic_sp_scheduler,

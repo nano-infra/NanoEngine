@@ -46,6 +46,7 @@ from nanodeploy.worker.ep_context import (
     set_ep_context,
 )
 from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
 
@@ -97,6 +98,10 @@ class ModelRunner:
             max_num_seqs=config.max_num_seqs,
             dummy_weight=config.dummy_weight,
             perfect_eplb=config.perfect_eplb,
+            moe_routing_simulation_strategy=(
+                config.moe_routing_simulation_strategy
+            ),
+            seed=config.seed,
         )
 
         dist.init_process_group(
@@ -483,6 +488,8 @@ class ModelRunner:
                 allocated = True
             if allocated:
                 layer_id += 1
+        if self.config.moe_routing_simulation_strategy == "uniform_random":
+            set_random_seed(self.config.seed)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")

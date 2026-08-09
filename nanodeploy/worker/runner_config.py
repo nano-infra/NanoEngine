@@ -12,6 +12,8 @@ class RunnerConfig:
     max_num_seqs: int | None = None
     dummy_weight: bool = False
     perfect_eplb: bool = False
+    moe_routing_simulation_strategy: str = "model"
+    seed: int = 0
 
 
 # Singleton instance of RunnerConfig
@@ -26,10 +28,16 @@ def set_runner_config(
     max_num_seqs: int | None = None,
     dummy_weight: Optional[bool] = None,
     perfect_eplb: Optional[bool] = None,
+    moe_routing_simulation_strategy: str = "model",
+    seed: int = 0,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
-        max_num_seqs=max_num_seqs, dummy_weight=dummy_weight, perfect_eplb=perfect_eplb
+        max_num_seqs=max_num_seqs,
+        dummy_weight=dummy_weight,
+        perfect_eplb=perfect_eplb,
+        moe_routing_simulation_strategy=moe_routing_simulation_strategy,
+        seed=seed,
     )
 
 
