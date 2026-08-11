@@ -6,7 +6,7 @@ import torch
 
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.kernel.triton.generic.kv_store import store_kvcache
-from dlengine.layers.hopper.attention import HopperAttention, _gather_kv_cached_concat
+from dlengine.layers.hopper.attention import _gather_kv_cached_concat, HopperAttention
 from dlengine.logging import get_logger
 
 logger = get_logger()
@@ -285,7 +285,9 @@ class BlackwellMLAAttention(HopperAttention):
     ) -> None:
         del kwargs
         if attention_type != "MLA":
-            raise ValueError(f"BlackwellMLAAttention requires MLA, got {attention_type}")
+            raise ValueError(
+                f"BlackwellMLAAttention requires MLA, got {attention_type}"
+            )
         if _trtllm_mla_decode_func is None:
             message = (
                 "Blackwell MLA decode requires FlashInfer's TRTLLM-GEN MLA "
@@ -334,6 +336,16 @@ class BlackwellMLAAttention(HopperAttention):
         batch_size = q.shape[0] // ntps
         query = q.reshape(batch_size, ntps, self.num_heads, self.head_dim)
         block_tables = context.block_tables[0, :batch_size]
+        # Attention-DP ranks without a local request execute a synthetic one-token
+        # batch so that the shared EP collectives stay ordered. The generic dummy
+        # metadata intentionally carries an empty page table, but TRTLLM-GEN MLA
+        # requires its page-table batch dimension to match the query batch even
+        # when no KV write is performed. Page zero is allocated and safe to read;
+        # the dummy result is discarded by the scheduler.
+        if context.is_dummy and block_tables.numel() == 0:
+            block_tables = torch.zeros(
+                (batch_size, 1), dtype=torch.int32, device=query.device
+            )
         seq_lens = context.context_lens[0, :batch_size]
         kv_cache = self.k_cache
         if kv_cache.ndim == 4 and kv_cache.shape[2] == 1:

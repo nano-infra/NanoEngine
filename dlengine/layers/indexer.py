@@ -38,7 +38,13 @@ import os
 import deep_gemm
 import torch
 import torch.nn as nn
-from fast_hadamard_transform import hadamard_transform
+
+try:
+    from fast_hadamard_transform import hadamard_transform
+except ImportError:
+    # Some runtime images provide the JIT Hadamard op without the
+    # optional fast-hadamard-transform wheel. Both implement the same API.
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
 from dlengine.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
@@ -132,9 +138,7 @@ def _weighted_relu_mqa_scores(
     num_queries, num_heads, _ = query.shape
     num_keys = key.shape[0]
     if num_keys == 0:
-        return torch.empty(
-            num_queries, 0, dtype=torch.float32, device=query.device
-        )
+        return torch.empty(num_queries, 0, dtype=torch.float32, device=query.device)
 
     query_f = query.float()
     weights_f = weights.float()
@@ -427,11 +431,7 @@ class Indexer(nn.Module):
 
         # K projection + LayerNorm
         key = self.wk(hidden_states)
-        if (
-            key.is_cuda
-            and self.indexer_rope_interleave
-            and not defer_key_transform
-        ):
+        if key.is_cuda and self.indexer_rope_interleave and not defer_key_transform:
             key = indexer_layer_norm_bf16(
                 key.contiguous(),
                 self.k_norm.weight,
@@ -628,9 +628,7 @@ class Indexer(nn.Module):
 
         total_cached = int(cu_cached[-1].item())
         if total_cached == 0:
-            return torch.empty(
-                0, self.head_dim, dtype=dtype, device=block_table.device
-            )
+            return torch.empty(0, self.head_dim, dtype=dtype, device=block_table.device)
 
         from dlengine.kernel.triton.generic.paged_gather import (
             build_paged_gather_indices,
@@ -665,9 +663,7 @@ class Indexer(nn.Module):
 
         byte_range = torch.arange(head_dim, device=block_table.device)
         fp8_byte_offset = offset_in_page.long() * head_dim
-        fp8_indices = (
-            flat_base.unsqueeze(1) + fp8_byte_offset.unsqueeze(1) + byte_range
-        )
+        fp8_indices = flat_base.unsqueeze(1) + fp8_byte_offset.unsqueeze(1) + byte_range
         key_fp8_bytes = buf_flat[fp8_indices.reshape(-1)].view(total_cached, head_dim)
         key_fp8 = key_fp8_bytes.contiguous().view(torch.float8_e4m3fn)
 
@@ -768,9 +764,7 @@ class Indexer(nn.Module):
                     prefix_scores = _weighted_relu_mqa_scores(
                         seq_q, seq_weights, seq_prefix_key
                     )
-                    prefix_values, prefix_indices = prefix_scores.topk(
-                        prefix_k, dim=-1
-                    )
+                    prefix_values, prefix_indices = prefix_scores.topk(prefix_k, dim=-1)
                     candidate_values.append(prefix_values)
                     candidate_indices.append(prefix_indices.to(torch.int64))
 
@@ -782,9 +776,7 @@ class Indexer(nn.Module):
                     cols = torch.arange(seq_q_len, device=query.device).unsqueeze(0)
                     fresh_scores.masked_fill_(cols > rows, neg_inf)
 
-                    fresh_values, fresh_indices = fresh_scores.topk(
-                        fresh_k, dim=-1
-                    )
+                    fresh_values, fresh_indices = fresh_scores.topk(fresh_k, dim=-1)
                     fresh_indices = fresh_indices.to(torch.int64) + cached_len
                     fresh_indices = torch.where(
                         fresh_values == neg_inf,
@@ -938,9 +930,7 @@ class Indexer(nn.Module):
                 # Top-2048. Keep production paged-FP8 scoring and select the
                 # exact TopK here until a Top-2048 cluster kernel is available.
                 actual_topk = min(self.index_topk, context_len)
-                cols = torch.arange(
-                    max_context_len, device=q_fp8.device
-                ).unsqueeze(0)
+                cols = torch.arange(max_context_len, device=q_fp8.device).unsqueeze(0)
                 logits.masked_fill_(cols >= context_lens, float("-inf"))
                 top_values, logical = logits.topk(actual_topk, dim=-1)
                 logical = logical.to(torch.int32).masked_fill_(
@@ -953,9 +943,7 @@ class Indexer(nn.Module):
                         value=-1,
                     )
 
-                logical = torch.where(
-                    logical >= 0, logical + k_start, logical
-                )
+                logical = torch.where(logical >= 0, logical + k_start, logical)
                 indices[q_start + a : q_start + b] = logical
 
         return indices
@@ -1014,9 +1002,7 @@ class Indexer(nn.Module):
         batch_size = context_lens.shape[0]
 
         # Step 1-4: Compute query and key (with RoPE + Hadamard)
-        use_fused_query = (
-            fused_kernels_enabled() and self.indexer_rope_interleave
-        )
+        use_fused_query = fused_kernels_enabled() and self.indexer_rope_interleave
         use_fused_key = use_fused_query and hidden_states.is_cuda
         query, key = self._compute_q_k(
             q_lora,
@@ -1087,9 +1073,7 @@ class Indexer(nn.Module):
         # (block_tables.shape[-1] * page_size is constant per captured graph).
         max_context_len = block_tables.shape[-1] * page_size
         context_lens_i32 = context_lens.to(torch.int32)
-        context_lens_for_gemm = _expand_decode_context_lens(
-            context_lens_i32, ntps
-        )
+        context_lens_for_gemm = _expand_decode_context_lens(context_lens_i32, ntps)
 
         # All layers share this schedule. The model builds it once per forward;
         # retain the fallback for standalone Indexer calls and tests.
