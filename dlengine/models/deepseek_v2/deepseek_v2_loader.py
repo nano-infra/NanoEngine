@@ -183,6 +183,20 @@ def load_weights(
 
         # Per-expert weights -> combined 3D tensors
         if "experts." in weight_name and EXPERT_RE.match(weight_name):
+            match = EXPERT_RE.match(weight_name)
+            expert_module = model.get_submodule(f"{match.group(1)}.routed_experts")
+            custom_loader = getattr(expert_module, "load_expert_weight", None)
+            if callable(custom_loader):
+                ep_rank = getattr(ctx, "ffn_ep_rank", 0)
+                if custom_loader(
+                    int(match.group(2)),
+                    match.group(3),
+                    match.group(4),
+                    tensor,
+                    ep_rank=ep_rank,
+                ):
+                    loaded_count += 1
+                    continue
             if load_per_expert_weight(model, weight_name, tensor, config):
                 loaded_count += 1
                 continue
@@ -248,3 +262,9 @@ def load_weights(
 
     model_params = set(name for name, _ in model.named_parameters())
     logger.warning(f"  Model has {len(model_params)} parameters total")
+
+    # Backends convert loaded checkpoint tensors into their kernel layout once.
+    for module in model.modules():
+        process = getattr(module, "process_weights_after_loading", None)
+        if callable(process):
+            process()

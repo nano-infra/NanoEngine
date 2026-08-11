@@ -93,7 +93,7 @@ class _HopperLinearMixin:
 
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             n_blk, k_blk = self.quantization_config.block_size
             self.weight_scale_inv = nn.Parameter(
                 torch.empty(
@@ -184,9 +184,9 @@ class HopperReplicatedLinear(_HopperLinearMixin, ReplicatedLinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.quantization_config.quant_method:
+        if not self.quantization_config.linear_quant_method:
             return _bf16_linear(x, self.weight, self.bias)
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             return self._fp8_forward(x)
         else:
             raise AttributeError(
@@ -240,9 +240,9 @@ class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.quantization_config.quant_method:
+        if not self.quantization_config.linear_quant_method:
             return _bf16_linear(x, self.weight, self.bias)
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             return self._fp8_forward(x)
         else:
             raise AttributeError(
@@ -312,9 +312,9 @@ class HopperMergedColumnParallelLinear(
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.quantization_config.quant_method:
+        if not self.quantization_config.linear_quant_method:
             return _bf16_linear(x, self.weight, self.bias)
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             return self._fp8_forward(x)
         else:
             raise AttributeError(
@@ -394,9 +394,9 @@ class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.quantization_config.quant_method:
+        if not self.quantization_config.linear_quant_method:
             return _bf16_linear(x, self.weight, self.bias)
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             return self._fp8_forward(x)
         else:
             raise AttributeError(
@@ -450,12 +450,12 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.quantization_config.quant_method:
+        if not self.quantization_config.linear_quant_method:
             y = _bf16_linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
             if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
                 dist.all_reduce(y, group=self._tp_group)
             return y
-        elif self.quantization_config.quant_method == "fp8":
+        elif self.quantization_config.linear_quant_method == "fp8":
             x_shape = x.shape
             x = x.flatten(0, -2)
             out = self._fp8_forward(x)

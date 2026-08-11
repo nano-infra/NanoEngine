@@ -4,12 +4,17 @@ import torch
 class QuantizationConfig:
     def __init__(self, **kwargs):
         self.quant_method = kwargs.get("quant_method", None)
+        self.quant_algo = str(kwargs.get("quant_algo", "")).upper()
         self.fmt = kwargs.get("fmt", None)
         self.compression_format = kwargs.get("format", None)
         self.is_mxfp4 = self.compression_format in {
             "mxfp4-pack-quantized",
             "mxfp4-quantized",
         } or self.quant_method in {"mxfp4", "nvfp4"}
+        # ModelOpt NVFP4 is group-16, unlike K3 MXFP4/group-32.
+        self.is_modelopt_nvfp4 = (
+            str(self.quant_method).lower() == "modelopt" and self.quant_algo == "NVFP4"
+        )
         if self.is_mxfp4:
             # Compressed-tensors describes the checkpoint container, not the
             # dense GEMM datatype. K3 ignores attention/shared/dense linears;
@@ -40,7 +45,7 @@ class QuantizationConfig:
 
     @property
     def dtype(self):
-        if not self.quant_method:
+        if not self.quant_method or self.is_modelopt_nvfp4:
             return torch.get_default_dtype()
         elif self.quant_method == "fp8":
             # Support both explicit fmt="e4m3" and implicit fp8 (default to e4m3fn)
@@ -56,3 +61,8 @@ class QuantizationConfig:
             if "group_size" in weights:
                 return int(weights["group_size"])
         return 32
+
+    @property
+    def linear_quant_method(self):
+        """Quantization method for ordinary linear layers, excluding MoE."""
+        return None if self.is_modelopt_nvfp4 else self.quant_method

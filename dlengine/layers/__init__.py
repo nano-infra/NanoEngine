@@ -59,7 +59,7 @@ def init_backend(
             import torch
 
             cap = torch.cuda.get_device_capability()
-            if cap == (10, 3):
+            if cap[0] >= 10:
                 backend_type = "blackwell"
             else:
                 backend_type = "hopper" if cap[0] >= 9 else "gpu_generic"
@@ -92,9 +92,7 @@ def init_backend(
     _backend.attention_backend = attention_backend or os.environ.get(
         "DLENGINE_ATTENTION_BACKEND", "auto"
     )
-    _backend.gdn_backend = gdn_backend or os.environ.get(
-        "DLENGINE_GDN_BACKEND", "auto"
-    )
+    _backend.gdn_backend = gdn_backend or os.environ.get("DLENGINE_GDN_BACKEND", "auto")
 
 
 def get_backend() -> BackendFactory:
