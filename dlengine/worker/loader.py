@@ -27,9 +27,38 @@ _SKIP_PATTERNS = (
 # Regex to parse layer index from weight name
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
+# Lightweight expert index parser used before safetensors materialization.
+_EP_EXPERT_INDEX_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def _make_ep_weight_filter(config):
+    """Return a name filter that rejects non-local experts before disk I/O."""
+    ctx = get_dist_context()
+    ep_size = getattr(ctx, "ffn_ep_world_size", 1)
+    if ep_size <= 1:
+        return None
+    num_experts = getattr(config, "num_experts", 0) or getattr(
+        config, "n_routed_experts", 0
+    )
+    if not num_experts or num_experts % ep_size:
+        return None
+    local_experts = num_experts // ep_size
+    start = getattr(ctx, "ffn_ep_rank", 0) * local_experts
+    end = start + local_experts
+
+    def should_load(weight_name: str) -> bool:
+        match = _EP_EXPERT_INDEX_RE.search(weight_name)
+        return match is None or start <= int(match.group(1)) < end
+
+    return should_load
+
+
 # Regex to parse expert index from weight name
 # e.g. "model.layers.3.mlp.experts.5.gate_proj.weight" -> expert_idx=5
-EXPERT_RE = re.compile(r"(.+\.mlp)\.experts\.(\d+)\.(\w+)\.(weight(?:_scale_inv)?)")
+EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(\w+)\."
+    r"(weight(?:_scale_inv|_scale_2|_scale)?|input_scale)$"
+)
 
 # Regex for already-packed 3D expert weights (no per-expert index)
 # e.g. "model.layers.0.mlp.experts.gate_up_proj" -> mlp_prefix, proj_name
@@ -170,20 +199,19 @@ def load_mtp_model(model: nn.Module, path: str) -> None:
 
 
 def iterate_weights(
-    path: str, num_hidden_layers: int | None = None
-) -> Generator[Tuple[str, str, Callable[[], torch.Tensor]], None, None]:
-    """Iterate over safetensors weight files, yielding (weight_name, raw_weight_name, get_tensor_fn).
+    path: str,
+    num_hidden_layers: int | None = None,
+    weight_name_filter: Callable[[str], bool] | None = None,
+) -> Generator[Tuple[str, str, torch.Tensor], None, None]:
+    """Iterate weights, filtering names before safetensors tensor materialization.
 
     Applies universal skip/strip logic:
     - Skips MTP, vision, rotary cache weights
     - Strips VLM prefix (model.language_model. -> model.)
-    - Uses lazy get_tensor_fn to avoid loading tensors that the model will skip
 
     Yields:
-        (weight_name, raw_weight_name, get_tensor_fn) tuples where:
         - weight_name: cleaned name (VLM prefix stripped)
         - raw_weight_name: original name in safetensors file
-        - get_tensor_fn: callable that returns the tensor when called
     """
     weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
     pbar = tqdm(weight_files, desc="Loading weights", unit="files")
@@ -199,9 +227,13 @@ def iterate_weights(
                     # Strip VLM prefix
                     weight_name = _strip_vlm_prefix(raw_weight_name)
 
-                    # Yield with a lazy tensor loader bound to this file handle
-                    # We need to load the tensor eagerly since the file handle
-                    # closes when we leave the `with` block
+                    # EP ownership must be checked before get_tensor(): on
+                    # sharded checkpoints get_tensor faults the full tensor pages in.
+                    if weight_name_filter is not None and not weight_name_filter(
+                        weight_name
+                    ):
+                        continue
+
                     yield weight_name, raw_weight_name, f.get_tensor(raw_weight_name)
     finally:
         pbar.close()
@@ -218,7 +250,10 @@ def load_model(model: nn.Module, path: str):
 
     if hasattr(model, "load_weights"):
         # Per-model loader: model handles its own weight mapping
-        weights = iterate_weights(path, num_hidden_layers)
+        weight_name_filter = _make_ep_weight_filter(config)
+        weights = iterate_weights(
+            path, num_hidden_layers, weight_name_filter=weight_name_filter
+        )
         model.load_weights(weights)
         return
 
