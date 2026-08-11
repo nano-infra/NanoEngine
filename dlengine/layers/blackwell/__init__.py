@@ -21,6 +21,20 @@ class BlackwellBackendFactory(HopperBackendFactory):
         tp_size: int,
         **kwargs,
     ) -> DistributedRoutedExpertsBase:
+        if bool(getattr(self.quant_config, "is_modelopt_nvfp4", False)):
+            from dlengine.layers.backends.nvfp4 import ModelOptNvFp4Experts
+
+            kwargs.pop("quantization_config", None)
+            return ModelOptNvFp4Experts(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                top_k=top_k,
+                ep_size=ep_size,
+                tp_size=tp_size,
+                quantization_config=self.quant_config,
+                **kwargs,
+            )
         if bool(getattr(self.quant_config, "is_mxfp4", False)):
             from dlengine.layers.backends.megamoe import MegaMoEExperts
 

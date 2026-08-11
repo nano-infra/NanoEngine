@@ -111,16 +111,17 @@ class DecodeGraphRunner:
             else None
         )
 
-        # MLA-specific: per-BS FlashMLASchedMeta created during capture
-        if is_mla or is_dsv4:
+        # FlashMLA scheduler metadata is only used by legacy MLA backends.
+        # Native MLA backends must not require the optional flash_mla package.
+        self._uses_flash_mla_sched = (
+            is_mla or is_dsv4
+        ) and torch.cuda.get_device_capability()[0] < 10
+        if self._uses_flash_mla_sched:
             import flash_mla
 
             self._flash_mla = flash_mla
         self._sched_metas: dict[int, object] = {}
         self._sparse_sched_metas: dict[int, object] = {}
-        self._uses_flash_mla_sched = (
-            (is_mla or is_dsv4) and torch.cuda.get_device_capability()[0] < 10
-        )
 
         # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
         self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0
@@ -558,15 +559,15 @@ class LazyVerifyGraphRunner:
         self._outputs = torch.zeros(max_bs * 2, hf_config.hidden_size)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
-        if is_mla:
+        self._uses_flash_mla_sched = (
+            is_mla and torch.cuda.get_device_capability()[0] < 10
+        )
+        if self._uses_flash_mla_sched:
             import flash_mla
 
             self._flash_mla = flash_mla
         self._sched_metas: dict[int, object] = {}
         self._sparse_sched_metas: dict[int, object] = {}
-        self._uses_flash_mla_sched = (
-            is_mla and torch.cuda.get_device_capability()[0] < 10
-        )
 
         # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
         self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0

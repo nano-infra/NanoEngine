@@ -1,9 +1,7 @@
-import torch
-
 import dlengine.layers as layers
+import torch
 from dlengine.context_v2.batch import reset_batch_context, set_batch_context
-from dlengine.layers.blackwell import BlackwellBackendFactory
-from dlengine.layers.blackwell import attention
+from dlengine.layers.blackwell import attention, BlackwellBackendFactory
 
 
 def teardown_function():
@@ -12,9 +10,9 @@ def teardown_function():
     attention._trtllm_workspace = None
 
 
-def test_b300_auto_selects_blackwell_backend(monkeypatch):
+def test_blackwell_auto_selects_blackwell_backend(monkeypatch):
     monkeypatch.delenv("NANO_BACKEND", raising=False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
 
     layers.init_backend(quant_config=object())
 

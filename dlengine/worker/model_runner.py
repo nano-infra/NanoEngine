@@ -1175,6 +1175,12 @@ class ModelRunner:
         is_fp8_kvcache = (
             cache_plan.has_indexer() and index_head_dim > 0
         ) and not getattr(config, "disable_nsa", False)
+        # The native MLA backend consumes the logical BF16 KV layout.
+        # Packed FP8 caches include scale metadata and are not ABI-compatible.
+        from dlengine.layers import get_backend
+
+        if getattr(get_backend(), "hardware_backend", "") == "blackwell":
+            is_fp8_kvcache = False
         if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
             logger.warning(
                 "Disabling FP8 MLA KV cache because MLA reference fallback is "
