@@ -4,8 +4,6 @@ from typing import Any, Iterable, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from lmdeploy.pytorch.nn import build_rotary_embedding, RopeType
-from lmdeploy.pytorch.nn.rotary_embedding import YarnParameters
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -573,38 +571,6 @@ class DeepseekV2Attention(nn.Module):
             config.kv_lora_rank,
         )
 
-        emb_type = RopeType.LinearScaling
-        rope_dim = (
-            config.qk_rope_head_dim
-            if getattr(config, "use_mla", True)
-            else (config.hidden_size // config.num_attention_heads)
-        )
-        rope_max_pos_emb = config.max_position_embeddings
-        rope_base = config.rope_theta
-        scaling_factor = 1.0
-        other_params = dict()
-        if config.rope_scaling is not None:
-            scaling_type = config.rope_scaling["type"]
-            scaling_factor = config.rope_scaling["factor"]
-            if scaling_type == "dynamic":
-                emb_type = RopeType.DynamicNTKScaling
-            elif scaling_type == "yarn":
-                emb_type = RopeType.Yarn
-                rope_max_pos_emb = config.rope_scaling.get(
-                    "original_max_position_embeddings", 4096
-                )
-                kwargs = {
-                    key: config.rope_scaling[key]
-                    for key in [
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in config.rope_scaling
-                }
-                yarn_params = YarnParameters(**kwargs)
-                other_params["yarn_params"] = yarn_params
         self.rotary_emb = get_rope(
             config.qk_rope_head_dim,
             rotary_dim=config.qk_rope_head_dim,
