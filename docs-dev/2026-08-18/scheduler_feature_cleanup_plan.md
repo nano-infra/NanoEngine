@@ -2,11 +2,11 @@
 
 状态：待 review，尚未修改运行时代码  
 日期：2026-08-18  
-调研基线：首次 `gemm-update@f5ac869`；补充 `gemm-update@e40b0f9`
+调研基线：首次 `gemm-update@f5ac869`；补充 `gemm-update@0a1e8a6`
 
 ## 1. 目标与结论摘要
 
-本次清理针对四类不再需要的功能：
+本次清理针对五类不再需要的功能：
 
 1. 最初由单个中心化 `Scheduler` 加多个 per-worker waiting queue 模拟的
    `scheduler_mode="decentralized"`；
@@ -15,7 +15,10 @@
 3. 允许 legacy 单请求 SP allocator 在初始 SP rank 数分配失败后继续扩大到更多
    rank 的 `enable_dynamic_sp_size`；
 4. MLA SP all-to-all 的旧 `legacy_ll` 后端。保留 `hao_basic`、`nccl`、
-   `nccl_compact`，并把默认后端改为 `hao_basic`。
+   `nccl_compact`，并把默认后端改为 `hao_basic`；
+5. 旧 decentralized DP 路由遗留的 `routing_strategy="VLLMLoadBalance"`。
+   保留现行 `RoundRobin`、`LeastBatch`、`LeastCache`，以及 hierarchical 独立使用的
+   `router_policy`。
 
 调研后的核心结论如下。
 
@@ -33,6 +36,12 @@
 - 旧 decentralized 仍有三类外围残留：旧参数的 fail-fast 护栏与测试、仍传递
   `--scheduler-mode` 的过期脚本、以及把现行 hierarchical 实验命名为
   `decentralized_*` 的标签。脚本残留需要清理；参数护栏建议保留，理由见第 5 节。
+- `VLLMLoadBalance` 不是 vLLM scheduler 集成，而是旧 decentralized
+  `select_dp_worker_for_routing()` 中一个简单的 DP 打分策略：最小化
+  `waiting * 4 + running`。该实现已随旧 per-worker queue 一起删除；当前只剩
+  C++ enum、pybind、Config/CLI 和脚本字符串。若等待队列中真有请求，现行 C++
+  `_schedule_prefill()` 没有对应分支，会落到 `Unknown routing strategy`，因此它是
+  失效的公开入口，应完整删除。
 - long-short 仍是一条完整的生产调用链，并非只有脚本残留。它同时存在于
   `Config`、Python/C++ 构造接口、C++ placement、hierarchical admission mirror、
   benchmark CLI 和实验脚本中，必须按同一个提交原子删除。
@@ -54,6 +63,8 @@
 
 - 旧 `scheduler_mode`/`--scheduler-mode` 的活动入口、过期脚本参数和误导性
   `decentralized` 实验标签；
+- `RoutingStrategy::VLLMLoadBalance` 的 C++ enum、pybind 导出与枚举查找、Config
+  合法值、CLI choice、shell 校验/短名/tag 和脚本调用；
 - `long_short_sp8` 策略值及其两个专属配置字段：
   `dynamic_sp_long_request_threshold`、`dynamic_sp_long_request_size`；
 - long-short 对应的 C++ enum、构造参数、成员、placement 分支与 pybind 参数；
@@ -71,7 +82,9 @@
   `LocalScheduler`、`DecodeCoordinator`；
 - hierarchical 架构当前需要的 global ingress queue、local command queue、
   local scheduler waiting queue 和相关 queue latency metric；
-- `routing_strategy`、`router_policy`、`sp_master_selector`；
+- `routing_strategy` 字段及其现行值 `RoundRobin`、`LeastBatch`、`LeastCache`；
+- hierarchical global DP 路由使用的 `router_policy` 及其
+  `round_robin|least_batch|least_batch_v2|least_cache`，以及 `sp_master_selector`；
 - surviving SP placement：`legacy`、`bucket`、`fixed_sp_size` 和新的 decode batch
   planner。这里的 `dynamic_sp_size_strategy="legacy"` 是默认 segment placement，
   与本次删除的通信后端 `legacy_ll` 不是同一概念；
@@ -137,7 +150,55 @@ Config.scheduler_mode
 `--scheduler-arch`。它们会把未知参数当作 rate，因此旧 `--scheduler-mode` 不只是
 死文本，还可能把 `--scheduler-mode` 和 `centralized` 错当成 benchmark rate。
 
-### 3.2 long-short 的当前调用链
+### 3.2 `VLLMLoadBalance` 的历史语义与当前状态
+
+`d7913a7 add vLLM scheduling strategy` 当时增加的调用链为：
+
+```text
+Config.routing_strategy == "VLLMLoadBalance"
+  -> Python RoutingStrategy enum lookup
+  -> 旧 Scheduler::add() / select_dp_worker_for_routing()
+  -> 对每个 DP 计算 waiting * 4 + running
+  -> 选择分数最小的 DP（同分时选择编号更小的 DP）
+```
+
+这里的 “VLLM” 只表示借用了 waiting request 权重大于 running request 的负载分数，
+没有调用 vLLM、也没有复用 vLLM scheduler。它依赖旧 decentralized 的 per-worker
+waiting/running 状态；`2f94869` 删除这套队列与
+`select_dp_worker_for_routing()` 后，没有留下等价的运行时实现。
+
+当前残留为：
+
+- `csrc/nanodeploy/scheduler/sp_state_manager.h` 中的
+  `RoutingStrategy::VLLMLoadBalance`；
+- `csrc/python/sp_state_manager_binding.cpp` 中的 enum value、
+  `__class_getitem__` 与 `__members__`；
+- `nanodeploy/config.py` 的 `routing_strategy` Literal；
+- examples、两套 benchmark adapter 与 shell 脚本中的 CLI choice、合法值校验、
+  display short name 和运行参数。
+
+已确认需要清理的外围文件为：
+
+- examples：`examples/dummy_prefill.py`、`examples/bench_2seq.py`、
+  `examples/bench_serving.py`、`examples/bench_serving_overhead.py`；
+- benchmark adapter：`scripts/issue003/bench_serving_overhead.py`、
+  `scripts/sp_ablation/bench_serving_overhead.py`；
+- shell 入口：两份 `start_bench.sh`、`scripts/sp_ablation/sweep_4node_variants.sh`、
+  `scripts/run_issue001_deepseek_v3_issue001_bucket.sh`、
+  `scripts/decent-e2e/run_decent_e2e_longshort_dp4sp8_ep32.sh`、
+  `scripts/issue003/run_issue003_deepseek_rate5_sweep.sh` 和
+  `scripts/issue003/run_issue003_deepseek_rate5_sweep_0409_linbinbin.sh`。
+
+现行 `_schedule_prefill()` 只实现 `RoundRobin`、`LeastBatch`、`LeastCache`，其他值会
+抛出 `Unknown routing strategy`。它可能在空 waiting queue 时暂时不报错，但这不代表
+策略有效；一旦真实请求进入需要路由/placement 的路径就会失败。因此不能只从 CLI
+隐藏，应从 C++、binding、Config 与脚本一起删除，并在 Config 层对旧值明确报错。
+
+hierarchical 架构的 global ingress 到 DP 路由由 `router_policy` 控制，策略集合是
+`round_robin|least_batch|least_batch_v2|least_cache`。它没有
+`VLLMLoadBalance` 选项，也不读取 `routing_strategy`；本次删除不得改动该调用链。
+
+### 3.3 long-short 的当前调用链
 
 ```text
 Config.dynamic_sp_size_strategy == "long_short_sp8"
@@ -180,7 +241,7 @@ placement，进而触发 reservation mismatch、错误的 KV credit 或不必要
 覆盖。因此清理后的测试重点应放在 surviving `legacy`/`bucket` placement，而不是
 简单删除断言后结束。
 
-### 3.3 long-short 的 CLI 与脚本影响面
+### 3.4 long-short 的 CLI 与脚本影响面
 
 直接暴露 long-short 参数的 CLI/adapter：
 
@@ -212,7 +273,7 @@ placement，进而触发 reservation mismatch、错误的 KV credit 或不必要
 
 其余混合/通用脚本保留并移除 long-short 参数，见实施阶段 3。
 
-### 3.4 `enable_dynamic_sp_size` 的真实作用域
+### 3.5 `enable_dynamic_sp_size` 的真实作用域
 
 legacy 单请求 placement 首先按 prompt segment 数计算 `initial_num_ranks`。当前
 C++ 与 hierarchical frontend mirror 都使用同一逻辑：
@@ -248,7 +309,7 @@ C++ 同样只检查 `use_new_decode_dynamic_sp_scheduler`，从而消除双开�
 入口条件不一致的可能性。除非后续单独确认论文也不需要新 batch planner，本次不顺带
 删除 `use_new_decode_dynamic_sp_scheduler` 本体。
 
-### 3.5 `legacy_ll` SP backend 的当前调用链
+### 3.6 `legacy_ll` SP backend 的当前调用链
 
 后端选择链为：
 
@@ -326,6 +387,15 @@ fallback；新 decode batch planner 若启用，只由
 - `scheduler_arch="legacy_global"`；
 - `scheduler_arch="hierarchical"`。
 
+legacy/local C++ scheduler 的 `routing_strategy` 只保留：
+
+- `RoundRobin`；
+- `LeastBatch`；
+- `LeastCache`。
+
+`VLLMLoadBalance` 不再是合法配置，也不再出现在 C++/pybind 枚举或 CLI 中。hierarchical
+的 global DP routing 继续由独立的 `router_policy` 控制，其现行策略和值不变。
+
 活动源码、示例和脚本中不再把 hierarchical 称为 decentralized，也不再传递
 `--scheduler-mode`。只有明确的 removed-option fail-fast 护栏、相应负向测试和
 dated historical notes 可以保留旧名称。
@@ -345,7 +415,7 @@ dated historical notes 可以保留旧名称。
 4. 先运行现有 CPU focused tests，记录任何基线失败，避免把环境或用户改动造成的
    失败误归因于清理。
 
-### 阶段 1：清理旧 decentralized 的外围残留
+### 阶段 1：清理旧 decentralized 的外围残留与失效路由值
 
 1. 保留 `LLMEngine` 对 `scheduler_mode` 的 fail-fast 语义，但把它与 long-short
    removed options 合并为一个小型、集中式的 removed-option 检查。
@@ -360,6 +430,19 @@ dated historical notes 可以保留旧名称。
    `legacy_global_dp*`/`hierarchical_dp*`，不保留 `decentralized_*` alias，避免继续
    传播两代实现混淆。
 5. 删除的 long-short 专属脚本无需先修旧 flag；它们在阶段 3 直接移除。
+6. 原子删除 `VLLMLoadBalance` 公开入口：
+   - 从 `csrc/nanodeploy/scheduler/sp_state_manager.h` 删除 enum value；
+   - 从 `csrc/python/sp_state_manager_binding.cpp` 删除 pybind value，并同步收缩
+     `__class_getitem__` 与 `__members__`；
+   - 从 `Config.routing_strategy` Literal 删除旧值，并增加显式 whitelist 校验，确保
+     `VLLMLoadBalance` 和其他未知值在 driver 端得到清晰 ValueError，而不是稍后触发
+     C++ `Unknown routing strategy`；
+   - examples、benchmark adapter、`start_bench.sh`、sweep/run 脚本中的 choice、case、
+     display short name、tag 和参数转发全部删除；
+   - 保留 `RoundRobin|LeastBatch|LeastCache`，不改 hierarchical `router_policy`。
+7. 删除值后不保留同名 alias。与已删除字段不同，`routing_strategy` 字段本身仍存在，
+   Config whitelist 足以提供 fail-fast；无需在 `LLMEngine` 的 removed-option kwargs
+   护栏里增加特殊分支。
 
 ### 阶段 2：原子删除 long-short 与 `enable_dynamic_sp_size` 生产调用链
 
@@ -433,7 +516,7 @@ dated historical notes 可以保留旧名称。
 4. 对所有 surviving script 做 `enable_dynamic_sp_size` 残留扫描，删除对应环境变量、
    positional function 参数、条件拼接、日志和下游转发；不能只清理两份
    `start_bench.sh`。
-5. 删除第 3.3 节列出的 long-short 专属脚本/工具。
+5. 删除第 3.4 节列出的 long-short 专属脚本/工具。
 6. 更新 `scripts/README.md`，删除已移除绘图工具与实验脚本的活动说明；不修改
    dated `docs-dev/` 历史记录。
 
@@ -489,6 +572,10 @@ dated historical notes 可以保留旧名称。
 ### 阶段 5：测试与验证
 
 1. 增补/调整 CPU tests：
+   - `routing_strategy` 接受 `RoundRobin|LeastBatch|LeastCache`，明确拒绝
+     `VLLMLoadBalance` 与其他未知值；
+   - pybind `RoutingStrategy.__members__` 只包含三个 surviving 值；
+   - 三个 surviving routing strategy 的现有调度测试继续通过；
    - `long_short_sp8` 被配置层明确拒绝；
    - 两个 removed long-short kwargs 与 `enable_dynamic_sp_size` 不会被 `LLMEngine`
      静默忽略；
@@ -532,6 +619,7 @@ dated historical notes 可以保留旧名称。
    - `SchedulerMode`
    - `_schedule_decentralized`
    - `--scheduler-mode`
+   - `VLLMLoadBalance`
    - `long_short` / `longshort` / `LongShortSP8`
    - `dynamic_sp_long_request_*`
    - `--long-request-sp-*`
@@ -546,18 +634,20 @@ dated historical notes 可以保留旧名称。
 
 ## 6. 提交拆分建议
 
-为便于 review 与回滚，建议拆成四个窄提交：
+为便于 review 与回滚，建议拆成五个窄提交：
 
 1. `fix: remove stale decentralized scheduler script options`
    - 只做 `scheduler_mode -> scheduler_arch` 脚本迁移和命名清理；
-2. `refactor: remove unused dynamic SP placement paths`
+2. `refactor: remove stale VLLM load-balance route`
+   - C++/pybind enum、Config 校验、CLI/脚本 choices 和 routing tests；
+3. `refactor: remove unused dynamic SP placement paths`
    - Config、Python mirror、C++、bindings、tests；
-3. `chore: remove obsolete long-short experiment tooling`
+4. `chore: remove obsolete long-short experiment tooling`
    - CLI、launch/plot scripts、README；
-4. `refactor: remove legacy_ll SP backend`
+5. `refactor: remove legacy_ll SP backend`
    - backend adapter/factory、Config 默认值与校验、CLI choices、tests/docs。
 
-第 2 个提交必须原子覆盖 Python mirror、C++ implementation 和 bindings；不能拆成会
+第 3 个提交必须原子覆盖 Python mirror、C++ implementation 和 bindings；不能拆成会
 产生 frontend/local placement 不一致或 extension 构造 ABI 不一致的中间提交。
 
 ## 7. 风险与控制
@@ -565,6 +655,8 @@ dated historical notes 可以保留旧名称。
 | 风险 | 后果 | 控制方式 |
 |---|---|---|
 | 把当前 hierarchical queue 当成旧 per-worker queue 删除 | 当前分层运行时不可用 | 按第 2.2 节白名单保留，只删除历史 `scheduler_mode` 语义 |
+| 把 `VLLMLoadBalance` 当成 hierarchical router policy | 误删当前 global DP 路由或错误迁移配置 | 只删除精确 enum/配置值；明确保留整个 `router_policy` 调用链 |
+| 只隐藏 `VLLMLoadBalance` CLI、保留 C++/pybind 值 | 失效 API 仍可被 Python 配置触发并在请求到达后报错 | 同一提交删除 enum、binding、Config/CLI，并增加旧值拒绝测试 |
 | C++ 构造参数与 pybind/Python adapter 不同步 | 编译失败或运行时构造 TypeError | 同一提交改六个 C++/binding 文件与 adapter，随后 editable install |
 | 只删 C++ 或只删 admission mirror | frontend reservation 与本地 placement 失配 | 两边原子删除，并跑 mirror 等价测试 |
 | 删除字段后 kwargs 被静默过滤 | 用户以为 long-short 仍生效，实际跑默认策略 | 保留集中式 removed-option fail-fast 护栏 |
@@ -597,9 +689,11 @@ dated historical notes 可以保留旧名称。
    planner 本体纳入删除范围。
 7. **只删除 `legacy_ll`（已确认）**：保留 `hao_basic`、`nccl`、`nccl_compact`，默认改为
    `hao_basic`，继续保留 backend switch、对比测试和 benchmark。
-8. **旧 SP backend 设计文档的归档方式**：推荐保留技术历史但加醒目标记；若开源活动
+8. **删除 `VLLMLoadBalance`（已确认）**：它是旧 decentralized 的失效枚举，不是
+   hierarchical `router_policy`；保留 `RoundRobin`、`LeastBatch`、`LeastCache`。
+9. **旧 SP backend 设计文档的归档方式**：推荐保留技术历史但加醒目标记；若开源活动
    `docs/` 只允许现行说明，则将这些文档迁入 dated `docs-dev/`，不直接抹除内容。
 
-以上决策确认后再进入实现，避免把“删除旧 decentralized/legacy_ll”误扩展为删除
-`legacy_global`、默认 legacy segment placement、当前 hierarchical control plane 或
-surviving NCCL 后端。
+以上决策确认后再进入实现，避免把“删除旧 decentralized、`VLLMLoadBalance`、
+`legacy_ll`”误扩展为删除 `legacy_global`、默认 legacy segment placement、当前
+hierarchical control plane/`router_policy` 或 surviving NCCL 后端。
