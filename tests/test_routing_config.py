@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from nanodeploy.config import Config
+from nanodeploy.engine.llm_engine import LLMEngine
 from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
 
 
@@ -133,3 +134,16 @@ def test_removed_scheduler_mode_is_not_a_config_field():
             model=str(DEEPSEEK_MODEL),
             scheduler_mode="decentralized",
         )
+
+
+def test_removed_sp_debug_is_not_a_config_field():
+    with pytest.raises(TypeError, match="sp_debug"):
+        Config(  # type: ignore[call-arg]
+            model=str(DEEPSEEK_MODEL),
+            sp_debug=True,
+        )
+
+
+def test_llm_engine_rejects_removed_sp_debug_before_filtering_kwargs():
+    with pytest.raises(TypeError, match="sp_debug was removed"):
+        LLMEngine(str(DEEPSEEK_MODEL), sp_debug=True)

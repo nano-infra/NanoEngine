@@ -115,7 +115,6 @@ public:
                    int                lse_bytes_per_edge,
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
-                   bool               sp_debug = false,
                    int                fixed_sp_size = 0);
 
     void set_dp_idx(int dp_idx)
@@ -266,7 +265,6 @@ private:
     CostModel cost_model_;
     TrafficModel traffic_model_;
     bool enable_non_uniform_split_;
-    bool sp_debug_;
     int  fixed_sp_size_;
 
     SPMasterSelector master_selector_;

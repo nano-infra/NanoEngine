@@ -140,10 +140,9 @@ void bind_scheduler_utils(py::module_& m)
                          double             lse_cost_b,
                          int                q_bytes_per_edge,
                          int                res_bytes_per_edge,
-                         int                lse_bytes_per_edge,
+                          int                lse_bytes_per_edge,
                           bool               enable_non_uniform_split,
                           const std::string& sp_master_selector,
-                          bool               sp_debug,
                           int                fixed_sp_size) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
@@ -175,10 +174,9 @@ void bind_scheduler_utils(py::module_& m)
                                                     lse_cost_b,
                                                     q_bytes_per_edge,
                                                     res_bytes_per_edge,
-                                                    lse_bytes_per_edge,
+                                                     lse_bytes_per_edge,
                                                      enable_non_uniform_split,
                                                      sp_master_selector,
-                                                     sp_debug,
                                                      fixed_sp_size);
               }),
              py::arg("engine_id"),
@@ -211,10 +209,9 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("lse_cost_b") = 0.0,
              py::arg("q_bytes_per_edge") = 1,
              py::arg("res_bytes_per_edge") = 1,
-             py::arg("lse_bytes_per_edge") = 1,
+              py::arg("lse_bytes_per_edge") = 1,
               py::arg("enable_non_uniform_split"),
               py::arg("sp_master_selector"),
-              py::arg("sp_debug") = false,
               py::arg("fixed_sp_size") = 0)
 
         // Queue management

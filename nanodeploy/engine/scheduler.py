@@ -73,7 +73,6 @@ class Scheduler(_CppScheduler):
             config.dynamic_sp_lse_bytes_per_edge,
             config.enable_non_uniform_split,
             config.sp_master_selector,
-            config.sp_debug,
             config.fixed_sp_size,
         )
         # Store config for compatibility

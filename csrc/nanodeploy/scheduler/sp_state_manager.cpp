@@ -108,7 +108,6 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                lse_bytes_per_edge,
                                bool               enable_non_uniform_split,
                                const std::string& sp_master_selector,
-                               bool               sp_debug,
                                int                fixed_sp_size) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
@@ -132,7 +131,6 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     },
     traffic_model_{q_bytes_per_edge, res_bytes_per_edge, lse_bytes_per_edge},
     enable_non_uniform_split_(enable_non_uniform_split),
-    sp_debug_(sp_debug),
     fixed_sp_size_(fixed_sp_size)
 {
     // Initialize Strategy
@@ -168,8 +166,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     if (fixed_sp_size_ > 0
         && (enable_dynamic_sp_size_
             || dynamic_sp_size_strategy_ != DynamicSPSizeStrategy::Legacy
-            || enable_dynamic_sp_bucket_policy_
-            || sp_debug_)) {
+            || enable_dynamic_sp_bucket_policy_)) {
         throw std::runtime_error(
             "fixed_sp_size cannot be combined with dynamic SP size strategies");
     }
@@ -881,120 +878,6 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
     if (attention_sp_ > 1) {
-        // ==========================================
-        //  Debug Strategy (sp_debug mode)
-        // ==========================================
-        if (sp_debug_) {
-            auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-            
-            int num_tokens = seq.num_tokens;
-            // Segment equals Block Size in debug mode
-            int debug_segment_size = kvcache_block_size_;
-            int num_segments = (num_tokens + debug_segment_size - 1) / debug_segment_size;
-            
-            // SP Size is determined by number of segments
-            int target_num_ranks = std::min(num_segments, attention_sp_);
-            if (target_num_ranks == 0) target_num_ranks = 1;
-            
-            // Select Master Rank using Round Robin
-            SPMasterSelector original_selector = master_selector_;
-            master_selector_ = SPMasterSelector::RoundRobin;
-            int master_rank = select_master_rank();
-            master_selector_ = original_selector; // Restore original selector
-            
-            // Check Master Rank capacity
-            if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) {
-                return false;
-            }
-            
-            auto it_tokens = num_batched_tokens.find(master_rank);
-            int current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
-            if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-                return false;
-            }
-            
-            // Prepare rank selection (excluding master for now)
-            std::vector<std::pair<int, int>> rank_free_count;
-            for (const auto& [rank, bm] : block_manager) {
-                if (rank != master_rank) {
-                    rank_free_count.push_back({rank, bm->num_free_blocks()});
-                }
-            }
-            std::sort(rank_free_count.begin(),
-                      rank_free_count.end(),
-                      [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                          return a.second != b.second ? a.second > b.second
-                                                     : a.first < b.first;
-                      });
-            
-            // Select participating ranks (non-master ranks first)
-            std::vector<int> participating_ranks;
-            int non_master_ranks_needed = std::min((int)rank_free_count.size(), target_num_ranks - 1);
-            for (int i = 0; i < non_master_ranks_needed; ++i) {
-                participating_ranks.push_back(rank_free_count[i].first);
-            }
-            participating_ranks.push_back(master_rank); // Master is always included
-            
-            // Initialize token dispatch
-            block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
-            block_ctx.master_sp_idx_ = master_rank;
-            
-            // Allocate tokens: non-master ranks get full segments, master gets the remainder (tail segment)
-            int remaining_tokens = num_tokens;
-            int segments_assigned_to_non_master = std::min(non_master_ranks_needed, num_segments - 1);
-            
-            // Assign full segments to non-master ranks
-            for (int i = 0; i < segments_assigned_to_non_master; ++i) {
-                int sp_idx = participating_ranks[i];
-                block_ctx.num_dispatched_tokens[sp_idx] = debug_segment_size;
-                remaining_tokens -= debug_segment_size;
-            }
-            
-            // Assign remaining tokens (tail segment) to master rank
-            block_ctx.num_dispatched_tokens[master_rank] = remaining_tokens;
-            
-            // Reservation Check
-            std::vector<int> master_req_counts(attention_sp_, 0);
-            for (const auto& running_seq : running) {
-                int m_idx = running_seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-                if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx]++;
-            }
-            for (const auto& [m_idx, count] : num_seqs) {
-                if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx] += count;
-            }
-            master_req_counts[master_rank]++;
-            
-            // Memory check
-            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                if (block_ctx.num_dispatched_tokens[sp_idx] > 0 || sp_idx == master_rank) {
-                    
-                    if (fixed_sp_size_ == 0 && sp_idx != master_rank
-                        && block_ctx.num_dispatched_tokens[sp_idx] > 0) {
-                        if (num_recv_seqs_per_sp_[sp_idx] >= max_num_recv_seqs_) {
-                            return false;
-                        }
-                    }
-                    
-                    int free_blocks = block_manager[sp_idx]->num_free_blocks();
-                    int prefill_tokens = block_ctx.num_dispatched_tokens[sp_idx];
-                    int prefill_blocks_needed = (prefill_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
-                    
-                    double needed_float = master_req_counts[sp_idx] * reserved_blocks_per_req_;
-                    int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
-                    
-                    if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) {
-                        return false;
-                    }
-                    
-                    if (!block_manager[sp_idx]->can_allocate(seq)) {
-                        return false;
-                    }
-                }
-            }
-            
-            return true;
-        }
-        
         // ==========================================
         //  Optimized Strategy (Dynamic SP Size)
         // ==========================================

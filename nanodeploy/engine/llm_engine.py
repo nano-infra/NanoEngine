@@ -42,11 +42,19 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
 
 class LLMEngine:
     def __init__(self, model, **kwargs):
-        if "scheduler_mode" in kwargs:
-            raise TypeError(
+        removed_options = {
+            "scheduler_mode": (
                 "scheduler_mode was removed; use "
                 "scheduler_arch='legacy_global' or 'hierarchical'"
-            )
+            ),
+            "sp_debug": (
+                "sp_debug was removed; use a supported legacy, bucket, "
+                "or fixed SP placement"
+            ),
+        }
+        for option, message in removed_options.items():
+            if option in kwargs:
+                raise TypeError(message)
         self.engine_id = str(uuid.uuid4())
 
         config_fields = {field.name for field in fields(Config)}

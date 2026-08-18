@@ -108,7 +108,6 @@ public:
               int                lse_bytes_per_edge,
               bool               enable_non_uniform_split,
               const std::string& sp_master_selector,
-              bool               sp_debug,
               int                fixed_sp_size);
 
     // Queue management
@@ -186,7 +185,6 @@ private:
     int         dynamic_sp_long_request_threshold_;
     int         dynamic_sp_long_request_size_;
     bool        enable_non_uniform_split_;
-    bool        sp_debug_;
 
     std::string sp_master_selector_;
 

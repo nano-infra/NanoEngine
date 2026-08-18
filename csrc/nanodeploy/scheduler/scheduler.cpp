@@ -45,7 +45,6 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                lse_bytes_per_edge,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector,
-                     bool               sp_debug,
                      int                fixed_sp_size) :
     engine_id_(engine_id),
     loop_count_(loop_count),
@@ -64,7 +63,6 @@ Scheduler::Scheduler(const std::string& engine_id,
     dynamic_sp_long_request_threshold_(dynamic_sp_long_request_threshold),
     dynamic_sp_long_request_size_(dynamic_sp_long_request_size),
     enable_non_uniform_split_(enable_non_uniform_split),
-    sp_debug_(sp_debug),
     sp_master_selector_(sp_master_selector)
 {
     Sequence::block_size = kvcache_block_size;
@@ -84,7 +82,7 @@ Scheduler::Scheduler(const std::string& engine_id,
             lse_cost_a, lse_cost_b,
             q_bytes_per_edge, res_bytes_per_edge, lse_bytes_per_edge,
             enable_non_uniform_split,
-            sp_master_selector, sp_debug_, fixed_sp_size);
+            sp_master_selector, fixed_sp_size);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);

@@ -168,9 +168,6 @@ class Config:
         "RoundRobin", "LeastBatch", "LeastCache"
     ] = "LeastBatch"
 
-    # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
-    sp_debug: bool = False
-
     # Fixed number of participating SP ranks per request.
     # 0 keeps the segment-size / dynamic-SP scheduling behavior.
     fixed_sp_size: int = 0
@@ -288,7 +285,6 @@ class Config:
             or self.enable_dynamic_sp_bucket_policy
             or bool(self.dynamic_sp_bucket_policy.strip())
             or self.dynamic_sp_bucket_preset != "none"
-            or self.sp_debug
         ):
             raise ValueError(
                 "fixed_sp_size is a baseline scheduling mode and cannot be "

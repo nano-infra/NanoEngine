@@ -32,7 +32,6 @@ class AdmissionPlannerConfig:
     dynamic_sp_bucket_policy: str = ""
     enable_non_uniform_split: bool = False
     sp_master_selector: str = "LeastBatch"
-    sp_debug: bool = False
     fixed_sp_size: int = 0
 
     @classmethod
@@ -60,7 +59,6 @@ class AdmissionPlannerConfig:
             dynamic_sp_bucket_policy=config.dynamic_sp_bucket_policy,
             enable_non_uniform_split=config.enable_non_uniform_split,
             sp_master_selector=config.sp_master_selector,
-            sp_debug=config.sp_debug,
             fixed_sp_size=config.fixed_sp_size,
         )
 
@@ -225,31 +223,6 @@ class AdmissionPlanner:
             >= self.config.max_num_batched_tokens
         ):
             return None
-
-        if self.config.sp_debug:
-            target_ranks = min(
-                self._ceil_div(
-                    prompt_tokens, self.config.kvcache_block_size
-                ),
-                self.config.attention_sp,
-            )
-            target_ranks = max(1, target_ranks)
-            nonmasters = self._richest_nonmasters(shadow, master)
-            participants = nonmasters[: target_ranks - 1] + [master]
-            dispatched = [0] * self.config.attention_sp
-            remaining = prompt_tokens
-            for sp_idx in participants[:-1]:
-                dispatched[sp_idx] = min(
-                    remaining, self.config.kvcache_block_size
-                )
-                remaining -= dispatched[sp_idx]
-            dispatched[master] = remaining
-            return self._check_legacy_placement(
-                shadow,
-                command.request_id,
-                master,
-                dispatched,
-            )
 
         num_segments = self._ceil_div(
             prompt_tokens, self.config.segment_size
