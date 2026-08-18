@@ -21,7 +21,7 @@ ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/downl
 # module from PyTorch's official prebuilt index (ABI-stable for torch>=2.9).
 # Needed by DeepSeek-V3 MLA varlen prefill (qk=192 / v=128 head dims).
 ARG FLASH_ATTN3_INDEX_URL=https://download.pytorch.org/whl/cu128
-ARG FLASH_ATTN3_VERSION=flash-attn-3
+ARG FLASH_ATTN3_VERSION=flash-attn-3==3.0.0
 ARG OH_MY_ZSH_REF=c86ba78e2ff5c5a3e9282a84c0cc220dd3d5f253
 ARG ZSH_AUTOSUGGESTIONS_REF=v0.7.1
 ARG ZSH_SYNTAX_HIGHLIGHTING_REF=0.8.0
