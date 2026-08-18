@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 
-SPBackend = Literal["legacy_ll", "hao_basic", "nccl", "nccl_compact"]
+SPBackend = Literal["hao_basic", "nccl", "nccl_compact"]
 
 
 @runtime_checkable
@@ -47,13 +47,6 @@ class MLAAllToAllBackendFactoryProtocol(Protocol):
 
 
 @lru_cache(maxsize=1)
-def _resolve_legacy_buffer_cls():
-    from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
-
-    return AllToAllIntraLLBuffer
-
-
-@lru_cache(maxsize=1)
 def _resolve_hao_symbols():
     import dlslime
 
@@ -79,47 +72,6 @@ def _maybe_get_local_buffer(buffer) -> torch.Tensor | None:
         return candidate
 
     return None
-
-
-class LegacyIntraLLBufferAdapter:
-    def __init__(
-        self,
-        *,
-        max_dispatch_per_msg: int,
-        max_bs: int,
-        rank: int,
-        world_size: int,
-        buffer_size_bytes: int,
-    ):
-        buffer_cls = _resolve_legacy_buffer_cls()
-        self._buffer = buffer_cls(
-            max_dispatch_per_msg,
-            max_bs,
-            rank,
-            world_size,
-            buffer_size_bytes,
-        )
-
-    @property
-    def local_buffer(self) -> torch.Tensor:
-        return self._buffer.local_buffer
-
-    def connect_full_mesh(self, group: dist.ProcessGroup) -> None:
-        self._buffer.connect_full_mesh(group)
-
-    def all_to_all_ll(
-        self,
-        x: torch.Tensor,
-        is_transpose: bool = False,
-        mask: torch.Tensor | None = None,
-        offsets: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self._buffer.all_to_all_ll(
-            x,
-            is_transpose=is_transpose,
-            mask=mask,
-            offsets=offsets,
-        )
 
 
 class HaoAllToAllBufferAdapter:
@@ -851,40 +803,6 @@ class NcclCompactAllToAllBufferAdapter:
         return self.local_buffer.view(dtype=output.dtype)[: output.numel()].view_as(output)
 
 
-class LegacyIntraLLBackendFactory:
-    @staticmethod
-    def get_buffer_size_hint(
-        max_dispatch_per_msg: int,
-        max_bs: int,
-        max_msg_size: int,
-        itemsize: int,
-    ) -> int:
-        buffer_cls = _resolve_legacy_buffer_cls()
-        return buffer_cls.get_buffer_size_hint(
-            max_dispatch_per_msg,
-            max_bs,
-            max_msg_size,
-            itemsize,
-        )
-
-    def create_buffer(
-        self,
-        *,
-        max_dispatch_per_msg: int,
-        max_bs: int,
-        rank: int,
-        world_size: int,
-        buffer_size_bytes: int,
-    ) -> MLAAllToAllBufferProtocol:
-        return LegacyIntraLLBufferAdapter(
-            max_dispatch_per_msg=max_dispatch_per_msg,
-            max_bs=max_bs,
-            rank=rank,
-            world_size=world_size,
-            buffer_size_bytes=buffer_size_bytes,
-        )
-
-
 class HaoBasicBackendFactory:
     @staticmethod
     def get_buffer_size_hint(
@@ -972,8 +890,6 @@ class NcclCompactBackendFactory:
 def create_sp_backend_factory(
     backend: SPBackend,
 ) -> MLAAllToAllBackendFactoryProtocol:
-    if backend == "legacy_ll":
-        return LegacyIntraLLBackendFactory()
     if backend == "hao_basic":
         return HaoBasicBackendFactory()
     if backend == "nccl":

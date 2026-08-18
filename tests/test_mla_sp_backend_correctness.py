@@ -12,7 +12,7 @@ Covered cases:
 The script initializes `SPContext` twice, once per backend, so the exercised path
 matches NanoDeploy's startup-time backend selection:
 
-`set_sp_context(..., backend="legacy_ll" | "hao_basic" | "nccl" | "nccl_compact")`
+`set_sp_context(..., backend="hao_basic" | "nccl" | "nccl_compact")`
 
 Usage:
 `torchrun --nproc_per_node=8 tests/test_mla_sp_backend_correctness.py --mode both`
@@ -35,7 +35,6 @@ from nanodeploy.worker.sp_context import get_sp_context, set_sp_context
 
 MASTER_RANK = 0
 BACKEND_CHOICES: tuple[SPBackend, ...] = (
-    "legacy_ll",
     "hao_basic",
     "nccl",
     "nccl_compact",

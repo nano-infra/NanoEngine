@@ -192,3 +192,16 @@ def test_llm_engine_rejects_removed_long_short_sp8_strategy():
             str(DEEPSEEK_MODEL),
             dynamic_sp_size_strategy="long_short_sp8",
         )
+
+
+def test_sp_backend_defaults_to_hao_basic():
+    assert make_config().sp_backend == "hao_basic"
+
+
+@pytest.mark.parametrize("backend", ["legacy_ll", "unknown"])
+def test_config_rejects_removed_or_unknown_sp_backend(backend):
+    with pytest.raises(
+        ValueError,
+        match="sp_backend must be one of: hao_basic, nccl, nccl_compact",
+    ):
+        make_config(sp_backend=backend)

@@ -27,7 +27,7 @@ class SPContext:
     rank: int
     sp_size: int
 
-    backend: SPBackend = "legacy_ll"
+    backend: SPBackend = "hao_basic"
 
     q_buffer: MLAAllToAllBufferProtocol | None = None
     res_buffer: MLAAllToAllBufferProtocol | None = None
@@ -97,7 +97,7 @@ def set_sp_context(
     dtype: torch.dtype,
     rank: int,
     sp_size: int,
-    backend: SPBackend = "legacy_ll",
+    backend: SPBackend = "hao_basic",
 ):
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(

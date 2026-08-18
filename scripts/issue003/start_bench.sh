@@ -94,7 +94,7 @@ usage() {
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
-    echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
+    echo "  --sp-backend <str>        hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
@@ -174,7 +174,7 @@ case "$SCHEDULER_ARCH" in
 esac
 
 case "$SP_BACKEND" in
-    legacy_ll|hao_basic|nccl) ;;
+    hao_basic|nccl) ;;
     *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
 esac
 

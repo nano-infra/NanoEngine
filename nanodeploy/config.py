@@ -111,7 +111,7 @@ class Config:
 
     # performance optimization
     use_dlslime_rpc: bool = True
-    sp_backend: Literal["legacy_ll", "hao_basic", "nccl", "nccl_compact"] = "legacy_ll"
+    sp_backend: Literal["hao_basic", "nccl", "nccl_compact"] = "hao_basic"
     # Optimize Block Table transmission in Decode phase: if True, only send BlockTable
     # for sequences that have KVCache on the target rank; if False, send all BlockTables
     optimize_decode_block_table: bool = True
@@ -332,6 +332,10 @@ class Config:
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         if self.cuda_graph_mode not in {"full", "piecewise"}:
             raise ValueError("cuda_graph_mode must be one of: full, piecewise")
+        if self.sp_backend not in {"hao_basic", "nccl", "nccl_compact"}:
+            raise ValueError(
+                "sp_backend must be one of: hao_basic, nccl, nccl_compact"
+            )
         if (
             self.sp_backend == "nccl_compact"
             and not self.enforce_eager

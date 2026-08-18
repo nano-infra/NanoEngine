@@ -107,7 +107,7 @@ usage() {
     echo "  --sp-master-selector <str> RoundRobin | LeastBatch | LeastCache (default: $DEFAULT_SP_MASTER_SELECTOR)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
-    echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
+    echo "  --sp-backend <str>        hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
@@ -207,7 +207,7 @@ case "$SP_MASTER_SELECTOR" in
 esac
 
 case "$SP_BACKEND" in
-    legacy_ll|hao_basic|nccl) ;;
+    hao_basic|nccl|nccl_compact) ;;
     *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
 esac
 

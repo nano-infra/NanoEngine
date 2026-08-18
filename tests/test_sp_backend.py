@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nanodeploy.worker import sp_backend, sp_context
@@ -80,6 +81,11 @@ class _FakeFactory:
         buffer = _FakeCreatedBuffer(**kwargs)
         self.created.append(buffer)
         return buffer
+
+
+def test_removed_legacy_ll_factory_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported SP backend: legacy_ll"):
+        sp_backend.create_sp_backend_factory("legacy_ll")  # type: ignore[arg-type]
 
 
 def test_hao_adapter_compat_mode_translates_mask_and_transpose(monkeypatch):

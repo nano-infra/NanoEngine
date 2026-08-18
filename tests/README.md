@@ -4,13 +4,12 @@
 
 这个脚本用于对比 NanoDeploy 里的 MLA SP all2all 后端是否一致：
 
-- `legacy_ll`
 - `hao_basic`
 - `nccl`
 
 脚本会走仓库里的正式后端切换路径：
 
-`set_sp_context(..., backend="legacy_ll" | "hao_basic" | "nccl")`
+`set_sp_context(..., backend="hao_basic" | "nccl")`
 
 覆盖三类 MLA 通信：
 
@@ -163,7 +162,6 @@ torchrun --nproc_per_node=4 tests/test_mla_sp_backend_correctness.py --mode both
 
 这个脚本用于在 NanoDeploy 仓库内直接对比 MLA SP all2all 后端的性能：
 
-- `legacy_ll`
 - `hao_basic`
 - `nccl`
 

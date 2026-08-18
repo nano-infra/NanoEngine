@@ -20,7 +20,6 @@ from nanodeploy.worker.sp_context import get_sp_context, set_sp_context
 
 MASTER_RANK = 0
 BACKEND_CHOICES: tuple[SPBackend, ...] = (
-    "legacy_ll",
     "hao_basic",
     "nccl",
     "nccl_compact",
