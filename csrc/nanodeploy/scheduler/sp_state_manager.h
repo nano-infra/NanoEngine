@@ -38,52 +38,9 @@ struct SPBucketInterval {
 
 class SPStateManager {
 public:
-    struct StageModel {
-        double a = 1.0;
-        double b = 0.0;
-
-        double predict(double load) const
-        {
-            return a * load + b;
-        }
-    };
-
-    struct CostModel {
-        StageModel attention;
-        StageModel q;
-        StageModel res;
-        StageModel lse;
-    };
-
-    struct TrafficModel {
-        int q_bytes_per_edge = 1;
-        int res_bytes_per_edge = 1;
-        int lse_bytes_per_edge = 1;
-    };
-
-    struct LatencyBreakdown {
-        double total = 0.0;
-        double attention = 0.0;
-        double q = 0.0;
-        double res = 0.0;
-        double lse = 0.0;
-        double max_tokens = 0.0;
-        double max_q_bytes = 0.0;
-        double max_res_bytes = 0.0;
-        double max_lse_bytes = 0.0;
-    };
-
     struct PlannedPlacement {
         int              master_sp_idx = 0;
         std::vector<int> num_dispatched_tokens;
-    };
-
-    struct DecodeBatchPlan {
-        std::vector<PlannedPlacement> placements;
-        LatencyBreakdown              latency;
-        int                           max_tokens = 0;
-        int                           total_overflow = 0;
-        int                           extra_participants = 0;
     };
 
     SPStateManager(const std::string& engine_id,
@@ -98,17 +55,6 @@ public:
                    const std::string& dynamic_sp_size_strategy,
                    bool               enable_dynamic_sp_bucket_policy,
                    const std::string& dynamic_sp_bucket_policy,
-                   double             attention_cost_a,
-                   double             attention_cost_b,
-                   double             q_cost_a,
-                   double             q_cost_b,
-                   double             res_cost_a,
-                   double             res_cost_b,
-                   double             lse_cost_a,
-                   double             lse_cost_b,
-                   int                q_bytes_per_edge,
-                   int                res_bytes_per_edge,
-                   int                lse_bytes_per_edge,
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
                    int                fixed_sp_size = 0);
@@ -150,16 +96,7 @@ public:
                       const std::unordered_map<int, int>& num_seqs,
                       const std::unordered_map<int, int>& num_batched_tokens);
 
-    std::optional<DecodeBatchPlan> plan_decode_batch(
-        const std::vector<std::shared_ptr<Sequence>>& pending_seqs) const;
-
     void apply_planned_placement(Sequence& seq, const PlannedPlacement& placement);
-
-    // Build and reuse immutable running-state snapshots within a single
-    // scheduler step. This avoids rescanning all running sequences for each
-    // tentative decode-batch plan in the latency-aware scheduler.
-    void begin_decode_planning() const;
-    void end_decode_planning() const;
 
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
@@ -211,30 +148,10 @@ public:
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
 
 private:
-    struct PlanningState {
-        std::vector<int> tokens;
-        std::vector<int> master_counts;
-        std::vector<int> recv_counts;
-        std::vector<int> free_blocks;
-        std::vector<int> batch_tokens;
-        std::vector<int> send_q;
-        std::vector<int> recv_q;
-        std::vector<int> send_res;
-        std::vector<int> recv_res;
-        std::vector<int> send_lse;
-        std::vector<int> recv_lse;
-        int              group_max = 0;
-        int              rr_cursor = 0;
-    };
-
     void initialize_dummy_seqs();
     int  select_master_rank();
     int  effective_target_sp_size(int requested_sp_size, int num_tokens) const;
     std::optional<int> select_bucket_sp_size(int seq_len) const;
-    void add_communication(PlanningState& state,
-                           int            master_sp_idx,
-                           const std::vector<int>& dispatched_tokens) const;
-    PlanningState build_running_state_snapshot() const;
 
     std::string engine_id_;
     int         dp_idx_ = -1;
@@ -255,14 +172,11 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_recv_seqs_per_sp_;
 
-    CostModel cost_model_;
-    TrafficModel traffic_model_;
     bool enable_non_uniform_split_;
     int  fixed_sp_size_;
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;
-    mutable std::optional<PlanningState> cached_running_state_;
 };
 
 }  // namespace nanodeploy

@@ -24,7 +24,6 @@ class AdmissionPlannerConfig:
     reserved_blocks_per_req: float
     segment_size: int
     queue_capacity: int
-    use_new_decode_dynamic_sp_scheduler: bool = False
     dynamic_sp_size_strategy: str = "legacy"
     dynamic_sp_bucket_policy: str = ""
     enable_non_uniform_split: bool = False
@@ -42,9 +41,6 @@ class AdmissionPlannerConfig:
             reserved_blocks_per_req=config.reserved_blocks_per_req,
             segment_size=config.segment_size,
             queue_capacity=config.hierarchical_queue_capacity,
-            use_new_decode_dynamic_sp_scheduler=(
-                config.use_new_decode_dynamic_sp_scheduler
-            ),
             dynamic_sp_size_strategy=config.dynamic_sp_size_strategy,
             dynamic_sp_bucket_policy=config.dynamic_sp_bucket_policy,
             enable_non_uniform_split=config.enable_non_uniform_split,
@@ -186,10 +182,7 @@ class AdmissionPlanner:
     ) -> AdmissionReservation | None:
         if shadow.queue_slots >= self.config.queue_capacity:
             return None
-        if self.config.use_new_decode_dynamic_sp_scheduler:
-            reservation = self._plan_balanced(shadow, command)
-        else:
-            reservation = self._plan_legacy(shadow, command)
+        reservation = self._plan_legacy(shadow, command)
         if reservation is None:
             return None
         if not self._fits_lifetime(reservation, command.max_tokens, shadow):
@@ -318,92 +311,6 @@ class AdmissionPlanner:
             dispatched_tokens=tuple(dispatched),
         )
 
-    def _plan_balanced(
-        self,
-        shadow: AdmissionShadow,
-        command: AddCommand,
-    ) -> AdmissionReservation | None:
-        prompt_tokens = len(command.prompt_token_ids)
-        allowed = [1]
-        size = 2
-        while size <= self.config.attention_sp:
-            allowed.append(size)
-            size *= 2
-        if allowed[-1] != self.config.attention_sp:
-            allowed.append(self.config.attention_sp)
-        if self.config.fixed_sp_size > 0:
-            allowed = [self.config.fixed_sp_size]
-
-        master = self._select_master(shadow)
-        if shadow.master_counts[master] + 1 > self.config.max_num_seqs:
-            return None
-        if (
-            shadow.batch_tokens[master] + prompt_tokens
-            >= self.config.max_num_batched_tokens
-        ):
-            return None
-        others = sorted(
-            (sp for sp in range(self.config.attention_sp) if sp != master),
-            key=lambda sp: (
-                shadow.dispatched_tokens[sp],
-                -shadow.free_blocks[sp],
-                sp,
-            ),
-        )
-        for target_ranks in allowed:
-            target_ranks = min(target_ranks, max(1, prompt_tokens))
-            participants = [master] + others[: target_ranks - 1]
-            dispatched = self._waterfill_tokens(
-                shadow, participants, prompt_tokens
-            )
-            reservation = self._check_balanced_placement(
-                shadow,
-                command.request_id,
-                master,
-                dispatched,
-            )
-            if reservation is not None:
-                return reservation
-        return None
-
-    def _check_balanced_placement(
-        self,
-        shadow: AdmissionShadow,
-        request_id: int,
-        master: int,
-        dispatched: list[int],
-    ) -> AdmissionReservation | None:
-        block_size = self.config.kvcache_block_size
-        for sp_idx, token_count in enumerate(dispatched):
-            if token_count <= 0:
-                continue
-            if (
-                self.config.fixed_sp_size == 0
-                and sp_idx != master
-                and shadow.receiver_counts[sp_idx] + 1
-                > self.config.max_num_recv_seqs
-            ):
-                return None
-            prefill_blocks = self._ceil_div(token_count, block_size)
-            projected_masters = shadow.master_counts[sp_idx] + (
-                1 if sp_idx == master else 0
-            )
-            reservation_blocks = ceil(
-                projected_masters
-                * self.config.reserved_blocks_per_req
-            )
-            if (
-                shadow.free_blocks[sp_idx]
-                < prefill_blocks + reservation_blocks
-            ):
-                return None
-        return AdmissionReservation(
-            request_id=request_id,
-            engine_id=shadow.engine_id,
-            master_sp_idx=master,
-            dispatched_tokens=tuple(dispatched),
-        )
-
     def _select_master(self, shadow: AdmissionShadow) -> int:
         selector = self.config.sp_master_selector
         if selector == "RoundRobin":
@@ -478,45 +385,6 @@ class AdmissionPlanner:
         base, extra = divmod(token_count, len(participants))
         for index, sp_idx in enumerate(participants):
             dispatched[sp_idx] = base + (1 if index < extra else 0)
-        return dispatched
-
-    def _waterfill_tokens(
-        self,
-        shadow: AdmissionShadow,
-        participants: list[int],
-        token_count: int,
-    ) -> list[int]:
-        dispatched = [0] * self.config.attention_sp
-        if token_count < len(participants):
-            return dispatched
-        loads = [shadow.dispatched_tokens[sp] for sp in participants]
-        low = min(loads) + 1
-        high = max(loads) + token_count
-        best = low
-        while low <= high:
-            middle = (low + high) // 2
-            needed = sum(max(1, middle - load) for load in loads)
-            if needed <= token_count:
-                best = middle
-                low = middle + 1
-            else:
-                high = middle - 1
-        allocations = [max(1, best - load) for load in loads]
-        remaining = token_count - sum(allocations)
-        order = sorted(
-            range(len(participants)),
-            key=lambda index: (
-                loads[index] + allocations[index],
-                participants[index],
-            ),
-        )
-        index = 0
-        while remaining > 0:
-            allocations[order[index]] += 1
-            remaining -= 1
-            index = (index + 1) % len(order)
-        for index, sp_idx in enumerate(participants):
-            dispatched[sp_idx] = allocations[index]
         return dispatched
 
     def _fits_lifetime(

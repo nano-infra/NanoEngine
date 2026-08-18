@@ -30,7 +30,6 @@ DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
 DEFAULT_CUDA_GRAPH_MODE="full"
 DEFAULT_ENFORCE_EAGER=0
-DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
 DEFAULT_DYNAMIC_SP_BUCKET_PRESET="none"
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
@@ -64,7 +63,6 @@ CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-$DEFAULT_CUDA_GRAPH_MODE}"
 MAX_INPUT_LEN="$DEFAULT_MAX_INPUT_LEN"
 MAX_REQUEST_TOKENS="${MAX_REQUEST_TOKENS:-$DEFAULT_MAX_REQUEST_TOKENS}"
 ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
-USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
 DYNAMIC_SP_BUCKET_PRESET="$DEFAULT_DYNAMIC_SP_BUCKET_PRESET"
 RUN_LABEL="${RUN_LABEL:-}"
@@ -98,7 +96,6 @@ usage() {
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
-    echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
     echo "  --dynamic-sp-size-strategy <str>  legacy | bucket (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
     echo "  --dynamic-sp-bucket-preset <str>  none | deepseek_v3 | kimi_k2 (default: $DEFAULT_DYNAMIC_SP_BUCKET_PRESET)"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
@@ -134,7 +131,6 @@ while [[ $# -gt 0 ]]; do
         --run-label)        RUN_LABEL="$2"; shift 2 ;;
         --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-request-tokens) MAX_REQUEST_TOKENS="$2"; shift 2 ;;
-        --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --dynamic-sp-bucket-preset) DYNAMIC_SP_BUCKET_PRESET="$2"; shift 2 ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
@@ -247,7 +243,6 @@ echo "Fixed SP Size: $FIXED_SP_SIZE"
 echo "SP Backend  : $SP_BACKEND"
 echo "CUDA Graph  : $CUDA_GRAPH_MODE"
 echo "Run Label   : ${RUN_LABEL:-none}"
-echo "New Decode Dynamic SP Scheduler: $USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 echo "Dynamic SP Size Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
 echo "Dynamic SP Bucket Preset: $DYNAMIC_SP_BUCKET_PRESET"
 echo "Enforce Eager: $ENFORCE_EAGER"
@@ -261,7 +256,6 @@ log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_A
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | MaxRequestTokens=${MAX_REQUEST_TOKENS:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
-log_progress "UseNewDecodeDynamicSPScheduler=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 log_progress "DynamicSPSizeStrategy=$DYNAMIC_SP_SIZE_STRATEGY"
 log_progress "DynamicSPBucketPreset=$DYNAMIC_SP_BUCKET_PRESET"
 log_progress "EnforceEager=$ENFORCE_EAGER"
@@ -374,9 +368,6 @@ for rate in "${RATES[@]}"; do
 
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         CMD+=(--enforce-eager)
-    fi
-    if [[ "$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER" -ne 0 ]]; then
-        CMD+=(--use-new-decode-dynamic-sp-scheduler)
     fi
     # 如果设置了 max-input-len
     if [[ -n "$MAX_INPUT_LEN" ]]; then

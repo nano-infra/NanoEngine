@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 
 #include "nanodeploy/metrics/sequence_metric.h"
@@ -25,21 +24,9 @@ Scheduler::Scheduler(const std::string& engine_id,
                      const std::string& mode,
                      double             reserved_blocks_per_req,
                      int                segment_size,
-                     bool               use_new_decode_dynamic_sp_scheduler,
                      const std::string& dynamic_sp_size_strategy,
                      bool               enable_dynamic_sp_bucket_policy,
                      const std::string& dynamic_sp_bucket_policy,
-                     double             attention_cost_a,
-                     double             attention_cost_b,
-                     double             q_cost_a,
-                     double             q_cost_b,
-                     double             res_cost_a,
-                     double             res_cost_b,
-                     double             lse_cost_a,
-                     double             lse_cost_b,
-                     int                q_bytes_per_edge,
-                     int                res_bytes_per_edge,
-                     int                lse_bytes_per_edge,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector,
                      int                fixed_sp_size) :
@@ -54,7 +41,6 @@ Scheduler::Scheduler(const std::string& engine_id,
     mode_(mode),
     reserved_blocks_per_req_(reserved_blocks_per_req),
     segment_size_(segment_size),
-    use_new_decode_dynamic_sp_scheduler_(use_new_decode_dynamic_sp_scheduler),
     dynamic_sp_size_strategy_(dynamic_sp_size_strategy),
     enable_non_uniform_split_(enable_non_uniform_split),
     sp_master_selector_(sp_master_selector)
@@ -68,11 +54,6 @@ Scheduler::Scheduler(const std::string& engine_id,
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
             reserved_blocks_per_req_, segment_size_, dynamic_sp_size_strategy_,
             enable_dynamic_sp_bucket_policy, dynamic_sp_bucket_policy,
-            attention_cost_a, attention_cost_b,
-            q_cost_a, q_cost_b,
-            res_cost_a, res_cost_b,
-            lse_cost_a, lse_cost_b,
-            q_bytes_per_edge, res_bytes_per_edge, lse_bytes_per_edge,
             enable_non_uniform_split,
             sp_master_selector, fixed_sp_size);
         
@@ -81,7 +62,6 @@ Scheduler::Scheduler(const std::string& engine_id,
     }
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
               << ", fixed_sp_size=" << fixed_sp_size
-              << ", use_new_decode_dynamic_sp_scheduler=" << use_new_decode_dynamic_sp_scheduler_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_
               << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
@@ -389,102 +369,8 @@ ScheduleResult Scheduler::schedule()
     return result;
 }
 
-std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode_prefill_latency_aware()
-{
-    std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
-    std::vector<std::vector<std::shared_ptr<Sequence>>> tentative_batches(attention_dp_);
-    std::vector<std::optional<SPStateManager::DecodeBatchPlan>> tentative_plans(attention_dp_);
-
-    struct PlanningCacheGuard {
-        std::vector<std::shared_ptr<SPStateManager>>& workers;
-        explicit PlanningCacheGuard(std::vector<std::shared_ptr<SPStateManager>>& worker_state) : workers(worker_state)
-        {
-            for (auto& worker : workers) {
-                worker->begin_decode_planning();
-            }
-        }
-        ~PlanningCacheGuard()
-        {
-            for (auto& worker : workers) {
-                worker->end_decode_planning();
-            }
-        }
-    } planning_cache_guard(worker_state);
-
-    auto& waiting_queue = waiting_migration;
-
-    while (!waiting_queue.empty()) {
-        auto seq = waiting_queue.front();
-
-        std::vector<std::pair<int, int>> dp_order;
-        dp_order.reserve(attention_dp_);
-        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-            int projected_batch = worker_state[dp_idx]->num_running_seqs()
-                                  + static_cast<int>(tentative_batches[dp_idx].size());
-            dp_order.push_back({projected_batch, dp_idx});
-        }
-        std::sort(dp_order.begin(), dp_order.end());
-
-        bool admitted = false;
-        for (const auto& entry : dp_order) {
-            int dp_idx = entry.second;
-            auto& candidate_batch = tentative_batches[dp_idx];
-            candidate_batch.push_back(seq);
-
-            auto candidate_plan = worker_state[dp_idx]->plan_decode_batch(candidate_batch);
-            if (!candidate_plan.has_value()) {
-                candidate_batch.pop_back();
-                continue;
-            }
-
-            tentative_plans[dp_idx] = std::move(candidate_plan);
-            waiting_queue.pop_front();
-            admitted = true;
-            break;
-        }
-
-        if (!admitted) {
-            break;
-        }
-    }
-
-    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        if (!tentative_plans[dp_idx].has_value()) {
-            continue;
-        }
-
-        auto& plan = *tentative_plans[dp_idx];
-        auto& batch = tentative_batches[dp_idx];
-        for (size_t i = 0; i < batch.size(); ++i) {
-            auto& seq = batch[i];
-            worker_state[dp_idx]->apply_planned_placement(*seq, plan.placements[i]);
-
-            auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
-            block_ctx.dp_idx_ = dp_idx;
-
-            worker_state[dp_idx]->allocate(*seq);
-            seq->status = SequenceStatus::RUNNING;
-            worker_state[dp_idx]->running.push_back(seq);
-            scheduled_seqs[dp_idx].push_back(seq);
-
-            if (seq->metric) {
-                seq->metric->record_first_scheduled();
-                seq->metric->record_decode_scheduled();
-            }
-        }
-    }
-
-    return scheduled_seqs;
-}
-
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
 {
-    if (mode_ == "decode"
-        && use_new_decode_dynamic_sp_scheduler_
-        && routing_strategy == RoutingStrategy::LeastBatch) {
-        return _schedule_decode_prefill_latency_aware();
-    }
-
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 
     // num_seqs and num_batched_tokens track per-DP, per-SP-rank counts for the CURRENT batch

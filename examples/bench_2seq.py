@@ -51,9 +51,6 @@ def parse_args():
     parser.add_argument("--sp-backend", type=str, default="hao_basic",
                         choices=["hao_basic", "nccl"],
                         help="SP all-to-all backend.")
-    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
-                        help="Use the new decode-only dynamic SP scheduler.")
-
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
@@ -380,7 +377,6 @@ def main():
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
         sp_backend=args.sp_backend,
-        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
     )
     
     # Print Config

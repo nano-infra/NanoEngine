@@ -73,9 +73,6 @@ def parse_args():
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
     parser.add_argument("--fixed-sp-size", type=int, default=0,
                         help="Fixed number of participating SP ranks per request (0 = disabled).")
-    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
-                        help="Use the new decode-only dynamic SP scheduler.")
-
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
@@ -463,7 +460,6 @@ def main():
         enable_non_uniform_split=not args.disable_non_uniform_split,
         fixed_sp_size=args.fixed_sp_size,
         sp_backend=args.sp_backend,
-        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
         use_dlslime_rpc=True,
         optimize_decode_block_table=True
     )

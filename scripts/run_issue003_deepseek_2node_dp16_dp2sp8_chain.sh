@@ -21,7 +21,6 @@ MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
-USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 
 START_RATE="${START_RATE:-10}"
 STEP_RATE="${STEP_RATE:-10}"
@@ -180,7 +179,6 @@ run_stage_sweep() {
                 --dp-size "$dp" \
                 --sp-size "$sp" \
                 $( ((ENFORCE_EAGER != 0)) && echo --enforce-eager ) \
-                $( ((USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER != 0)) && echo --use-new-decode-dynamic-sp-scheduler ) \
                 "$rate" >> "$stage_log_dir/sweep.out" 2>&1
             local rc=$?
             set -e

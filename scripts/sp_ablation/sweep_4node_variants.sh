@@ -24,7 +24,6 @@ FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 SP_BACKEND="${SP_BACKEND:-hao_basic}"
 CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-full}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
-USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-legacy}"
 DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-none}"
 SWEEP_STRATEGY="${SWEEP_STRATEGY:-dp4sp8}"
@@ -355,13 +354,11 @@ run_one_attempt() {
     local n_reqs="$4"
     local strat_args
     local eager_args=()
-    local scheduler_args=()
     local sp_strategy_args=()
     local fixed_sp_size="$FIXED_SP_SIZE"
     local sp_backend="$SP_BACKEND"
     local cuda_graph_mode="$CUDA_GRAPH_MODE"
     local gpu_util="$GPU_UTIL"
-    local use_new_decode_dynamic_sp_scheduler="$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
     local dynamic_sp_size_strategy="$DYNAMIC_SP_SIZE_STRATEGY"
     local dynamic_sp_bucket_preset="$DYNAMIC_SP_BUCKET_PRESET"
     local policy_key
@@ -375,7 +372,6 @@ run_one_attempt() {
             fixed_sp_size=8
             sp_backend="hao_basic"
             cuda_graph_mode="full"
-            use_new_decode_dynamic_sp_scheduler=0
             dynamic_sp_size_strategy="legacy"
             dynamic_sp_bucket_preset="none"
             ;;
@@ -395,9 +391,6 @@ run_one_attempt() {
     strat_args="$(strategy_args "$strategy")"
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         eager_args+=(--enforce-eager)
-    fi
-    if [[ "$use_new_decode_dynamic_sp_scheduler" -ne 0 ]]; then
-        scheduler_args+=(--use-new-decode-dynamic-sp-scheduler)
     fi
     if [[ -n "${dynamic_sp_size_strategy:-}" ]]; then
         sp_strategy_args+=(--dynamic-sp-size-strategy "$dynamic_sp_size_strategy")
@@ -422,7 +415,6 @@ run_one_attempt() {
         --sp-backend "$sp_backend" \
         --cuda-graph-mode "$cuda_graph_mode" \
         --run-label "$policy_key" \
-        "${scheduler_args[@]}" \
         "${sp_strategy_args[@]}" \
         "${eager_args[@]}" \
         --max-input-len "$MAX_INPUT_LEN" \
@@ -548,7 +540,6 @@ main() {
     log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
     log "SEG=$SEG BATCH_SIZE=$BATCH_SIZE MAX_INPUT_LEN=$MAX_INPUT_LEN RATE_DURATION_SEC=$RATE_DURATION_SEC"
     log "ENFORCE_EAGER=$ENFORCE_EAGER"
-    log "USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
     log "DYNAMIC_SP_SIZE_STRATEGY=$DYNAMIC_SP_SIZE_STRATEGY DYNAMIC_SP_BUCKET_PRESET=$DYNAMIC_SP_BUCKET_PRESET"
     log "SP_BACKEND=$SP_BACKEND CUDA_GRAPH_MODE=$CUDA_GRAPH_MODE FIXED_SP_SIZE=$FIXED_SP_SIZE"
     log "GPU_UTIL=$GPU_UTIL PIECEWISE_GPU_UTIL=$PIECEWISE_GPU_UTIL"

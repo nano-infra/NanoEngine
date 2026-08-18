@@ -67,6 +67,26 @@ class LLMEngine:
         for option, message in removed_options.items():
             if option in kwargs:
                 raise TypeError(message)
+        latency_planner_options = (
+            "use_new_decode_dynamic_sp_scheduler",
+            "dynamic_sp_attention_cost_a",
+            "dynamic_sp_attention_cost_b",
+            "dynamic_sp_q_cost_a",
+            "dynamic_sp_q_cost_b",
+            "dynamic_sp_res_cost_a",
+            "dynamic_sp_res_cost_b",
+            "dynamic_sp_lse_cost_a",
+            "dynamic_sp_lse_cost_b",
+            "dynamic_sp_q_bytes_per_edge",
+            "dynamic_sp_res_bytes_per_edge",
+            "dynamic_sp_lse_bytes_per_edge",
+        )
+        for option in latency_planner_options:
+            if option in kwargs:
+                raise TypeError(
+                    f"{option} was removed with the latency-aware "
+                    "dynamic-SP planner"
+                )
         if kwargs.get("dynamic_sp_size_strategy") == "long_short_sp8":
             raise ValueError(
                 "dynamic_sp_size_strategy='long_short_sp8' was removed; "

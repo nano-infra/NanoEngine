@@ -21,7 +21,6 @@ LOOP_COUNT="${LOOP_COUNT:-16}"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 SP_BACKEND="${SP_BACKEND:-hao_basic}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
-USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-legacy}"
 DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-none}"
 SWEEP_STRATEGY="${SWEEP_STRATEGY:-dp4sp8}"
@@ -306,15 +305,11 @@ run_one_attempt() {
     local n_reqs="$4"
     local strat_args
     local eager_args=()
-    local scheduler_args=()
     local sp_strategy_args=()
 
     strat_args="$(strategy_args "$strategy")"
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         eager_args+=(--enforce-eager)
-    fi
-    if [[ "$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER" -ne 0 ]]; then
-        scheduler_args+=(--use-new-decode-dynamic-sp-scheduler)
     fi
     if [[ -n "${DYNAMIC_SP_SIZE_STRATEGY:-}" ]]; then
         sp_strategy_args+=(--dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY")
@@ -336,7 +331,6 @@ run_one_attempt() {
         --scheduler-arch "$SCHEDULER_ARCH" \
         --loop-count "$LOOP_COUNT" \
         --fixed-sp-size "$FIXED_SP_SIZE" \
-        "${scheduler_args[@]}" \
         "${sp_strategy_args[@]}" \
         "${eager_args[@]}" \
         --max-input-len "$MAX_INPUT_LEN" \
@@ -461,7 +455,6 @@ main() {
     log "SEG=$SEG BATCH_SIZE=$BATCH_SIZE MAX_INPUT_LEN=$MAX_INPUT_LEN"
     log "SP_BACKEND=$SP_BACKEND"
     log "ENFORCE_EAGER=$ENFORCE_EAGER"
-    log "USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
     log "DYNAMIC_SP_SIZE_STRATEGY=$DYNAMIC_SP_SIZE_STRATEGY DYNAMIC_SP_BUCKET_PRESET=$DYNAMIC_SP_BUCKET_PRESET"
     log "RESUME_SKIP_SUCCESS=$RESUME_SKIP_SUCCESS FORCE_RERUN=$FORCE_RERUN"
     log "ORDER=${SWEEP_STRATEGY}/$(routing_short "$SWEEP_ROUTING")"

@@ -12,15 +12,20 @@
 - `6c79b10 chore: remove obsolete long-short experiment tooling`
 - `a40aa06 refactor: remove legacy_ll SP backend`
 - `9fd0282 refactor: remove nccl_compact SP backend`
+- 补充实施：删除论文未使用的 latency-aware dynamic-SP batch planner
 
 验收结果：editable build 成功；routing/config、hierarchical contract、control plane、
 serving ingress 与 SP backend 共 148 项 CPU 测试通过；所有保留且修改过的 shell
 脚本通过 `bash -n`，修改过的 Python 入口通过 `py_compile`。未运行 CUDA、`torchrun`
 或其他 GPU 测试。
 
+补充删除 latency-aware planner 后，editable C++/pybind build 再次通过；routing/config、
+hierarchical contract、control plane、serving ingress 与 SP backend 共 174 项 CPU 测试
+通过，相关 Python 与 shell 入口语法检查通过。未额外运行 GPU 测试。
+
 ## 1. 目标与结论摘要
 
-本次清理针对七类不再需要的功能：
+本次清理针对八类不再需要的功能：
 
 1. 最初由单个中心化 `Scheduler` 加多个 per-worker waiting queue 模拟的
    `scheduler_mode="decentralized"`；
@@ -34,7 +39,12 @@ serving ingress 与 SP backend 共 148 项 CPU 测试通过；所有保留且修
    `router_policy`；
 6. 实验性的 MLA SP variable-split NCCL 后端 `nccl_compact`。SP backend 最终只保留
    `hao_basic` 与静态 padding 版本 `nccl`；
-7. 绕过正常 segment placement、以 KV block size 做简化切分的 `sp_debug` 分支。
+7. 绕过正常 segment placement、以 KV block size 做简化切分的 `sp_debug` 分支；
+8. 由 `use_new_decode_dynamic_sp_scheduler` 控制、使用 attention/Q/Res/LSE
+   线性延迟模型的 decode batch planner。
+
+> 补充决策：第 8 项最初作为 surviving planner 调研，后经确认纳入删除范围。下文涉及
+> “保留新 planner”的内容属于删除前的历史分析，最终状态以本节和实施记录为准。
 
 调研后的核心结论如下。
 
@@ -835,9 +845,8 @@ dated historical notes 可以保留旧名称。
 5. **`run_kimi_conversation_16gpu.sh` 与
    `run_kimi_32x8k_16gpu_profile.sh` 删除（推荐）**：两者核心矩阵依赖 long-short；若仍有
    独立使用价值，需要 review 时指定希望保留的 surviving policy 和新脚本命名。
-6. **删除 `enable_dynamic_sp_size`，保留新 batch planner（当前计划）**：新 planner 改为
-   只由 `use_new_decode_dynamic_sp_scheduler` 控制；若论文也未使用它，应另行确认后把
-   planner 本体纳入删除范围。
+6. **删除 `enable_dynamic_sp_size` 与 latency-aware batch planner（已确认）**：保留
+   `dynamic_sp_size_strategy="legacy"|"bucket"` 和 `fixed_sp_size` placement。
 7. **删除 `legacy_ll`（已确认）**：默认改为 `hao_basic`，不移除 DLSlime 依赖。
 8. **删除 `nccl_compact`（已确认）**：保留 `hao_basic`、静态 `nccl`、backend switch、
    两后端对比测试和 benchmark。

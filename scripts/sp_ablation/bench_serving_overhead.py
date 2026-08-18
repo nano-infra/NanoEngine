@@ -115,8 +115,6 @@ def parse_args():
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
     parser.add_argument("--fixed-sp-size", type=int, default=0,
                         help="Fixed number of participating SP ranks per request (0 = disabled).")
-    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
-                        help="Use the new decode dynamic SP scheduler instead of the legacy path.")
     parser.add_argument("--dynamic-sp-size-strategy", type=str, default="legacy",
                         choices=["legacy", "bucket"],
                         help="SP size selection policy for the legacy dynamic-SP path.")
@@ -2033,7 +2031,6 @@ def main():
         enable_non_uniform_split=not args.disable_non_uniform_split,
         fixed_sp_size=args.fixed_sp_size,
         sp_backend=args.sp_backend,
-        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
         dynamic_sp_bucket_preset=args.dynamic_sp_bucket_preset,
         hierarchical_execution_trace=args.hierarchical_execution_trace,

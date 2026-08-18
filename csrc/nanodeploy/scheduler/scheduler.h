@@ -2,7 +2,6 @@
 
 #include <deque>
 #include <memory>
-#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -88,21 +87,9 @@ public:
               const std::string& mode,
               double             reserved_blocks_per_req,
               int                segment_size,
-              bool               use_new_decode_dynamic_sp_scheduler,
               const std::string& dynamic_sp_size_strategy,
               bool               enable_dynamic_sp_bucket_policy,
               const std::string& dynamic_sp_bucket_policy,
-              double             attention_cost_a,
-              double             attention_cost_b,
-              double             q_cost_a,
-              double             q_cost_b,
-              double             res_cost_a,
-              double             res_cost_b,
-              double             lse_cost_a,
-              double             lse_cost_b,
-              int                q_bytes_per_edge,
-              int                res_bytes_per_edge,
-              int                lse_bytes_per_edge,
               bool               enable_non_uniform_split,
               const std::string& sp_master_selector,
               int                fixed_sp_size);
@@ -157,7 +144,6 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
-    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
     void append_missing_control_dummies(
         std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_seqs);
 
@@ -176,7 +162,6 @@ private:
     std::string mode_;
     double      reserved_blocks_per_req_;
     int         segment_size_;
-    bool        use_new_decode_dynamic_sp_scheduler_;
     std::string dynamic_sp_size_strategy_;
     bool        enable_non_uniform_split_;
 

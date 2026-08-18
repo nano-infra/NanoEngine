@@ -37,7 +37,6 @@ FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 SCHEDULER_ARCH="${SCHEDULER_ARCH:-legacy_global}"
 ROUTING="${ROUTING:-LeastBatch}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
-USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-bucket}"
 DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-deepseek_v3}"
 DISABLE_NON_UNIFORM_SPLIT="${DISABLE_NON_UNIFORM_SPLIT:-0}"
@@ -184,9 +183,6 @@ for rate in "${RATES[@]}"; do
 
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         bench_args+=(--enforce-eager)
-    fi
-    if [[ "$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER" -ne 0 ]]; then
-        bench_args+=(--use-new-decode-dynamic-sp-scheduler)
     fi
     if [[ "$DISABLE_NON_UNIFORM_SPLIT" -ne 0 ]]; then
         bench_args+=(--disable-non-uniform-split)

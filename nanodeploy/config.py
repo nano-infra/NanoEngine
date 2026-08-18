@@ -120,11 +120,7 @@ class Config:
     reserved_blocks_per_req: float = 1.0
     segment_size: int = 65536
 
-    # Decode-only scheduler implementation selector for dynamic SP:
-    # False -> legacy can_allocate-based path
-    # True  -> new batch planner path
-    use_new_decode_dynamic_sp_scheduler: bool = False
-    # SP size selection policy for the legacy dynamic-SP path.
+    # SP size selection policy for dynamic SP placement.
     # "legacy": keep the current segment-based SP size selection.
     # "bucket": choose CP size directly from a configured seq-len bucket policy.
     dynamic_sp_size_strategy: Literal["legacy", "bucket"] = "legacy"
@@ -132,25 +128,6 @@ class Config:
     dynamic_sp_bucket_policy: str = ""
     dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
 
-    # Linear attention latency model for the new decode dynamic SP scheduler.
-    # Current defaults come from:
-    # mla_decode_latency_suite/mla_decode_cost_model/models/flashmla_axb_fit_20260405_160308.json
-    # which was fit on CUDA Graph measurements with batch_size=64.
-    dynamic_sp_attention_cost_a: float = 0.000444280970
-    dynamic_sp_attention_cost_b: float = 9.862626316559
-    # Q/Res/LSE defaults are calibrated from the current DLSlime hao_basic path
-    # used by NanoDeploy-new. Keep this note here so later updates do not
-    # accidentally mix old all_to_all_ll coefficients with hao_basic ones.
-    dynamic_sp_q_cost_a: float = 0.000002768410
-    dynamic_sp_q_cost_b: float = 5.924184585189
-    dynamic_sp_res_cost_a: float = 0.000002764389
-    dynamic_sp_res_cost_b: float = 5.639326242620
-    dynamic_sp_lse_cost_a: float = 0.000026547019
-    dynamic_sp_lse_cost_b: float = 4.263571143096
-    # Leave these at 0 to auto-derive bytes-per-edge for DeepSeek-V3 MLA in __post_init__().
-    dynamic_sp_q_bytes_per_edge: int = 0
-    dynamic_sp_res_bytes_per_edge: int = 0
-    dynamic_sp_lse_bytes_per_edge: int = 0
 
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
@@ -271,8 +248,7 @@ class Config:
         if self.fixed_sp_size > self.attention_sp:
             raise ValueError("fixed_sp_size must be in [0, attention_sp]")
         if self.fixed_sp_size > 0 and (
-            self.use_new_decode_dynamic_sp_scheduler
-            or self.dynamic_sp_size_strategy != "legacy"
+            self.dynamic_sp_size_strategy != "legacy"
             or self.enable_dynamic_sp_bucket_policy
             or bool(self.dynamic_sp_bucket_policy.strip())
             or self.dynamic_sp_bucket_preset != "none"
@@ -319,15 +295,6 @@ class Config:
             raise ValueError(
                 "dynamic_sp_bucket_policy must be non-empty when "
                 "enable_dynamic_sp_bucket_policy is True"
-            )
-        if (
-            self.enable_dynamic_sp_bucket_policy
-            and self.use_new_decode_dynamic_sp_scheduler
-        ):
-            raise ValueError(
-                "dynamic_sp_bucket_policy only applies to the legacy can_allocate path "
-                "and must not be combined with "
-                "use_new_decode_dynamic_sp_scheduler=True"
             )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         if self.cuda_graph_mode not in {"full", "piecewise"}:
@@ -388,37 +355,6 @@ class Config:
 
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
-
-            def _dtype_size_bytes(torch_dtype: Any) -> int:
-                if torch_dtype is None:
-                    return 2
-                if isinstance(torch_dtype, str):
-                    mapping = {
-                        "torch.float16": 2,
-                        "float16": 2,
-                        "torch.bfloat16": 2,
-                        "bfloat16": 2,
-                        "torch.float32": 4,
-                        "float32": 4,
-                    }
-                    return mapping.get(torch_dtype, 2)
-                try:
-                    return torch.tensor([], dtype=torch_dtype).element_size()
-                except Exception:
-                    return 2
-
-            dtype_size = _dtype_size_bytes(getattr(self.hf_config, "torch_dtype", None))
-            num_heads = int(getattr(self.hf_config, "num_attention_heads"))
-            kv_lora_rank = int(getattr(self.hf_config, "kv_lora_rank"))
-            qk_rope_head_dim = int(getattr(self.hf_config, "qk_rope_head_dim"))
-
-            if self.dynamic_sp_q_bytes_per_edge <= 0:
-                self.dynamic_sp_q_bytes_per_edge = num_heads * (kv_lora_rank + qk_rope_head_dim) * dtype_size
-            if self.dynamic_sp_res_bytes_per_edge <= 0:
-                self.dynamic_sp_res_bytes_per_edge = num_heads * kv_lora_rank * dtype_size
-            if self.dynamic_sp_lse_bytes_per_edge <= 0:
-                # LSE is explicitly converted to bfloat16 before communication.
-                self.dynamic_sp_lse_bytes_per_edge = num_heads * 2
 
     @property
     def attn_world_size(self):
@@ -492,7 +428,6 @@ class Config:
                 "legacy_perfect_eplb": self.perfect_eplb,
             },
             "dynamic_sp": {
-                "new_scheduler": self.use_new_decode_dynamic_sp_scheduler,
                 "strategy": self.dynamic_sp_size_strategy,
                 "bucket": self.dynamic_sp_bucket_policy,
                 "fixed_sp_size": self.fixed_sp_size,

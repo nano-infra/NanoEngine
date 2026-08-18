@@ -10,6 +10,20 @@ from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
 DEEPSEEK_MODEL = Path(
     "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3"
 )
+REMOVED_LATENCY_PLANNER_OPTIONS = (
+    "use_new_decode_dynamic_sp_scheduler",
+    "dynamic_sp_attention_cost_a",
+    "dynamic_sp_attention_cost_b",
+    "dynamic_sp_q_cost_a",
+    "dynamic_sp_q_cost_b",
+    "dynamic_sp_res_cost_a",
+    "dynamic_sp_res_cost_b",
+    "dynamic_sp_lse_cost_a",
+    "dynamic_sp_lse_cost_b",
+    "dynamic_sp_q_bytes_per_edge",
+    "dynamic_sp_res_bytes_per_edge",
+    "dynamic_sp_lse_bytes_per_edge",
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -174,6 +188,21 @@ def test_removed_dynamic_sp_options_are_not_config_fields(option):
     ],
 )
 def test_llm_engine_rejects_removed_dynamic_sp_options(option):
+    with pytest.raises(TypeError, match=f"{option} was removed"):
+        LLMEngine(str(DEEPSEEK_MODEL), **{option: True})
+
+
+@pytest.mark.parametrize("option", REMOVED_LATENCY_PLANNER_OPTIONS)
+def test_removed_latency_planner_options_are_not_config_fields(option):
+    with pytest.raises(TypeError, match=option):
+        Config(  # type: ignore[call-arg]
+            model=str(DEEPSEEK_MODEL),
+            **{option: True},
+        )
+
+
+@pytest.mark.parametrize("option", REMOVED_LATENCY_PLANNER_OPTIONS)
+def test_llm_engine_rejects_removed_latency_planner_options(option):
     with pytest.raises(TypeError, match=f"{option} was removed"):
         LLMEngine(str(DEEPSEEK_MODEL), **{option: True})
 
