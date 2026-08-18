@@ -55,6 +55,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1e-5)
     parser.add_argument("--decode-loop-count", type=int, default=1)
+    parser.add_argument(
+        "--cuda-graph-mode",
+        choices=("full", "piecewise"),
+        default="full",
+        help="Decode CUDA Graph mode (default: full).",
+    )
+    parser.add_argument(
+        "--decode-eager",
+        action="store_true",
+        help="Disable decode CUDA Graph for debugging.",
+    )
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument(
@@ -138,11 +149,17 @@ def build_decode(args: argparse.Namespace) -> LLM:
         args.decode_master_address,
         "attention=DP1/SP8/TP1",
         "ffn=DP1/EP8/TP1",
+        (
+            "cuda_graph=disabled"
+            if args.decode_eager
+            else f"cuda_graph={args.cuda_graph_mode}"
+        ),
         flush=True,
     )
     return LLM(
         args.model_path,
-        enforce_eager=True,
+        enforce_eager=args.decode_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
         attention_dp=1,
         attention_sp=8,
         attention_tp=1,
