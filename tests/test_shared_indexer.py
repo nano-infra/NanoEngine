@@ -2,15 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from dlengine.layers.indexer import _expand_decode_context_lens
 from dlengine.models.deepseek_v2.deepseek_v2 import (
-    _IndexerTopKState,
     _can_use_fused_indexer_topk,
     _get_indexer_mode,
+    _IndexerTopKState,
 )
-from dlengine.layers.indexer import _expand_decode_context_lens
 from dlengine.models.trait import apply_hf_config_compatibility_fixes
-
 
 GLM52_INDEXER_TYPES = [
     "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared"
@@ -148,9 +146,10 @@ def test_dummy_decode_context_lens_do_not_underflow():
 
 def test_fused_indexer_topk_is_limited_to_exact_context_range():
     assert _can_use_fused_indexer_topk(2048, 8192)
-    assert not _can_use_fused_indexer_topk(2048, 8193)
+    assert _can_use_fused_indexer_topk(2048, 16384)
+    assert not _can_use_fused_indexer_topk(2048, 16385)
     assert not _can_use_fused_indexer_topk(2048, 1_048_576)
-    assert not _can_use_fused_indexer_topk(1024, 8192)
+    assert not _can_use_fused_indexer_topk(1024, 16384)
 
 
 def test_glm52_repairs_transformers_rope_head_dim_alias():
