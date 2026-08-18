@@ -22,6 +22,13 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
 
 ## Agent-Specific Repository Instructions
 
+- Use these local model snapshots for DeepSeek V3 and Kimi K2 Instruct 0905:
+
+  ```text
+  DeepSeek-V3: /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb
+  Kimi-K2-Instruct-0905: /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--moonshotai--Kimi-K2-Instruct-0905/snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73
+  ```
+
 - Before internet access or any external HTTP(S) request, configure the repository proxy:
 
   ```bash
