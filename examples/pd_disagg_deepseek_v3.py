@@ -34,7 +34,7 @@ RDMA_ENV_DEFAULTS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one real-weight DeepSeek-V3 request through a two-node "
+            "Run one DeepSeek-V3 request through a two-node "
             "prefill/decode-disaggregated deployment."
         )
     )
@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1e-5)
     parser.add_argument("--decode-loop-count", type=int, default=1)
+    parser.add_argument(
+        "--dummy-weight",
+        action="store_true",
+        help="Skip checkpoint loading and use initialized dummy weights.",
+    )
     parser.add_argument(
         "--cuda-graph-mode",
         choices=("full", "piecewise"),
@@ -171,7 +176,7 @@ def build_decode(args: argparse.Namespace) -> LLM:
         master_address=args.decode_master_address,
         ray_address=args.ray_address,
         dummy_prefill=False,
-        dummy_weight=False,
+        dummy_weight=args.dummy_weight,
         fixed_sp_size=8,
         sp_backend=args.sp_backend,
         optimize_decode_block_table=args.optimize_decode_block_table,
@@ -208,7 +213,7 @@ def build_prefill(args: argparse.Namespace) -> LLM:
         master_address=args.prefill_master_address,
         ray_address=args.ray_address,
         dummy_prefill=False,
-        dummy_weight=False,
+        dummy_weight=args.dummy_weight,
         sp_backend=args.sp_backend,
         kvcache_block_size=64,
         loop_count=1,
