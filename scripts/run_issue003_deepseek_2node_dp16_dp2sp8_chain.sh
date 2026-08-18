@@ -19,7 +19,7 @@ GPU_UTIL="${GPU_UTIL:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
-FIXED_SP_SEGMENTS="${FIXED_SP_SEGMENTS:-0}"
+FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 
@@ -29,8 +29,6 @@ MAX_RATE="${MAX_RATE:-500}"
 STOP_THRESHOLD_MS="${STOP_THRESHOLD_MS:-100}"
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-20}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
-
-CP_SIZE_THRESHOLD="${CP_SIZE_THRESHOLD:-100000}"
 
 RUN_TAG="${RUN_TAG:-issue003_deepseek_v3_2node_dp16_dp2sp8_$(date -u +%Y%m%d_%H%M%S)}"
 CHAIN_LOG_DIR="${CHAIN_LOG_DIR:-$ROOT_DIR/bench_logs/$RUN_TAG}"
@@ -135,15 +133,12 @@ run_stage_sweep() {
     local stage_log_dir="$2"
     local dp="$3"
     local sp="$4"
-    local enable_dynamic_sp_size="$5"
-    local dynamic_sp_size_strategy="$6"
-    local long_request_sp_threshold="$7"
 
     local rate="$START_RATE"
     local strat_prefix="dp${dp}sp${sp}"
 
     mkdir -p "$stage_log_dir"
-    log "START stage=$stage_name dp=$dp sp=$sp dynamic_sp=$enable_dynamic_sp_size strategy=$dynamic_sp_size_strategy threshold=$long_request_sp_threshold start_rate=$START_RATE step_rate=$STEP_RATE"
+    log "START stage=$stage_name dp=$dp sp=$sp strategy=legacy start_rate=$START_RATE step_rate=$STEP_RATE"
 
     while ! rate_gt "$rate" "$MAX_RATE"; do
         local n_reqs
@@ -179,15 +174,13 @@ run_stage_sweep() {
                 --routing-strategy LeastBatch \
                 --scheduler-arch "$SCHEDULER_ARCH" \
                 --loop-count "$LOOP_COUNT" \
-                --fixed-sp-segments "$FIXED_SP_SEGMENTS" \
+                --fixed-sp-size "$FIXED_SP_SIZE" \
                 --max-input-len "$MAX_INPUT_LEN" \
-                --dynamic-sp-size-strategy "$dynamic_sp_size_strategy" \
-                --long-request-sp-threshold "$long_request_sp_threshold" \
+                --dynamic-sp-size-strategy legacy \
                 --dp-size "$dp" \
                 --sp-size "$sp" \
                 $( ((ENFORCE_EAGER != 0)) && echo --enforce-eager ) \
                 $( ((USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER != 0)) && echo --use-new-decode-dynamic-sp-scheduler ) \
-                $( ((enable_dynamic_sp_size != 0)) && echo --enable-dynamic-sp-size ) \
                 "$rate" >> "$stage_log_dir/sweep.out" 2>&1
             local rc=$?
             set -e
@@ -246,11 +239,10 @@ main() {
     log "MODEL=$DEEPSEEK_MODEL"
     log "DATASET=$ISSUE003_DATASET"
     log "START_RATE=$START_RATE STEP_RATE=$STEP_RATE MAX_RATE=$MAX_RATE STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"
-    log "ORDER=dp16sp1 -> dp2sp8_legacy_segment_cp -> dp2sp8_threshold_cp"
+    log "ORDER=dp16sp1_legacy -> dp2sp8_legacy"
 
-    run_stage_sweep "dp16sp1" "$CHAIN_LOG_DIR/dp16_issue003_deepseek_v3" 16 1 0 "legacy" "$CP_SIZE_THRESHOLD"
-    run_stage_sweep "dp2sp8_legacy_segment_cp" "$CHAIN_LOG_DIR/dp2sp8_issue003_deepseek_v3_legacy_segment_cp" 2 8 1 "legacy" "$CP_SIZE_THRESHOLD"
-    run_stage_sweep "dp2sp8_threshold_cp" "$CHAIN_LOG_DIR/dp2sp8_issue003_deepseek_v3_threshold_cp" 2 8 1 "long_short_sp8" "$CP_SIZE_THRESHOLD"
+    run_stage_sweep "dp16sp1_legacy" "$CHAIN_LOG_DIR/dp16_issue003_deepseek_v3_legacy" 16 1
+    run_stage_sweep "dp2sp8_legacy" "$CHAIN_LOG_DIR/dp2sp8_issue003_deepseek_v3_legacy" 2 8
 
     log "ALL_DONE"
 }

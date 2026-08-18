@@ -33,15 +33,13 @@ GPU_UTIL="${GPU_UTIL:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
-FIXED_SP_SEGMENTS="${FIXED_SP_SEGMENTS:-0}"
-SCHEDULER="${SCHEDULER:-legacy_global}"
+FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
+SCHEDULER_ARCH="${SCHEDULER_ARCH:-legacy_global}"
 ROUTING="${ROUTING:-LeastBatch}"
-ENABLE_DYNAMIC_SP_SIZE="${ENABLE_DYNAMIC_SP_SIZE:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-bucket}"
 DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-deepseek_v3}"
-LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
 DISABLE_NON_UNIFORM_SPLIT="${DISABLE_NON_UNIFORM_SPLIT:-0}"
 STOP_THRESHOLD_MS="${STOP_THRESHOLD_MS:-100}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -121,7 +119,7 @@ fi
 DATASET_NAME="$(basename "$DATASET_PATH" .csv)"
 MODEL_NAME="$(basename "$MODEL_PATH")"
 RT_SHORT="$(routing_short "$ROUTING")"
-SC_SHORT="$(scheduler_short "$SCHEDULER")"
+SC_SHORT="$(scheduler_short "$SCHEDULER_ARCH")"
 SEG_SHORT="$((SEG / 1024))k"
 
 log "RUN_TAG=$RUN_TAG"
@@ -139,8 +137,8 @@ for rate in "${RATES[@]}"; do
     rate_tag="${rate//./p}"
 
     extra_tags="_bucket_cp_${DYNAMIC_SP_BUCKET_PRESET}"
-    if [[ "$FIXED_SP_SEGMENTS" -ne 0 ]]; then
-        extra_tags="${extra_tags}_fsp${FIXED_SP_SEGMENTS}"
+    if [[ "$FIXED_SP_SIZE" -ne 0 ]]; then
+        extra_tags="${extra_tags}_fsp${FIXED_SP_SIZE}"
     fi
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         extra_tags="${extra_tags}_eager"
@@ -177,16 +175,13 @@ for rate in "${RATES[@]}"; do
         --routing-strategy "$ROUTING"
         --itl-log-path "$json_file"
         --segment-size "$SEG"
-        --scheduler-arch "$SCHEDULER"
-        --fixed-sp-segments "$FIXED_SP_SEGMENTS"
+        --scheduler-arch "$SCHEDULER_ARCH"
+        --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
-        --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
+        --dynamic-sp-bucket-preset "$DYNAMIC_SP_BUCKET_PRESET"
         --max-input-len "$MAX_INPUT_LEN"
     )
 
-    if [[ "$ENABLE_DYNAMIC_SP_SIZE" -ne 0 ]]; then
-        bench_args+=(--enable-dynamic-sp-size)
-    fi
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         bench_args+=(--enforce-eager)
     fi
@@ -205,14 +200,14 @@ for rate in "${RATES[@]}"; do
         echo "Rate: $rate"
         echo "Num Requests: $num_reqs"
         echo "Topology: dp=$DP sp=$SP tp=$TP ep=$EP"
-        echo "Scheduler: $SCHEDULER"
+        echo "Scheduler Architecture: $SCHEDULER_ARCH"
         echo "Routing: $ROUTING"
         echo "Dynamic SP Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
         echo "Dynamic SP Bucket Preset: $DYNAMIC_SP_BUCKET_PRESET"
         echo "Output Dir: $current_log_dir"
         echo ""
         echo "================= Wrapped Command ================="
-        echo "python -u - \"$BENCH_SCRIPT\" ${bench_args[*]}"
+        echo "python -u \"$BENCH_SCRIPT\" ${bench_args[*]}"
         echo "====================================================="
         echo ""
     } > "$log_file"
@@ -226,51 +221,8 @@ for rate in "${RATES[@]}"; do
 
     cd "$ROOT_DIR"
     set -o pipefail
-    DYNAMIC_SP_BUCKET_PRESET="$DYNAMIC_SP_BUCKET_PRESET" \
     RAY_DEDUP_LOGS=0 \
-    python -u - "$BENCH_SCRIPT" "${bench_args[@]}" <<'PY' 2>&1 | tee -a "$log_file"
-import argparse
-import os
-import runpy
-import sys
-
-bench_script = sys.argv[1]
-bench_args = sys.argv[2:]
-
-orig_add_argument = argparse._ActionsContainer.add_argument
-
-def patched_add_argument(self, *args, **kwargs):
-    option_names = {arg for arg in args if isinstance(arg, str)}
-    if "--dynamic-sp-size-strategy" in option_names:
-        choices = list(kwargs.get("choices") or [])
-        if "bucket" not in choices:
-            kwargs["choices"] = choices + ["bucket"]
-    return orig_add_argument(self, *args, **kwargs)
-
-argparse._ActionsContainer.add_argument = patched_add_argument
-
-import nanodeploy
-import nanodeploy.llm as llm_mod
-
-OriginalLLM = llm_mod.LLM
-
-class BucketPresetLLM(OriginalLLM):
-    def __init__(self, model, **kwargs):
-        if (
-            kwargs.get("dynamic_sp_size_strategy") == "bucket"
-            and "dynamic_sp_bucket_preset" not in kwargs
-        ):
-            kwargs["dynamic_sp_bucket_preset"] = os.environ.get(
-                "DYNAMIC_SP_BUCKET_PRESET", "deepseek_v3"
-            )
-        super().__init__(model, **kwargs)
-
-nanodeploy.LLM = BucketPresetLLM
-llm_mod.LLM = BucketPresetLLM
-
-sys.argv = [bench_script] + bench_args
-runpy.run_path(bench_script, run_name="__main__")
-PY
+    python -u "$BENCH_SCRIPT" "${bench_args[@]}" 2>&1 | tee -a "$log_file"
     exit_code=$?
     set +o pipefail
 

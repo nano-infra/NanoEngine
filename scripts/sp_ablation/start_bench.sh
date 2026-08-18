@@ -31,12 +31,10 @@ DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
 DEFAULT_CUDA_GRAPH_MODE="full"
-DEFAULT_ENABLE_DYNAMIC_SP_SIZE=0
 DEFAULT_ENFORCE_EAGER=0
 DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
-DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
-DEFAULT_LONG_REQUEST_SP_SIZE=0
+DEFAULT_DYNAMIC_SP_BUCKET_PRESET="none"
 DEFAULT_DIAGNOSTIC_LOG_INTERVAL=0
 DEFAULT_SLOW_ADD_THRESHOLD_MS=0
 DEFAULT_HIERARCHICAL_QUANTUM_DIAGNOSTICS=0
@@ -70,14 +68,12 @@ LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-$DEFAULT_FIXED_SP_SIZE}"
 SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
 CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-$DEFAULT_CUDA_GRAPH_MODE}"
-ENABLE_DYNAMIC_SP_SIZE="$DEFAULT_ENABLE_DYNAMIC_SP_SIZE"
 MAX_INPUT_LEN="$DEFAULT_MAX_INPUT_LEN"
 MAX_REQUEST_TOKENS="${MAX_REQUEST_TOKENS:-$DEFAULT_MAX_REQUEST_TOKENS}"
 ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
-LONG_REQUEST_SP_THRESHOLD="$DEFAULT_LONG_REQUEST_SP_THRESHOLD"
-LONG_REQUEST_SP_SIZE="$DEFAULT_LONG_REQUEST_SP_SIZE"
+DYNAMIC_SP_BUCKET_PRESET="$DEFAULT_DYNAMIC_SP_BUCKET_PRESET"
 DIAGNOSTIC_LOG_INTERVAL="${DIAGNOSTIC_LOG_INTERVAL:-$DEFAULT_DIAGNOSTIC_LOG_INTERVAL}"
 SLOW_ADD_THRESHOLD_MS="${SLOW_ADD_THRESHOLD_MS:-$DEFAULT_SLOW_ADD_THRESHOLD_MS}"
 HIERARCHICAL_EXECUTION_TRACE="${HIERARCHICAL_EXECUTION_TRACE:-0}"
@@ -113,13 +109,11 @@ usage() {
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
     echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
-    echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --max-request-tokens <int> Filter out CSV rows with prompt_len + output_len above this value (default: $DEFAULT_MAX_REQUEST_TOKENS; 0 disables)"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
-    echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
-    echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
-    echo "  --long-request-sp-size <int>      SP size for long requests (0 = SP size, default: $DEFAULT_LONG_REQUEST_SP_SIZE)"
+    echo "  --dynamic-sp-size-strategy <str>  legacy | bucket (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
+    echo "  --dynamic-sp-bucket-preset <str>  none | deepseek_v3 | kimi_k2 (default: $DEFAULT_DYNAMIC_SP_BUCKET_PRESET)"
     echo "  --diagnostic-log-interval <sec>   Structured client/scheduler snapshot interval (0 = disabled)"
     echo "  --slow-add-threshold-ms <ms>      Log slow async due-batch submissions (0 = disabled)"
     echo "  --hierarchical-execution-trace    Capture high-overhead per-rank hierarchical traces"
@@ -157,13 +151,11 @@ while [[ $# -gt 0 ]]; do
         --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
         --cuda-graph-mode)  CUDA_GRAPH_MODE="$2"; shift 2 ;;
         --run-label)        RUN_LABEL="$2"; shift 2 ;;
-        --enable-dynamic-sp-size) ENABLE_DYNAMIC_SP_SIZE=1; shift ;;
         --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-request-tokens) MAX_REQUEST_TOKENS="$2"; shift 2 ;;
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
-        --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
-        --long-request-sp-size) LONG_REQUEST_SP_SIZE="$2"; shift 2 ;;
+        --dynamic-sp-bucket-preset) DYNAMIC_SP_BUCKET_PRESET="$2"; shift 2 ;;
         --diagnostic-log-interval) DIAGNOSTIC_LOG_INTERVAL="$2"; shift 2 ;;
         --slow-add-threshold-ms) SLOW_ADD_THRESHOLD_MS="$2"; shift 2 ;;
         --hierarchical-execution-trace) HIERARCHICAL_EXECUTION_TRACE=1; shift ;;
@@ -171,6 +163,10 @@ while [[ $# -gt 0 ]]; do
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
+        --*)
+            echo "Error: Unknown option '$1'." >&2
+            exit 1
+            ;;
         *)
             RATES+=("$1")
             shift
@@ -219,6 +215,25 @@ case "$CUDA_GRAPH_MODE" in
     full|piecewise) ;;
     *) echo "Error: Invalid CUDA graph mode '$CUDA_GRAPH_MODE'."; exit 1 ;;
 esac
+
+case "$DYNAMIC_SP_SIZE_STRATEGY" in
+    legacy|bucket) ;;
+    *) echo "Error: Invalid dynamic SP size strategy '$DYNAMIC_SP_SIZE_STRATEGY'."; exit 1 ;;
+esac
+
+case "$DYNAMIC_SP_BUCKET_PRESET" in
+    none|deepseek_v3|kimi_k2) ;;
+    *) echo "Error: Invalid dynamic SP bucket preset '$DYNAMIC_SP_BUCKET_PRESET'."; exit 1 ;;
+esac
+
+if [[ "$DYNAMIC_SP_SIZE_STRATEGY" == "bucket" && "$DYNAMIC_SP_BUCKET_PRESET" == "none" ]]; then
+    echo "Error: bucket strategy requires --dynamic-sp-bucket-preset."
+    exit 1
+fi
+if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "bucket" && "$DYNAMIC_SP_BUCKET_PRESET" != "none" ]]; then
+    echo "Error: --dynamic-sp-bucket-preset requires bucket strategy."
+    exit 1
+fi
 
 if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
     if [[ "$SCHEDULER_ARCH" != "hierarchical" ]]; then
@@ -290,10 +305,9 @@ echo "Fixed SP Size: $FIXED_SP_SIZE"
 echo "SP Backend  : $SP_BACKEND"
 echo "CUDA Graph  : $CUDA_GRAPH_MODE"
 echo "Run Label   : ${RUN_LABEL:-none}"
-echo "Enable Dynamic SP Size: $ENABLE_DYNAMIC_SP_SIZE"
 echo "New Decode Dynamic SP Scheduler: $USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 echo "Dynamic SP Size Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
-echo "Long Request SP Threshold: $LONG_REQUEST_SP_THRESHOLD"
+echo "Dynamic SP Bucket Preset: $DYNAMIC_SP_BUCKET_PRESET"
 echo "Diagnostic Log Interval: $DIAGNOSTIC_LOG_INTERVAL"
 echo "Slow Add Threshold: ${SLOW_ADD_THRESHOLD_MS}ms"
 echo "Hierarchical Execution Trace: $HIERARCHICAL_EXECUTION_TRACE"
@@ -309,10 +323,9 @@ log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_A
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | MaxRequestTokens=${MAX_REQUEST_TOKENS:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
-log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
 log_progress "UseNewDecodeDynamicSPScheduler=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 log_progress "DynamicSPSizeStrategy=$DYNAMIC_SP_SIZE_STRATEGY"
-log_progress "LongRequestSPThreshold=$LONG_REQUEST_SP_THRESHOLD"
+log_progress "DynamicSPBucketPreset=$DYNAMIC_SP_BUCKET_PRESET"
 log_progress "DiagnosticLogInterval=$DIAGNOSTIC_LOG_INTERVAL"
 log_progress "SlowAddThresholdMs=$SLOW_ADD_THRESHOLD_MS"
 log_progress "HierarchicalExecutionTrace=$HIERARCHICAL_EXECUTION_TRACE"
@@ -383,10 +396,7 @@ for rate in "${RATES[@]}"; do
         extra_tags="${extra_tags}_${CUDA_GRAPH_MODE}"
     fi
     if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
-        extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_thr${LONG_REQUEST_SP_THRESHOLD}"
-        if [[ "$LONG_REQUEST_SP_SIZE" -ne 0 ]]; then
-            extra_tags="${extra_tags}_sp${LONG_REQUEST_SP_SIZE}"
-        fi
+        extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_${DYNAMIC_SP_BUCKET_PRESET}"
     fi
     if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
         extra_tags="${extra_tags}_qdiag"
@@ -435,8 +445,7 @@ for rate in "${RATES[@]}"; do
         --sp-master-selector "$SP_MASTER_SELECTOR"
         --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
-        --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
-        --long-request-sp-size "$LONG_REQUEST_SP_SIZE"
+        --dynamic-sp-bucket-preset "$DYNAMIC_SP_BUCKET_PRESET"
         --diagnostic-log-interval "$DIAGNOSTIC_LOG_INTERVAL"
         --slow-add-threshold-ms "$SLOW_ADD_THRESHOLD_MS"
     )
@@ -451,9 +460,6 @@ for rate in "${RATES[@]}"; do
     fi
     if [[ "$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER" -ne 0 ]]; then
         CMD+=(--use-new-decode-dynamic-sp-scheduler)
-    fi
-    if [[ "$ENABLE_DYNAMIC_SP_SIZE" -ne 0 ]]; then
-        CMD+=(--enable-dynamic-sp-size)
     fi
     if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
         CMD+=(

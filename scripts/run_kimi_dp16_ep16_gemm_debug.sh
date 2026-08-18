@@ -88,9 +88,8 @@ cmd=(
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --routing-strategy LeastBatch
   --sp-backend hao_basic
-  --sp-size-policy legacy
+  --dynamic-sp-size-strategy legacy
   --segment-size 65536
-  --long-request-sp-threshold 100000
   --enable-non-uniform-split
   --enforce-eager
 )

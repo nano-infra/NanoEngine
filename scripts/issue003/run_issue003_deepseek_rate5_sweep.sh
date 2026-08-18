@@ -18,12 +18,11 @@ GPU_UTIL="${GPU_UTIL:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
-FIXED_SP_SEGMENTS="${FIXED_SP_SEGMENTS:-0}"
-ENABLE_DYNAMIC_SP_SIZE="${ENABLE_DYNAMIC_SP_SIZE:-1}"
+FIXED_SP_SIZE="${FIXED_SP_SIZE:-0}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-legacy}"
-LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
+DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-none}"
 SWEEP_STRATEGY="${SWEEP_STRATEGY:-dp4sp8}"
 
 START_RATE="${START_RATE:-10}"
@@ -174,7 +173,6 @@ run_one_attempt() {
     local n_reqs="$4"
     local strat_args
     local eager_args=()
-    local dynamic_sp_args=()
     local scheduler_args=()
     local sp_strategy_args=()
 
@@ -182,15 +180,12 @@ run_one_attempt() {
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
         eager_args+=(--enforce-eager)
     fi
-    if [[ "$ENABLE_DYNAMIC_SP_SIZE" -ne 0 ]]; then
-        dynamic_sp_args+=(--enable-dynamic-sp-size)
-    fi
     if [[ "$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER" -ne 0 ]]; then
         scheduler_args+=(--use-new-decode-dynamic-sp-scheduler)
     fi
     if [[ -n "${DYNAMIC_SP_SIZE_STRATEGY:-}" ]]; then
         sp_strategy_args+=(--dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY")
-        sp_strategy_args+=(--long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD")
+        sp_strategy_args+=(--dynamic-sp-bucket-preset "$DYNAMIC_SP_BUCKET_PRESET")
     fi
     # shellcheck disable=SC2086
     BASE_LOG_DIR="$BASE_LOG_DIR" bash "$START_BENCH_SH" \
@@ -207,8 +202,7 @@ run_one_attempt() {
         --routing-strategy "$routing" \
         --scheduler-arch "$SCHEDULER_ARCH" \
         --loop-count "$LOOP_COUNT" \
-        --fixed-sp-segments "$FIXED_SP_SEGMENTS" \
-        "${dynamic_sp_args[@]}" \
+        --fixed-sp-size "$FIXED_SP_SIZE" \
         "${scheduler_args[@]}" \
         "${sp_strategy_args[@]}" \
         "${eager_args[@]}" \
@@ -315,9 +309,9 @@ main() {
     log "DATASET_PATH=$DATASET_PATH"
     log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
     log "SEG=$SEG BATCH_SIZE=$BATCH_SIZE MAX_INPUT_LEN=$MAX_INPUT_LEN"
-    log "ENABLE_DYNAMIC_SP_SIZE=$ENABLE_DYNAMIC_SP_SIZE"
     log "ENFORCE_EAGER=$ENFORCE_EAGER"
     log "USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
+    log "DYNAMIC_SP_SIZE_STRATEGY=$DYNAMIC_SP_SIZE_STRATEGY DYNAMIC_SP_BUCKET_PRESET=$DYNAMIC_SP_BUCKET_PRESET"
     log "ORDER=${SWEEP_STRATEGY}/LB"
 
     sweep_one_setting "$SWEEP_STRATEGY" LeastBatch "$START_RATE"

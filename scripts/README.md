@@ -4,7 +4,7 @@
 
 用途：
 
-- 串行运行两节点/16 卡的四组合对照：中心化与去中心化各自的 DP16、
+- 串行运行两节点/16 卡的四组合对照：legacy global 与 hierarchical 各自的 DP16、
   DP2SP8
 - 每组固定 rate 30、投递 6 分钟，共 10,800 个请求
 - 四组统一使用 `hao_basic` SP 后端和 910,000 total-token 数据集过滤
@@ -30,13 +30,13 @@ scripts/run_2node_rate30_6min_matrix.sh
 `scripts/sp_ablation/bench_serving_overhead.py` 的默认
 `tpot_with_queue_ms` 使用统一的调度执行边界：
 
-- 中心化：C++ `SequenceMetric` 的首次 scheduled 到本地完成时间，加调度器
+- legacy global：C++ `SequenceMetric` 的首次 scheduled 到本地完成时间，加调度器
   GPU 容量排队；
-- 去中心化：LocalScheduler 首次进入 `executor.run` 到本地完成时间，加
+- hierarchical：LocalScheduler 首次进入 `executor.run` 到本地完成时间，加
   RequestRouter 全局 GPU 容量排队；
 - 两者都会扣除最后一个固定 16-loop quantum 中未生成真实 token 的
-  decode slot，再除以实际生成 token 数。中心化使用
-  `record_step_tokens()` 保存的末 step ITL，去中心化使用末 quantum 的
+  decode slot，再除以实际生成 token 数。legacy global 使用
+  `record_step_tokens()` 保存的末 step ITL，hierarchical 使用末 quantum 的
   `executor.run / 16`，统计口径一致；
 - GPU 容量排队完整保留；不计 benchmark dispatch、RPC/command pickup 或
   非容量的 quantum 边界等待。
@@ -50,7 +50,7 @@ scripts/run_2node_rate30_6min_matrix.sh
 
 ### Admission 延迟拆解
 
-去中心化请求的 `T0 -> T1 -> T3` 指标会写入 per-request JSONL 和
+hierarchical 请求的 `T0 -> T1 -> T3` 指标会写入 per-request JSONL 和
 `summary.json`：
 
 - `dispatch_lag_ms`：T0 计划到达至 T1 实际投递；
@@ -102,42 +102,6 @@ MPLCONFIGDIR=/tmp/matplotlib python scripts/plot_run_metrics.py \
 - 如果是链式 run，顶层目录只有 `chain_summary.tsv`、实际 `.log` 分散在别的子目录里，需要先把目标 `.log` 整理到一个 staging 目录，再对 staging 目录运行这个脚本。
 
 
-## `plot_nano_longshort_matrix.py`
-
-用途：
-- 针对 `issue001_issue003_issue005_mixed60k_longshort...` 这类 NanoDeploy 链式 run
-- 扫描对应 stage 的 `sweep_summary.tsv`
-- 从每个点位的 benchmark `.json` 逐行复算 `Normalized Latency`
-- 输出 `SLO Attainment`、`Goodput`、`NormLat Avg`、`NormLat P99` 等汇总表
-- 生成和论文侧 nano 图类似的 5 列数据集矩阵图
-
-当前内置的数据集：
-- `ShareGPT4o`
-- `Issue1%`
-- `Issue3%`
-- `Issue5%`
-- `Gemini Issues`
-
-基本用法：
-
-```bash
-MPLCONFIGDIR=/tmp/matplotlib python scripts/plot_nano_longshort_matrix.py \
-  --run-dir bench_logs/issue001_issue003_mixed60k_longshort_dp4dp32_bs256_20260408_165526
-```
-
-输出内容：
-- `data/metrics_summary.tsv`
-- `data/metrics_duplicates_dropped.tsv`
-- `data/slo90_crossings.tsv`
-- `data/metadata.tsv`
-- `plots/nano_longshort_matrix.png`
-- `plots/nano_longshort_matrix.pdf`
-
-说明：
-- 会自动合并 `issue003/issue005/gemini` 这种分段补跑 stage，并按 `dataset + strategy + rate` 去重，默认保留时间戳最新的点位。
-- 当前只读取 DeepSeek v3 的 nano 相关 stage，不会把 `kimi_k2` 混进图里。
-
-
 ## `plot_step_log_timeseries.py`
 
 用途：
@@ -177,7 +141,7 @@ MPLCONFIGDIR=/tmp/matplotlib python scripts/plot_step_log_timeseries.py \
 
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib python scripts/plot_step_log_timeseries.py \
-  bench_logs/issue001_issue003_mixed60k_longshort_dp4dp32_bs256_20260407_193009/longshort_issue003_deepseek_v3/sweep.out \
+  bench_logs/<run>/<stage>/sweep.out \
   --skip-steps 5 \
   --max-steps 200
 ```

@@ -115,17 +115,17 @@ def parse_args():
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
     parser.add_argument("--fixed-sp-size", type=int, default=0,
                         help="Fixed number of participating SP ranks per request (0 = disabled).")
-    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
-                        help="Enable dynamic SP size.")
     parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
                         help="Use the new decode dynamic SP scheduler instead of the legacy path.")
     parser.add_argument("--dynamic-sp-size-strategy", type=str, default="legacy",
-                        choices=["legacy", "long_short_sp8"],
+                        choices=["legacy", "bucket"],
                         help="SP size selection policy for the legacy dynamic-SP path.")
-    parser.add_argument("--long-request-sp-threshold", type=int, default=100000,
-                        help="Prompt length threshold for long_short_sp8: prompt_len > threshold -> SP=8.")
-    parser.add_argument("--long-request-sp-size", type=int, default=0,
-                        help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
+    parser.add_argument(
+        "--dynamic-sp-bucket-preset",
+        choices=["none", "deepseek_v3", "kimi_k2"],
+        default="none",
+        help="Named sequence-length bucket policy.",
+    )
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
@@ -2021,7 +2021,6 @@ def main():
         scheduler_arch=args.scheduler_arch,
         router_policy=args.router_policy,
         segment_size=args.segment_size,
-        enable_dynamic_sp_size=args.enable_dynamic_sp_size,
         kvcache_block_size=64,
         max_num_recv_seqs=32,
         max_num_send_seqs=16,
@@ -2036,8 +2035,7 @@ def main():
         sp_backend=args.sp_backend,
         use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
-        dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
-        dynamic_sp_long_request_size=args.long_request_sp_size,
+        dynamic_sp_bucket_preset=args.dynamic_sp_bucket_preset,
         hierarchical_execution_trace=args.hierarchical_execution_trace,
         hierarchical_quantum_diagnostics=bool(
             args.hierarchical_quantum_log_path
