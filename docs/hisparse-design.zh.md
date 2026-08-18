@@ -105,9 +105,9 @@ scheduler 需要保留一个 dummy row。DLEngine 现在 DSv4 已经用 `max_num
 
 ### Runtime context
 
-在 `context_v2` 下增加 HiSparse runtime context，和现有 cache contexts 并列：
+在 `context` 下增加 HiSparse runtime context，和现有 cache contexts 并列：
 
-- `context_v2/cache/hisparse.py`
+- `context/cache/hisparse.py`
 - `HiSparseContext`
 - `get_hisparse_context()`
 - `reset_hisparse_context()`
@@ -292,9 +292,9 @@ CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个
   - `CacheContext` 存在后、CUDA graph capture 前完成 cache wiring；
   - eager decode 和 graph replay 前调用 coordinator refresh；
   - `InputPreparer` 继续负责把 C++ aux data 转为 CUDA tensors。
-- `dlengine/context_v2/`
+- `dlengine/context/`
   - 给 `BatchContext` 增加 runtime tensors；
-  - 在 `context_v2/cache` 下增加 persistent HiSparse cache/coordinator tensors；
+  - 在 `context/cache` 下增加 persistent HiSparse cache/coordinator tensors；
   - 接入现有 context reset 路径。
 - `dlengine/kernel/`
   - 增加 `hisparse.cuh` 和 graph-safe top-k remap Python wrapper；

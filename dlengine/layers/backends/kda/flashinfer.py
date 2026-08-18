@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.generic.gated_delta_net import GenericGatedDeltaNet
 
@@ -57,7 +57,9 @@ class FlashInferKDA(GenericGatedDeltaNet):
         total_heads = int(linear["num_heads"])
         tp = get_dist_context().attn_tp_world_size
         if total_heads % tp:
-            raise ValueError(f"K3 KDA heads={total_heads} not divisible by attn_tp={tp}")
+            raise ValueError(
+                f"K3 KDA heads={total_heads} not divisible by attn_tp={tp}"
+            )
         self.num_k_heads = self.num_v_heads = total_heads // tp
         self.head_k_dim = int(linear["head_dim"])
         self.head_v_dim = int(config.v_head_dim)
@@ -72,63 +74,90 @@ class FlashInferKDA(GenericGatedDeltaNet):
         backend = get_backend()
 
         self.q_proj = backend.get_column_parallel_linear(
-            self.hidden_size, total_heads * self.head_k_dim,
-            bias=False, tp_group=tp_group,
+            self.hidden_size,
+            total_heads * self.head_k_dim,
+            bias=False,
+            tp_group=tp_group,
         )
         self.k_proj = backend.get_column_parallel_linear(
-            self.hidden_size, total_heads * self.head_k_dim,
-            bias=False, tp_group=tp_group,
+            self.hidden_size,
+            total_heads * self.head_k_dim,
+            bias=False,
+            tp_group=tp_group,
         )
         self.v_proj = backend.get_column_parallel_linear(
-            self.hidden_size, total_heads * self.head_v_dim,
-            bias=False, tp_group=tp_group,
+            self.hidden_size,
+            total_heads * self.head_v_dim,
+            bias=False,
+            tp_group=tp_group,
         )
         self.g_proj = backend.get_column_parallel_linear(
-            self.hidden_size, total_heads * self.head_k_dim,
-            bias=False, tp_group=tp_group,
+            self.hidden_size,
+            total_heads * self.head_k_dim,
+            bias=False,
+            tp_group=tp_group,
         )
         self.b_proj = backend.get_column_parallel_linear(
-            self.hidden_size, total_heads, bias=False, tp_group=tp_group,
+            self.hidden_size,
+            total_heads,
+            bias=False,
+            tp_group=tp_group,
         )
         self.f_a_proj = backend.get_replicated_linear(
-            self.hidden_size, self.head_k_dim, bias=False,
+            self.hidden_size,
+            self.head_k_dim,
+            bias=False,
         )
         self.f_b_proj = backend.get_column_parallel_linear(
-            self.head_k_dim, total_heads * self.head_k_dim,
-            bias=False, tp_group=tp_group,
+            self.head_k_dim,
+            total_heads * self.head_k_dim,
+            bias=False,
+            tp_group=tp_group,
         )
         self.o_proj = backend.get_row_parallel_linear(
-            total_heads * self.head_v_dim, self.hidden_size,
-            bias=False, tp_group=tp_group,
+            total_heads * self.head_v_dim,
+            self.hidden_size,
+            bias=False,
+            tp_group=tp_group,
         )
 
         self.conv1d = nn.Conv1d(
-            self.conv_dim, self.conv_dim, self.conv_kernel_size,
-            groups=self.conv_dim, bias=False,
+            self.conv_dim,
+            self.conv_dim,
+            self.conv_kernel_size,
+            groups=self.conv_dim,
+            bias=False,
             # The checkpoint and Blackwell KDA reference keep causal-conv
             # coefficients in fp32 even though projected activations are bf16.
-            padding=self.conv_kernel_size - 1, dtype=torch.float32,
+            padding=self.conv_kernel_size - 1,
+            dtype=torch.float32,
         )
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(
             torch.empty(self.num_v_heads * self.head_k_dim, dtype=torch.float32)
         )
-        self.o_norm = SigmoidRMSNormGated(
-            self.head_v_dim, float(config.rms_norm_eps)
-        )
+        self.o_norm = SigmoidRMSNormGated(self.head_v_dim, float(config.rms_norm_eps))
         self._conv1d_prefill_padded_ws = None
         self.register_buffer("fused_a_beta_weight", None, persistent=False)
         self.register_buffer("fused_qkvg_weight", None, persistent=False)
 
     def prepare_fused_decode_projections(self) -> None:
-        qkvg = torch.cat((
-            self.q_proj.weight,
-            self.k_proj.weight,
-            self.v_proj.weight,
-            self.g_proj.weight,
-        ), dim=0).contiguous()
+        qkvg = torch.cat(
+            (
+                self.q_proj.weight,
+                self.k_proj.weight,
+                self.v_proj.weight,
+                self.g_proj.weight,
+            ),
+            dim=0,
+        ).contiguous()
         offset = 0
-        for proj, size in ((self.q_proj, self.key_dim), (self.k_proj, self.key_dim), (self.v_proj, self.value_dim), (self.g_proj, self.key_dim)):
+        for proj, size in (
+            (self.q_proj, self.key_dim),
+            (self.k_proj, self.key_dim),
+            (self.v_proj, self.value_dim),
+            (self.g_proj, self.key_dim),
+        ):
             proj.weight.data = qkvg[offset : offset + size]
             offset += size
         self.fused_qkvg_weight = qkvg
@@ -154,7 +183,9 @@ class FlashInferKDA(GenericGatedDeltaNet):
             forget = self.f_b_proj(self.f_a_proj(hidden_states))
         else:
             if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
-                raise RuntimeError("K3 decode projection weights were not fused after loading")
+                raise RuntimeError(
+                    "K3 decode projection weights were not fused after loading"
+                )
             from dlengine.kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm
             from dlengine.kernel.jit.sgl.tiny_gemm import (
                 tiny_k_gemm_bf16,
@@ -169,15 +200,12 @@ class FlashInferKDA(GenericGatedDeltaNet):
             fused_a_beta = tiny_n_gemm_bf16(
                 hidden_states, self.fused_a_beta_weight, max_m=8
             )
-            beta = fused_a_beta[
-                :, self.head_k_dim : self.head_k_dim + self.num_v_heads
-            ]
+            beta = fused_a_beta[:, self.head_k_dim : self.head_k_dim + self.num_v_heads]
             forget = tiny_k_gemm_bf16(
                 fused_a_beta[:, : self.head_k_dim],
                 self.f_b_proj.weight,
                 max_m=8,
             )
-
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
@@ -238,9 +266,14 @@ class FlashInferKDA(GenericGatedDeltaNet):
             from dlengine.kernel.triton.fla.fused_recurrent import (
                 fused_recurrent_kda_packed_decode,
             )
+
             out = torch.empty(
-                batch, 1, self.num_v_heads, self.head_v_dim,
-                device=q.device, dtype=q.dtype,
+                batch,
+                1,
+                self.num_v_heads,
+                self.head_v_dim,
+                device=q.device,
+                dtype=q.dtype,
             )
             fused_recurrent_kda_packed_decode(
                 mixed_qkv=qkv,
@@ -248,7 +281,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 b=beta_logits,
                 A_log=self.A_log.reshape(-1).float().contiguous(),
                 dt_bias=self.dt_bias.reshape(-1).float().contiguous(),
-                scale=self.head_k_dim ** -0.5,
+                scale=self.head_k_dim**-0.5,
                 initial_state=pool,
                 out=out,
                 ssm_state_indices=indices,

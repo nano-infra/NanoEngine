@@ -10,8 +10,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from dlengine.context_v2.cache.plan import qwen35_cache_plan
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.cache.plan import qwen35_cache_plan
+from dlengine.context.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import QKVParallelLinearBase, RowParallelLinearBase
 from dlengine.layers.embed_head import ParallelLMHead, VocabParallelEmbedding

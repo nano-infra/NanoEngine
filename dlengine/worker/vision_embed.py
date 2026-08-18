@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 import torch
-from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.context.peer import PeerAgentContext
 from dlengine.disagg.p2p import get_p2p_cache_transfer
 from dlengine.logging import get_logger
 
@@ -102,7 +102,7 @@ class VisionEmbedManager:
             return
         peer_agent = self.peer_agent_context.agent
 
-        from dlengine.context_v2.cache.emb import _VISION_EMBED_BUFFER_ID
+        from dlengine.context.cache.emb import _VISION_EMBED_BUFFER_ID
 
         by_encoder: dict[str, list] = defaultdict(list)
         for v in vision_slot_views:

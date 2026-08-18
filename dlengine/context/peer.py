@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 
 
 @dataclass

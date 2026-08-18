@@ -3,8 +3,8 @@ from typing import Any
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.cache._registry import register_cache_backend
+from dlengine.context import BaseContext
+from dlengine.context.cache._backend import CacheBackend, CacheKind
 
 FP8_QUANT_TILE_SIZE = 128
 
@@ -110,8 +110,8 @@ def allocate_mla_kvcache(context) -> None:
     )
 
 
-MLA_CACHE_BACKEND = register_cache_backend(
-    "mla",
+MLA_CACHE_BACKEND = CacheBackend(
+    kind=CacheKind.MLA,
     configure=configure_mla_cache,
     get_block_bytes=get_mla_block_bytes,
     allocate=allocate_mla_kvcache,

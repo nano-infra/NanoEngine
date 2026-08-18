@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import torch
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 
 try:
     import deep_ep  # type: ignore

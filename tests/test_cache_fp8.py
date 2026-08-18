@@ -8,7 +8,9 @@ import torch
 # We need to mock distributed + dlslime since CacheContext.__post_init__ calls them.
 # Instead, we test allocate_kvcache directly.
 
-from dlengine.context.cache import _FP8_MLA_BYTES_PER_TOKEN, CacheContext
+from dlengine.context.cache import CacheContext
+from dlengine.context.cache.mla import get_mla_block_bytes
+from dlengine.disagg.p2p.cache_layout import CacheTensorLayout
 
 
 class TestCacheContextFP8:
@@ -39,8 +41,24 @@ class TestCacheContextFP8:
         ctx.ctrl_address = None
         ctx.ctrl_scope = None
         ctx.engine_id = None
-        ctx._fp8_head_dim = _FP8_MLA_BYTES_PER_TOKEN if is_fp8 else 0
+        ctx._fp8_head_dim = 0
+        if is_fp8:
+            get_mla_block_bytes(ctx)
         return ctx
+
+    @staticmethod
+    def _layout(ctx):
+        return CacheTensorLayout(
+            num_blocks=ctx.num_local_kvcache_blocks,
+            block_size=ctx.block_size,
+            num_local_kv_heads=ctx.num_local_kv_heads,
+            head_dim=ctx.head_dim,
+            dtype_itemsize=ctx.dtype.itemsize,
+            num_hidden_layers=ctx.num_hidden_layers,
+            mode=ctx.mode,
+            is_fp8_kvcache=ctx.is_fp8_kvcache,
+            fp8_head_dim=ctx._fp8_head_dim,
+        )
 
     def test_fp8_allocate_shape(self):
         """FP8 MLA cache should have shape [1, layers, blocks, 64, 1, 656]."""
@@ -73,12 +91,12 @@ class TestCacheContextFP8:
         """FP8 MLA should use ~57% of BF16 memory (656 vs 1152 bytes/token)."""
         ctx_bf16 = self._make_cache_context(is_fp8=False)
         ctx_bf16.allocate_kvcache(100)
+        bf16_bytes = ctx_bf16.kv_cache.nelement() * ctx_bf16.kv_cache.element_size()
 
         ctx_fp8 = self._make_cache_context(is_fp8=True)
         ctx_fp8.allocate_kvcache(100)
 
-        bf16_bytes = ctx_bf16.kv_cache.nelement() * ctx_bf16.kv_cache.element_size()
-        fp8_bytes = ctx_fp8.kv_cache.storage().nbytes()
+        fp8_bytes = ctx_fp8.kv_cache.untyped_storage().nbytes()
 
         ratio = fp8_bytes / bf16_bytes
         # 656 / (576*2) = 0.569, but fp8 has +1 row padding so slightly more
@@ -104,14 +122,14 @@ class TestCacheContextFP8:
     def test_block_stride_fp8(self):
         """block_stride should return correct byte offset for FP8."""
         ctx = self._make_cache_context(is_fp8=True)
-        stride = ctx.block_stride(1)
-        expected = 64 * 1 * 656 * 1  # block_size * kv_heads * fp8_head_dim * elem_size
+        stride = self._layout(ctx).block_stride(1)
+        expected = (64 + 1) * 656  # FP8 blocks include one padding row.
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
 
     def test_block_stride_bf16(self):
         """block_stride should return correct byte offset for BF16."""
         ctx = self._make_cache_context(is_fp8=False)
-        stride = ctx.block_stride(1)
+        stride = self._layout(ctx).block_stride(1)
         expected = 64 * 1 * 576 * 2  # block_size * kv_heads * head_dim * bf16_size
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
 

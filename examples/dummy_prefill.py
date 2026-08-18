@@ -3,7 +3,7 @@ import uuid
 
 import numpy as np
 from dlengine._rust.proto import RequestIn, SamplingParams
-from dlengine.llm_component import LLM
+from dlengine.engine.llm_component import LLM
 from dlengine.offline import generate
 from transformers import AutoTokenizer
 

@@ -81,9 +81,10 @@ class Config(BaseModel):
 
     # runner config
     enforce_eager: bool = False
-    attention_backend: Literal[
-        "auto", "fa2", "fa3", "fa4", "flashinfer", "torch"
-    ] = "auto"
+    hardware_backend: Literal["auto", "blackwell", "hopper", "gpu_generic"] = "auto"
+    attention_backend: Literal["auto", "fa2", "fa3", "fa4", "flashinfer", "torch"] = (
+        "auto"
+    )
     gdn_backend: Literal["auto", "flashinfer", "fla", "torch"] = "auto"
     use_flashinfer_decode: bool = Field(
         default_factory=lambda: os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1")

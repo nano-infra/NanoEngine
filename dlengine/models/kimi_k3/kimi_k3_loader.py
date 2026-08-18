@@ -6,7 +6,7 @@ import re
 
 import torch
 
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.distributed import get_dist_context
 from dlengine.logging import get_logger
 from dlengine.models.deepseek_v2.deepseek_v2_loader import _handle_kv_b_proj
 from dlengine.worker.loader import default_weight_loader
@@ -49,7 +49,10 @@ def load_weights(model, weights) -> None:
             layer, expert, projection, kind = expert_match.groups()
             module = model.get_submodule(f"model.layers.{layer}.mlp.experts")
             module.load_expert_weight(
-                int(expert), projection, kind, tensor,
+                int(expert),
+                projection,
+                kind,
+                tensor,
                 ep_rank=ctx.ffn_ep_rank,
             )
             loaded += 1
@@ -98,7 +101,11 @@ def load_weights(model, weights) -> None:
 
     for name, tensor in kv_b:
         _handle_kv_b_proj(
-            model, name, tensor, {}, model.config,
+            model,
+            name,
+            tensor,
+            {},
+            model.config,
             getattr(model.quantization_config, "block_size", []),
         )
         loaded += 1
@@ -124,5 +131,8 @@ def load_weights(model, weights) -> None:
         torch.cuda.empty_cache()
     logger.warning(
         "K3 weights: loaded=%d skipped=%d MegaMoE layers=%d missing=%s",
-        loaded, skipped, transformed, sorted(missing),
+        loaded,
+        skipped,
+        transformed,
+        sorted(missing),
     )

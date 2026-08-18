@@ -24,7 +24,7 @@ def update_weights(executor, named_tensors: dict[str, torch.Tensor]):
 
     Each worker resolves its own TP/EP slice via the per-parameter
     ``weight_loader`` callback (see
-    ``dlengine.context_v2.parameter.apply_named_tensors_in_place``).
+    ``dlengine.context.parameter.apply_named_tensors_in_place``).
 
     Args:
         executor: An object exposing ``collective_rpc(method, args)`` —

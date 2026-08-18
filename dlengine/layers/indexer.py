@@ -1071,7 +1071,7 @@ class Indexer(nn.Module):
 
         # All layers share this schedule. The model builds it once per forward;
         # retain the fallback for standalone Indexer calls and tests.
-        from dlengine.context_v2.batch import get_batch_context
+        from dlengine.context.batch import get_batch_context
 
         schedule_meta = get_batch_context().indexer_schedule_meta
         if schedule_meta is None:

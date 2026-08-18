@@ -161,7 +161,7 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
 
         # Match the verified SGLang recipe for both prefill and decode:
         # DeepEP low-latency dispatch -> masked CuteDSL grouped GEMMs -> combine.
-        from dlengine.context_v2.expert import ExpertContext
+        from dlengine.context.expert import ExpertContext
         from dlengine.kernel.cutedsl_nvfp4_moe import flashinfer_cutedsl_moe_masked
         from dlengine.layers.token_dispatcher import DeepEPTokenDispatcherLowLatency
 

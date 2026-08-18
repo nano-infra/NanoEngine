@@ -9,21 +9,21 @@ import torch
 import torch.distributed as dist
 from dlengine._rust.proto import RunnerIn
 from dlengine.config import Config
-from dlengine.context_v2.batch import BatchContext, get_batch_context, set_batch_context
-from dlengine.context_v2.batch_out import get_batch_out_context
-from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
-from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import (
+from dlengine.context.batch import BatchContext, get_batch_context, set_batch_context
+from dlengine.context.batch_out import get_batch_out_context
+from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
+from dlengine.context.cache.hca import get_hca_context
+from dlengine.context.cache.hisparse import (
     allocate_gqa_hot_buffer,
     initialize_hisparse_context,
     initialize_mla_hisparse_cache,
 )
-from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
-from dlengine.context_v2.distributed import get_dist_context, set_dist_context
-from dlengine.context_v2.expert import ExpertContext
-from dlengine.context_v2.management import reset_runtime_contexts
-from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
-from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.context.cache.plan import CachePlan, gqa_cache_plan
+from dlengine.context.distributed import get_dist_context, set_dist_context
+from dlengine.context.expert import ExpertContext
+from dlengine.context.management import reset_runtime_contexts
+from dlengine.context.parameter import WeightContext, WeightUpdateEngine
+from dlengine.context.peer import PeerAgentContext
 from dlengine.disagg.p2p import get_p2p_cache_transfer
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger, set_log_level
@@ -371,18 +371,42 @@ class ModelRunner:
         self.profiler = None
         self.profiler_trace_dir = None
 
-        # Initialise the hardware backend before constructing the model so that
-        # all layer factories are available when model __init__ runs.
-        from dlengine.layers import init_backend
+        # Resolve the hardware decision once at worker startup. Model code still
+        # reads the process-local holder during the compatibility migration.
+        from dlengine.layers import set_backend
+        from dlengine.layers.backend_selection import (
+            create_backend,
+            resolve_backend_selection,
+        )
         from dlengine.models.quant_config import QuantizationConfig as _QC
 
         _quant_cfg_dict = getattr(hf_config, "quantization_config", None) or {}
         if not isinstance(_quant_cfg_dict, dict):
             _quant_cfg_dict = {}
-        init_backend(
-            quant_config=_QC(**_quant_cfg_dict),
-            attention_backend=getattr(config, "attention_backend", "auto"),
-            gdn_backend=getattr(config, "gdn_backend", "auto"),
+        try:
+            cuda_capability = torch.cuda.get_device_capability()
+        except Exception:
+            cuda_capability = None
+        backend_selection = resolve_backend_selection(
+            requested_hardware=getattr(config, "hardware_backend", "auto"),
+            requested_attention=getattr(config, "attention_backend", "auto"),
+            requested_gdn=getattr(config, "gdn_backend", "auto"),
+            cuda_capability=cuda_capability,
+            legacy_hardware_backend=os.environ.get("NANO_BACKEND"),
+        )
+        self.backend = create_backend(
+            backend_selection,
+            _QC(**_quant_cfg_dict),
+        )
+        set_backend(self.backend)
+        logger.info(
+            "Selected runtime backend: hardware=%s attention=%s gdn=%s "
+            "source=%s reason=%s",
+            backend_selection.hardware,
+            backend_selection.attention,
+            backend_selection.gdn,
+            backend_selection.hardware_source,
+            backend_selection.hardware_reason,
         )
 
         model_architecture = hf_config.architectures[0]
@@ -882,7 +906,7 @@ class ModelRunner:
                 "DLSLime transport requires the optional 'dlslime' dependency"
             ) from exc
 
-        from dlengine.engine.dlslime_protocol import ModelRunnerRpcService
+        from dlengine.executor.dlslime_protocol import ModelRunnerRpcService
 
         available_nics = dlslime.available_nic()
         if not available_nics:

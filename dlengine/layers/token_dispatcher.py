@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from dlengine.context_v2.expert import ExpertContext
+from dlengine.context.expert import ExpertContext
 
 
 class DeepEPMode(Enum):

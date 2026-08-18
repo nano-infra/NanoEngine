@@ -18,9 +18,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.plan import qwen35_cache_plan
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.plan import qwen35_cache_plan
+from dlengine.context.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
 from dlengine.layers.base_backend import (

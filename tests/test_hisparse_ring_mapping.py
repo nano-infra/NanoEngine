@@ -1,7 +1,7 @@
 import pytest
 import torch
-from dlengine.context_v2.batch import set_batch_context
-from dlengine.context_v2.cache.hisparse import (
+from dlengine.context.batch import set_batch_context
+from dlengine.context.cache.hisparse import (
     initialize_hisparse_context,
     reset_hisparse_context,
 )

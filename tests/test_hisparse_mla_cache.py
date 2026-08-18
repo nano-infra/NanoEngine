@@ -1,6 +1,6 @@
 import pytest
 import torch
-from dlengine.context_v2.cache.hisparse import (
+from dlengine.context.cache.hisparse import (
     initialize_hisparse_context,
     initialize_mla_hisparse_cache,
     reset_hisparse_context,
@@ -8,7 +8,7 @@ from dlengine.context_v2.cache.hisparse import (
     update_mla_hisparse_slot_owners,
     writeback_mla_output_pages,
 )
-from dlengine.context_v2.cache.mla import allocate_mla_kvcache
+from dlengine.context.cache.mla import allocate_mla_kvcache
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned cache requires CUDA")

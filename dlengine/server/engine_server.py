@@ -9,7 +9,7 @@ import zmq
 import zmq.asyncio
 
 from dlengine.config import Config
-from dlengine.llm_component import LLMComponent
+from dlengine.engine.llm_component import LLMComponent
 from dlengine.logging import get_logger
 from dlengine.server import pd
 from dlengine.server.wire import (

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 from dlengine.logging import get_logger
 from dlengine.utils.cuda import get_cuda_compute_capability
 
@@ -88,12 +88,7 @@ def estimate_gdn_state_bytes(
     conv_bytes = num_layers * num_slots * conv_dim * conv_kernel_size * 2
     state_size = torch.empty((), dtype=_recurrent_state_dtype()).element_size()
     recurrent_bytes = (
-        num_layers
-        * num_slots
-        * num_v_heads
-        * head_v_dim
-        * head_k_dim
-        * state_size
+        num_layers * num_slots * num_v_heads * head_v_dim * head_k_dim * state_size
     )
     return conv_bytes + recurrent_bytes
 

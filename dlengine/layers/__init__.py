@@ -1,4 +1,4 @@
-"""DLEngine Hardware Abstraction Layer — backend factory singleton.
+"""DLEngine Hardware Abstraction Layer.
 
 Usage
 -----
@@ -12,10 +12,10 @@ Usage
 
 Backend selection order
 -----------------------
-1. ``NANO_BACKEND`` environment variable
-   (``"blackwell"`` | ``"hopper"`` | ``"gpu_generic"``)
-2. Auto-detect from ``torch.cuda.get_device_capability()``:
-   - compute capability 10.3    → ``"blackwell"``
+1. Config.hardware_backend when explicitly set.
+2. Legacy NANO_BACKEND environment variable.
+3. Auto-detect from torch.cuda.get_device_capability():
+   - compute capability >= 10.x → ``"blackwell"``
    - compute capability >= 9.x  → ``"hopper"``
    - otherwise                  → ``"gpu_generic"``
 
@@ -24,9 +24,9 @@ Attention and GDN kernels are selected independently by
 resolve from CUDA capability and installed kernel support.
 """
 
-import os
 from typing import Optional
 
+from .backend_selection import create_backend, resolve_backend_selection
 from .base_backend import BackendFactory
 
 _backend: Optional[BackendFactory] = None
@@ -37,62 +37,49 @@ def init_backend(
     backend_type: Optional[str] = None,
     attention_backend: Optional[str] = None,
     gdn_backend: Optional[str] = None,
-) -> None:
-    """Initialise the global backend factory.
+) -> BackendFactory:
+    """Compatibility entry point that selects, constructs, and stores a backend.
 
-    Parameters
-    ----------
-    quant_config:
-        A ``QuantizationConfig`` instance (or ``None`` for BF16).
-        If ``None``, a default (no-quantization) config is created.
-    backend_type:
-        Explicit backend name. When ``None`` the backend is resolved via
-        the ``NANO_BACKEND`` env var or GPU capability auto-detection.
+    New runtime code should resolve and construct explicitly, then call
+    set_backend.
     """
-    global _backend
-
-    if backend_type is None:
-        backend_type = os.environ.get("NANO_BACKEND")
-
-    if backend_type is None:
-        try:
-            import torch
-
-            cap = torch.cuda.get_device_capability()
-            if cap[0] >= 10:
-                backend_type = "blackwell"
-            else:
-                backend_type = "hopper" if cap[0] >= 9 else "gpu_generic"
-        except Exception:
-            backend_type = "gpu_generic"
+    import os
 
     if quant_config is None:
         from dlengine.models.quant_config import QuantizationConfig
 
         quant_config = QuantizationConfig()
 
-    if backend_type == "blackwell":
-        from .blackwell import BlackwellBackendFactory
+    try:
+        import torch
 
-        _backend = BlackwellBackendFactory(quant_config)
-    elif backend_type == "hopper":
-        from .hopper import HopperBackendFactory
+        capability = torch.cuda.get_device_capability()
+    except Exception:
+        capability = None
 
-        _backend = HopperBackendFactory(quant_config)
-    elif backend_type == "gpu_generic":
-        from .generic import GenericBackendFactory
-
-        _backend = GenericBackendFactory(quant_config)
-    else:
-        raise ValueError(
-            f"Unknown backend type: {backend_type!r}. "
-            "Valid values: 'blackwell', 'hopper', 'gpu_generic'."
-        )
-
-    _backend.attention_backend = attention_backend or os.environ.get(
-        "DLENGINE_ATTENTION_BACKEND", "auto"
+    selection = resolve_backend_selection(
+        requested_hardware=backend_type or "auto",
+        requested_attention=attention_backend
+        or os.environ.get("DLENGINE_ATTENTION_BACKEND", "auto"),
+        requested_gdn=gdn_backend or os.environ.get("DLENGINE_GDN_BACKEND", "auto"),
+        cuda_capability=capability,
+        legacy_hardware_backend=os.environ.get("NANO_BACKEND"),
     )
-    _backend.gdn_backend = gdn_backend or os.environ.get("DLENGINE_GDN_BACKEND", "auto")
+    backend = create_backend(selection, quant_config)
+    set_backend(backend)
+    return backend
+
+
+def set_backend(backend: BackendFactory) -> None:
+    """Store the already-resolved backend for the current worker process."""
+    global _backend
+    _backend = backend
+
+
+def reset_backend() -> None:
+    """Clear process backend state. Intended for worker teardown and tests."""
+    global _backend
+    _backend = None
 
 
 def get_backend() -> BackendFactory:
@@ -106,3 +93,13 @@ def get_backend() -> BackendFactory:
             "before creating model layers."
         )
     return _backend
+
+
+__all__ = [
+    "create_backend",
+    "get_backend",
+    "init_backend",
+    "reset_backend",
+    "resolve_backend_selection",
+    "set_backend",
+]

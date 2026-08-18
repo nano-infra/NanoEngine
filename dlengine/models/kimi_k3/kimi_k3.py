@@ -9,17 +9,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.plan import kimi_k3_cache_plan
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.plan import kimi_k3_cache_plan
+from dlengine.context.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SituAndMul
 from dlengine.layers.backends.kda import FlashInferKDA
 from dlengine.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.layers.layernorm import RMSNorm
-from dlengine.layers.parallelism_transition import AttnToFfnTransition, FfnToAttnTransition
+from dlengine.layers.parallelism_transition import (
+    AttnToFfnTransition,
+    FfnToAttnTransition,
+)
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2Attention
-from dlengine.models.pp_utils import get_pp_layer_range, make_pp_layers, pp_recv_hidden, pp_send_hidden
+from dlengine.models.pp_utils import (
+    get_pp_layer_range,
+    make_pp_layers,
+    pp_recv_hidden,
+    pp_send_hidden,
+)
 from dlengine.models.quant_config import QuantizationConfig
 
 
@@ -33,14 +41,22 @@ class KimiMLP(nn.Module):
             self.down_proj = backend.get_replicated_linear(intermediate, hidden)
         else:
             group = get_dist_context().ffn_tp_group
-            self.gate_proj = backend.get_column_parallel_linear(hidden, intermediate, tp_group=group)
-            self.up_proj = backend.get_column_parallel_linear(hidden, intermediate, tp_group=group)
-            self.down_proj = backend.get_row_parallel_linear(intermediate, hidden, tp_group=group)
+            self.gate_proj = backend.get_column_parallel_linear(
+                hidden, intermediate, tp_group=group
+            )
+            self.up_proj = backend.get_column_parallel_linear(
+                hidden, intermediate, tp_group=group
+            )
+            self.down_proj = backend.get_row_parallel_linear(
+                intermediate, hidden, tp_group=group
+            )
         self.act = SituAndMul(4.0, 25.0)
         self.register_buffer("fused_gate_up_weight", None, persistent=False)
 
     def prepare_fused_gate_up(self) -> None:
-        weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0).contiguous()
+        weight = torch.cat(
+            (self.gate_proj.weight, self.up_proj.weight), dim=0
+        ).contiguous()
         split = self.gate_proj.weight.shape[0]
         self.fused_gate_up_weight = weight
         self.gate_proj.weight.data = weight[:split]
@@ -94,7 +110,11 @@ class AttentionResidual:
     def _combined_score_weight(proj, norm):
         cached = getattr(proj, "_k3_residual_score_weight", None)
         if cached is None:
-            cached = (norm.weight.float() * proj.weight.squeeze().float()).to(norm.weight.dtype).contiguous()
+            cached = (
+                (norm.weight.float() * proj.weight.squeeze().float())
+                .to(norm.weight.dtype)
+                .contiguous()
+            )
             proj._k3_residual_score_weight = cached
         return cached
 
@@ -110,9 +130,7 @@ class AttentionResidual:
                 prefix = F.pad(prefix, (0, 0, 0, delta.shape[0] - prefix.shape[0]))
         prefix = delta if prefix is None else prefix + delta
         if self.valid:
-            from dlengine.kernel.jit.sgl.attn_res import (
-                fused_attention_residual_tma,
-            )
+            from dlengine.kernel.jit.sgl.attn_res import fused_attention_residual_tma
 
             output = fused_attention_residual_tma(
                 prefix,
@@ -145,11 +163,17 @@ class KimiMoE(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
         self.gate = nn.Linear(self.hidden, self.num_experts, bias=False)
-        self.e_score_correction_bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(self.num_experts, dtype=torch.float32)
+        )
         backend = get_backend()
-        self.routed_expert_down_proj = backend.get_replicated_linear(self.hidden, self.latent)
+        self.routed_expert_down_proj = backend.get_replicated_linear(
+            self.hidden, self.latent
+        )
         self.routed_expert_norm = RMSNorm(self.latent, eps=config.rms_norm_eps)
-        self.routed_expert_up_proj = backend.get_replicated_linear(self.latent, self.hidden)
+        self.routed_expert_up_proj = backend.get_replicated_linear(
+            self.latent, self.hidden
+        )
         ctx = get_dist_context()
         self.experts = backend.get_distributed_routed_experts(
             hidden_size=self.latent,
@@ -168,7 +192,8 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor,
         )
         self.shared_experts = KimiMLP(
-            self.hidden, config.moe_intermediate_size * config.num_shared_experts,
+            self.hidden,
+            config.moe_intermediate_size * config.num_shared_experts,
             replicated=True,
         )
         self.register_buffer("fused_front_weight", None, persistent=False)
@@ -179,7 +204,9 @@ class KimiMoE(nn.Module):
         """Merge router and latent-down weights once, outside graph capture."""
         gate_weight = self.gate.weight
         down_weight = self.routed_expert_down_proj.weight
-        self.fused_front_weight = torch.cat((gate_weight, down_weight), dim=0).contiguous()
+        self.fused_front_weight = torch.cat(
+            (gate_weight, down_weight), dim=0
+        ).contiguous()
         # Keep loader-visible parameters as views of the merged allocation so
         # the unfused copies can be released rather than costing ~6 GiB/GPU.
         self.gate.weight.data = self.fused_front_weight[: self.num_experts]
@@ -189,7 +216,9 @@ class KimiMoE(nn.Module):
 
     def forward(self, x: torch.Tensor, prefix: Optional[torch.Tensor] = None):
         if self.fused_front_weight is None:
-            raise RuntimeError("K3 fused MoE front was not prepared after weight loading")
+            raise RuntimeError(
+                "K3 fused MoE front was not prepared after weight loading"
+            )
         from dlengine.kernel.jit.sgl.moe_front import fused_front
 
         renormalize = getattr(self.experts, "routed_scaling_factor", 1.0) == 1.0
@@ -239,17 +268,32 @@ class KimiDecoderLayer(nn.Module):
             if self.is_kda
             else KimiMLAAttention(config, layer_idx, cache_idx)
         )
-        self.is_moe = layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0
-        self.mlp = KimiMoE(config, quant, layer_idx) if self.is_moe else KimiMLP(config.hidden_size, config.intermediate_size)
+        self.is_moe = (
+            layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        )
+        self.mlp = (
+            KimiMoE(config, quant, layer_idx)
+            if self.is_moe
+            else KimiMLP(config.hidden_size, config.intermediate_size)
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.use_res = config.attn_res_block_size is not None
         if self.use_res:
             self.write_block = layer_idx % config.attn_res_block_size == 0
-            self.self_attention_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
             self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.self_attention_res_proj = get_backend().get_replicated_linear(config.hidden_size, 1)
-            self.mlp_res_proj = get_backend().get_replicated_linear(config.hidden_size, 1)
+            self.self_attention_res_proj = get_backend().get_replicated_linear(
+                config.hidden_size, 1
+            )
+            self.mlp_res_proj = get_backend().get_replicated_linear(
+                config.hidden_size, 1
+            )
         # SP-MoE: shard TP-replicated rows before MegaMoE and gather afterward.
         self.attn_to_ffn = AttnToFfnTransition(use_k3_sp=True)
         self.ffn_to_attn = FfnToAttnTransition(self.attn_to_ffn)
@@ -264,25 +308,38 @@ class KimiDecoderLayer(nn.Module):
                 prefix, hidden = hidden, self.input_layernorm(hidden)
             else:
                 hidden, prefix = self.input_layernorm(hidden, prefix)
-            hidden = self.self_attn(hidden) if self.is_kda else self.self_attn(positions, hidden)
+            hidden = (
+                self.self_attn(hidden)
+                if self.is_kda
+                else self.self_attn(positions, hidden)
+            )
             hidden, prefix = self.post_attention_layernorm(hidden, prefix)
             hidden = self.attn_to_ffn(hidden)
             hidden = self.mlp(hidden)
             return self.ffn_to_attn(hidden), prefix
 
         hidden, prefix = residual_bank.aggregate(
-            prefix, hidden, self.self_attention_res_proj,
-            self.self_attention_res_norm, self.input_layernorm,
+            prefix,
+            hidden,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.input_layernorm,
             write=self.write_block,
         )
         if self.write_block:
             prefix = None
-        hidden = self.self_attn(hidden) if self.is_kda else self.self_attn(positions, hidden)
+        hidden = (
+            self.self_attn(hidden) if self.is_kda else self.self_attn(positions, hidden)
+        )
         rows = self.attn_to_ffn.local_rows(hidden)
         hidden = self.attn_to_ffn.reduce_scatter(hidden)
         hidden, prefix = residual_bank.aggregate(
-            prefix, hidden, self.mlp_res_proj, self.mlp_res_norm,
-            self.post_attention_layernorm, rows=rows,
+            prefix,
+            hidden,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+            rows=rows,
         )
         # Attention-residual consumes prefix in the FFN tail. Under TP8/EP8
         # hidden has already been token-scattered, so prefix must follow the
@@ -299,7 +356,11 @@ class KimiK3Model(nn.Module):
         self.is_last_pp_stage = ctx.is_last_pp_stage
         self.hidden_size = config.hidden_size
         self.hidden_dtype = config.dtype
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size) if self.is_first_pp_stage else None
+        self.embed_tokens = (
+            VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+            if self.is_first_pp_stage
+            else None
+        )
         pp_start, _ = get_pp_layer_range(config.num_hidden_layers)
         local_types = config.layer_types[pp_start:]
         state_prefix = [0]
@@ -310,17 +371,40 @@ class KimiK3Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_pp_layers(
             config.num_hidden_layers,
             lambda i: KimiDecoderLayer(
-                config, quant, i,
-                state_prefix[i - pp_start], cache_prefix[i - pp_start],
+                config,
+                quant,
+                i,
+                state_prefix[i - pp_start],
+                cache_prefix[i - pp_start],
             ),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.is_last_pp_stage else None
-        self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.is_last_pp_stage else None
-        self.output_attn_res_proj = get_backend().get_replicated_linear(config.hidden_size, 1) if self.is_last_pp_stage else None
+        self.norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if self.is_last_pp_stage
+            else None
+        )
+        self.output_attn_res_norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if self.is_last_pp_stage
+            else None
+        )
+        self.output_attn_res_proj = (
+            get_backend().get_replicated_linear(config.hidden_size, 1)
+            if self.is_last_pp_stage
+            else None
+        )
         self.blocks = math.ceil(config.num_hidden_layers / config.attn_res_block_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None):
-        hidden = (inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)) if self.is_first_pp_stage else pp_recv_hidden(positions.numel(), self.hidden_size, self.hidden_dtype)
+        hidden = (
+            (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_tokens(input_ids)
+            )
+            if self.is_first_pp_stage
+            else pp_recv_hidden(positions.numel(), self.hidden_size, self.hidden_dtype)
+        )
         prefix = None
         bank = AttentionResidual(hidden, self.blocks)
         for i in range(self.start_layer, self.end_layer):
@@ -328,7 +412,13 @@ class KimiK3Model(nn.Module):
         if not self.is_last_pp_stage:
             pp_send_hidden(hidden if prefix is None else hidden + prefix)
             return hidden
-        hidden, _ = bank.aggregate(prefix, hidden, self.output_attn_res_proj, self.output_attn_res_norm, self.norm)
+        hidden, _ = bank.aggregate(
+            prefix,
+            hidden,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+            self.norm,
+        )
         return hidden
 
 
@@ -336,9 +426,15 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.quantization_config = QuantizationConfig(**getattr(config, "quantization_config", {}))
+        self.quantization_config = QuantizationConfig(
+            **getattr(config, "quantization_config", {})
+        )
         self.model = KimiK3Model(config, self.quantization_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size) if get_dist_context().is_last_pp_stage else None
+        self.lm_head = (
+            ParallelLMHead(config.vocab_size, config.hidden_size)
+            if get_dist_context().is_last_pp_stage
+            else None
+        )
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         return self.model(input_ids, positions, inputs_embeds)
@@ -351,4 +447,5 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights):
         from .kimi_k3_loader import load_weights
+
         load_weights(self, weights)

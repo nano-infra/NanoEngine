@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.compile_utils import maybe_compile
-from dlengine.context_v2.batch import get_batch_context
+from dlengine.context.batch import get_batch_context
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.logging import get_logger

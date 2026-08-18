@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.cache.hca import DSV4_BYTES_PER_TOKEN
+from dlengine.context import BaseContext
+from dlengine.context.cache.hca import DSV4_BYTES_PER_TOKEN
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")

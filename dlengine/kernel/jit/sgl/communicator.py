@@ -118,7 +118,7 @@ _STATE: dict[tuple[int, int], K3SPCommunicator] = {}
 
 
 def get_k3_sp_communicator() -> K3SPCommunicator | None:
-    from dlengine.context_v2.distributed import get_dist_context
+    from dlengine.context.distributed import get_dist_context
 
     ctx = get_dist_context()
     if ctx.attn_tp_world_size not in (4, 8):

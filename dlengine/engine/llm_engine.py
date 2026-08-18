@@ -15,11 +15,11 @@ _TRACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 def _build_executor(config: Config):
     if config.executor_backend == "ray":
-        from dlengine.engine.ray_executor import RayExecutor
+        from dlengine.executor.ray_executor import RayExecutor
 
         return RayExecutor(config=config)
     if config.executor_backend == "dlslime":
-        from dlengine.engine.dlslime_executor import DLSLimeExecutor
+        from dlengine.executor.dlslime_executor import DLSLimeExecutor
 
         return DLSLimeExecutor(config=config)
     raise ValueError(f"Unknown executor backend: {config.executor_backend}")

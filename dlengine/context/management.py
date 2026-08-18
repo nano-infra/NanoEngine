@@ -1,7 +1,7 @@
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.batch import reset_batch_context
-from dlengine.context_v2.batch_out import reset_batch_out_context
-from dlengine.context_v2.expert import reset_expert_context
+from dlengine.context import BaseContext
+from dlengine.context.batch import reset_batch_context
+from dlengine.context.batch_out import reset_batch_out_context
+from dlengine.context.expert import reset_expert_context
 
 
 class ContextManagement:

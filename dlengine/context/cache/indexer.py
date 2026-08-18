@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 
 INDEXER_QUANT_BLOCK_SIZE = 128
 

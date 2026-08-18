@@ -80,7 +80,7 @@ def _collect_dsv4_debug_env() -> dict[str, str] | None:
     return debug_env or None
 
 
-from dlengine.engine.ray_utils import get_available_nodes_with_master_first
+from dlengine.executor.ray_utils import get_available_nodes_with_master_first
 
 
 class RayExecutor:

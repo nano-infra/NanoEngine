@@ -18,7 +18,7 @@ from typing import Generator, Tuple
 import torch
 from torch import nn
 
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.distributed import get_dist_context
 from dlengine.logging import get_logger
 from dlengine.models.pp_utils import pp_weight_belongs_to_stage
 from dlengine.worker.loader import (

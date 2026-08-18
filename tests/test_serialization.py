@@ -1,7 +1,7 @@
 from dlengine._rust.config import CachePlan, SchedulerConfig
 from dlengine._rust.core import Scheduler
 from dlengine._rust.proto import RequestIn, RunnerIn, SamplingParams
-from dlengine.engine.dlslime_protocol import decode_run_result, encode_run_result
+from dlengine.executor.dlslime_protocol import decode_run_result, encode_run_result
 
 
 def _scheduler() -> Scheduler:
