@@ -34,13 +34,20 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 
 from dlengine.config import Config
 from dlengine.logging import get_logger
+from dlengine.utils.trace_merger import merge_trace_jsons_to_gzip
 
 logger = get_logger("dlengine.server")
 
@@ -704,6 +711,38 @@ class OpenAIServer:
 # ----------------------------------------------------------------------------
 
 
+def _profiler_trace_files(result: dict[str, Any]) -> list[Path]:
+    """Return the unique, finalized worker traces from a stop response."""
+    paths = {
+        Path(path).expanduser().resolve()
+        for worker in result.get("workers", [])
+        for path in worker.get("trace_files", [])
+        if str(path).endswith(".pt.trace.json")
+    }
+    traces = sorted(paths)
+    if not traces:
+        raise ValueError("profiler stop returned no finalized trace files")
+    missing = [path for path in traces if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "profiler traces are not visible to the HTTP server: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return traces
+
+
+def _profiler_merged_trace_path(result: dict[str, Any], traces: list[Path]) -> Path:
+    trace_dirs = {
+        Path(worker["trace_dir"]).expanduser().resolve()
+        for worker in result.get("workers", [])
+        if worker.get("trace_dir")
+    }
+    if len(trace_dirs) > 1:
+        raise ValueError("profiler workers reported different trace directories")
+    trace_dir = trace_dirs.pop() if trace_dirs else traces[0].parent
+    return trace_dir / f"{trace_dir.name}_merged.trace.json.gz"
+
+
 def build_app(server: OpenAIServer):
     app = FastAPI(title="DLEngine OpenAI Server")
 
@@ -767,13 +806,40 @@ def build_app(server: OpenAIServer):
             return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
     @app.post("/stop_profiler")
-    async def stop_profiler() -> JSONResponse:  # noqa: ANN202
+    async def stop_profiler(request: Request):  # noqa: ANN202
         try:
+            raw_body = await request.body()
+            body = json.loads(raw_body) if raw_body else {}
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be an object")
+            merge = body.get("merge", False)
+            if type(merge) is not bool:
+                raise ValueError("merge must be a boolean")
+
             result = await server.worker.stop_profiler()
-            return JSONResponse(
-                status_code=200 if result.get("ok") else 500,
-                content=result,
+            if not result.get("ok") or not merge:
+                return JSONResponse(
+                    status_code=200 if result.get("ok") else 500,
+                    content=result,
+                )
+
+            traces = _profiler_trace_files(result)
+            merged_trace = _profiler_merged_trace_path(result, traces)
+            await asyncio.to_thread(
+                merge_trace_jsons_to_gzip,
+                traces,
+                merged_trace,
             )
+            return FileResponse(
+                merged_trace,
+                media_type="application/gzip",
+                filename=merged_trace.name,
+                headers={
+                    "X-DLEngine-Profiler-Trace-Count": str(len(traces)),
+                },
+            )
+        except (ValueError, json.JSONDecodeError) as e:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
         except asyncio.TimeoutError:
             return JSONResponse(
                 status_code=504,
