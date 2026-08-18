@@ -15,9 +15,9 @@ def test_topk_transform_matches_torch(top_k):
 
     torch.manual_seed(0)
     page_size = 64
-    max_context_len = 8192
+    max_context_len = 16384
     seq_lens = torch.tensor(
-        [min(64, top_k), max(4096, top_k + 1)],
+        [min(64, top_k), max_context_len],
         dtype=torch.int32,
         device="cuda",
     )

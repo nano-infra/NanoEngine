@@ -46,15 +46,14 @@ from ..quant_config import QuantizationConfig
 logger = get_logger()
 
 
-# The current fused radix selector stores at most 8192 candidates from its
-# threshold bucket. It is exact only while the whole context fits that bound.
-_FUSED_INDEXER_TOPK_MAX_CONTEXT = 8192
+# The current fused radix selector stores at most 16384 candidates from its
+# threshold bucket. It is exact only while the whole configured context fits that bound.
+_FUSED_INDEXER_TOPK_MAX_CONTEXT = 16384
 
 
 def _can_use_fused_indexer_topk(index_topk: int, max_context_len: int) -> bool:
     return (
-        index_topk in (512, 2048)
-        and max_context_len <= _FUSED_INDEXER_TOPK_MAX_CONTEXT
+        index_topk in (512, 2048) and max_context_len <= _FUSED_INDEXER_TOPK_MAX_CONTEXT
     )
 
 
@@ -144,9 +143,7 @@ class _IndexerTopKState:
                 f"{tuple(logical.shape)} from layer {self.source_layer}; expected {expected}"
             )
         physical = self.physical_indices
-        if require_physical and (
-            physical is None or tuple(physical.shape) != expected
-        ):
+        if require_physical and (physical is None or tuple(physical.shape) != expected):
             shape = None if physical is None else tuple(physical.shape)
             raise RuntimeError(
                 f"Shared indexer layer {layer_idx} received invalid physical TopK "
@@ -155,9 +152,7 @@ class _IndexerTopKState:
         return logical, physical
 
 
-def _pp_send_indexer_state(
-    state: _IndexerTopKState, device: torch.device
-) -> None:
+def _pp_send_indexer_state(state: _IndexerTopKState, device: torch.device) -> None:
     """Send prefill TopK state after the residual stream at a PP boundary."""
     ctx = get_dist_context()
     logical = state.logical_indices
@@ -187,12 +182,8 @@ def _pp_recv_indexer_state(
     if source_layer < 0:
         return state
     if index_topk <= 0:
-        raise RuntimeError(
-            "Received Indexer TopK state for a model without index_topk"
-        )
-    logical = torch.empty(
-        (num_tokens, index_topk), dtype=torch.int32, device=device
-    )
+        raise RuntimeError("Received Indexer TopK state for a model without index_topk")
+    logical = torch.empty((num_tokens, index_topk), dtype=torch.int32, device=device)
     dist.recv(logical, src=ctx.pp_prev_global_rank)
     physical = None
     if has_physical:
@@ -401,6 +392,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.shared_experts = None
+        self._shared_expert_stream: torch.cuda.Stream | None = None
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -424,6 +416,26 @@ class DeepseekV2MoE(nn.Module):
             topk_indices: (batch, top_k)
             topk_weights: (batch, top_k)
         """
+        # GLM-5 uses one expert group. SGLang's fused gate performs sigmoid,
+        # correction-bias TopK, weight gather, normalization and routed-scale
+        # application in one launch instead of the eager ATen chain below.
+        if (
+            self.n_group == 1
+            and router_logits.is_cuda
+            and fused_kernels_enabled()
+            and self.scoring_func in ("sigmoid", "sqrtsoftplus")
+        ):
+            from dlengine.kernel.jit.sgl.moe_fused_gate import moe_fused_gate
+
+            return moe_fused_gate(
+                router_logits.float(),
+                self.gate.e_score_correction_bias.float(),
+                self.top_k,
+                self.scoring_func,
+                self.norm_topk_prob,
+                self.routed_scaling_factor,
+            )
+
         if self.scoring_func == "sigmoid":
             scores = router_logits.float().sigmoid()
         else:
@@ -476,12 +488,36 @@ class DeepseekV2MoE(nn.Module):
         context = get_batch_context()
         is_prefill = context.is_prefill
 
+        # The dense shared MLP is independent of routing. During decode, run it
+        # while DeepEP dispatch/expert/combine is in flight, then join before
+        # the add. This mirrors SGLang and DLEngine's DSV4 implementation.
+        overlap_shared = (
+            not is_prefill
+            and self.shared_experts is not None
+            and hidden_states.is_cuda
+            and hidden_states.numel() > 0
+        )
+        shared_states = None
+        if overlap_shared:
+            if self._shared_expert_stream is None:
+                self._shared_expert_stream = torch.cuda.Stream()
+            main_stream = torch.cuda.current_stream(hidden_states.device)
+            self._shared_expert_stream.wait_stream(main_stream)
+            with torch.cuda.stream(self._shared_expert_stream):
+                shared_states = self.shared_experts(residual)
+                shared_states.record_stream(self._shared_expert_stream)
+
         final_hidden_states = self.routed_experts(
             hidden_states, topk_idx, topk_weights, is_prefill=is_prefill
         )
 
         if self.shared_experts is not None:
-            shared_states = self.shared_experts(residual)
+            if overlap_shared:
+                torch.cuda.current_stream(hidden_states.device).wait_stream(
+                    self._shared_expert_stream
+                )
+            else:
+                shared_states = self.shared_experts(residual)
             final_hidden_states = final_hidden_states + shared_states.view(
                 -1, hidden_dim
             )
@@ -844,9 +880,10 @@ class DeepseekV2Attention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.index_topk = int(getattr(config, "index_topk", 0) or 0)
-        self.enable_mla_reference_fallback = getattr(
-            config, "enable_mla_reference_fallback", False
-        ) or os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") == "1"
+        self.enable_mla_reference_fallback = (
+            getattr(config, "enable_mla_reference_fallback", False)
+            or os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") == "1"
+        )
         # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
         num_key_value_heads = 1
         self.is_v32 = hasattr(config, "index_topk")
@@ -964,9 +1001,7 @@ class DeepseekV2Attention(nn.Module):
                 rope_theta=float(rope_theta),
                 rope_scaling=rope_params,
                 layer_id=(layer_idx if cache_layer_idx is None else cache_layer_idx),
-                indexer_norm_eps=float(
-                    getattr(config, "indexer_norm_eps", 1e-6)
-                ),
+                indexer_norm_eps=float(getattr(config, "indexer_norm_eps", 1e-6)),
                 indexer_rope_interleave=bool(
                     getattr(config, "indexer_rope_interleave", False)
                 ),
@@ -1349,9 +1384,7 @@ class DeepseekV2Attention(nn.Module):
                         if k_cached_raw.shape[0] > 0:
                             k_cached_raw = k_cached_raw.squeeze(1)
                             if k_cache.dtype == torch.float8_e4m3fn:
-                                dequantize_fn = getattr(
-                                    self, "_dequantize_fn", None
-                                )
+                                dequantize_fn = getattr(self, "_dequantize_fn", None)
                                 if dequantize_fn is None:
                                     from dlengine.kernel.triton.hopper.fp8_utils import (
                                         dequantize_and_unpack_mla as dequantize_fn,

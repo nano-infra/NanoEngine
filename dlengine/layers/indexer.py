@@ -39,15 +39,9 @@ import deep_gemm
 import torch
 import torch.nn as nn
 
-try:
-    from fast_hadamard_transform import hadamard_transform
-except ImportError:
-    # Some runtime images provide the JIT Hadamard op without the
-    # optional fast-hadamard-transform wheel. Both implement the same API.
-    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
-
 from dlengine.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
+from dlengine.kernel.jit.sgl.hadamard import hadamard_transform
 from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
 from dlengine.kernel.triton.generic.indexer_transform import (
     indexer_k_rope_inplace,
