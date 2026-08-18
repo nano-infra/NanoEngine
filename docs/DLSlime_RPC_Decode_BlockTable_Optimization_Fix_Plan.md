@@ -1,5 +1,8 @@
 # DLSlime RPC Decode BlockTable 优化修复计划
 
+> 历史设计说明（2026-08-18）：本文提到的 `legacy_ll` 已从当前实现删除；当前支持的
+> SP backend 为 `hao_basic` 和 `nccl`。
+
 ## 1. 问题定义
 
 当前在以下条件同时满足时，会出现 decode 卡住：

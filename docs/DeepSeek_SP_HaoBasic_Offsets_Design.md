@@ -1,5 +1,8 @@
 # DeepSeek SP 下 MLA 路径 Q `offsets` 支持与 DLSlime `hao_basic` 原生扩展设计
 
+> 历史设计说明（2026-08-18）：本文以 `legacy_ll` 作迁移期对照；该 backend 已从
+> 当前实现删除，现行 SP backend 为 `hao_basic` 和 `nccl`。
+
 ## 1. 目标
 
 本文档的目标是两件事：

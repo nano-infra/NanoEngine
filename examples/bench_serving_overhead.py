@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
     parser.add_argument("--sp-backend", type=str, default="hao_basic",
-                        choices=["hao_basic", "nccl", "nccl_compact"],
+                        choices=["hao_basic", "nccl"],
                         help="SP all-to-all backend.")
     parser.add_argument("--disable-non-uniform-split", action="store_true", 
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")

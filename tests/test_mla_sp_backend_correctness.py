@@ -12,7 +12,7 @@ Covered cases:
 The script initializes `SPContext` twice, once per backend, so the exercised path
 matches NanoDeploy's startup-time backend selection:
 
-`set_sp_context(..., backend="hao_basic" | "nccl" | "nccl_compact")`
+`set_sp_context(..., backend="hao_basic" | "nccl")`
 
 Usage:
 `torchrun --nproc_per_node=8 tests/test_mla_sp_backend_correctness.py --mode both`
@@ -37,7 +37,6 @@ MASTER_RANK = 0
 BACKEND_CHOICES: tuple[SPBackend, ...] = (
     "hao_basic",
     "nccl",
-    "nccl_compact",
 )
 MODE_CHOICES = ("eager", "graph", "both")
 
@@ -767,16 +766,6 @@ def main() -> None:
         raise ValueError("--num-requests must be <= --max-num-seqs.")
     if args.graph_replays <= 0:
         raise ValueError("--graph-replays must be positive.")
-    if (
-        "nccl_compact" in {args.reference_backend, args.candidate_backend}
-        and args.mode != "eager"
-    ):
-        raise ValueError(
-            "nccl_compact uses variable split-size NCCL collectives and only "
-            "supports --mode eager in this buffer-level correctness test. "
-            "End-to-end piecewise CUDA Graph keeps these collectives outside graph capture."
-        )
-
     rank = -1
     try:
         rank, world_size, device = init_dist()

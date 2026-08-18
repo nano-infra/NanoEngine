@@ -64,7 +64,7 @@ def main():
         "--sp-backend",
         type=str,
         default="hao_basic",
-        choices=["hao_basic", "nccl", "nccl_compact"],
+        choices=["hao_basic", "nccl"],
     )
     parser.add_argument(
         "--dynamic-sp-size-strategy",

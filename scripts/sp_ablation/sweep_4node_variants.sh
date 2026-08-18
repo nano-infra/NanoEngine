@@ -150,14 +150,13 @@ policy_key_for_strategy() {
         fixed_sp8) echo "fixed_sp8" ;;
         piecewise) echo "piecewise_${base_policy}" ;;
         nccl) echo "nccl_${base_policy}" ;;
-        nccl_compact) echo "nccl_compact_${base_policy}" ;;
         *) echo "${CURRENT_VARIANT}_${base_policy}" ;;
     esac
 }
 
 validate_variant() {
     case "$1" in
-        current|fixed_sp8|piecewise|nccl|nccl_compact) ;;
+        current|fixed_sp8|piecewise|nccl) ;;
         *) echo "Error: Invalid BENCH_VARIANTS entry '$1'."; exit 1 ;;
     esac
 }
@@ -390,12 +389,6 @@ run_one_attempt() {
             fixed_sp_size=0
             sp_backend="nccl"
             cuda_graph_mode="full"
-            ;;
-        nccl_compact)
-            fixed_sp_size=0
-            sp_backend="nccl_compact"
-            cuda_graph_mode="piecewise"
-            gpu_util="$PIECEWISE_GPU_UTIL"
             ;;
     esac
 

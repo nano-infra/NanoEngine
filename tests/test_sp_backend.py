@@ -83,9 +83,10 @@ class _FakeFactory:
         return buffer
 
 
-def test_removed_legacy_ll_factory_is_rejected():
-    with pytest.raises(ValueError, match="Unsupported SP backend: legacy_ll"):
-        sp_backend.create_sp_backend_factory("legacy_ll")  # type: ignore[arg-type]
+@pytest.mark.parametrize("backend", ["legacy_ll", "nccl_compact"])
+def test_removed_sp_backend_factory_is_rejected(backend):
+    with pytest.raises(ValueError, match=f"Unsupported SP backend: {backend}"):
+        sp_backend.create_sp_backend_factory(backend)  # type: ignore[arg-type]
 
 
 def test_hao_adapter_compat_mode_translates_mask_and_transpose(monkeypatch):
@@ -460,137 +461,6 @@ def test_nccl_static_transpose_uses_fixed_exchange_and_local_patch(monkeypatch):
     )
 
     expected = torch.tensor([[3.0], [0.0], [7.0], [0.0]])
-    assert torch.equal(output, expected)
-
-
-def test_nccl_compact_q_uses_variable_payload_exchange_without_mask_a2a(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    adapter = sp_backend.NcclCompactAllToAllBufferAdapter(
-        max_dispatch_per_msg=2,
-        max_bs=3,
-        rank=1,
-        world_size=2,
-        buffer_size_bytes=2 * 3 * 2 * torch.float32.itemsize,
-    )
-    adapter.connect_full_mesh(SimpleNamespace())
-
-    calls = {"value": 0}
-
-    def fake_all_to_all_single(
-        output,
-        input,
-        output_split_sizes=None,
-        input_split_sizes=None,
-        group=None,
-    ):
-        del group
-        calls["value"] += 1
-        assert input.dtype == torch.float32
-        assert input_split_sizes == [1, 0]
-        assert output_split_sizes == [2, 0]
-        assert torch.equal(input, torch.tensor([[1.0, 10.0]]))
-        output.copy_(torch.tensor([[101.0, 1010.0], [202.0, 2020.0]]))
-
-    monkeypatch.setattr(sp_backend.dist, "all_to_all_single", fake_all_to_all_single)
-
-    local_patch = adapter.local_buffer.view(torch.float32).view(6, 2)
-    local_patch.zero_()
-    local_patch[2].copy_(torch.tensor([9.0, 90.0]))
-
-    output = adapter.all_to_all_ll(
-        torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
-        mask=torch.tensor([[1, 0, 0], [0, 0, 0]], dtype=torch.int32),
-        offsets=torch.tensor([0, 2, 3], dtype=torch.int32),
-    )
-
-    expected = torch.tensor(
-        [
-            [101.0, 1010.0],
-            [202.0, 2020.0],
-            [9.0, 90.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-        ]
-    )
-    assert calls["value"] == 1
-    assert torch.equal(output, expected)
-
-
-def test_nccl_compact_transpose_uses_single_static_exchange(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    adapter = sp_backend.NcclCompactAllToAllBufferAdapter(
-        max_dispatch_per_msg=1,
-        max_bs=3,
-        rank=0,
-        world_size=2,
-        buffer_size_bytes=2 * 3 * 2 * torch.float32.itemsize,
-    )
-    adapter.connect_full_mesh(SimpleNamespace())
-
-    calls = {"value": 0}
-
-    def fake_all_to_all_single(
-        output,
-        input,
-        output_split_sizes=None,
-        input_split_sizes=None,
-        group=None,
-    ):
-        del group
-        calls["value"] += 1
-        assert output_split_sizes is None
-        assert input_split_sizes is None
-        expected_send = torch.tensor(
-            [
-                [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-                [[5.0, 50.0], [0.0, 0.0], [6.0, 60.0]],
-            ]
-        )
-        assert torch.equal(input, expected_send)
-        output.copy_(
-            torch.tensor(
-                [
-                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-                    [[0.0, 0.0], [7.0, 70.0], [0.0, 0.0]],
-                ]
-            )
-        )
-
-    monkeypatch.setattr(sp_backend.dist, "all_to_all_single", fake_all_to_all_single)
-
-    local_patch = adapter.local_buffer.view(torch.float32).view(6, 2)
-    local_patch.zero_()
-    local_patch[0].copy_(torch.tensor([3.0, 30.0]))
-
-    output = adapter.all_to_all_ll(
-        torch.tensor(
-            [
-                [100.0, 1000.0],
-                [200.0, 2000.0],
-                [300.0, 3000.0],
-                [5.0, 50.0],
-                [500.0, 5000.0],
-                [6.0, 60.0],
-            ]
-        ),
-        mask=torch.tensor([[0, 0, 0], [1, 0, 1]], dtype=torch.int32),
-        is_transpose=True,
-    )
-
-    expected = torch.tensor(
-        [
-            [3.0, 30.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [7.0, 70.0],
-            [0.0, 0.0],
-        ]
-    )
-    assert calls["value"] == 1
     assert torch.equal(output, expected)
 
 

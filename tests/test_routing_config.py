@@ -198,10 +198,10 @@ def test_sp_backend_defaults_to_hao_basic():
     assert make_config().sp_backend == "hao_basic"
 
 
-@pytest.mark.parametrize("backend", ["legacy_ll", "unknown"])
+@pytest.mark.parametrize("backend", ["legacy_ll", "nccl_compact", "unknown"])
 def test_config_rejects_removed_or_unknown_sp_backend(backend):
     with pytest.raises(
         ValueError,
-        match="sp_backend must be one of: hao_basic, nccl, nccl_compact",
+        match="sp_backend must be one of: hao_basic, nccl",
     ):
         make_config(sp_backend=backend)

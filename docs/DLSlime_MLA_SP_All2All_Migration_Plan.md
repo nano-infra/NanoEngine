@@ -1,5 +1,8 @@
 # DLSlime MLA SP All2All 迁移与双后端切换计划
 
+> 历史设计说明（2026-08-18）：本文记录迁移过程，其中的 `legacy_ll` 与
+> `nccl_compact` 已从当前实现删除；当前支持的 SP backend 为 `hao_basic` 和 `nccl`。
+
 ## 仓库路径
 
 - 正在使用的DLSlime 仓库：`/mnt/nvme1n1/ml_research/linbinbin1/DLSlime`

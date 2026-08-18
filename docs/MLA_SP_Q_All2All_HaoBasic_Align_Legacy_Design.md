@@ -1,5 +1,8 @@
 # MLA SP Q All2All：修订版修复设计
 
+> 历史设计说明（2026-08-18）：本文以 `legacy_ll` 作迁移期语义对照；该 backend 已从
+> 当前实现删除，现行 SP backend 为 `hao_basic` 和 `nccl`。
+
 日期：2026-04-06  
 范围：`NanoDeploy-April`、`/mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-readonly`、`/mnt/nvme1n1/ml_research/linbinbin1/DLSlime`、`/mnt/nvme1n1/ml_research/linbinbin1/DLSlime-a2a`  
 目标：把当前版本的 `hao_basic` Q all2all 修到可承接 MLA SP decode 路径，同时把 `optimize_decode_block_table=True` 下真正破坏 decode 协议的问题描述准确、修法收敛、验证闭合

@@ -17,7 +17,7 @@ logger = get_logger()
 
 
 def _uses_nccl_comm_bs(sp_context) -> bool:
-    return sp_context.backend in {"nccl", "nccl_compact"}
+    return sp_context.backend == "nccl"
 
 
 def _get_sp_comm_bs(sp_context, context) -> int:

@@ -891,7 +891,7 @@ class ModelRunner:
         if (
             context.use_sp_a2a
             and (
-                self.config.sp_backend in {"nccl", "nccl_compact"}
+                self.config.sp_backend == "nccl"
                 or self.config.fixed_sp_size > 0
             )
             and context.sp_comm_bs is not None
