@@ -3,8 +3,8 @@ from typing import Any
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.cache._registry import register_cache_backend
+from dlengine.context import BaseContext
+from dlengine.context.cache._backend import CacheBackend, CacheKind
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
@@ -42,8 +42,8 @@ def allocate_dsv4_kvcache(context) -> None:
     )
 
 
-DSV4_CACHE_BACKEND = register_cache_backend(
-    "dsv4",
+DSV4_CACHE_BACKEND = CacheBackend(
+    kind=CacheKind.DSV4,
     configure=configure_dsv4_cache,
     get_block_bytes=get_dsv4_block_bytes,
     allocate=allocate_dsv4_kvcache,

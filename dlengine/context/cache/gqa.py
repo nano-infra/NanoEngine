@@ -2,8 +2,8 @@ from dataclasses import dataclass
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.cache._registry import register_cache_backend
+from dlengine.context import BaseContext
+from dlengine.context.cache._backend import CacheBackend, CacheKind
 
 
 @dataclass
@@ -66,8 +66,8 @@ def allocate_gqa_kvcache(context) -> None:
     )
 
 
-GQA_CACHE_BACKEND = register_cache_backend(
-    "gqa",
+GQA_CACHE_BACKEND = CacheBackend(
+    kind=CacheKind.GQA,
     configure=configure_gqa_cache,
     get_block_bytes=get_gqa_block_bytes,
     allocate=allocate_gqa_kvcache,

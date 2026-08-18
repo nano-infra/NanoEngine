@@ -4,14 +4,14 @@ import uuid
 import ray
 
 from dlengine.config import Config
-from dlengine.engine.dlslime_protocol import (
+from dlengine.executor.dlslime_protocol import (
     decode_run_result,
     decode_runner_out,
     encode_run_request,
     ModelRunnerRpcService,
     server_handler_ns,
 )
-from dlengine.engine.ray_executor import RayExecutor
+from dlengine.executor.ray_executor import RayExecutor
 from dlengine.logging import get_logger
 
 logger = get_logger()

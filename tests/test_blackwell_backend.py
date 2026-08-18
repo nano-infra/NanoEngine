@@ -1,12 +1,12 @@
 import dlengine.layers as layers
 import torch
-from dlengine.context_v2.batch import reset_batch_context, set_batch_context
+from dlengine.context.batch import reset_batch_context, set_batch_context
 from dlengine.layers.blackwell import attention, BlackwellBackendFactory
 
 
 def teardown_function():
     reset_batch_context()
-    layers._backend = None
+    layers.reset_backend()
     attention._trtllm_workspace = None
 
 

@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.distributed import get_dist_context
 
 
 def pp_layer_partition(

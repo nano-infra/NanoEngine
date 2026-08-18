@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
-from dlengine.context_v2.expert import ExpertContext, get_expert_runtime_context
+from dlengine.context.expert import ExpertContext, get_expert_runtime_context
 from dlengine.layers.base_backend import DistributedRoutedExpertsBase
 from dlengine.layers.local_dispatch import LocalPaddedDispatcher
 from dlengine.worker.runner_config import get_runner_config

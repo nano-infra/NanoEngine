@@ -5,16 +5,16 @@ from __future__ import annotations
 import torch
 from dlengine._rust.proto import RunnerIn
 from dlengine.config import Config
-from dlengine.context_v2.batch import get_batch_context, set_batch_context
-from dlengine.context_v2.cache import get_cache_context
-from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import (
+from dlengine.context.batch import get_batch_context, set_batch_context
+from dlengine.context.cache import get_cache_context
+from dlengine.context.cache.hca import get_hca_context
+from dlengine.context.cache.hisparse import (
     build_hot_slot_mapping,
     get_hisparse_context,
     update_mla_hisparse_slot_owners,
 )
-from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.graph import PagedAttentionStrategy
+from dlengine.context.distributed import get_dist_context
+from dlengine.context.graph import PagedAttentionStrategy
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")

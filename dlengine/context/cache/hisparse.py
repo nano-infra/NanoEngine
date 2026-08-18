@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 
 
 @dataclass

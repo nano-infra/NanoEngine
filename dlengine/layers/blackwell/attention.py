@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from dlengine.context_v2.batch import get_batch_context
+from dlengine.context.batch import get_batch_context
 from dlengine.kernel.triton.generic.kv_store import store_kvcache
 from dlengine.layers.hopper.attention import _gather_kv_cached_concat, HopperAttention
 from dlengine.logging import get_logger

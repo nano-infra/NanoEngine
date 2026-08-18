@@ -8,8 +8,8 @@ from typing import Any
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.context import BaseContext
+from dlengine.context.peer import PeerAgentContext
 
 logger = logging.getLogger("dlengine")
 

@@ -4,19 +4,19 @@ The public method names stay on CacheContext for compatibility. Backend
 allocation details live in the backend cache modules.
 """
 
-from dlengine.context_v2.cache._registry import get_cache_backend
-from dlengine.context_v2.cache.csa import (
+from dlengine.context.cache._backend import resolve_cache_backend
+from dlengine.context.cache.csa import (
     allocate_dsv4_compressed_caches,
     allocate_dsv4_compressor_state,
 )
-from dlengine.context_v2.cache.gdn import allocate_gdn_states, estimate_gdn_state_bytes
-from dlengine.context_v2.cache.indexer import allocate_indexer_cache
+from dlengine.context.cache.gdn import allocate_gdn_states, estimate_gdn_state_bytes
+from dlengine.context.cache.indexer import allocate_indexer_cache
 
 
 class KVCacheAllocatorMixin:
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-        get_cache_backend(self.mode).allocate(self)
+        resolve_cache_backend(self.mode).allocate(self)
 
     def allocate_host_kvcache(self, num_host_kvcache_blocks: int):
         self.num_host_kvcache_blocks = max(0, int(num_host_kvcache_blocks))
@@ -24,7 +24,7 @@ class KVCacheAllocatorMixin:
             self.host_kv_cache = None
             return
 
-        backend = get_cache_backend(self.mode)
+        backend = resolve_cache_backend(self.mode)
         gpu_kv_cache = self.kv_cache
         local_blocks = self.num_local_kvcache_blocks
         device = self.device

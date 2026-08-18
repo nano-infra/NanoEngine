@@ -12,7 +12,7 @@ from enum import Enum
 
 import torch
 
-from dlengine.context_v2 import BaseContext
+from dlengine.context import BaseContext
 
 
 class PagedAttentionStrategy(str, Enum):

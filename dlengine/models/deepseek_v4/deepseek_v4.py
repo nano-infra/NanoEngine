@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.compile_utils import maybe_compile
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.plan import deepseek_v4_cache_plan
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.plan import deepseek_v4_cache_plan
+from dlengine.context.distributed import get_dist_context
 from dlengine.kernel.jit.sgl import (
     fused_kernels_enabled as _sglang_fused_kernels_enabled,
 )

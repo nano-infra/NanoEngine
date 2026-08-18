@@ -11,7 +11,7 @@ import uuid
 
 from dlengine._rust.proto import RequestIn, SamplingParams
 from dlengine.config import Config
-from dlengine.llm_component import LLM
+from dlengine.engine.llm_component import LLM
 from dlengine.offline import generate
 from jsonargparse import ActionConfigFile, ArgumentParser
 from transformers import PreTrainedTokenizerFast

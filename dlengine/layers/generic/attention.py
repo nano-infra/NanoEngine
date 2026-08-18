@@ -30,9 +30,9 @@ except ImportError:
     flashinfer = None  # type: ignore
     _HAS_FLASHINFER = False
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.hisparse import get_hisparse_context
-from dlengine.context_v2.graph import get_graph_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.hisparse import get_hisparse_context
+from dlengine.context.graph import get_graph_context
 from dlengine.kernel.triton.generic.kv_store import store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,

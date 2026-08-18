@@ -5,12 +5,12 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from dlengine.config import Config
-from dlengine.context_v2.batch import get_batch_context, set_batch_context
-from dlengine.context_v2.batch_out import get_batch_out_context
-from dlengine.context_v2.cache import get_cache_context
-from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.expert import set_expert_context
+from dlengine.context.batch import get_batch_context, set_batch_context
+from dlengine.context.batch_out import get_batch_out_context
+from dlengine.context.cache import get_cache_context
+from dlengine.context.cache.hca import get_hca_context
+from dlengine.context.distributed import get_dist_context
+from dlengine.context.expert import set_expert_context
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger
 from dlengine.worker.graph_runner import LazyVerifyGraphRunner, MTPGraphRunner

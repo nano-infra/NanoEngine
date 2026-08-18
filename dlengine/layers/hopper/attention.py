@@ -19,10 +19,10 @@ except ImportError:
         flash_attn_with_kvcache = None  # type: ignore
         _FA_KVCACHE_TABLE_ARG = "page_table"
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import get_hisparse_context
-from dlengine.context_v2.cache.mla import get_mla_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.hca import get_hca_context
+from dlengine.context.cache.hisparse import get_hisparse_context
+from dlengine.context.cache.mla import get_mla_context
 from dlengine.kernel.triton.generic.kv_store import store_kcache, store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,

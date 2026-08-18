@@ -3,7 +3,7 @@
 Owns the PD-disaggregation transfer path: peer-agent memory-region
 registration, NanoCtrl engine lookup, peer connection setup, and the batched
 RDMA reads that pull KV / GDN / indexer / DSv4 state from a remote prefill
-engine. Cache state remains in ``context_v2.cache``; P2P-specific byte-offset
+engine. Cache state remains in ``context.cache``; P2P-specific byte-offset
 math lives next to the transfer path.
 
 This module is intentionally P2P-specific. Storage-backed transfer backends
@@ -17,8 +17,8 @@ import dlslime
 import torch
 import torch.distributed as dist
 
-from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.context.distributed import get_dist_context
+from dlengine.context.peer import PeerAgentContext
 from dlengine.disagg.p2p.cache_layout import P2PCacheLayout
 from dlengine.logging import get_logger
 from dlengine.models.pp_utils import (
@@ -111,7 +111,7 @@ class P2PCacheTransfer:
 
     @property
     def cache_context(self):
-        from dlengine.context_v2.cache import get_cache_context
+        from dlengine.context.cache import get_cache_context
 
         return get_cache_context()
 
@@ -168,7 +168,7 @@ class P2PCacheTransfer:
             # Decode-only NSA/MLA HiSparse receives the prefill KV directly
             # into its CPU cold tier. The normal device MR remains registered
             # for non-HiSparse migration and for backwards compatibility.
-            from dlengine.context_v2.cache.hisparse import get_hisparse_context
+            from dlengine.context.cache.hisparse import get_hisparse_context
 
             hisparse_ctx = get_hisparse_context()
             if (

@@ -8,7 +8,7 @@ and peer metadata, then exposes the transfer-facing helper methods.
 
 from dataclasses import dataclass, field
 
-from dlengine.context_v2.cache.hca import DSV4_BYTES_PER_TOKEN
+from dlengine.context.cache.hca import DSV4_BYTES_PER_TOKEN
 
 
 @dataclass

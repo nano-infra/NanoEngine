@@ -5,7 +5,7 @@ from typing import Callable, Generator, Tuple
 
 import torch
 import torch.distributed as dist
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.distributed import get_dist_context
 from dlengine.logging import get_logger
 from safetensors import safe_open
 from torch import nn

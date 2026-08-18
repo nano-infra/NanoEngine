@@ -15,22 +15,19 @@ import os
 
 import torch
 import torch.distributed as dist
-from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
-from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import (
-    build_hot_slot_mapping,
-    get_hisparse_context,
-)
-from dlengine.context_v2.cache.mla import get_mla_context
-from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.expert import ExpertContext, set_expert_context
-from dlengine.context_v2.graph import (
+from dlengine.context.batch import Context, get_batch_context, set_batch_context
+from dlengine.context.cache.hca import get_hca_context
+from dlengine.context.cache.hisparse import build_hot_slot_mapping, get_hisparse_context
+from dlengine.context.cache.mla import get_mla_context
+from dlengine.context.distributed import get_dist_context
+from dlengine.context.expert import ExpertContext, set_expert_context
+from dlengine.context.graph import (
     DecodeGraphContext,
     FlashInferDecodeGraphConfig,
     get_graph_context,
     PagedAttentionStrategy,
 )
-from dlengine.context_v2.management import reset_runtime_contexts
+from dlengine.context.management import reset_runtime_contexts
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")

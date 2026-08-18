@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import DeepseekV3Config
 
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.cache.plan import deepseek_mla_cache_plan
-from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context.batch import get_batch_context
+from dlengine.context.cache.plan import deepseek_mla_cache_plan
+from dlengine.context.distributed import get_dist_context
 from dlengine.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
@@ -1672,7 +1672,7 @@ class DeepseekV2Attention(nn.Module):
                             self.layer_idx, topk_indices, sparse_indices
                         )
                 if getattr(self.config, "enable_hisparse", False):
-                    from dlengine.context_v2.cache.hisparse import (
+                    from dlengine.context.cache.hisparse import (
                         get_hisparse_context,
                         remap_sparse_indices,
                         stage_mla_sparse_indices,
@@ -1714,7 +1714,7 @@ class DeepseekV2Attention(nn.Module):
                 sparse_indices=sparse_indices,
             )
             if getattr(self.config, "enable_hisparse", False):
-                from dlengine.context_v2.cache.hisparse import (
+                from dlengine.context.cache.hisparse import (
                     get_hisparse_context,
                     writeback_mla_output_pages,
                 )

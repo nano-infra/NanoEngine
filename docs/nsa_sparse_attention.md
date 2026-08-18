@@ -115,7 +115,7 @@ fallback. Depends on the same paged sparse-prefill primitive as chunked prefill.
 ## Relevant debug env vars
 
 All must be prefixed `DLENGINE_DSV4_DEBUG_` to be forwarded to Ray workers
-(see `engine/ray_executor.py`).
+(see `executor/ray_executor.py`).
 
 - `DLENGINE_DSV4_DEBUG_NSA_SPARSE_PREFILL` — enable/disable sparse prefill
   (default on). Leftover `=0` from a debug session silently disables it.

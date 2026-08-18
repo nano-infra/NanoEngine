@@ -3,8 +3,8 @@ from typing import Optional
 
 import torch
 
-from dlengine.context_v2 import BaseContext
-from dlengine.context_v2.graph import PagedAttentionStrategy
+from dlengine.context import BaseContext
+from dlengine.context.graph import PagedAttentionStrategy
 
 
 @dataclass
@@ -25,7 +25,7 @@ class BatchContext(BaseContext):
     graph_attention_strategy: PagedAttentionStrategy | None = None
     decode_page_plan_key: tuple[int, ...] | None = None
 
-    # TODO(context_v2): move these backend-specific fields to their own
+    # TODO(context): move these backend-specific fields to their own
     # attention contexts after all call sites use BatchContext directly.
     block_tables: torch.Tensor | None = None
     gdn_conv_states: torch.Tensor | None = None

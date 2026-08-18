@@ -142,7 +142,7 @@ def step_llm(args, slot_metas, token_ids) -> list:
     import ray
     from dlengine._rust.proto import RequestIn, SamplingParams
     from dlengine.config import Config
-    from dlengine.llm_component import LLMComponent
+    from dlengine.engine.llm_component import LLMComponent
 
     ray.init(address=args.ray_address, ignore_reinit_error=True)
 

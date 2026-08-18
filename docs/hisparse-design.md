@@ -126,10 +126,10 @@ HiSparse tensors:
 
 ### Runtime context
 
-Add a HiSparse runtime context under `context_v2`, parallel to the existing
+Add a HiSparse runtime context under `context`, parallel to the existing
 cache contexts:
 
-- `context_v2/cache/hisparse.py`
+- `context/cache/hisparse.py`
 - `HiSparseContext`
 - `get_hisparse_context()`
 - `reset_hisparse_context()`
@@ -356,9 +356,9 @@ layout:
   - call coordinator refresh before eager decode and before graph replay;
   - keep `InputPreparer` responsible for converting C++ aux data into CUDA
     tensors.
-- `dlengine/context_v2/`
+- `dlengine/context/`
   - add runtime tensors to `BatchContext`;
-  - add persistent HiSparse cache/coordinator tensors under `context_v2/cache`;
+  - add persistent HiSparse cache/coordinator tensors under `context/cache`;
   - reset HiSparse runtime state from the existing context reset path.
 - `dlengine/kernel/`
   - add `hisparse.cuh` and a Python wrapper for graph-safe top-k remapping;

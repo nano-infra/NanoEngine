@@ -20,7 +20,7 @@ import uuid
 import ray
 from dlengine._rust.proto import RequestIn, RequestMigrate, SamplingParams
 from dlengine.config import Config
-from dlengine.llm_component import LLMComponent
+from dlengine.engine.llm_component import LLMComponent
 from jsonargparse import ActionConfigFile, ArgumentParser
 from transformers import PreTrainedTokenizerFast
 

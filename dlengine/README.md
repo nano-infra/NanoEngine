@@ -14,6 +14,7 @@
 | `kvcache_block_size`     | int   | `256`              | KV cache block size (64 for MLA models)                              |
 | `gpu_memory_utilization` | float | `0.9`              | GPU memory usage fraction                                            |
 | `enforce_eager`          | bool  | `False`            | Disable CUDA Graph (for debugging)                                   |
+| `hardware_backend`       | str   | `"auto"`           | Hardware backend: `auto`, `blackwell`, `hopper`, or `gpu_generic`    |
 | `ray_address`            | str   | `"auto"`           | Ray cluster address (`auto` discovers a local cluster)               |
 | `master_address`         | str   | `None`             | Optional legacy rendezvous override; normally discovered from rank 0 |
 | `ctrl_address`           | str   | `None`             | dlslime-ctrl HTTP address for PD disaggregation                      |
