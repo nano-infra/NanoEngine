@@ -34,10 +34,14 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
   ```
 
-- Before launching any experiment or benchmark, set `SLIME_QP_NUM=4` in the
-  driver environment so the value is propagated to newly created Ray actors:
+- Before launching any GPU test, experiment, or benchmark, configure the
+  DLSlime/RDMA devices, GID index, and QP count in the driver environment.
+  Always include all three settings so the driver uses the eight data-plane
+  NICs and the values are available when creating Ray actors:
 
   ```bash
+  export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+  export SLIME_GID_INDEX=3
   export SLIME_QP_NUM=4
   ```
 
