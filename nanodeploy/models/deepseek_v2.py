@@ -59,6 +59,114 @@ def compute_topk_ids(topk_ids, ranks, num_experts):
     return topk_ids
 
 
+def deepseek_grouped_topk(
+    router_logits: torch.Tensor,
+    *,
+    top_k: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    e_score_correction_bias: torch.Tensor | None,
+    sorted_topk: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select DeepSeek routed experts and return their unbiased weights."""
+    if router_logits.ndim != 2:
+        raise ValueError(
+            "DeepSeek router logits must have shape [num_tokens, num_experts]"
+        )
+
+    num_tokens, num_experts = router_logits.shape
+    if num_expert_group <= 0 or num_experts % num_expert_group != 0:
+        raise ValueError(
+            f"num_experts={num_experts} must be divisible by "
+            f"num_expert_group={num_expert_group}"
+        )
+    if not 1 <= topk_group <= num_expert_group:
+        raise ValueError(
+            f"topk_group={topk_group} must be in [1, {num_expert_group}]"
+        )
+
+    experts_per_group = num_experts // num_expert_group
+    if not 1 <= top_k <= topk_group * experts_per_group:
+        raise ValueError(
+            f"top_k={top_k} exceeds the {topk_group * experts_per_group} "
+            "experts available in the selected groups"
+        )
+
+    if scoring_func == "sigmoid":
+        scores = torch.sigmoid(router_logits.float())
+    elif scoring_func == "softmax":
+        scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unsupported DeepSeek scoring_func={scoring_func!r}")
+
+    scores_for_choice = scores
+    if e_score_correction_bias is not None:
+        if tuple(e_score_correction_bias.shape) != (num_experts,):
+            raise ValueError(
+                "e_score_correction_bias must have shape "
+                f"[{num_experts}], got {tuple(e_score_correction_bias.shape)}"
+            )
+        if experts_per_group < 2:
+            raise ValueError(
+                "DeepSeek correction-bias routing requires at least two "
+                "experts per group"
+            )
+        scores_for_choice = scores + e_score_correction_bias.to(
+            device=scores.device,
+            dtype=scores.dtype,
+        ).unsqueeze(0)
+        group_scores = (
+            scores_for_choice.view(num_tokens, num_expert_group, experts_per_group)
+            .topk(2, dim=-1, sorted=False)
+            .values.sum(dim=-1)
+        )
+    else:
+        group_scores = (
+            scores_for_choice.view(
+                num_tokens, num_expert_group, experts_per_group
+            )
+            .max(dim=-1)
+            .values
+        )
+
+    selected_groups = torch.topk(
+        group_scores,
+        k=topk_group,
+        dim=-1,
+        sorted=False,
+    ).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    expert_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_expert_group, experts_per_group)
+        .reshape(num_tokens, num_experts)
+    )
+    masked_choice_scores = scores_for_choice.masked_fill(
+        ~expert_mask, float("-inf")
+    )
+    selected_experts = torch.topk(
+        masked_choice_scores,
+        k=top_k,
+        dim=-1,
+        sorted=sorted_topk,
+    ).indices
+
+    # The correction bias is only a load-balancing aid for expert selection.
+    # The actual mixture weights come from the original sigmoid/softmax scores.
+    routing_weights = scores.gather(1, selected_experts)
+    if renormalize:
+        routing_weights = routing_weights / routing_weights.sum(
+            dim=-1, keepdim=True
+        )
+    if routed_scaling_factor != 1.0:
+        routing_weights = routing_weights * routed_scaling_factor
+    return routing_weights, selected_experts
+
+
 # 已改
 
 
@@ -80,10 +188,26 @@ class DeepseekV2MoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
+        self.num_expert_group = int(getattr(config, "n_group", 1))
+        self.topk_group = int(getattr(config, "topk_group", 1))
+        self.scoring_func = getattr(config, "scoring_func", "softmax")
+        self.renormalize_routing_weights = bool(
+            getattr(config, "norm_topk_prob", False)
+        )
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0)
+        )
         # Use optimized Linear layer for gate
         # For gate, we don't need quantization, so use standard Linear
         # but we can optimize it by using F.linear directly in forward
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.register_parameter(
+                "e_score_correction_bias",
+                nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32)),
+            )
+        else:
+            self.gate.register_parameter("e_score_correction_bias", None)
 
         weight_dtype = quantization_config.dtype or config.dtype
 
@@ -240,17 +364,21 @@ class DeepseekV2MoE(nn.Module):
                     device=hidden_states.device,
                 )
             else:
-                routing_weights = torch.softmax(router_logits, dim=-1)
                 sorted_topk = (
                     context.is_prefill
                     if hasattr(context, "is_prefill")
                     else True
                 )
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights,
-                    self.top_k,
-                    dim=-1,
-                    sorted=sorted_topk,
+                routing_weights, selected_experts = deepseek_grouped_topk(
+                    router_logits,
+                    top_k=self.top_k,
+                    num_expert_group=self.num_expert_group,
+                    topk_group=self.topk_group,
+                    scoring_func=self.scoring_func,
+                    renormalize=self.renormalize_routing_weights,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    e_score_correction_bias=self.gate.e_score_correction_bias,
+                    sorted_topk=sorted_topk,
                 )
 
             if routing_strategy == "perfect_eplb":
@@ -269,7 +397,7 @@ class DeepseekV2MoE(nn.Module):
                 expert_list=self.expert_list_this_rank,
             )
         if self.shared_experts is not None:
-            shared_states = self.shared_experts(final_hidden_states)
+            shared_states = self.shared_experts(hidden_states)
             final_hidden_states += shared_states
         final_hidden_states = final_hidden_states.reshape(batch_size, -1)
 
@@ -712,10 +840,11 @@ class DeepseekV2Attention(nn.Module):
 
         key_states = key_states.unsqueeze(1)
         value_states = value_states.unsqueeze(1)
+        k_pe = k_pe.unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        # query_states[..., nope_size:] = q_pe
-        # key_states[..., nope_size:] = k_pe
+        query_states[..., self.kv_lora_rank :] = q_pe
+        key_states[..., self.kv_lora_rank :] = k_pe
 
         return query_states, key_states, value_states
 
