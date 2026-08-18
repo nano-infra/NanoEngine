@@ -136,7 +136,7 @@ class RayExecutor:
             if config.ffn_ep > 1
             else {}
         )
-        for env_name in ("SLIME_QP_NUM",):
+        for env_name in ("SLIME_QP_NUM", "NANODEPLOY_LOG_DECODE_A2A_MASKS"):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
         worker_runtime_env = (
@@ -187,7 +187,7 @@ class RayExecutor:
                 self.workers.append(worker)
 
         self.endpoint = RPCServerEndpoint(
-            8*32_000_000, 
+            32 * 32_000_000,
             self.config.attn_world_size,
             self.config.attention_sp,
             self.config.attention_tp,
@@ -321,7 +321,7 @@ class RayExecutor:
                 worker_end_times.append(res[1])
             else:
                 token_ids_list.append(res)
-        
+
         if worker_end_times:
             # Output Transfer Latency = Driver Recv Time - Max Worker Finish Time
             last_worker_end = max(worker_end_times)

@@ -27,7 +27,7 @@ from nanodeploy.engine.worker_transport import (
 class LocalExecutor:
     """Drives only the workers owned by one attention-DP engine."""
 
-    _SERVER_BUFFER_BYTES = 8 * 32_000_000
+    _SERVER_BUFFER_BYTES = 32 * 32_000_000
 
     def __init__(
         self,

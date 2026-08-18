@@ -1,3 +1,4 @@
+import base64
 import os
 import time
 
@@ -162,7 +163,7 @@ class ModelRunner:
             # Check if using time-based profiling
             profiler_start_time = getattr(config, "profiler_start_time", None)
             profiling_duration = getattr(config, "profiling_duration", None)
-            
+
             if profiler_start_time is not None and profiling_duration is not None:
                 # Time-based profiling mode
                 self.profiler_use_time = True
@@ -186,10 +187,10 @@ class ModelRunner:
                 logger.info(
                     f"Rank {rank}: Profiler enabled (step-based). Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
                 )
-            
+
             profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
             os.makedirs(profiler_dir, exist_ok=True)
-            
+
             # Store profiler directory for logging
             self.profiler_dir = profiler_dir
             self.profiler_worker_name = f"{self.engine_id}_rank_{self.rank}"
@@ -209,11 +210,11 @@ class ModelRunner:
                 profile_memory=True,
                 with_stack=True,
             )
-            
+
             logger.info(
                 f"Rank {rank}: Profiler initialized. Directory: {profiler_dir}, Worker name: {self.profiler_worker_name}"
             )
-            
+
             # Record the start time for time-based profiling
             if self.profiler_use_time:
                 self.profiler_init_time = time.time()
@@ -810,7 +811,7 @@ class ModelRunner:
         attention_compute_bs = (
             context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
         )
-        
+
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
@@ -908,6 +909,10 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
+    def _pack_binary_mask(self, mask: torch.Tensor) -> list[str]:
+        packed = np.packbits(mask.detach().cpu().numpy().astype(np.uint8), axis=1)
+        return [base64.b64encode(row.tobytes()).decode("ascii") for row in packed]
+
     def _log_decode_a2a_masks(self, loop_idx: int, is_dummy: bool) -> None:
         context = get_context()
         if context.use_sp_a2a is not True:
@@ -929,9 +934,10 @@ class ModelRunner:
                 "max_bs": int(context.q_mask.shape[1]),
                 "sp_comm_bs": context.sp_comm_bs,
                 "is_dummy": is_dummy,
+                "mask_encoding": "bit_b64",
                 "q_offsets": context.q_offsets.detach().cpu().tolist(),
-                "q_mask": context.q_mask.detach().cpu().tolist(),
-                "res_lse_mask": context.res_lse_mask.detach().cpu().tolist(),
+                "q_mask": self._pack_binary_mask(context.q_mask),
+                "res_lse_mask": self._pack_binary_mask(context.res_lse_mask),
             }
         )
 
@@ -1260,7 +1266,7 @@ class ModelRunner:
             gpu_loop_begin.record()
         for i in range(loop_count):
             current_time = time.time()
-            
+
             # Check if should start profiling (time-based or step-based)
             should_start_profiling = False
             if self.profiler:
@@ -1273,7 +1279,7 @@ class ModelRunner:
                     # Step-based: check if reached start step
                     if self.run_count == self.profiler_start_step:
                         should_start_profiling = True
-            
+
             if should_start_profiling:
                 logger.info(
                     f"Rank {self.rank}: Starting profiler... (profiler_dir={self.profiler_dir}, worker_name={self.profiler_worker_name})"
@@ -1359,11 +1365,11 @@ class ModelRunner:
                 else:
                     # Step-based: check if reached start step
                     is_profiling = self.run_count >= self.profiler_start_step
-            
+
             if is_profiling:
                 should_continue = False
                 should_stop = False
-                
+
                 if self.profiler_use_time:
                     # Time-based: check current time
                     current_time = time.time()
@@ -1380,7 +1386,7 @@ class ModelRunner:
                         should_continue = True
                     else:
                         should_stop = True
-                
+
                 if should_continue:
                     try:
                         self.profiler.step()
