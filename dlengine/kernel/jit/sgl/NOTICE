@@ -3,8 +3,9 @@ project, licensed under the Apache License, Version 2.0.
 
   Upstream:   https://github.com/sgl-project/sglang
   Hadamard revision: 58592f07063b9d553c5c624ec11038d357971226
-  Source:     python/sglang/jit_kernel/  (utils.py, deepseek_v4.py, hadamard.py)
+  Source:     python/sglang/jit_kernel/  (utils.py, deepseek_v4.py, hadamard.py, moe_fused_gate.py)
               python/sglang/jit_kernel/csrc/fast-hadamard-transform/
+              python/sglang/jit_kernel/csrc/moe/moe_fused_gate.cuh
               python/sglang/jit_kernel/csrc/deepseek_v4/ (rope.cuh, rmsnorm.cuh)
               python/sglang/kernels/jit/csrc/distributed/
               python/sglang/kernels/jit/csrc/kimi_k3/attn_res/
@@ -23,6 +24,7 @@ Modifications by DLEngine:
   - deepseek_v4.py:  reduced to the kernels used by DLEngine;
                      references to ``sglang.srt.debug_utils`` removed.
   - hadamard.py:     imports redirected to the vendored JIT utilities.
+  - moe_fused_gate.py: imports redirected to the vendored JIT utilities.
   - attn_res.py, moe_front.py, tiny_gemm.py, add3.py, communicator.py, and
     sp_collective.py: wrappers adapted to the NanoDeploy tensor layouts,
     distributed context, and JIT loader.

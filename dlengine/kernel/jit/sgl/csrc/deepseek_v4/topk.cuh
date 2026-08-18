@@ -11,7 +11,7 @@
 
 namespace {
 
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+constexpr uint32_t kSMEM = 32 * 1024 * sizeof(uint32_t);  // 128KB: exact through 16K contexts
 
 struct TopKParams {
     const float* __restrict__ scores;
