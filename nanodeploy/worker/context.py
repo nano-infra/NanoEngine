@@ -50,6 +50,7 @@ class Context:
     # used for all2all q transfer
     q_offsets: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
+    prefill_cu_seqlens_q_host: tuple[int, ...] | None = None
 
 
 _CONTEXT = Context()
@@ -89,6 +90,7 @@ def set_context(
     sp_comm_bs: Optional[int] = None,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
+    prefill_cu_seqlens_q_host: tuple[int, ...] | None = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -121,6 +123,7 @@ def set_context(
         sp_comm_bs=sp_comm_bs,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
+        prefill_cu_seqlens_q_host=prefill_cu_seqlens_q_host,
     )
 
 

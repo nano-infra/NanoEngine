@@ -146,27 +146,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::plan_decode()
     return _schedule_decode();
 }
 
-void Scheduler::append_missing_control_dummies(
-    std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_seqs)
-{
-    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        std::vector<bool> has_master(attention_sp_, false);
-        for (const auto& seq : dp_seqs[dp_idx]) {
-            int master_sp_idx =
-                seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-            if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
-                has_master[master_sp_idx] = true;
-            }
-        }
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            if (!has_master[sp_idx]) {
-                dp_seqs[dp_idx].push_back(
-                    worker_state[dp_idx]->dummy_seqs[sp_idx]);
-            }
-        }
-    }
-}
-
 ScheduleResult Scheduler::schedule()
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
@@ -181,10 +160,7 @@ ScheduleResult Scheduler::schedule()
         }
     }
 
-    if (has_prefill) {
-        append_missing_control_dummies(dp_seqs);
-    }
-    else {
+    if (!has_prefill) {
         dp_seqs = plan_decode();
     }
 

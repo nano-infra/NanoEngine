@@ -626,6 +626,13 @@ class ModelRunner:
         meta = prepare_prefill_cpp(
             seqs, sp_rank, sp_size, block_size, self.config.max_num_seqs
         )
+        if not is_dummy and len(meta.input_ids) != len(meta.slot_mapping):
+            raise RuntimeError(
+                "Non-dummy prefill metadata has mismatched KV rows: "
+                f"rank={self.rank}, sp_rank={sp_rank}, "
+                f"input_ids={len(meta.input_ids)}, "
+                f"slot_mapping={len(meta.slot_mapping)}"
+            )
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -644,12 +651,53 @@ class ModelRunner:
         ).cuda(non_blocking=True)
 
         block_tables = None
+        hf_config = self.config.hf_config
+        is_mla = (
+            getattr(hf_config, "num_key_value_heads", 0) == 1
+            and hasattr(hf_config, "kv_lora_rank")
+            and hasattr(hf_config, "qk_rope_head_dim")
+        )
+        num_prefill_seqs = len(meta.cu_seqlens_q) - 1
         if meta.use_block_tables:
-            block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
-                .cuda(non_blocking=True)
-            )
+            all_block_tables = torch.tensor(
+                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
+            ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
+            if is_mla:
+                # FlashMLA consumes the local packed batch rather than the
+                # scheduler's dense [SP, max_num_seqs, blocks] layout.
+                all_block_tables = all_block_tables[
+                    sp_rank, :num_prefill_seqs
+                ].contiguous()
+            block_tables = all_block_tables.cuda(non_blocking=True)
+        elif is_mla and not is_dummy:
+            # A cache-less prefill still runs FlashMLA against the paged cache
+            # after store_kcache. Reconstruct each sequence's block table from
+            # its token-to-slot mapping; prefix-cache prefills use the dense
+            # block tables supplied above instead.
+            block_table_rows: list[list[int]] = []
+            for seq_idx in range(num_prefill_seqs):
+                start = meta.cu_seqlens_q[seq_idx]
+                end = meta.cu_seqlens_q[seq_idx + 1]
+                row: list[int] = []
+                for slot in meta.slot_mapping[start:end]:
+                    block_id = slot // block_size
+                    if not row or row[-1] != block_id:
+                        row.append(block_id)
+                if not row:
+                    raise RuntimeError(
+                        "Non-dummy MLA prefill sequence has no KV-cache blocks: "
+                        f"rank={self.rank}, sp_rank={sp_rank}, seq_idx={seq_idx}"
+                    )
+                block_table_rows.append(row)
+
+            max_num_blocks = max(map(len, block_table_rows), default=0)
+            padded_block_tables = [
+                row + [-1] * (max_num_blocks - len(row))
+                for row in block_table_rows
+            ]
+            block_tables = torch.tensor(
+                padded_block_tables, dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
 
         set_context(
             True,
@@ -663,6 +711,7 @@ class ModelRunner:
             block_tables,
             None,
             is_dummy=is_dummy,
+            prefill_cu_seqlens_q_host=tuple(meta.cu_seqlens_q),
         )
         return input_ids, positions
 
@@ -1178,13 +1227,20 @@ class ModelRunner:
             for seq in dp_seqs
             if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         )
-        if num_sp_seqs == 0:
+        is_dummy = num_sp_seqs == 0
+        if is_dummy and not is_prefill:
             raise RuntimeError(
                 "worker received no canonical Sequence for its SP rank; "
                 "the scheduler must provide a persistent control dummy with "
                 "reserved KV blocks"
             )
-        is_dummy = False
+        if is_dummy:
+            # Prefill collectives still need every rank, but decode-shaped
+            # persistent dummies must not enter the prefill KV write path.
+            seq = Sequence([0])
+            seq.active(self.engine_id, sp_size, 1)
+            seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx = sp_rank
+            dp_seqs.append(seq)
 
         sp_seqs = [
             seq

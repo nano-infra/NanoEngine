@@ -315,7 +315,72 @@ class FlashMLAImpl:
         sp_size = get_dist_context().attn_sp_world_size
         use_sp_a2a = sp_size > 1 and context.use_sp_a2a
 
-        if not context.is_prefill:  # decode
+        if context.is_prefill:
+            if context.is_dummy:
+                # Empty DP lanes still execute the transformer/MoE collectives,
+                # but they own no KV blocks and their sampled output is ignored.
+                return q.new_zeros((q.shape[0], self.num_heads, self.v_head_size))
+
+            if context.block_tables is None:
+                raise RuntimeError("MLA prefill requires local paged block tables")
+            cu_seqlens_q_host = context.prefill_cu_seqlens_q_host
+            if cu_seqlens_q_host is None:
+                raise RuntimeError("MLA prefill requires host query offsets")
+
+            num_seqs = len(cu_seqlens_q_host) - 1
+            if context.block_tables.ndim != 2 or context.block_tables.shape[0] != num_seqs:
+                raise RuntimeError(
+                    "MLA prefill block-table batch mismatch: "
+                    f"block_tables={tuple(context.block_tables.shape)}, "
+                    f"num_seqs={num_seqs}"
+                )
+
+            context_lens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+            output_by_seq: list[torch.Tensor | None] = [None] * num_seqs
+            groups: dict[int, list[tuple[int, int, int]]] = {}
+            for seq_idx, (start, end) in enumerate(
+                zip(
+                    cu_seqlens_q_host[:-1],
+                    cu_seqlens_q_host[1:],
+                    strict=True,
+                )
+            ):
+                query_len = end - start
+                if query_len <= 0:
+                    raise RuntimeError(
+                        f"MLA prefill sequence {seq_idx} has no query tokens"
+                    )
+                groups.setdefault(query_len, []).append((seq_idx, start, end))
+
+            for query_len, group in groups.items():
+                seq_indices = [item[0] for item in group]
+                q_batch = torch.stack([q[start:end] for _, start, end in group])
+                group_context_lens = context_lens[seq_indices].contiguous()
+                group_block_tables = context.block_tables[seq_indices].contiguous()
+                tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+                    group_context_lens,
+                    query_len * self.num_heads // self.num_kv_heads,
+                    self.num_kv_heads,
+                )
+                group_output, _ = flash_mla.flash_mla_with_kvcache(
+                    q_batch,
+                    k_cache,
+                    group_block_tables,
+                    group_context_lens,
+                    self.v_head_size,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    self.scale,
+                    self.causal,
+                )
+                for group_idx, seq_idx in enumerate(seq_indices):
+                    output_by_seq[seq_idx] = group_output[group_idx]
+
+            if any(output is None for output in output_by_seq):
+                raise RuntimeError("MLA prefill did not produce every sequence output")
+            return torch.cat(output_by_seq, dim=0)
+
+        else:  # decode
             bs, num_head, head_dim = q.shape
             if use_sp_a2a:
                 sp_context = get_sp_context()

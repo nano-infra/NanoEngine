@@ -144,9 +144,6 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
-    void append_missing_control_dummies(
-        std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_seqs);
-
     // Round-robin counter for DP
     int next_dp_idx();
 
