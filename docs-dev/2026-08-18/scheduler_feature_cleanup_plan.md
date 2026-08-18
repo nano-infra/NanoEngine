@@ -1,8 +1,22 @@
 # 开源前调度、SP placement 与 SP backend 清理计划
 
-状态：待 review，尚未修改运行时代码  
+状态：已实施；非 GPU 验收通过，GPU 测试按要求未运行
 日期：2026-08-18  
 调研基线：首次 `gemm-update@f5ac869`；补充 `gemm-update@12acd29`
+
+实施记录：
+
+- `e5a6168 refactor: remove stale decentralized routing interfaces`
+- `a4e292d refactor: remove sp_debug placement path`
+- `d6d2558 refactor: remove unused dynamic SP placement paths`
+- `6c79b10 chore: remove obsolete long-short experiment tooling`
+- `a40aa06 refactor: remove legacy_ll SP backend`
+- `9fd0282 refactor: remove nccl_compact SP backend`
+
+验收结果：editable build 成功；routing/config、hierarchical contract、control plane、
+serving ingress 与 SP backend 共 148 项 CPU 测试通过；所有保留且修改过的 shell
+脚本通过 `bash -n`，修改过的 Python 入口通过 `py_compile`。未运行 CUDA、`torchrun`
+或其他 GPU 测试。
 
 ## 1. 目标与结论摘要
 
