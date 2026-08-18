@@ -128,7 +128,7 @@ def parse_args():
                         help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
+                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
     parser.add_argument(
         "--sp-master-selector",

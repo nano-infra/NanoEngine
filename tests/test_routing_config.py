@@ -40,6 +40,20 @@ def test_legacy_routing_strategy(name, expected):
     assert scheduler.routing_strategy == expected
 
 
+@pytest.mark.parametrize("name", ["VLLMLoadBalance", "random"])
+def test_legacy_routing_strategy_rejects_removed_or_unknown_value(name):
+    with pytest.raises(ValueError, match="routing_strategy must be one of"):
+        make_config(routing_strategy=name)
+
+
+def test_routing_strategy_binding_only_exports_supported_values():
+    assert set(RoutingStrategy.__members__) == {
+        "RoundRobin",
+        "LeastBatch",
+        "LeastCache",
+    }
+
+
 @pytest.mark.parametrize(
     "router_policy",
     ["round_robin", "least_batch", "least_batch_v2", "least_cache"],

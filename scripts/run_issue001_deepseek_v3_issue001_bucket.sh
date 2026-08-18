@@ -101,7 +101,6 @@ routing_short() {
         LeastBatch) echo "LB" ;;
         LeastCache) echo "LC" ;;
         RoundRobin) echo "RR" ;;
-        VLLMLoadBalance) echo "VLLM" ;;
         *) echo "$1" ;;
     esac
 }

@@ -168,7 +168,7 @@ fi
 
 # ================= 校验逻辑 (Validation) =================
 case "$ROUTING_STRATEGY" in
-    RoundRobin|LeastBatch|LeastCache|WeightedScore|VLLMLoadBalance) ;;
+    RoundRobin|LeastBatch|LeastCache) ;;
     *) echo "Error: Invalid routing strategy '$ROUTING_STRATEGY'."; exit 1 ;;
 esac
 
@@ -270,13 +270,12 @@ for rate in "${RATES[@]}"; do
     TIMESTAMP=$(TZ='Asia/Shanghai' date "+%Y%m%d_%H%M%S")
 
     # 策略标识字符串 (缩写)
-    # 路由缩写: LeastBatch->LB, LeastCache->LC, RoundRobin->RR, VLLMLoadBalance->VLLM
+    # 路由缩写: LeastBatch->LB, LeastCache->LC, RoundRobin->RR
     rt_short=""
     case "$ROUTING_STRATEGY" in
         LeastBatch)      rt_short="LB" ;;
         LeastCache)      rt_short="LC" ;;
         RoundRobin)      rt_short="RR" ;;
-        VLLMLoadBalance) rt_short="VLLM" ;;
         *)               rt_short="$ROUTING_STRATEGY" ;;
     esac
     # 调度缩写

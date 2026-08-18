@@ -41,7 +41,7 @@ class Config:
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.85
     gpu_memory_limit_gb: float | None = None
-    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"] = "RoundRobin"
+    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
     scheduler_arch: Literal["legacy_global", "hierarchical"] = "legacy_global"
     router_policy: Literal[
         "round_robin", "least_batch", "least_batch_v2", "least_cache"
@@ -199,6 +199,15 @@ class Config:
         if self.scheduler_arch not in {"legacy_global", "hierarchical"}:
             raise ValueError(
                 "scheduler_arch must be one of: legacy_global, hierarchical"
+            )
+        if self.routing_strategy not in {
+            "RoundRobin",
+            "LeastBatch",
+            "LeastCache",
+        }:
+            raise ValueError(
+                "routing_strategy must be one of: "
+                "RoundRobin, LeastBatch, LeastCache"
             )
         if self.hierarchical_worker_transport not in {"ray", "zmq"}:
             raise ValueError(

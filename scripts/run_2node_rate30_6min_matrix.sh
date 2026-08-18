@@ -44,10 +44,10 @@ PROGRESS_LOG="$CHAIN_LOG_DIR/matrix.progress"
 SUMMARY_TSV="$CHAIN_LOG_DIR/matrix_summary.tsv"
 
 DEFAULT_STAGES=(
-    centralized_dp16
-    centralized_dp2sp8
-    decentralized_dp16
-    decentralized_dp2sp8
+    legacy_global_dp16
+    legacy_global_dp2sp8
+    hierarchical_dp16
+    hierarchical_dp2sp8
 )
 
 if (( $# > 0 )); then
@@ -66,10 +66,10 @@ usage() {
     echo "Usage: $0 [stage ...]"
     echo
     echo "Stages:"
-    echo "  centralized_dp16"
-    echo "  centralized_dp2sp8"
-    echo "  decentralized_dp16"
-    echo "  decentralized_dp2sp8"
+    echo "  legacy_global_dp16"
+    echo "  legacy_global_dp2sp8"
+    echo "  hierarchical_dp16"
+    echo "  hierarchical_dp2sp8"
     echo
     echo "No stage arguments runs all four in the order above."
     echo "Set DRY_RUN=1 to print commands without launching the benchmark."
@@ -78,22 +78,22 @@ usage() {
 stage_config() {
     local stage="$1"
     case "$stage" in
-        centralized_dp16)
+        legacy_global_dp16)
             STAGE_SCHEDULER_ARCH="legacy_global"
             STAGE_DP=16
             STAGE_SP=1
             ;;
-        centralized_dp2sp8)
+        legacy_global_dp2sp8)
             STAGE_SCHEDULER_ARCH="legacy_global"
             STAGE_DP=2
             STAGE_SP=8
             ;;
-        decentralized_dp16)
+        hierarchical_dp16)
             STAGE_SCHEDULER_ARCH="hierarchical"
             STAGE_DP=16
             STAGE_SP=1
             ;;
-        decentralized_dp2sp8)
+        hierarchical_dp2sp8)
             STAGE_SCHEDULER_ARCH="hierarchical"
             STAGE_DP=2
             STAGE_SP=8

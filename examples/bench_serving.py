@@ -79,7 +79,7 @@ def parse_args():
                         help="Use the new decode-only dynamic SP scheduler.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
+                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],

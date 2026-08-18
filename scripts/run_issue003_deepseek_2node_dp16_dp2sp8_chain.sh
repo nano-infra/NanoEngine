@@ -13,7 +13,7 @@ ISSUE003_DATASET="${ISSUE003_DATASET:-/mnt/nvme1n1/ml_research/linbinbin1/paper-
 
 SEG="${SEG:-65536}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-SCHEDULER="${SCHEDULER:-centralized}"
+SCHEDULER_ARCH="${SCHEDULER_ARCH:-legacy_global}"
 GPU_MEM="${GPU_MEM:-141}"
 GPU_UTIL="${GPU_UTIL:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
@@ -177,7 +177,7 @@ run_stage_sweep() {
                 --gpu-util "$GPU_UTIL" \
                 --max-model-len "$MAX_MODEL_LEN" \
                 --routing-strategy LeastBatch \
-                --scheduler-mode "$SCHEDULER" \
+                --scheduler-arch "$SCHEDULER_ARCH" \
                 --loop-count "$LOOP_COUNT" \
                 --fixed-sp-segments "$FIXED_SP_SEGMENTS" \
                 --max-input-len "$MAX_INPUT_LEN" \

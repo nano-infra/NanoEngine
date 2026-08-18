@@ -16,8 +16,7 @@ namespace nanodeploy {
 enum class RoutingStrategy {
     RoundRobin,
     LeastBatch,
-    LeastCache,
-    VLLMLoadBalance  // vLLM-style: score = waiting * 4 + running
+    LeastCache
 };
 
 enum class SPMasterSelector {

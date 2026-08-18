@@ -11,7 +11,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/nvme1n1/ml_research/chenjiefei/models/deepseek-v3
 DATASET_PATH="${DATASET_PATH:-/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.03_n60000.csv}"
 
 SEG="${SEG:-65536}"
-SCHEDULER="${SCHEDULER:-centralized}"
+SCHEDULER_ARCH="${SCHEDULER_ARCH:-legacy_global}"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 GPU_MEM="${GPU_MEM:-141}"
 GPU_UTIL="${GPU_UTIL:-0.9}"
@@ -110,7 +110,6 @@ routing_short() {
         LeastBatch) echo "LB" ;;
         LeastCache) echo "LC" ;;
         RoundRobin) echo "RR" ;;
-        VLLMLoadBalance) echo "VLLM" ;;
         *) echo "$1" ;;
     esac
 }
@@ -458,7 +457,7 @@ run_one_attempt() {
         --gpu-util "$gpu_util" \
         --max-model-len "$MAX_MODEL_LEN" \
         --routing-strategy "$routing" \
-        --scheduler-mode "$SCHEDULER" \
+        --scheduler-arch "$SCHEDULER_ARCH" \
         --loop-count "$LOOP_COUNT" \
         --fixed-sp-size "$fixed_sp_size" \
         --sp-backend "$sp_backend" \
