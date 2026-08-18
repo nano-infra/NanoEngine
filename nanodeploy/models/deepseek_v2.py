@@ -23,6 +23,7 @@ from torch import nn
 from transformers import DeepseekV3Config
 
 from .quant_config import QuantizationConfig
+from .weight_loadable import WeightLoadableModel
 
 logger = get_logger()
 
@@ -466,7 +467,7 @@ class DeepseekV2Model(nn.Module):
 # 已改
 
 
-class DeepseekV2ForCausalLM(nn.Module):
+class DeepseekV2ForCausalLM(WeightLoadableModel):
     """Mixture model for causalLM."""
 
     def __init__(self, config: DeepseekV3Config):
@@ -475,8 +476,22 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quantization_config = QuantizationConfig(
             **getattr(config, "quantization_config", dict())
         )
+        self._weight_loader_local_expert_indices: dict[str, dict[int, int]] = {}
         self.model = DeepseekV2Model(config, self.quantization_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+
+    def should_load_weight(self, weight_name: str) -> bool:
+        from nanodeploy.worker.loader import should_load_deepseek_weight
+
+        return should_load_deepseek_weight(self, weight_name)
+
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> set[str]:
+        from nanodeploy.worker.loader import load_deepseek_weights
+
+        return load_deepseek_weights(self, weights)
 
     def forward(
         self,

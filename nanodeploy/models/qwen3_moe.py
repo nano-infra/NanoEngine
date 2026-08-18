@@ -23,6 +23,7 @@ from torch import nn
 from transformers import Qwen3MoeConfig
 
 from .quant_config import QuantizationConfig
+from .weight_loadable import WeightLoadableModel
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -527,7 +528,7 @@ class Qwen3MoeModel(nn.Module):
         return hidden_states
 
 
-class Qwen3MoeForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(WeightLoadableModel):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
