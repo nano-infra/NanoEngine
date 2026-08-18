@@ -1,0 +1,341 @@
+import argparse
+import os
+import time
+from typing import Any
+
+import ray
+from transformers import AutoTokenizer
+
+from nanodeploy import LLM, SamplingParams
+from nanodeploy.engine.sequence import Sequence
+
+
+DEFAULT_MODEL_PATH = (
+    "/mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/"
+    "models--deepseek-ai--DeepSeek-V3/snapshots/"
+    "e815299b0bcbac849fa540c768ef21845365c9eb"
+)
+DEFAULT_SLIME_VISIBLE_DEVICES = ",".join(f"mlx5_{idx}" for idx in range(8))
+PROXY_ENV_NAMES = (
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+)
+RDMA_ENV_DEFAULTS = {
+    "SLIME_VISIBLE_DEVICES": DEFAULT_SLIME_VISIBLE_DEVICES,
+    "SLIME_GID_INDEX": "3",
+    "SLIME_QP_NUM": "4",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run one real-weight DeepSeek-V3 request through a two-node "
+            "prefill/decode-disaggregated deployment."
+        )
+    )
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--ray-address", default="10.102.252.174:6380")
+    parser.add_argument(
+        "--prefill-master-address",
+        default="10.102.252.174:6006",
+    )
+    parser.add_argument(
+        "--decode-master-address",
+        default="10.102.243.60:6006",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="请用三句话解释月亮为什么不会掉到地球上。",
+    )
+    parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--temperature", type=float, default=1e-5)
+    parser.add_argument("--decode-loop-count", type=int, default=1)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+    )
+    parser.add_argument(
+        "--sp-backend",
+        choices=("hao_basic", "nccl"),
+        default="hao_basic",
+    )
+    parser.add_argument(
+        "--optimize-decode-block-table",
+        action="store_true",
+        help=(
+            "Enable decode RPC block-table filtering. It is disabled by "
+            "default for the first correctness smoke."
+        ),
+    )
+    return parser.parse_args()
+
+
+def configure_driver_environment() -> dict[str, str]:
+    for name in PROXY_ENV_NAMES:
+        os.environ.pop(name, None)
+    for name, value in RDMA_ENV_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+    return {name: os.environ[name] for name in RDMA_ENV_DEFAULTS}
+
+
+def node_ip_from_master_address(address: str) -> str:
+    raw = address.split("://", 1)[-1]
+    return raw.rsplit(":", 1)[0]
+
+
+def validate_ray_cluster(
+    prefill_master_address: str,
+    decode_master_address: str,
+) -> None:
+    alive_nodes = {
+        node["NodeManagerAddress"]: node
+        for node in ray.nodes()
+        if node.get("Alive")
+    }
+    required_ips = {
+        node_ip_from_master_address(prefill_master_address),
+        node_ip_from_master_address(decode_master_address),
+    }
+    missing_ips = required_ips.difference(alive_nodes)
+    if missing_ips:
+        raise RuntimeError(
+            "Ray cluster is missing required nodes: "
+            + ", ".join(sorted(missing_ips))
+        )
+    for node_ip in sorted(required_ips):
+        gpu_count = float(alive_nodes[node_ip].get("Resources", {}).get("GPU", 0))
+        if gpu_count < 8:
+            raise RuntimeError(
+                f"Ray node {node_ip} exposes only {gpu_count:g} GPUs; 8 are required"
+            )
+
+    available_gpus = float(ray.available_resources().get("GPU", 0))
+    if available_gpus < 16:
+        raise RuntimeError(
+            "The two-node smoke requires 16 currently available Ray GPUs, "
+            f"but only {available_gpus:g} are available. Remove stale actors "
+            "or placement groups before retrying."
+        )
+    print(
+        "Ray cluster ready:",
+        f"nodes={sorted(required_ips)}",
+        f"available_gpus={available_gpus:g}",
+        flush=True,
+    )
+
+
+def build_decode(args: argparse.Namespace) -> LLM:
+    print(
+        "Creating decode engine first:",
+        args.decode_master_address,
+        "attention=DP1/SP8/TP1",
+        "ffn=DP1/EP8/TP1",
+        flush=True,
+    )
+    return LLM(
+        args.model_path,
+        enforce_eager=True,
+        attention_dp=1,
+        attention_sp=8,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=8,
+        ffn_tp=1,
+        mode="decode",
+        scheduler_arch="legacy_global",
+        master_address=args.decode_master_address,
+        ray_address=args.ray_address,
+        dummy_prefill=False,
+        dummy_weight=False,
+        fixed_sp_size=8,
+        sp_backend=args.sp_backend,
+        optimize_decode_block_table=args.optimize_decode_block_table,
+        kvcache_block_size=64,
+        loop_count=args.decode_loop_count,
+        seed=0,
+        max_num_seqs=args.max_num_seqs,
+        max_num_recv_seqs=max(args.max_num_seqs, 16),
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+
+
+def build_prefill(args: argparse.Namespace) -> LLM:
+    print(
+        "Creating prefill engine second:",
+        args.prefill_master_address,
+        "attention=DP8/SP1/TP1",
+        "ffn=DP1/EP8/TP1",
+        flush=True,
+    )
+    return LLM(
+        args.model_path,
+        enforce_eager=True,
+        attention_dp=8,
+        attention_sp=1,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=8,
+        ffn_tp=1,
+        mode="prefill",
+        scheduler_arch="legacy_global",
+        master_address=args.prefill_master_address,
+        ray_address=args.ray_address,
+        dummy_prefill=False,
+        dummy_weight=False,
+        sp_backend=args.sp_backend,
+        kvcache_block_size=64,
+        loop_count=1,
+        seed=0,
+        max_num_seqs=args.max_num_seqs,
+        max_num_recv_seqs=max(args.max_num_seqs, 16),
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+
+
+def connect_kv_transfer(prefill: LLM, decode: LLM) -> None:
+    print("Initializing P/D KV-transfer endpoints", flush=True)
+    prefill_endpoints = prefill.p2p_init(
+        decode.engine_id,
+        decode.config.num_kvcache_blocks,
+        decode.config.attn_world_size,
+    )
+    decode_endpoints = decode.p2p_init(
+        prefill.engine_id,
+        prefill.config.num_kvcache_blocks,
+        prefill.config.attn_world_size,
+    )
+    prefill.p2p_connect(decode.engine_id, decode_endpoints)
+    decode.p2p_connect(prefill.engine_id, prefill_endpoints)
+    print("P/D KV-transfer endpoints connected", flush=True)
+
+
+def make_sequence(
+    tokenizer: Any,
+    prompt: str,
+    sampling_params: SamplingParams,
+) -> Sequence:
+    prompt_token_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    prompt_token_ids = list(prompt_token_ids)
+    if len(prompt_token_ids) < 8:
+        raise ValueError(
+            "The prompt must contain at least 8 tokens so fixed SP8 uses all ranks"
+        )
+    print(f"Prompt tokens: {len(prompt_token_ids)}", flush=True)
+    return Sequence(prompt_token_ids, sampling_params=sampling_params)
+
+
+def close_engine(engine: LLM | None, label: str) -> None:
+    if engine is None:
+        return
+    try:
+        engine.exit()
+    except Exception as exc:
+        print(f"Warning: failed to close {label} engine: {exc}", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive")
+    if args.temperature <= 1e-10:
+        raise ValueError(
+            "NanoDeploy does not support temperature=0; use a small positive value"
+        )
+    if args.decode_loop_count <= 0:
+        raise ValueError("--decode-loop-count must be positive")
+    if not os.path.isdir(args.model_path):
+        raise FileNotFoundError(f"Model path does not exist: {args.model_path}")
+
+    rdma_env = configure_driver_environment()
+    print(f"RDMA environment: {rdma_env}", flush=True)
+    ray.init(
+        address=args.ray_address,
+        ignore_reinit_error=True,
+        runtime_env={"env_vars": rdma_env},
+    )
+    validate_ray_cluster(
+        args.prefill_master_address,
+        args.decode_master_address,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        ignore_eos=True,
+    )
+    sequence = make_sequence(tokenizer, args.prompt, sampling_params)
+
+    decode: LLM | None = None
+    prefill: LLM | None = None
+    try:
+        init_begin = time.perf_counter()
+        decode = build_decode(args)
+        prefill = build_prefill(args)
+        print(
+            f"Both engines initialized in {time.perf_counter() - init_begin:.2f}s",
+            flush=True,
+        )
+
+        connect_kv_transfer(prefill, decode)
+
+        prefill_begin = time.perf_counter()
+        prefill.add_request(sequence)
+        prefill.generate(use_tqdm=False)
+        print(
+            f"Prefill completed in {time.perf_counter() - prefill_begin:.3f}s",
+            flush=True,
+        )
+
+        decode_begin = time.perf_counter()
+        decode.add_request(sequence)
+        decode.generate(use_tqdm=False)
+        print(
+            f"KV migration and decode completed in "
+            f"{time.perf_counter() - decode_begin:.3f}s",
+            flush=True,
+        )
+        prefill.free_to_be_migrated(sequence)
+
+        completion_token_ids = list(sequence.completion_token_ids)
+        if len(completion_token_ids) != args.max_tokens:
+            raise RuntimeError(
+                "Unexpected completion length: "
+                f"expected {args.max_tokens}, got {len(completion_token_ids)}"
+            )
+        completion = tokenizer.decode(
+            completion_token_ids,
+            skip_special_tokens=True,
+        )
+        print("Completion token IDs:", completion_token_ids, flush=True)
+        print("Completion:", completion, flush=True)
+        print("DeepSeek-V3 one-request P/D smoke passed", flush=True)
+    finally:
+        close_engine(prefill, "prefill")
+        close_engine(decode, "decode")
+        if ray.is_initialized():
+            ray.shutdown()
+
+
+if __name__ == "__main__":
+    main()
