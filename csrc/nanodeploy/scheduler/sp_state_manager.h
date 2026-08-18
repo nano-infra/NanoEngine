@@ -27,7 +27,6 @@ enum class SPMasterSelector {
 
 enum class DynamicSPSizeStrategy {
     Legacy,
-    LongShortSP8,
     Bucket
 };
 
@@ -96,10 +95,7 @@ public:
                    int                max_num_recv_seqs,
                    double             reserved_blocks_per_req,
                    int                segment_size,
-                   bool               enable_dynamic_sp_size,
                    const std::string& dynamic_sp_size_strategy,
-                   int                dynamic_sp_long_request_threshold,
-                   int                dynamic_sp_long_request_size,
                    bool               enable_dynamic_sp_bucket_policy,
                    const std::string& dynamic_sp_bucket_policy,
                    double             attention_cost_a,
@@ -251,8 +247,6 @@ private:
     int kvcache_block_size_;
     int segment_size_;
     DynamicSPSizeStrategy dynamic_sp_size_strategy_;
-    int                   long_request_sp_threshold_;
-    int                   long_request_sp_size_;
     bool                  enable_dynamic_sp_bucket_policy_;
     std::vector<SPBucketInterval> dynamic_sp_bucket_policy_;
 
@@ -261,7 +255,6 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_recv_seqs_per_sp_;
 
-    bool enable_dynamic_sp_size_;
     CostModel cost_model_;
     TrafficModel traffic_model_;
     bool enable_non_uniform_split_;

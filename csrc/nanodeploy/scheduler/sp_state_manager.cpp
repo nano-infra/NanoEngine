@@ -70,8 +70,6 @@ const char* dynamic_sp_size_strategy_name(DynamicSPSizeStrategy strategy)
     switch (strategy) {
         case DynamicSPSizeStrategy::Legacy:
             return "legacy";
-        case DynamicSPSizeStrategy::LongShortSP8:
-            return "long_short_sp8";
         case DynamicSPSizeStrategy::Bucket:
             return "bucket";
     }
@@ -89,10 +87,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                max_num_recv_seqs,
                                double             reserved_blocks_per_req,
                                int                segment_size,
-                               bool               enable_dynamic_sp_size,
                                const std::string& dynamic_sp_size_strategy,
-                               int                dynamic_sp_long_request_threshold,
-                               int                dynamic_sp_long_request_size,
                                bool               enable_dynamic_sp_bucket_policy,
                                const std::string& dynamic_sp_bucket_policy,
                                double             attention_cost_a,
@@ -118,11 +113,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     kvcache_block_size_(kvcache_block_size),
     segment_size_(segment_size),
     dynamic_sp_size_strategy_(DynamicSPSizeStrategy::Legacy),
-    long_request_sp_threshold_(dynamic_sp_long_request_threshold),
-    long_request_sp_size_(dynamic_sp_long_request_size > 0 ? dynamic_sp_long_request_size : attention_sp),
     enable_dynamic_sp_bucket_policy_(enable_dynamic_sp_bucket_policy),
     num_recv_seqs_per_sp_(attention_sp, 0),
-    enable_dynamic_sp_size_(enable_dynamic_sp_size),
     cost_model_{
         {attention_cost_a, attention_cost_b},
         {q_cost_a, q_cost_b},
@@ -144,8 +136,6 @@ SPStateManager::SPStateManager(const std::string& engine_id,
 
     if (dynamic_sp_size_strategy == "legacy") {
         dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::Legacy;
-    } else if (dynamic_sp_size_strategy == "long_short_sp8") {
-        dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::LongShortSP8;
     } else if (dynamic_sp_size_strategy == "bucket") {
         dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::Bucket;
     } else {
@@ -164,8 +154,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
         throw std::runtime_error("fixed_sp_size must be in [0, attention_sp]");
     }
     if (fixed_sp_size_ > 0
-        && (enable_dynamic_sp_size_
-            || dynamic_sp_size_strategy_ != DynamicSPSizeStrategy::Legacy
+        && (dynamic_sp_size_strategy_ != DynamicSPSizeStrategy::Legacy
             || enable_dynamic_sp_bucket_policy_)) {
         throw std::runtime_error(
             "fixed_sp_size cannot be combined with dynamic SP size strategies");
@@ -186,8 +175,6 @@ SPStateManager::SPStateManager(const std::string& engine_id,
               << ", segment_size=" << segment_size_
               << ", fixed_sp_size=" << fixed_sp_size_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_name(dynamic_sp_size_strategy_)
-              << ", dynamic_sp_long_request_threshold=" << long_request_sp_threshold_
-              << ", dynamic_sp_long_request_size=" << long_request_sp_size_
               << ", enable_dynamic_sp_bucket_policy=" << enable_dynamic_sp_bucket_policy_
               << std::endl;
 
@@ -913,7 +900,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                   });
 
         int start_ranks = initial_num_ranks;
-        int end_ranks   = enable_dynamic_sp_size_ ? attention_sp_ : initial_num_ranks;
+        int end_ranks   = initial_num_ranks;
         bool recompute_segments_for_forced_sp = false;
         if (fixed_sp_size_ > 0) {
             const int forced_num_ranks = effective_target_sp_size(fixed_sp_size_, seq.num_tokens);
@@ -925,12 +912,6 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                 std::min(
                     attention_sp_,
                     select_bucket_sp_size(seq.num_tokens).value_or(initial_num_ranks)));
-            start_ranks = forced_num_ranks;
-            end_ranks = forced_num_ranks;
-            recompute_segments_for_forced_sp = true;
-        } else if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8) {
-            const bool is_long_request = seq.num_prompt_tokens > long_request_sp_threshold_;
-            const int forced_num_ranks = is_long_request ? long_request_sp_size_ : 1;
             start_ranks = forced_num_ranks;
             end_ranks = forced_num_ranks;
             recompute_segments_for_forced_sp = true;

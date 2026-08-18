@@ -120,22 +120,14 @@ class Config:
     reserved_blocks_per_req: float = 1.0
     segment_size: int = 65536
 
-    # Dynamic SP Size Knob
-    enable_dynamic_sp_size: bool = False
     # Decode-only scheduler implementation selector for dynamic SP:
     # False -> legacy can_allocate-based path
     # True  -> new batch planner path
     use_new_decode_dynamic_sp_scheduler: bool = False
     # SP size selection policy for the legacy dynamic-SP path.
-    # "legacy": keep the current segment-based SP size search.
-    # "long_short_sp8": prompt_len > dynamic_sp_long_request_threshold -> SP=attention_sp,
-    #                   otherwise SP=1. Master selection and KV placement stay unchanged.
+    # "legacy": keep the current segment-based SP size selection.
     # "bucket": choose CP size directly from a configured seq-len bucket policy.
-    dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8", "bucket"] = "legacy"
-    dynamic_sp_long_request_threshold: int = 100000
-    # 0 is normalized in __post_init__ to preserve the historical behavior:
-    # long requests use attention_sp.
-    dynamic_sp_long_request_size: int = 0
+    dynamic_sp_size_strategy: Literal["legacy", "bucket"] = "legacy"
     enable_dynamic_sp_bucket_policy: bool = False
     dynamic_sp_bucket_policy: str = ""
     dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
@@ -279,8 +271,7 @@ class Config:
         if self.fixed_sp_size > self.attention_sp:
             raise ValueError("fixed_sp_size must be in [0, attention_sp]")
         if self.fixed_sp_size > 0 and (
-            self.enable_dynamic_sp_size
-            or self.use_new_decode_dynamic_sp_scheduler
+            self.use_new_decode_dynamic_sp_scheduler
             or self.dynamic_sp_size_strategy != "legacy"
             or self.enable_dynamic_sp_bucket_policy
             or bool(self.dynamic_sp_bucket_policy.strip())
@@ -290,24 +281,13 @@ class Config:
                 "fixed_sp_size is a baseline scheduling mode and cannot be "
                 "combined with dynamic SP size strategies"
             )
-        if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
+        if self.dynamic_sp_size_strategy not in {"legacy", "bucket"}:
             raise ValueError(
-                "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"
+                "dynamic_sp_size_strategy must be one of: legacy, bucket"
             )
         if self.dynamic_sp_bucket_preset not in {"none", "deepseek_v3"}:
             raise ValueError(
                 "dynamic_sp_bucket_preset must be one of: none, deepseek_v3"
-            )
-        if self.dynamic_sp_long_request_size < 0:
-            raise ValueError("dynamic_sp_long_request_size must be >= 0")
-        if self.dynamic_sp_long_request_size == 0:
-            self.dynamic_sp_long_request_size = self.attention_sp
-        if (
-            self.dynamic_sp_long_request_size < 1
-            or self.dynamic_sp_long_request_size > self.attention_sp
-        ):
-            raise ValueError(
-                "dynamic_sp_long_request_size must be in [1, attention_sp]"
             )
         preset_policy = ""
         if self.dynamic_sp_bucket_preset == "deepseek_v3":
@@ -331,7 +311,7 @@ class Config:
             raise ValueError(
                 "bucket policy is an independent scheduling strategy; use "
                 "dynamic_sp_size_strategy='bucket' instead of combining it with "
-                "legacy/long_short_sp8"
+                "legacy"
             )
         if self.dynamic_sp_size_strategy == "bucket":
             self.enable_dynamic_sp_bucket_policy = True
@@ -519,7 +499,6 @@ class Config:
                 "legacy_perfect_eplb": self.perfect_eplb,
             },
             "dynamic_sp": {
-                "enabled": self.enable_dynamic_sp_size,
                 "new_scheduler": self.use_new_decode_dynamic_sp_scheduler,
                 "strategy": self.dynamic_sp_size_strategy,
                 "bucket": self.dynamic_sp_bucket_policy,

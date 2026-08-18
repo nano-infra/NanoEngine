@@ -147,3 +147,48 @@ def test_removed_sp_debug_is_not_a_config_field():
 def test_llm_engine_rejects_removed_sp_debug_before_filtering_kwargs():
     with pytest.raises(TypeError, match="sp_debug was removed"):
         LLMEngine(str(DEEPSEEK_MODEL), sp_debug=True)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "enable_dynamic_sp_size",
+        "dynamic_sp_long_request_threshold",
+        "dynamic_sp_long_request_size",
+    ],
+)
+def test_removed_dynamic_sp_options_are_not_config_fields(option):
+    with pytest.raises(TypeError, match=option):
+        Config(  # type: ignore[call-arg]
+            model=str(DEEPSEEK_MODEL),
+            **{option: True},
+        )
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "enable_dynamic_sp_size",
+        "dynamic_sp_long_request_threshold",
+        "dynamic_sp_long_request_size",
+    ],
+)
+def test_llm_engine_rejects_removed_dynamic_sp_options(option):
+    with pytest.raises(TypeError, match=f"{option} was removed"):
+        LLMEngine(str(DEEPSEEK_MODEL), **{option: True})
+
+
+def test_config_rejects_removed_long_short_sp8_strategy():
+    with pytest.raises(
+        ValueError,
+        match="dynamic_sp_size_strategy must be one of: legacy, bucket",
+    ):
+        make_config(dynamic_sp_size_strategy="long_short_sp8")
+
+
+def test_llm_engine_rejects_removed_long_short_sp8_strategy():
+    with pytest.raises(ValueError, match="long_short_sp8.*was removed"):
+        LLMEngine(
+            str(DEEPSEEK_MODEL),
+            dynamic_sp_size_strategy="long_short_sp8",
+        )

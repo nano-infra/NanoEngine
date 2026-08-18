@@ -51,10 +51,27 @@ class LLMEngine:
                 "sp_debug was removed; use a supported legacy, bucket, "
                 "or fixed SP placement"
             ),
+            "enable_dynamic_sp_size": (
+                "enable_dynamic_sp_size was removed; select the bucket "
+                "strategy or the decode batch planner explicitly"
+            ),
+            "dynamic_sp_long_request_threshold": (
+                "dynamic_sp_long_request_threshold was removed with the "
+                "long_short_sp8 strategy"
+            ),
+            "dynamic_sp_long_request_size": (
+                "dynamic_sp_long_request_size was removed with the "
+                "long_short_sp8 strategy"
+            ),
         }
         for option, message in removed_options.items():
             if option in kwargs:
                 raise TypeError(message)
+        if kwargs.get("dynamic_sp_size_strategy") == "long_short_sp8":
+            raise ValueError(
+                "dynamic_sp_size_strategy='long_short_sp8' was removed; "
+                "use 'legacy' or 'bucket'"
+            )
         self.engine_id = str(uuid.uuid4())
 
         config_fields = {field.name for field in fields(Config)}

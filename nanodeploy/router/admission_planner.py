@@ -24,11 +24,8 @@ class AdmissionPlannerConfig:
     reserved_blocks_per_req: float
     segment_size: int
     queue_capacity: int
-    enable_dynamic_sp_size: bool = False
     use_new_decode_dynamic_sp_scheduler: bool = False
     dynamic_sp_size_strategy: str = "legacy"
-    dynamic_sp_long_request_threshold: int = 100000
-    dynamic_sp_long_request_size: int = 1
     dynamic_sp_bucket_policy: str = ""
     enable_non_uniform_split: bool = False
     sp_master_selector: str = "LeastBatch"
@@ -45,17 +42,10 @@ class AdmissionPlannerConfig:
             reserved_blocks_per_req=config.reserved_blocks_per_req,
             segment_size=config.segment_size,
             queue_capacity=config.hierarchical_queue_capacity,
-            enable_dynamic_sp_size=config.enable_dynamic_sp_size,
             use_new_decode_dynamic_sp_scheduler=(
                 config.use_new_decode_dynamic_sp_scheduler
             ),
             dynamic_sp_size_strategy=config.dynamic_sp_size_strategy,
-            dynamic_sp_long_request_threshold=(
-                config.dynamic_sp_long_request_threshold
-            ),
-            dynamic_sp_long_request_size=(
-                config.dynamic_sp_long_request_size
-            ),
             dynamic_sp_bucket_policy=config.dynamic_sp_bucket_policy,
             enable_non_uniform_split=config.enable_non_uniform_split,
             sp_master_selector=config.sp_master_selector,
@@ -232,11 +222,7 @@ class AdmissionPlanner:
         )
         initial_ranks = self._ceil_div(num_segments, segments_per_rank)
         start_ranks = initial_ranks
-        end_ranks = (
-            self.config.attention_sp
-            if self.config.enable_dynamic_sp_size
-            else initial_ranks
-        )
+        end_ranks = initial_ranks
         recompute_segments = False
 
         if self.config.fixed_sp_size > 0:
@@ -249,16 +235,6 @@ class AdmissionPlanner:
             forced = self._bucket_sp_size(prompt_tokens, initial_ranks)
             start_ranks = end_ranks = forced
             recompute_segments = True
-        elif self.config.dynamic_sp_size_strategy == "long_short_sp8":
-            forced = (
-                self.config.dynamic_sp_long_request_size
-                if prompt_tokens
-                > self.config.dynamic_sp_long_request_threshold
-                else 1
-            )
-            start_ranks = end_ranks = forced
-            recompute_segments = True
-
         nonmasters = self._richest_nonmasters(shadow, master)
         for target_ranks in range(start_ranks, end_ranks + 1):
             target_segments = segments_per_rank
