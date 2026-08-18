@@ -1,12 +1,12 @@
-# 开源前调度、SP placement 与 legacy_ll 后端清理计划
+# 开源前调度、SP placement 与 SP backend 清理计划
 
 状态：待 review，尚未修改运行时代码  
 日期：2026-08-18  
-调研基线：首次 `gemm-update@f5ac869`；补充 `gemm-update@0a1e8a6`
+调研基线：首次 `gemm-update@f5ac869`；补充 `gemm-update@12acd29`
 
 ## 1. 目标与结论摘要
 
-本次清理针对五类不再需要的功能：
+本次清理针对七类不再需要的功能：
 
 1. 最初由单个中心化 `Scheduler` 加多个 per-worker waiting queue 模拟的
    `scheduler_mode="decentralized"`；
@@ -14,11 +14,13 @@
    `dynamic_sp_size_strategy="long_short_sp8"`；
 3. 允许 legacy 单请求 SP allocator 在初始 SP rank 数分配失败后继续扩大到更多
    rank 的 `enable_dynamic_sp_size`；
-4. MLA SP all-to-all 的旧 `legacy_ll` 后端。保留 `hao_basic`、`nccl`、
-   `nccl_compact`，并把默认后端改为 `hao_basic`；
+4. MLA SP all-to-all 的旧 `legacy_ll` 后端，并把默认后端改为 `hao_basic`；
 5. 旧 decentralized DP 路由遗留的 `routing_strategy="VLLMLoadBalance"`。
    保留现行 `RoundRobin`、`LeastBatch`、`LeastCache`，以及 hierarchical 独立使用的
-   `router_policy`。
+   `router_policy`；
+6. 实验性的 MLA SP variable-split NCCL 后端 `nccl_compact`。SP backend 最终只保留
+   `hao_basic` 与静态 padding 版本 `nccl`；
+7. 绕过正常 segment placement、以 KV block size 做简化切分的 `sp_debug` 分支。
 
 调研后的核心结论如下。
 
@@ -52,8 +54,16 @@
   mirror 则都固定为只尝试初始 rank 数。bucket 会覆盖 start/end rank，不依赖这个
   布尔量，可以独立保留。
 - `legacy_ll` 是 `nanodeploy/worker/sp_backend.py` 中一条相对独立的 lazy import、
-  adapter、factory 与 dispatch 分支；可以窄范围删除。`nccl`/`nccl_compact` 的 adapter、
-  attention shape 处理和 CUDA Graph 特判必须保留。
+  adapter、factory 与 dispatch 分支；可以窄范围删除。删除后默认使用 `hao_basic`。
+- `nccl_compact` 由 `bfc9f23 feat: add compact nccl sp backend` 引入，只在 Q
+  non-transpose+offsets 路径使用 variable split-size collective，Res/Lse 仍走静态交换。
+  它不能被 full CUDA Graph capture，Config 和 microbenchmark 都限制为 eager 或
+  piecewise；当前 ablation sweep 虽生成该 variant，`start_bench.sh` 校验却不接受该值。
+  删除时要保留静态 `nccl` 共用的 `comm_bs`、mask/stride remap 和 graph batch 逻辑。
+- `sp_debug` 由 `263a583 add sp debug utils` 引入，是一条独立于正常 legacy/bucket/fixed
+  placement 的调试捷径：临时强制 RoundRobin master，以 `kvcache_block_size` 为 segment，
+  给非 master 各分一个 block、其余 token 留给 master。它没有活动 CLI、专属测试或论文
+  路径，却同时存在于 C++ allocator 和 hierarchical admission mirror；必须两边原子删除。
 - 删除 `legacy_ll` **不等于删除 DLSlime 依赖**。`hao_basic` 自身需要 DLSlime 的
   `AllToAllBuffer`/`KernelImpl`，NanoDeploy 的 RPC 与 KV cache 路径也仍依赖 DLSlime。
 
@@ -73,7 +83,11 @@
 - `enable_dynamic_sp_size` 的 Config/CLI、Python/C++ 构造参数、成员、pybind 参数、
   legacy rank 扩大重试分支与 hierarchical admission mirror 分支；
 - `legacy_ll` 的公开配置值、默认值、CLI choice、lazy import、adapter、factory、
-  factory dispatch、专属测试与 benchmark/documentation 列表项。
+  factory dispatch、专属测试与 benchmark/documentation 列表项；
+- `nccl_compact` 的公开配置值、eager/piecewise 特殊校验、compact adapter/factory/
+  dispatch、attention/model-runner 集合判断、专属测试、benchmark 与 ablation variant；
+- `sp_debug` 的 Config 字段、fixed-SP 冲突判断、Python/C++ 构造参数和成员、pybind
+  参数、C++ `can_allocate()` 调试分支及 hierarchical admission mirror 分支。
 
 ### 2.2 明确不删除
 
@@ -88,8 +102,9 @@
 - surviving SP placement：`legacy`、`bucket`、`fixed_sp_size` 和新的 decode batch
   planner。这里的 `dynamic_sp_size_strategy="legacy"` 是默认 segment placement，
   与本次删除的通信后端 `legacy_ll` 不是同一概念；
-- surviving SP all-to-all 后端：`hao_basic`、`nccl`、`nccl_compact`，以及后两者需要的
-  attention `comm_bs`、buffer layout、CUDA Graph/piecewise 特判；
+- surviving SP all-to-all 后端：`hao_basic`、静态 padding 版本 `nccl`，以及 `nccl`
+  需要的 attention `comm_bs`、mask/stride remap、buffer layout 和 CUDA Graph batch
+  shape 处理；
 - `torch.distributed` 的 NCCL process group 和其他 NCCL collective。不得通过全仓删除
   `nccl` 关键词来清理 SP backend；
 - `dlslime` Python/package 依赖、`hao_basic` native symbols、DLSlime RPC、RDMA KV cache；
@@ -334,11 +349,11 @@ Config.sp_backend
 - `LegacyIntraLLBackendFactory`；
 - `create_sp_backend_factory()` 的一个 dispatch 分支。
 
-因此无需重写 `SPContext` 或移除 factory abstraction。目标是把 surviving backend
-集合收缩为：
+因此无需重写 `SPContext` 或移除 factory abstraction。结合第 3.7 节的 compact
+清理，目标是把 surviving backend 集合收缩为：
 
 ```text
-hao_basic（默认） | nccl | nccl_compact
+hao_basic（默认） | nccl
 ```
 
 外围影响面包括：
@@ -353,7 +368,7 @@ hao_basic（默认） | nccl | nccl_compact
 - 若干 `docs/` 设计文档把它作为历史 reference implementation。
 
 删除后仍保留跨后端测试与 benchmark：以 `hao_basic` 为 reference/baseline，继续验证
-`nccl` 与 `nccl_compact`。`tests/test_sp_attention_cudagraph.py` 等文件中的
+静态 `nccl`。`tests/test_sp_attention_cudagraph.py` 等文件中的
 `dist.init_process_group(backend="nccl")` 是 PyTorch 分布式 transport，不是待删的
 SP backend choice，必须保留。
 
@@ -361,6 +376,93 @@ SP backend choice，必须保留。
 删掉 `legacy_ll`，旧配置会一直到 Ray worker 初始化 `SPContext` 时才失败。应在
 `Config.__post_init__()` 早期拒绝 `legacy_ll` 和其他未知值，让错误发生在 driver
 启动阶段。
+
+### 3.7 `nccl_compact` SP backend 的当前调用链
+
+`bfc9f23 feat: add compact nccl sp backend` 在静态 NCCL 后端之外增加了：
+
+```text
+Config.sp_backend == "nccl_compact"
+  -> create_sp_backend_factory()
+  -> NcclCompactBackendFactory
+  -> NcclCompactAllToAllBufferAdapter
+       Q + mask + offsets
+         -> 按 mask/offsets 计算 input/output split sizes
+         -> variable-size dist.all_to_all_single()
+         -> 将 recv payload 回填到完整 comm_bs 输出
+       Res/Lse transpose 或无 offsets
+         -> equal-size static dist.all_to_all_single()
+```
+
+该实现的目标是只传递 Q 的有效 rows，避免静态 `nccl` 发送 padding 和额外 mask
+all-to-all。代价是每轮把 mask/offsets 转到 CPU 生成 Python split-size list，collective
+shape 随请求变化，不能被 full CUDA Graph capture。因此当前约束为：
+
+- `Config.__post_init__()` 要求 `enforce_eager=True` 或
+  `cuda_graph_mode="piecewise"`；
+- correctness/benchmark microbenchmark 发现 compact 时只允许 `--mode eager`；
+- end-to-end piecewise 依赖 collective 留在 graph capture 外执行。
+
+生产实现与外围影响面为：
+
+- `nanodeploy/worker/sp_backend.py`：`SPBackend` 值、compact adapter、factory 与
+  factory dispatch；
+- `nanodeploy/layers/attention.py`：`_uses_nccl_comm_bs()` 把 `nccl` 与
+  `nccl_compact` 合并处理；删除后不能删 helper 语义，只需收缩为静态 `nccl` 判断；
+- `nanodeploy/worker/model_runner.py`：graph master batch 选择的 backend 集合判断；
+- `nanodeploy/config.py`：Literal、full graph 兼容性报错和通用 backend fingerprint；
+- examples 与 `scripts/sp_ablation/bench_serving_overhead.py` 的 choices；
+- `tests/test_sp_backend.py` 的两个 compact adapter 单元测试，以及 correctness/
+  benchmark 的 choice 和 eager-only 护栏；
+- `scripts/sp_ablation/sweep_4node_variants.sh` 的 variant 名、tag 和 piecewise 参数。
+
+还存在一个活动脚本不一致：sweep 会生成 `nccl_compact` 并调用
+`scripts/sp_ablation/start_bench.sh`，但该脚本的 backend validation 只接受
+`legacy_ll|hao_basic|nccl`（help 又宣称 compact 可用）。因此 compact ablation 当前并非
+稳定可运行的公开路径。删除时应同时删 sweep variant 和错误 help choice，不做迁移或
+alias；保留独立静态 `nccl` variant。
+
+### 3.8 `sp_debug` placement 的当前调用链
+
+`263a583 add sp debug utils` 引入的 legacy/C++ 路径为：
+
+```text
+Config.sp_debug
+  -> nanodeploy.engine.scheduler.Scheduler
+  -> pybind Scheduler(..., sp_debug)
+  -> C++ Scheduler::sp_debug_
+  -> SPStateManager(..., sp_debug)
+  -> SPStateManager::can_allocate() 的首个特殊分支
+```
+
+当 `attention_sp > 1 && sp_debug` 时，它完全绕过正常 legacy/bucket/fixed placement：
+
+1. 把调试 segment 固定为 `kvcache_block_size`；
+2. 目标 SP 数为 `min(ceil(num_tokens / block_size), attention_sp)`；
+3. 临时把 C++ master selector 改成 RoundRobin；
+4. 按 free blocks 选择 non-master，每个 non-master 最多放一个完整 block；
+5. 所有剩余 token 都放到 master，再执行 receiver、reservation 和 KV allocation
+   capacity 检查。
+
+hierarchical 架构在 `1136a72 Eliminate speculative decentralized admission retries`
+中复制了同语义的 frontend mirror：
+
+```text
+Config.sp_debug
+  -> AdmissionPlannerConfig.from_config()
+  -> AdmissionPlanner._plan_legacy() 特殊分支
+```
+
+这条 mirror 在进入分支前已经按配置的 `sp_master_selector` 选择 master，并不像 C++
+实现那样无条件临时切到 RoundRobin；默认 selector 又是 `LeastBatch`。因此
+hierarchical `sp_debug` 存在 frontend reservation 与 LocalScheduler master 选择不一致
+的风险。仓库中没有 `sp_debug` CLI、命名测试或 benchmark 覆盖，也没有发现论文实验
+脚本使用它。
+
+删除必须覆盖 Config、Python adapter、两个 C++ 类、两个 pybind 构造接口及 admission
+mirror，不能只删除 C++ if-block。`fixed_sp_size` 冲突条件里的 `sp_debug` 同步删除。
+由于 `LLMEngine` 会过滤未知 kwargs，还应把 `sp_debug` 加入集中式 removed-option
+fail-fast 护栏，防止旧调用静默退化为默认 legacy placement。
 
 ## 4. 计划中的目标状态
 
@@ -377,10 +479,14 @@ fallback；新 decode batch planner 若启用，只由
 外部可见的 SP all-to-all 后端为：
 
 - `hao_basic`（默认）；
-- `nccl`；
-- `nccl_compact`。
+- `nccl`（静态 padding 版本）。
 
-`legacy_ll` 不再是合法配置，活动代码中也不再 import 其 DLSlime buffer class。
+`legacy_ll` 与 `nccl_compact` 不再是合法配置。活动代码中不再 import 旧 DLSlime
+buffer class，也不再维护 variable split-size NCCL adapter/eager-only 兼容分支。
+
+`sp_debug` 字段、构造 ABI 与特殊 placement 不再存在。legacy、bucket、fixed baseline
+和新 decode batch planner 继续使用各自的正式 placement 语义；删除 debug 分支不改变
+`sp_master_selector` 的三个现行值。
 
 调度架构只使用：
 
@@ -410,8 +516,9 @@ dated historical notes 可以保留旧名称。
    - `nanodeploy/engine/local_executor.py`
    - `nanodeploy/engine/ray_executor.py`
    - `nanodeploy/worker/model_runner.py`
-3. `config.py` 与本次清理有重叠，实施时只做目标字段/hunk 的精确修改，不覆盖用户
-   现有配置改动；其余三个文件不应被本任务触碰。
+3. `config.py` 与 `model_runner.py` 都和本次清理有重叠，实施时只做目标字段/hunk 的
+   精确修改，不覆盖用户现有 bucket policy 与 decode mask logging 改动；
+   `local_executor.py`、`ray_executor.py` 不应被本任务触碰。
 4. 先运行现有 CPU focused tests，记录任何基线失败，避免把环境或用户改动造成的
    失败误归因于清理。
 
@@ -444,32 +551,36 @@ dated historical notes 可以保留旧名称。
    Config whitelist 足以提供 fail-fast；无需在 `LLMEngine` 的 removed-option kwargs
    护栏里增加特殊分支。
 
-### 阶段 2：原子删除 long-short 与 `enable_dynamic_sp_size` 生产调用链
+### 阶段 2：原子删除 long-short、`enable_dynamic_sp_size` 与 `sp_debug`
 
 1. `nanodeploy/config.py`
    - `dynamic_sp_size_strategy` 的合法值收缩为 `legacy|bucket`；
    - 删除 `dynamic_sp_long_request_threshold`、
      `dynamic_sp_long_request_size`；
    - 删除 `enable_dynamic_sp_size`；
+   - 删除 `sp_debug`；
    - 删除 size=0 归一化及范围校验；
-   - 更新 fixed/bucket 冲突报错和注释；
+   - 更新 fixed/bucket 冲突报错和注释，移除 fixed 与 `sp_debug` 的冲突项；
    - 从 fingerprint 删除 `enabled` 位，保留 strategy/bucket/fixed/new planner 信息。
 2. `nanodeploy/engine/llm_engine.py`
    - 在集中式 removed-option 检查中加入两个已删除 long-short 字段；
    - 将 `enable_dynamic_sp_size` 加入 removed-option 检查；
+   - 将 `sp_debug` 加入 removed-option 检查，避免 LLM kwargs 静默忽略；
    - 对 `dynamic_sp_size_strategy="long_short_sp8"` 保持明确 ValueError；
    - 不在本任务中顺带改成“拒绝所有未知 kwargs”，以免扩大公共 API 兼容面。
 3. `nanodeploy/engine/scheduler.py`
    - 从 C++ `Scheduler` 构造调用中删除两个 long-short 参数和
-     `enable_dynamic_sp_size` 参数。
+     `enable_dynamic_sp_size`、`sp_debug` 参数。
 4. `nanodeploy/router/admission_planner.py`
    - 从 `AdmissionPlannerConfig` 及 `from_config()` 删除 long-short 两个字段和
-     `enable_dynamic_sp_size`；
+     `enable_dynamic_sp_size`、`sp_debug`；
+   - 删除 `_plan_legacy()` 的 `sp_debug` block-size placement 分支；
    - 删除 `_plan_legacy()` 的 long-short forced-rank 分支；
    - legacy placement 固定 `start_ranks=end_ranks=initial_ranks`；
    - 保留 fixed/bucket 的 `recompute_segments` 行为。
 5. `csrc/nanodeploy/scheduler/scheduler.{h,cpp}`
-   - 删除 long-short 与 `enable_dynamic_sp_size` 的构造参数、成员、转发和日志字段；
+   - 删除 long-short、`enable_dynamic_sp_size` 与 `sp_debug` 的构造参数、成员、转发和
+     日志字段；
    - latency-aware decode planner 的入口改为只检查
      `use_new_decode_dynamic_sp_scheduler`；
    - 不改 `waiting`/`waiting_migration`、`worker_state` 或 surviving scheduler path。
@@ -477,11 +588,13 @@ dated historical notes 可以保留旧名称。
    - 删除 `DynamicSPSizeStrategy::LongShortSP8`；
    - 删除 threshold/size 构造参数与成员；
    - 删除 `enable_dynamic_sp_size` 构造参数与成员；
+   - 删除 `sp_debug` 构造参数、成员、fixed-SP 冲突条件及 `can_allocate()` 的完整调试
+     placement/capacity 分支；
    - 删除字符串解析、name/logging 和 `can_allocate()` 阈值分支；
    - legacy `can_allocate()` 只尝试 `initial_num_ranks`；
    - 保留 `Legacy`/`Bucket`，并让未知字符串继续 fail fast。
-7. 两个 pybind 文件同步删除 long-short 和 `enable_dynamic_sp_size` 参数、默认值与
-   构造转发。该步骤会改变 extension 构造
+7. 两个 pybind 文件同步删除 long-short、`enable_dynamic_sp_size`、`sp_debug` 参数、
+   默认值与构造转发。该步骤会改变 extension 构造
    ABI，必须与 C++/Python adapter 同一提交完成，并在测试前重新 editable install。
 
 ### 阶段 3：清理 CLI、实验脚本和文档入口
@@ -520,54 +633,66 @@ dated historical notes 可以保留旧名称。
 6. 更新 `scripts/README.md`，删除已移除绘图工具与实验脚本的活动说明；不修改
    dated `docs-dev/` 历史记录。
 
-### 阶段 4：删除 `legacy_ll`，保留三种现行 SP backend
+### 阶段 4：删除 `legacy_ll` 与 `nccl_compact`，保留两种 SP backend
 
 1. `nanodeploy/config.py`
-   - `sp_backend` 类型收缩为 `Literal["hao_basic", "nccl", "nccl_compact"]`；
+   - `sp_backend` 类型收缩为 `Literal["hao_basic", "nccl"]`；
    - 默认值从 `legacy_ll` 改为 `hao_basic`；
-   - 在 `__post_init__()` 增加显式 whitelist 校验，使旧值和未知值在 driver 端
-     fail fast；
-   - 保留 `nccl_compact` 对 eager/piecewise 的现有校验和 fingerprint 中的 backend。
+   - 在 `__post_init__()` 增加显式 whitelist 校验，使 `legacy_ll`、`nccl_compact` 和
+     其他未知值在 driver 端 fail fast；
+   - 删除 compact 专属的 eager/piecewise 兼容性校验；保留通用 backend fingerprint。
 2. `nanodeploy/worker/sp_backend.py`
-   - 从 `SPBackend` 删除 `legacy_ll`；
+   - 从 `SPBackend` 删除 `legacy_ll` 与 `nccl_compact`；
    - 删除 `_resolve_legacy_buffer_cls()`、`LegacyIntraLLBufferAdapter`、
-     `LegacyIntraLLBackendFactory` 及 factory dispatch 分支；
+     `LegacyIntraLLBackendFactory` 及对应 dispatch；
+   - 删除 `NcclCompactAllToAllBufferAdapter`、`NcclCompactBackendFactory`、split-size
+     cache/pack helpers 与对应 dispatch；
    - 保留 protocol/factory abstraction、`HaoAllToAllBufferAdapter`、
-     `NcclStaticAllToAllBufferAdapter`、`NcclCompactAllToAllBufferAdapter`；
-   - 保留 `torch.distributed as dist`，它仍被三种 surviving backend 使用。
+     `NcclStaticAllToAllBufferAdapter`；
+   - 保留 `torch.distributed as dist`，静态 `nccl` backend 仍使用
+     `dist.all_to_all_single()`。
 3. `nanodeploy/worker/sp_context.py`
    - `SPContext.backend` 与 `set_sp_context(..., backend=...)` 的默认值改为
      `hao_basic`；
    - 继续通过 `create_sp_backend_factory()` 初始化 q/res/lse buffer，不移除后端选择。
-4. examples 与 benchmark adapter：
+4. attention 与 CUDA Graph 相邻分支：
+   - `nanodeploy/layers/attention.py` 的 `_uses_nccl_comm_bs()` 收缩为只判断 `nccl`；
+   - 保留静态 NCCL 所需的 `comm_bs`、mask narrowing、stride remap、buffer zeroing 和
+     q/res/lse shape 逻辑；
+   - `nanodeploy/worker/model_runner.py` 的 graph master batch backend 集合收缩为
+     `nccl`，不触碰用户现有 decode A2A mask logging 改动；
+   - 保留 `_build_sp_graph_attn_bs_candidates()` 中静态 `nccl` 的 graph shape 上限。
+5. examples 与 benchmark adapter：
    - `examples/bench_2seq.py`、`examples/bench_serving.py`、
      `examples/bench_serving_overhead.py`、`examples/dummy_prefill.py`；
    - `scripts/issue003/bench_serving_overhead.py`、
      `scripts/sp_ablation/bench_serving_overhead.py`；
-   - choices 统一改为 `hao_basic|nccl|nccl_compact`，默认统一为 `hao_basic`。
-5. 启动与实验脚本：
-   - 两份 `start_bench.sh` 的 help/validation 删除 `legacy_ll`，保留另外三种；
-   - 保留有价值脚本中的 `--sp-backend`，因为 backend 对比仍是合法实验；
+   - choices 统一改为 `hao_basic|nccl`，默认统一为 `hao_basic`。
+6. 启动与实验脚本：
+   - 两份 `start_bench.sh` 的 help/validation 统一收缩为 `hao_basic|nccl`，顺便消除
+     sp_ablation help 宣称 compact 可用而 validation 拒绝它的不一致；
+   - 保留有价值脚本中的 `--sp-backend`，因为 hao/static-NCCL 对比仍是合法实验；
    - long-short 阶段要删除的专属脚本不单独迁移；
-   - `scripts/sp_ablation/sweep_4node_variants.sh` 保留 `nccl`、`nccl_compact` case，
-     只删除可能出现的 `legacy_ll` case/默认值。
-6. 测试与性能工具：
-   - `tests/test_sp_backend.py` 删除 legacy adapter/factory 测试，保留 hao、NCCL、
-     compact adapter 与 factory/context 覆盖，并增加 `legacy_ll` 拒绝测试；
+   - `scripts/sp_ablation/sweep_4node_variants.sh` 删除 `nccl_compact` variant、policy key、
+     tag、piecewise/gpu-util override，保留 `nccl` variant。
+7. 测试与性能工具：
+   - `tests/test_sp_backend.py` 删除 legacy 和 compact adapter/factory 测试，保留 hao、
+     static NCCL 与 factory/context 覆盖，并增加两个旧值的拒绝测试；
    - `tests/test_mla_sp_backend_correctness.py` 与
-     `tests/benchmark_mla_sp_backend.py` 只从 backend choices 删除 `legacy_ll`，继续以
-     `hao_basic` 为 reference 对比 `nccl`/`nccl_compact`；
+     `tests/benchmark_mla_sp_backend.py` 的 choices 收缩为 `hao_basic|nccl`，删除 compact
+     eager-only 护栏，继续以 `hao_basic` 为 reference 对比静态 `nccl`；
    - `utils_analysis/plot_mla_sp_backend_csv.py` 默认 baseline 改为 `hao_basic`、
      candidate 改为 `nccl`；
-   - 更新 `tests/README.md` 的 backend 列表与命令。
-7. 文档策略：
-   - 更新面向当前用户的 README、CLI 文档，不能继续宣称 `legacy_ll` 可选；
+   - 更新代码 docstring 与 `tests/README.md` 的 backend 列表和命令。
+8. 文档策略：
+   - 更新面向当前用户的 README、CLI 文档，不能继续宣称两个旧 backend 可选；
    - `docs-dev/` dated notes 不改；
-   - `docs/` 下以 legacy implementation 作技术对照的旧设计文档不做关键词硬删除，
-     应增加“历史设计、当前 backend 已移除”的页首说明，或在 review 后迁入
+   - `docs/` 下以 legacy/compact implementation 作技术对照的旧设计文档不做关键词
+     硬删除，应增加“历史设计、当前 backend 已移除”的页首说明，或在 review 后迁入
      `docs-dev/`。Git 历史继续保留。
-8. 不删除 `dlslime` 依赖，不修改外部 DLSlime 源码；NanoDeploy 只删除对旧
-   `AllToAllIntraLLBuffer` Python class 的 import。
+9. 不删除 `dlslime` 依赖，不修改外部 DLSlime 源码；NanoDeploy 只删除对旧
+   `AllToAllIntraLLBuffer` Python class 的 import。不得删除 PyTorch NCCL process group
+   或静态 `nccl` backend。
 
 ### 阶段 5：测试与验证
 
@@ -577,16 +702,18 @@ dated historical notes 可以保留旧名称。
    - pybind `RoutingStrategy.__members__` 只包含三个 surviving 值；
    - 三个 surviving routing strategy 的现有调度测试继续通过；
    - `long_short_sp8` 被配置层明确拒绝；
-   - 两个 removed long-short kwargs 与 `enable_dynamic_sp_size` 不会被 `LLMEngine`
-     静默忽略；
+   - 两个 removed long-short kwargs、`enable_dynamic_sp_size` 与 `sp_debug` 不会被
+     `LLMEngine` 静默忽略；
    - 旧 `scheduler_mode` 仍明确报错；
    - `legacy` 与 `bucket` 的 frontend admission mirror 和 C++ placement 保持一致；
    - 默认 legacy placement 不再扩大 rank 重试范围；
    - 新 decode batch planner 仅由其专属 flag 启用；
    - fixed SP 与 bucket/legacy 的互斥校验不回归；
-   - `sp_backend` 默认是 `hao_basic`，接受 `hao_basic|nccl|nccl_compact`，并在
-     Config 层拒绝 `legacy_ll` 与未知值；
-   - hao/NCCL/compact adapter 单元测试继续通过。
+   - 删除 `sp_debug` 后，legacy/bucket/fixed 的 frontend mirror 与 C++ placement
+     等价测试仍覆盖不同 master selector、SP size 和 block capacity 边界；
+   - `sp_backend` 默认是 `hao_basic`，只接受 `hao_basic|nccl`，并在 Config 层拒绝
+     `legacy_ll`、`nccl_compact` 与未知值；
+   - hao/static-NCCL adapter 单元测试继续通过。
 2. C++ 修改后按仓库要求重装：
 
    ```bash
@@ -614,7 +741,8 @@ dated historical notes 可以保留旧名称。
    ```
 
    并对两个 `start_bench.sh` 做不启动 benchmark 的参数解析测试，覆盖
-   `legacy_global`、`hierarchical+bucket` 和未知 option 拒绝。
+   `legacy_global`、`hierarchical+bucket`、`hao_basic|nccl` 接受，以及
+   `legacy_ll|nccl_compact` 和未知 option 拒绝。
 5. 运行残留扫描。活动源码/脚本应无以下符号，removed-option 护栏与负向测试除外：
    - `SchedulerMode`
    - `_schedule_decentralized`
@@ -624,31 +752,38 @@ dated historical notes 可以保留旧名称。
    - `dynamic_sp_long_request_*`
    - `--long-request-sp-*`
    - `enable_dynamic_sp_size` / `--enable-dynamic-sp-size`
+   - `sp_debug`
    - `LegacyIntraLLBufferAdapter` / `LegacyIntraLLBackendFactory`
-   - 活动源码、CLI、测试 choices 中的 `legacy_ll`
+   - `NcclCompactAllToAllBufferAdapter` / `NcclCompactBackendFactory`
+   - 活动源码、CLI、测试 choices 中的 `legacy_ll` / `nccl_compact`
 6. CPU 与构建通过后再考虑 GPU smoke。GPU 不是本次纯策略删除的第一验收门槛；如做，
    必须先获得 elevated permission，并在 driver 环境设置 `SLIME_QP_NUM=4`。建议只跑
    调度/placement 的两个 surviving path：一个 `legacy_global+legacy`，一个
    `hierarchical+bucket`；backend 至少覆盖默认 `hao_basic`，并按保留承诺分别做
-   `nccl` 和 `nccl_compact` 的匹配 eager/piecewise smoke，记录 GPU 数与 topology。
+   静态 `nccl` 的匹配 full/piecewise smoke，记录 GPU 数与 topology。
 
 ## 6. 提交拆分建议
 
-为便于 review 与回滚，建议拆成五个窄提交：
+为便于 review 与回滚，建议拆成七个窄提交：
 
 1. `fix: remove stale decentralized scheduler script options`
    - 只做 `scheduler_mode -> scheduler_arch` 脚本迁移和命名清理；
 2. `refactor: remove stale VLLM load-balance route`
    - C++/pybind enum、Config 校验、CLI/脚本 choices 和 routing tests；
-3. `refactor: remove unused dynamic SP placement paths`
+3. `refactor: remove sp_debug placement path`
+   - Config/removed-option 护栏、Python mirror、C++、bindings、tests；
+4. `refactor: remove unused dynamic SP placement paths`
    - Config、Python mirror、C++、bindings、tests；
-4. `chore: remove obsolete long-short experiment tooling`
+5. `chore: remove obsolete long-short experiment tooling`
    - CLI、launch/plot scripts、README；
-5. `refactor: remove legacy_ll SP backend`
-   - backend adapter/factory、Config 默认值与校验、CLI choices、tests/docs。
+6. `refactor: remove legacy_ll SP backend`
+   - legacy adapter/factory、Config 默认值、CLI choices、tests/docs；
+7. `refactor: remove nccl_compact SP backend`
+   - compact adapter/factory、共享 NCCL 条件收缩、ablation、tests/docs。
 
-第 3 个提交必须原子覆盖 Python mirror、C++ implementation 和 bindings；不能拆成会
-产生 frontend/local placement 不一致或 extension 构造 ABI 不一致的中间提交。
+第 3、4 个提交都必须各自原子覆盖 Python mirror、C++ implementation 和 bindings；
+不能产生 frontend/local placement 不一致或 extension 构造 ABI 不一致的中间提交。
+第 7 个提交不能删除静态 `nccl` 共用的 attention/graph shape 逻辑。
 
 ## 7. 风险与控制
 
@@ -659,16 +794,18 @@ dated historical notes 可以保留旧名称。
 | 只隐藏 `VLLMLoadBalance` CLI、保留 C++/pybind 值 | 失效 API 仍可被 Python 配置触发并在请求到达后报错 | 同一提交删除 enum、binding、Config/CLI，并增加旧值拒绝测试 |
 | C++ 构造参数与 pybind/Python adapter 不同步 | 编译失败或运行时构造 TypeError | 同一提交改六个 C++/binding 文件与 adapter，随后 editable install |
 | 只删 C++ 或只删 admission mirror | frontend reservation 与本地 placement 失配 | 两边原子删除，并跑 mirror 等价测试 |
-| 删除字段后 kwargs 被静默过滤 | 用户以为 long-short 仍生效，实际跑默认策略 | 保留集中式 removed-option fail-fast 护栏 |
+| 只删 `sp_debug` 的 C++ if-block | hierarchical mirror 仍生成已不存在的 block-size placement | 同一提交删除 Config、mirror、C++、bindings，并跑等价测试 |
+| 删除字段后 kwargs 被静默过滤 | 用户以为 long-short/`sp_debug` 仍生效，实际跑默认策略 | 保留集中式 removed-option fail-fast 护栏 |
 | 删除 `enable_dynamic_sp_size` 后新 batch planner 永远不再进入 | surviving planner 变成死代码 | C++ 入口改为只检查 `use_new_decode_dynamic_sp_scheduler`，并增加正负测试 |
 | 将 long-short 脚本直接改成 bucket/legacy | 历史脚本名与实验语义不一致，结果不可比较 | 专属脚本直接删除；新策略另建明确命名脚本 |
 | bucket CLI 仍依赖 monkeypatch | surviving policy 的公开入口脆弱 | 把 bucket preset 变成正式 benchmark/start_bench 参数 |
 | 把 `dynamic_sp_size_strategy="legacy"`、`legacy_global` 与 `legacy_ll` 混为一谈 | 误删仍需保留的 placement 或中心化调度 | 精确按完整符号清理，只删除通信后端 `legacy_ll` |
-| 全仓删除 `nccl` 关键词 | 破坏 surviving SP backends 或 PyTorch process group | 只删 `legacy_ll` adapter/choice；明确保留 `nccl`、`nccl_compact` 和 NCCL transport |
+| 删除 compact 时顺带删掉共享 NCCL shape 逻辑 | 静态 `nccl` 的 mask、stride 或 graph batch 失配 | 把 backend 集合判断收缩为 `nccl`，保留 `comm_bs`/remap/graph 分支及现有 static tests |
+| 全仓删除 `nccl` 关键词 | 破坏 surviving 静态 SP backend 或 PyTorch process group | 只精确删除 `nccl_compact` 类/choice；明确保留 `nccl` 和 NCCL transport |
 | 误删 DLSlime 依赖 | `hao_basic`、RPC、KV cache 无法启动 | 只删旧 buffer class import，不改依赖声明或外部库 |
 | 默认 backend 从 `legacy_ll` 改为 `hao_basic` 后旧 DLSlime build 不兼容 | worker 初始化失败 | driver 端校验配置，启动时保留 hao native-symbol fail-fast，并在支持的 DLSlime build 上做 GPU smoke |
-| 只删 factory 分支、不做 Config 校验 | 旧值延迟到 Ray actor 初始化才失败 | 在 `Config.__post_init__()` 明确 whitelist 校验 |
-| 覆盖当前未提交的 `config.py` 改动 | 丢失用户工作 | 精确 hunk 修改，提交前逐文件 diff，绝不 restore/reset 用户文件 |
+| 只删 factory 分支、不做 Config 校验 | 两个旧值延迟到 Ray actor 初始化才失败 | 在 `Config.__post_init__()` 明确 whitelist 校验 |
+| 覆盖当前未提交的 `config.py`/`model_runner.py` 改动 | 丢失用户 bucket policy 或 mask logging 工作 | 精确 hunk 修改，提交前逐文件 diff，绝不 restore/reset 用户文件 |
 
 ## 8. Review 决策点
 
@@ -687,13 +824,17 @@ dated historical notes 可以保留旧名称。
 6. **删除 `enable_dynamic_sp_size`，保留新 batch planner（当前计划）**：新 planner 改为
    只由 `use_new_decode_dynamic_sp_scheduler` 控制；若论文也未使用它，应另行确认后把
    planner 本体纳入删除范围。
-7. **只删除 `legacy_ll`（已确认）**：保留 `hao_basic`、`nccl`、`nccl_compact`，默认改为
-   `hao_basic`，继续保留 backend switch、对比测试和 benchmark。
-8. **删除 `VLLMLoadBalance`（已确认）**：它是旧 decentralized 的失效枚举，不是
+7. **删除 `legacy_ll`（已确认）**：默认改为 `hao_basic`，不移除 DLSlime 依赖。
+8. **删除 `nccl_compact`（已确认）**：保留 `hao_basic`、静态 `nccl`、backend switch、
+   两后端对比测试和 benchmark。
+9. **删除 `sp_debug`（已确认）**：同步删除 C++ placement 与 hierarchical mirror；不把
+   该调试语义迁移为新的 bucket/fixed 策略。
+10. **删除 `VLLMLoadBalance`（已确认）**：它是旧 decentralized 的失效枚举，不是
    hierarchical `router_policy`；保留 `RoundRobin`、`LeastBatch`、`LeastCache`。
-9. **旧 SP backend 设计文档的归档方式**：推荐保留技术历史但加醒目标记；若开源活动
+11. **旧 SP backend 设计文档的归档方式**：推荐保留技术历史但加醒目标记；若开源活动
    `docs/` 只允许现行说明，则将这些文档迁入 dated `docs-dev/`，不直接抹除内容。
 
 以上决策确认后再进入实现，避免把“删除旧 decentralized、`VLLMLoadBalance`、
-`legacy_ll`”误扩展为删除 `legacy_global`、默认 legacy segment placement、当前
-hierarchical control plane/`router_policy` 或 surviving NCCL 后端。
+`sp_debug`、`legacy_ll`、`nccl_compact`”误扩展为删除 `legacy_global`、默认 legacy
+segment placement、当前 hierarchical control plane/`router_policy`、静态 `nccl` 或
+PyTorch NCCL transport。
