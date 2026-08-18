@@ -13,6 +13,7 @@ import pytest
 import torch.distributed as dist
 
 from nanodeploy.engine.decode_coordinator import DecodeCoordinatorState
+from nanodeploy.engine.deployment_manager import DeploymentManager
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
@@ -39,6 +40,38 @@ from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.engine.worker_transport import DecodeSuccess
 from nanodeploy.router.request_router import RequestOwner, RequestRouter
 from nanodeploy.router.admission_planner import AdmissionPlannerConfig
+
+
+def test_hierarchical_runtime_env_propagates_dlslime_settings(monkeypatch):
+    expected = {
+        "SLIME_VISIBLE_DEVICES": (
+            "mlx5_0,mlx5_1,mlx5_2,mlx5_3,"
+            "mlx5_4,mlx5_5,mlx5_6,mlx5_7"
+        ),
+        "SLIME_GID_INDEX": "3",
+        "SLIME_QP_NUM": "4",
+    }
+    for env_name, value in expected.items():
+        monkeypatch.setenv(env_name, value)
+
+    manager = object.__new__(DeploymentManager)
+    manager.config = SimpleNamespace(ffn_ep=1, max_num_seqs=8)
+
+    assert manager._runtime_env() == {"env_vars": expected}
+
+
+def test_hierarchical_runtime_env_omits_unset_dlslime_settings(monkeypatch):
+    for env_name in (
+        "SLIME_VISIBLE_DEVICES",
+        "SLIME_GID_INDEX",
+        "SLIME_QP_NUM",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    manager = object.__new__(DeploymentManager)
+    manager.config = SimpleNamespace(ffn_ep=1, max_num_seqs=8)
+
+    assert manager._runtime_env() == {"env_vars": {}}
 
 
 def test_finish_event_excludes_unused_final_quantum_decode_slots():
