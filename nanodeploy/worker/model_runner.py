@@ -47,7 +47,7 @@ from nanodeploy.worker.ep_context import (
     set_ep_context,
 )
 from nanodeploy.worker.loader import load_model
-from nanodeploy.worker.prefill_logits import select_prefill_last_hidden_states
+from nanodeploy.worker.prefill_logits import compute_prefill_logits
 from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
@@ -1066,16 +1066,7 @@ class ModelRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
         if is_prefill:
-            hidden_states = self.model(input_ids, positions)
-            cu_seqlens_q = get_context().prefill_cu_seqlens_q_host
-            if cu_seqlens_q is None:
-                raise RuntimeError(
-                    "Prefill logits require host query offsets"
-                )
-            hidden_states = select_prefill_last_hidden_states(
-                hidden_states, cu_seqlens_q
-            )
-            return self.model.compute_logits(hidden_states)
+            return compute_prefill_logits(self.model, input_ids, positions)
 
         if self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
