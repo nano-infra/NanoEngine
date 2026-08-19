@@ -828,6 +828,72 @@ class DeepseekV2Attention(nn.Module):
 
         return query_states, key_states, value_states, q_pe, k_pe
 
+    def _qkv_proj_native(self, hidden_states: torch.Tensor, num_heads: int):
+        """Project native Q and compressed KV for non-absorbed prefill."""
+        nope_size = self.kv_lora_rank
+
+        if self.q_lora_rank is not None:
+            fused_output = self.fused_qkv_a_proj(hidden_states)
+            q_a = fused_output[..., : self.q_lora_rank]
+            kv_a_full = fused_output[..., self.q_lora_rank :]
+            q_a = self.q_a_layernorm(q_a)
+            q = self.q_b_proj(q_a)
+            key_states, value_states, k_pe = self._kv_proj_from_fused(
+                kv_a_full, nope_size
+            )
+        else:
+            q = self.q_proj(hidden_states)
+            key_states, value_states, k_pe = self._kv_proj(
+                hidden_states, nope_size
+            )
+
+        q = q.view(hidden_states.size(0), num_heads, self.q_head_dim)
+        q_pe = q[..., self.qk_nope_head_dim :]
+        return q, key_states, value_states, q_pe, k_pe
+
+    def _forward_prefill_native(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use native MLA head dimensions for compute-friendly prefill."""
+        q_len = hidden_states.size(0)
+        query_states, key_states, compressed_kv, q_pe, k_pe = (
+            self._qkv_proj_native(hidden_states, self.num_heads)
+        )
+
+        key_states = key_states.unsqueeze(1)
+        k_pe = k_pe.unsqueeze(1)
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        query_states[..., self.qk_nope_head_dim :] = q_pe
+        key_states[..., self.kv_lora_rank :] = k_pe
+
+        kc_weight = self.kc.weight.reshape(
+            self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank
+        ).T
+        k_nope = (compressed_kv @ kc_weight).view(
+            q_len, self.num_heads, self.qk_nope_head_dim
+        )
+        expanded_k = torch.cat(
+            [k_nope, k_pe.expand(-1, self.num_heads, -1)], dim=-1
+        )
+
+        vc_weight = self.vc.weight.permute(1, 0, 2).reshape(
+            self.kv_lora_rank, self.num_heads * self.v_head_dim
+        )
+        expanded_v = (compressed_kv @ vc_weight).view(
+            q_len, self.num_heads, self.v_head_dim
+        )
+
+        attn_output = self.attn_fwd.forward_mla_prefill_native(
+            query_states,
+            expanded_k,
+            expanded_v,
+            key_states,
+        )
+        projected = self.o_proj(attn_output.reshape(q_len, -1))
+        return projected
+
     def project_for_attention(
         self,
         positions: torch.Tensor,
@@ -873,6 +939,10 @@ class DeepseekV2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ):
         """Rewrite of LlamaAttention.forward."""
+        context = get_context()
+        if context.is_prefill and not context.prefill_has_prefix:
+            return self._forward_prefill_native(positions, hidden_states)
+
         query_states, key_states, value_states = self.project_for_attention(
             positions, hidden_states
         )

@@ -30,6 +30,11 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        # CUDA RMSNorm kernels assume a contiguous last-dimension layout.
+        # Fused projections commonly feed non-contiguous packed slices (for
+        # example, DeepSeek's q_a/kv_a views), so normalize the layout before
+        # selecting either the vLLM or Triton backend.
+        x = x.contiguous()
         if HAS_VLLM_OPS and x.is_cuda:
             out = torch.empty_like(x)
             ops.rms_norm(out, x, self.weight.data, self.eps)

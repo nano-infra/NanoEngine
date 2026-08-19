@@ -298,6 +298,43 @@ class FlashMLAImpl:
 
         assert num_kv_heads == 1, "MLA requires num kv heads equal to 1"
 
+    def forward_prefill_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cache_k: torch.Tensor,
+        k_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run non-absorbed MLA prefill and store compressed KV for decode."""
+        context = get_context()
+        if k_cache.numel() and not context.is_dummy:
+            store_kcache(cache_k, k_cache, context.slot_mapping)
+
+        if context.is_dummy:
+            return q.new_zeros((q.shape[0], self.num_heads, v.shape[-1]))
+        if context.prefill_has_prefix:
+            raise RuntimeError(
+                "Native MLA prefill only supports batches without cached prefixes"
+            )
+        if context.cu_seqlens_q is None or context.cu_seqlens_k is None:
+            raise RuntimeError("Native MLA prefill requires varlen sequence offsets")
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=context.cu_seqlens_q,
+            cu_seqlens_k=context.cu_seqlens_k,
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
+        return output
+
     def forward(
         self,
         q: torch.Tensor,
@@ -613,3 +650,12 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """forward."""
         return self.impl.forward(q, k, v, self.k_cache, self.v_cache)
+
+    def forward_mla_prefill_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.impl.forward_prefill_native(q, k, v, cache_k, self.k_cache)

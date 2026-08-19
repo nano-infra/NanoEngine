@@ -51,6 +51,7 @@ class Context:
     q_offsets: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None
+    prefill_has_prefix: bool = False
 
 
 _CONTEXT = Context()
@@ -91,6 +92,7 @@ def set_context(
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None,
+    prefill_has_prefix: bool = False,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -124,6 +126,7 @@ def set_context(
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
         prefill_cu_seqlens_q_host=prefill_cu_seqlens_q_host,
+        prefill_has_prefix=prefill_has_prefix,
     )
 
 

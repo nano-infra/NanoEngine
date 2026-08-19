@@ -660,6 +660,11 @@ class ModelRunner:
             and hasattr(hf_config, "qk_rope_head_dim")
         )
         num_prefill_seqs = len(meta.cu_seqlens_q) - 1
+        prefill_has_prefix = any(
+            meta.cu_seqlens_k[seq_idx + 1] - meta.cu_seqlens_k[seq_idx]
+            != meta.cu_seqlens_q[seq_idx + 1] - meta.cu_seqlens_q[seq_idx]
+            for seq_idx in range(num_prefill_seqs)
+        )
         if meta.use_block_tables:
             all_block_tables = torch.tensor(
                 meta.block_tables_flat, dtype=torch.int32, pin_memory=True
@@ -714,6 +719,7 @@ class ModelRunner:
             None,
             is_dummy=is_dummy,
             prefill_cu_seqlens_q_host=tuple(meta.cu_seqlens_q),
+            prefill_has_prefix=prefill_has_prefix,
         )
         return input_ids, positions
 

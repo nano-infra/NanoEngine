@@ -149,3 +149,64 @@ def test_flash_mla_prefill_dummy_skips_kv_cache_and_attention_kernel():
     assert output.shape == (1, 2, 3)
     assert torch.count_nonzero(output).item() == 0
     assert _FakeFlashMLA.calls == []
+
+
+def test_native_mla_prefill_stores_compressed_kv_and_uses_flash_attention():
+    context = SimpleNamespace(
+        is_dummy=False,
+        prefill_has_prefix=False,
+        slot_mapping=torch.tensor([192, 193, 320], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 2, 3], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 2, 3], dtype=torch.int32),
+        max_seqlen_q=2,
+        max_seqlen_k=2,
+    )
+    calls: list[tuple] = []
+
+    def fake_varlen(q, k, v, **kwargs):
+        calls.append(
+            (
+                tuple(q.shape),
+                tuple(k.shape),
+                tuple(v.shape),
+                kwargs,
+            )
+        )
+        return torch.ones_like(v), torch.empty(0)
+
+    with (
+        patch.object(attention, "get_context", return_value=context),
+        patch.object(
+            attention,
+            "store_kcache",
+            side_effect=lambda *args: calls.append(
+                ("store", tuple(args[0].shape), args[-1].numel())
+            ),
+        ),
+        patch.object(attention, "flash_attn_varlen_func", fake_varlen),
+    ):
+        implementation = attention.FlashMLAImpl(
+            2,
+            4,
+            scale=0.25,
+            num_kv_heads=1,
+            v_head_size=3,
+        )
+        output = implementation.forward_prefill_native(
+            torch.randn(3, 2, 4),
+            torch.randn(3, 2, 4),
+            torch.randn(3, 2, 3),
+            torch.randn(3, 1, 4),
+            torch.empty(8, 64, 1, 4),
+        )
+
+    assert output.shape == (3, 2, 3)
+    assert calls[0] == ("store", (3, 1, 4), 3)
+    q_shape, k_shape, v_shape, kwargs = calls[1]
+    assert q_shape == (3, 2, 4)
+    assert k_shape == (3, 2, 4)
+    assert v_shape == (3, 2, 3)
+    assert kwargs["softmax_scale"] == 0.25
+    assert kwargs["causal"] is True
+    torch.testing.assert_close(kwargs["cu_seqlens_q"], context.cu_seqlens_q)
+    torch.testing.assert_close(kwargs["cu_seqlens_k"], context.cu_seqlens_k)
