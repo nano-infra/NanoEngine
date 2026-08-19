@@ -11,6 +11,107 @@ from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
 
 
+@dataclasses.dataclass
+class _KVTokenRange:
+    remote_sp_rank: int
+    remote_block_id: int
+    remote_token_offset: int
+    local_block_id: int
+    local_token_offset: int
+    num_tokens: int
+
+
+def _cached_token_slots(block_ctx, block_size: int) -> list[tuple[int, int, int]]:
+    """Return physical slots whose KV has already been produced.
+
+    A sequence is migrated immediately after prefill samples its first token.
+    That token is already reflected in ``num_dispatched_tokens``, but its KV is
+    produced by the first decode forward.  It is always the last local token on
+    the master rank, so omit that one slot from both layouts.
+    """
+    dispatched = list(block_ctx.num_dispatched_tokens)
+    master_sp_rank = block_ctx.master_sp_idx
+    if not 0 <= master_sp_rank < len(dispatched):
+        raise RuntimeError(
+            f"Invalid migration master SP rank {master_sp_rank} for "
+            f"{len(dispatched)} dispatched-token entries"
+        )
+    if dispatched[master_sp_rank] <= 0:
+        raise RuntimeError(
+            "The migration master rank has no slot for the pending decode token"
+        )
+
+    slots: list[tuple[int, int, int]] = []
+    for sp_rank, num_tokens in enumerate(dispatched):
+        num_cached_tokens = num_tokens - int(sp_rank == master_sp_rank)
+        block_table = block_ctx.sp_block_table[sp_rank]
+        if num_cached_tokens > len(block_table) * block_size:
+            raise RuntimeError(
+                "KV migration metadata exceeds the allocated block table: "
+                f"sp_rank={sp_rank}, cached_tokens={num_cached_tokens}, "
+                f"blocks={len(block_table)}, block_size={block_size}"
+            )
+        for local_token_idx in range(num_cached_tokens):
+            slots.append(
+                (
+                    sp_rank,
+                    block_table[local_token_idx // block_size],
+                    local_token_idx % block_size,
+                )
+            )
+    return slots
+
+
+def _plan_kv_migration_ranges(
+    remote_ctx,
+    local_ctx,
+    block_size: int,
+    local_sp_rank: int,
+) -> list[_KVTokenRange]:
+    """Map a possibly differently-sharded remote KV layout to this SP rank."""
+    remote_slots = _cached_token_slots(remote_ctx, block_size)
+    local_slots = _cached_token_slots(local_ctx, block_size)
+    if len(remote_slots) != len(local_slots):
+        raise RuntimeError(
+            "P/D KV migration layouts contain different cached-token counts: "
+            f"remote={len(remote_slots)}, local={len(local_slots)}"
+        )
+
+    ranges: list[_KVTokenRange] = []
+    for remote_slot, local_slot in zip(remote_slots, local_slots):
+        remote_sp_rank, remote_block_id, remote_token_offset = remote_slot
+        dst_sp_rank, local_block_id, local_token_offset = local_slot
+        if dst_sp_rank != local_sp_rank:
+            continue
+
+        if ranges:
+            previous = ranges[-1]
+            can_extend = (
+                previous.remote_sp_rank == remote_sp_rank
+                and previous.remote_block_id == remote_block_id
+                and previous.remote_token_offset + previous.num_tokens
+                == remote_token_offset
+                and previous.local_block_id == local_block_id
+                and previous.local_token_offset + previous.num_tokens
+                == local_token_offset
+            )
+            if can_extend:
+                previous.num_tokens += 1
+                continue
+
+        ranges.append(
+            _KVTokenRange(
+                remote_sp_rank=remote_sp_rank,
+                remote_block_id=remote_block_id,
+                remote_token_offset=remote_token_offset,
+                local_block_id=local_block_id,
+                local_token_offset=local_token_offset,
+                num_tokens=1,
+            )
+        )
+    return ranges
+
+
 def _get_slime_qp_num() -> int:
     raw = os.environ.get("SLIME_QP_NUM", "1")
     try:
@@ -179,44 +280,46 @@ class CacheContext:
         assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
-            for remote_block_idx, source_block_idx in zip(
-                seq.block_ctx(BlockContextSlot.MIGRATE).block_location,
-                seq.block_ctx(BlockContextSlot.ACTIVE).block_location,
-            ):
+            remote_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+            local_ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+            ranges = _plan_kv_migration_ranges(
+                remote_ctx, local_ctx, self.block_size, sp_idx
+            )
+            token_bytes = self.block_stride(1) // self.block_size
+            for token_range in ranges:
+                remote_rank = (
+                    seq.dp_idx(BlockContextSlot.MIGRATE)
+                    * remote_ctx.attention_sp
+                    + token_range.remote_sp_rank
+                )
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
-                        if source_block_idx[0] == sp_idx:
-                            remote_rank = (
-                                seq.dp_idx(BlockContextSlot.MIGRATE)
-                                * seq.block_ctx(BlockContextSlot.MIGRATE).attention_sp
-                                + remote_block_idx[0]
+                        assignment = (
+                            get_dist_context().rank,
+                            remote_rank,
+                            self.remote_kv_stride(
+                                kv_idx,
+                                layer_idx,
+                                token_range.remote_block_id,
+                                remote_ctx.engine_id,
                             )
-                            assignment = (
-                                get_dist_context().rank,
-                                remote_rank,
-                                self.remote_kv_stride(
-                                    kv_idx,
-                                    layer_idx,
-                                    remote_block_idx[1],
-                                    seq.block_ctx(BlockContextSlot.MIGRATE).engine_id,
-                                ),
-                                self.local_kv_stride(
-                                    kv_idx, layer_idx, source_block_idx[1]
-                                ),
-                                self.block_stride(1),
+                            + token_range.remote_token_offset * token_bytes,
+                            self.local_kv_stride(
+                                kv_idx, layer_idx, token_range.local_block_id
                             )
-                            assigns[seq.block_ctx(BlockContextSlot.MIGRATE).engine_id][
-                                remote_rank
-                            ].append(assignment)
+                            + token_range.local_token_offset * token_bytes,
+                            token_range.num_tokens * token_bytes,
+                        )
+                        assigns[remote_ctx.engine_id][remote_rank].append(assignment)
 
-            futures = []
-            for endpoint_key, endpoint_assign_batch in assigns.items():
-                for replica_key, assign_batch in endpoint_assign_batch.items():
-                    futures.append(
-                        self.endpoints[endpoint_key][replica_key].read(assign_batch)
-                    )
+        futures = []
+        for endpoint_key, endpoint_assign_batch in assigns.items():
+            for replica_key, assign_batch in endpoint_assign_batch.items():
+                futures.append(
+                    self.endpoints[endpoint_key][replica_key].read(assign_batch)
+                )
 
-            [future.wait() for future in futures]
+        [future.wait() for future in futures]
 
 
 _CACHE_CONTEXT: CacheContext

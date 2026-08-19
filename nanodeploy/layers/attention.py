@@ -183,7 +183,9 @@ class FlashAttentionImpl:
                 )
                 res_buffer = sp_context.res_buffer
                 lse_buffer = sp_context.lse_buffer
-                lse = lse.to(torch.bfloat16)
+                # FlashAttention returns LSE in FP32.  Preserve that precision
+                # across SP communication because the inter-rank combine uses
+                # LSE to reconstruct the global softmax weights.
                 gathered_o = o.view([context.attention_compute_bs, num_head, head_dim])
                 gathered_lse = lse.view([context.attention_compute_bs, num_head, 1])
 
@@ -205,7 +207,7 @@ class FlashAttentionImpl:
 
                 # 2. Copy gathered_lse to lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
-                    sp_context.dtype
+                    gathered_lse.dtype
                 )[: sp_size * comm_bs * num_head * 1].view(
                     sp_size * comm_bs, num_head, 1
                 )
@@ -520,7 +522,9 @@ class FlashMLAImpl:
                 )
                 res_buffer = sp_context.res_buffer
                 lse_buffer = sp_context.lse_buffer
-                lse = lse.to(torch.bfloat16)
+                # FlashMLA returns LSE in FP32.  Quantizing it to the model
+                # dtype perturbs the weights used to merge partial attention
+                # outputs from different SP ranks.
                 gathered_o = o.view(
                     [context.attention_compute_bs, num_head, v_head_dim]
                 )
@@ -545,7 +549,7 @@ class FlashMLAImpl:
 
                 # 2. 拷贝 gathered_lse 到 lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
-                    sp_context.dtype
+                    gathered_lse.dtype
                 )[: sp_size * comm_bs * num_head * 1].view(
                     sp_size * comm_bs, num_head, 1
                 )
