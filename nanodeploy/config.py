@@ -21,12 +21,28 @@ from nanodeploy.worker.decode_backend_compat import (
 
 
 DEEPSEEK_V3_BUCKET_POLICY = (
-    "1:1024-104448;"
-    "5:104449-174080;"
-    "6:174081-194560;"
-    "7:194561-436224;"
-    "8:436225-1048576"
+    "1:1024-63488;"
+    "5:63489-210944;"
+    "6:210945-399360;"
+    "7:399361-428032;"
+    "8:428033-1048576"
 )
+
+KIMI_K2_BUCKET_POLICY = (
+    "1:1024-10240;"
+    "2:10241-22528;"
+    "3:22529-190464;"
+    "4:190465-210944;"
+    "5:210945-354304;"
+    "6:354305-624640;"
+    "7:624641-673792;"
+    "8:673793-1000000"
+)
+
+DYNAMIC_SP_BUCKET_POLICIES = {
+    "deepseek_v3": DEEPSEEK_V3_BUCKET_POLICY,
+    "kimi_k2": KIMI_K2_BUCKET_POLICY,
+}
 
 
 @dataclass
@@ -126,8 +142,9 @@ class Config:
     dynamic_sp_size_strategy: Literal["legacy", "bucket"] = "legacy"
     enable_dynamic_sp_bucket_policy: bool = False
     dynamic_sp_bucket_policy: str = ""
-    dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
-
+    dynamic_sp_bucket_preset: Literal[
+        "none", "deepseek_v3", "kimi_k2"
+    ] = "none"
 
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
@@ -261,13 +278,17 @@ class Config:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, bucket"
             )
-        if self.dynamic_sp_bucket_preset not in {"none", "deepseek_v3"}:
+        if self.dynamic_sp_bucket_preset not in {
+            "none",
+            *DYNAMIC_SP_BUCKET_POLICIES,
+        }:
             raise ValueError(
-                "dynamic_sp_bucket_preset must be one of: none, deepseek_v3"
+                "dynamic_sp_bucket_preset must be one of: "
+                "none, deepseek_v3, kimi_k2"
             )
-        preset_policy = ""
-        if self.dynamic_sp_bucket_preset == "deepseek_v3":
-            preset_policy = DEEPSEEK_V3_BUCKET_POLICY
+        preset_policy = DYNAMIC_SP_BUCKET_POLICIES.get(
+            self.dynamic_sp_bucket_preset, ""
+        )
         if preset_policy:
             if (
                 self.dynamic_sp_bucket_policy.strip()
@@ -297,6 +318,7 @@ class Config:
                 "enable_dynamic_sp_bucket_policy is True"
             )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        source_model_type = getattr(hf_config, "model_type", "")
         if self.cuda_graph_mode not in {"full", "piecewise"}:
             raise ValueError("cuda_graph_mode must be one of: full, piecewise")
         if self.sp_backend not in {"hao_basic", "nccl"}:
@@ -332,15 +354,22 @@ class Config:
         else:
             assert self.kvcache_block_size % 256 == 0
             assert 1 <= self.attention_tp <= 8
-        if self.dynamic_sp_bucket_preset == "deepseek_v3":
+        if self.dynamic_sp_bucket_preset != "none":
             if self.hf_config.architectures[0] != "DeepseekV3ForCausalLM":
                 raise ValueError(
-                    "dynamic_sp_bucket_preset=deepseek_v3 only supports "
+                    "dynamic SP bucket presets only support "
                     "DeepseekV3ForCausalLM"
+                )
+            if source_model_type != self.dynamic_sp_bucket_preset:
+                raise ValueError(
+                    "dynamic_sp_bucket_preset="
+                    f"{self.dynamic_sp_bucket_preset} requires model_type="
+                    f"{self.dynamic_sp_bucket_preset}, got {source_model_type!r}"
                 )
             if self.attention_sp < 8:
                 raise ValueError(
-                    "dynamic_sp_bucket_preset=deepseek_v3 requires attention_sp >= 8"
+                    "dynamic_sp_bucket_preset="
+                    f"{self.dynamic_sp_bucket_preset} requires attention_sp >= 8"
                 )
         # self.max_model_len = max(
         #     self.max_model_len, self.hf_config.max_position_embeddings

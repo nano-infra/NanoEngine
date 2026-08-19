@@ -56,6 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1e-5)
     parser.add_argument("--decode-loop-count", type=int, default=1)
     parser.add_argument(
+        "--decode-topology",
+        choices=("dp8", "sp8"),
+        default="sp8",
+        help=(
+            "Decode attention topology: dp8 uses DP8/SP1 and isolates local "
+            "decode/CUDA Graph; sp8 uses the production-like DP1/SP8 path."
+        ),
+    )
+    parser.add_argument(
         "--dummy-weight",
         action="store_true",
         help="Skip checkpoint loading and use initialized dummy weights.",
@@ -92,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def decode_topology(args: argparse.Namespace) -> tuple[int, int, int]:
+    if args.decode_topology == "dp8":
+        return 8, 1, 0
+    return 1, 8, 8
 
 
 def configure_driver_environment() -> dict[str, str]:
@@ -149,10 +164,11 @@ def validate_ray_cluster(
 
 
 def build_decode(args: argparse.Namespace) -> LLM:
+    attention_dp, attention_sp, fixed_sp_size = decode_topology(args)
     print(
         "Creating decode engine first:",
         args.decode_master_address,
-        "attention=DP1/SP8/TP1",
+        f"attention=DP{attention_dp}/SP{attention_sp}/TP1",
         "ffn=DP1/EP8/TP1",
         (
             "cuda_graph=disabled"
@@ -165,8 +181,8 @@ def build_decode(args: argparse.Namespace) -> LLM:
         args.model_path,
         enforce_eager=args.decode_eager,
         cuda_graph_mode=args.cuda_graph_mode,
-        attention_dp=1,
-        attention_sp=8,
+        attention_dp=attention_dp,
+        attention_sp=attention_sp,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -177,7 +193,7 @@ def build_decode(args: argparse.Namespace) -> LLM:
         ray_address=args.ray_address,
         dummy_prefill=False,
         dummy_weight=args.dummy_weight,
-        fixed_sp_size=8,
+        fixed_sp_size=fixed_sp_size,
         sp_backend=args.sp_backend,
         optimize_decode_block_table=args.optimize_decode_block_table,
         kvcache_block_size=64,
@@ -271,6 +287,24 @@ def close_engine(engine: LLM | None, label: str) -> None:
         print(f"Warning: failed to close {label} engine: {exc}", flush=True)
 
 
+def report_completion_stage(
+    tokenizer: Any,
+    sequence: Sequence,
+    stage: str,
+    previous_count: int = 0,
+) -> int:
+    completion_token_ids = list(sequence.completion_token_ids)
+    added_token_ids = completion_token_ids[previous_count:]
+    print(f"{stage} total completion token IDs: {completion_token_ids}", flush=True)
+    print(f"{stage} added token IDs: {added_token_ids}", flush=True)
+    print(
+        f"{stage} added text:",
+        tokenizer.decode(added_token_ids, skip_special_tokens=True),
+        flush=True,
+    )
+    return len(completion_token_ids)
+
+
 def main() -> None:
     args = parse_args()
     if args.max_tokens <= 0:
@@ -328,6 +362,11 @@ def main() -> None:
             f"Prefill completed in {time.perf_counter() - prefill_begin:.3f}s",
             flush=True,
         )
+        prefill_token_count = report_completion_stage(
+            tokenizer,
+            sequence,
+            "Prefill",
+        )
 
         decode_begin = time.perf_counter()
         decode.add_request(sequence)
@@ -336,6 +375,12 @@ def main() -> None:
             f"KV migration and decode completed in "
             f"{time.perf_counter() - decode_begin:.3f}s",
             flush=True,
+        )
+        report_completion_stage(
+            tokenizer,
+            sequence,
+            "Decode",
+            previous_count=prefill_token_count,
         )
         prefill.free_to_be_migrated(sequence)
 

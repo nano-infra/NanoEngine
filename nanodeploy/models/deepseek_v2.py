@@ -719,7 +719,8 @@ class DeepseekV2Attention(nn.Module):
             rotary_dim=config.qk_rope_head_dim,
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
-            # rope_scaling=config.rope_scaling,
+            rope_scaling=config.rope_scaling,
+            is_neox_style=False,
         )
 
         self.softmax_scale = self.q_head_dim ** (-0.5)

@@ -20,10 +20,11 @@ import pd_disagg_deepseek_v3 as serial_example
 
 
 def build_decode(args: argparse.Namespace) -> LLM:
+    attention_dp, attention_sp, fixed_sp_size = serial_example.decode_topology(args)
     print(
         "Creating decode engine concurrently:",
         args.decode_master_address,
-        "attention=DP1/SP8/TP1",
+        f"attention=DP{attention_dp}/SP{attention_sp}/TP1",
         "ffn=DP1/EP8/TP1",
         (
             "cuda_graph=disabled"
@@ -36,8 +37,8 @@ def build_decode(args: argparse.Namespace) -> LLM:
         args.model_path,
         enforce_eager=args.decode_eager,
         cuda_graph_mode=args.cuda_graph_mode,
-        attention_dp=1,
-        attention_sp=8,
+        attention_dp=attention_dp,
+        attention_sp=attention_sp,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -48,7 +49,7 @@ def build_decode(args: argparse.Namespace) -> LLM:
         ray_address=args.ray_address,
         dummy_prefill=False,
         dummy_weight=args.dummy_weight,
-        fixed_sp_size=8,
+        fixed_sp_size=fixed_sp_size,
         sp_backend=args.sp_backend,
         optimize_decode_block_table=args.optimize_decode_block_table,
         kvcache_block_size=64,
@@ -214,6 +215,11 @@ def main() -> None:
             f"Prefill completed in {time.perf_counter() - prefill_begin:.3f}s",
             flush=True,
         )
+        prefill_token_count = serial_example.report_completion_stage(
+            tokenizer,
+            sequence,
+            "Prefill",
+        )
 
         decode_begin = time.perf_counter()
         decode.add_request(sequence)
@@ -222,6 +228,12 @@ def main() -> None:
             "KV migration and decode completed in "
             f"{time.perf_counter() - decode_begin:.3f}s",
             flush=True,
+        )
+        serial_example.report_completion_stage(
+            tokenizer,
+            sequence,
+            "Decode",
+            previous_count=prefill_token_count,
         )
         prefill.free_to_be_migrated(sequence)
 
