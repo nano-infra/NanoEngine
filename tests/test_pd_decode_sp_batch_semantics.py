@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decode_cpp
-from nanodeploy.worker.sp_graph_policy import is_full_sp_graph_batch_uniform
+from nanodeploy.worker.sp_graph_policy import (
+    build_fixed_sp_graph_layout,
+    packed_attention_rows_to_dense,
+)
 
 
 _SP_SIZE = 8
@@ -332,19 +335,17 @@ def test_fixed_sp8_batch_metadata_roundtrips_distinct_request_identities():
             )
 
 
-def test_fixed_sp8_graph_policy_falls_back_consistently_after_eos():
-    """A rank-local control dummy must disable Graph replay on every rank.
+def test_fixed_sp8_graph_layout_stays_dense_after_eos():
+    """Graph padding must preserve dense identities after a request exits.
 
-    Before EOS, each of the eight requests has KV on all eight SP ranks, so a
-    fixed ``attn_bs=8`` graph is valid everywhere.  Once request 0 is replaced
-    by its persistent rank-0 control dummy, rank 0 still has eight attention
-    rows while ranks 1..7 have only seven.  The Graph decision must therefore
-    come from shared placement metadata instead of either local row count.
+    Request 0 is replaced by a rank-0-only control dummy.  Ranks 1..7 then
+    receive seven packed C++ attention rows, but the fixed graph must keep the
+    same eight-row master-major layout.  The absent row gets an explicit Q and
+    a legal throw-away attention row; its Res/LSE mask remains zero so it
+    cannot enter request 0's reduction.
     """
 
     batch = _schedule_fixed_sp_batch(8)
-    assert is_full_sp_graph_batch_uniform(batch.scheduled, _SP_SIZE)
-
     remaining = [
         sequence
         for sequence in batch.scheduled
@@ -353,22 +354,63 @@ def test_fixed_sp8_graph_policy_falls_back_consistently_after_eos():
     rank_zero_dummy = batch.scheduler.worker_state[0].dummy_seqs[0]
     after_eos = tuple(remaining + [rank_zero_dummy])
 
-    attention_rows_by_rank = [
-        len(
-            prepare_decode_cpp(
-                list(after_eos),
-                sp_rank,
-                _SP_SIZE,
-                _BLOCK_SIZE,
-                _MAX_NUM_SEQS,
-            ).context_lens_for_attn
+    for sp_rank in range(_SP_SIZE):
+        metadata = prepare_decode_cpp(
+            list(after_eos),
+            sp_rank,
+            _SP_SIZE,
+            _BLOCK_SIZE,
+            _MAX_NUM_SEQS,
         )
-        for sp_rank in range(_SP_SIZE)
-    ]
-    assert attention_rows_by_rank == [8] + [7] * 7
+        layout = build_fixed_sp_graph_layout(
+            sp_rank=sp_rank,
+            sp_world_size=_SP_SIZE,
+            max_num_seqs=_MAX_NUM_SEQS,
+            master_bs=1,
+        )
+        packed_to_dense = packed_attention_rows_to_dense(
+            metadata.context_lens_flat,
+            sp_world_size=_SP_SIZE,
+            max_num_seqs=_MAX_NUM_SEQS,
+            master_bs=1,
+        )
 
-    decisions = [
-        is_full_sp_graph_batch_uniform(after_eos, _SP_SIZE)
-        for _ in range(_SP_SIZE)
-    ]
-    assert decisions == [False] * _SP_SIZE
+        assert layout.attention_bs == _SP_SIZE
+        assert layout.q_offsets == tuple(range(_SP_SIZE + 1))
+        assert layout.q_slice_get == (0,)
+        assert layout.q_slice_fill == (sp_rank,)
+        assert layout.res_slice_get_to_buffer_output == (sp_rank,)
+        assert layout.res_slice_fill_to_buffer_output == (
+            sp_rank * _MAX_NUM_SEQS,
+        )
+
+        if sp_rank == 0:
+            assert len(metadata.context_lens_for_attn) == _SP_SIZE
+            assert packed_to_dense == tuple(range(_SP_SIZE))
+        else:
+            assert len(metadata.context_lens_for_attn) == _SP_SIZE - 1
+            assert packed_to_dense == tuple(range(1, _SP_SIZE))
+
+        dense_context_lens = [1] * layout.attention_bs
+        for packed_row, dense_row in enumerate(packed_to_dense):
+            dense_context_lens[dense_row] = metadata.context_lens_for_attn[
+                packed_row
+            ]
+        assert all(context_len > 0 for context_len in dense_context_lens)
+
+        # Transport every dense Q so no persistent receive-buffer row is
+        # stale.  Only real local KV shards return Res/LSE contributions.
+        q_mask = [
+            0 if destination == sp_rank else 1
+            for destination in range(_SP_SIZE)
+        ]
+        assert sum(q_mask) == _SP_SIZE - 1
+
+        response_mask = [
+            int(_matrix(metadata.context_lens_flat)[master][0] > 0)
+            for master in range(_SP_SIZE)
+        ]
+        if sp_rank == 0:
+            assert response_mask == [1] * _SP_SIZE
+        else:
+            assert response_mask == [0] + [1] * (_SP_SIZE - 1)

@@ -51,7 +51,10 @@ from nanodeploy.worker.prefill_logits import compute_prefill_logits
 from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
-from nanodeploy.worker.sp_graph_policy import is_full_sp_graph_batch_uniform
+from nanodeploy.worker.sp_graph_policy import (
+    build_fixed_sp_graph_layout,
+    packed_attention_rows_to_dense,
+)
 
 logger = get_logger()
 
@@ -94,7 +97,7 @@ class ModelRunner:
         self._deepep_enabled = False
         self._deepep_destroyed = False
         self._exited = False
-        self._logged_nonuniform_sp_graph_fallback = False
+        self._fixed_sp_graph_layout_cache = {}
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -820,9 +823,35 @@ class ModelRunner:
         attention_compute_bs = (
             context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
         )
-        sp_graph_batch_uniform = is_full_sp_graph_batch_uniform(
-            dp_seqs, sp_size
+        sp_graph_master_bs = None
+        sp_graph_packed_row_to_dense = None
+        fixed_full_sp_graph = (
+            not self.enforce_eager
+            and use_sp_a2a
+            and sp_size > 1
+            and self.config.fixed_sp_size == sp_size
         )
+        if fixed_full_sp_graph:
+            sp_graph_master_bs = next(
+                graph_bs
+                for graph_bs in self.graph_master_rank_bs
+                if graph_bs >= sp_comm_bs
+            )
+            packed_rows = packed_attention_rows_to_dense(
+                meta.context_lens_flat,
+                sp_world_size=sp_size,
+                max_num_seqs=self.config.max_num_seqs,
+                master_bs=sp_graph_master_bs,
+            )
+            if len(packed_rows) != context_lens_for_attn.numel():
+                raise RuntimeError(
+                    "fixed SP graph row map does not match packed attention "
+                    f"metadata: rows={len(packed_rows)} "
+                    f"attention_rows={context_lens_for_attn.numel()}"
+                )
+            sp_graph_packed_row_to_dense = torch.tensor(
+                packed_rows, dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
 
         config = self.config
         hf_config = config.hf_config
@@ -850,7 +879,9 @@ class ModelRunner:
             context_lens_for_attn=context_lens_for_attn,
             attention_compute_bs=attention_compute_bs,
             sp_comm_bs=sp_comm_bs,
-            sp_graph_batch_uniform=sp_graph_batch_uniform,
+            sp_graph_master_bs=sp_graph_master_bs,
+            sp_graph_packed_row_to_dense=sp_graph_packed_row_to_dense,
+            sp_master_batch_sizes=tuple(sp_master_batch_sizes),
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
             q_copy_mask=q_copy_mask,
@@ -982,6 +1013,7 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         bs: int,
+        master_bs: int,
         context,
     ) -> None:
         if graph_vars.get("input_ids") is not None:
@@ -993,6 +1025,27 @@ class ModelRunner:
 
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = context.slot_mapping  # type: ignore
+
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads == 1 and graph_vars.get("tile_scheduler_metadata") is not None:
+            graph_vars["tile_scheduler_metadata"].zero_()
+            graph_vars["num_splits"].zero_()
+
+        fixed_full_sp_graph = (
+            context.use_sp_a2a
+            and context.sp_graph_master_bs == master_bs
+            and context.sp_graph_packed_row_to_dense is not None
+            and context.sp_master_batch_sizes is not None
+        )
+        if fixed_full_sp_graph:
+            self._copy_fixed_sp_context_to_graph_vars(
+                graph_vars,
+                master_bs=master_bs,
+                context=context,
+            )
+            return
+
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
         graph_vars["global_context_lens"].zero_()
@@ -1005,12 +1058,6 @@ class ModelRunner:
         graph_vars["block_tables"][
             : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
         ] = context.block_tables
-
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads == 1 and graph_vars.get("tile_scheduler_metadata") is not None:
-            graph_vars["tile_scheduler_metadata"].zero_()
-            graph_vars["num_splits"].zero_()
 
         graph_vars["context_lens_for_attn"].zero_()
         graph_vars["context_lens_for_attn"][
@@ -1040,6 +1087,213 @@ class ModelRunner:
 
         graph_vars["q_offsets"].zero_()
         graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+
+    def _get_fixed_sp_graph_device_layout(self, master_bs: int, context):
+        dist_context = get_dist_context()
+        sp_rank = dist_context.attn_sp_rank
+        sp_world_size = dist_context.attn_sp_world_size
+        key = (sp_rank, sp_world_size, self.config.max_num_seqs, master_bs)
+        cached = self._fixed_sp_graph_layout_cache.get(key)
+        if cached is not None:
+            return cached
+
+        layout = build_fixed_sp_graph_layout(
+            sp_rank=sp_rank,
+            sp_world_size=sp_world_size,
+            max_num_seqs=self.config.max_num_seqs,
+            master_bs=master_bs,
+        )
+        device = context.context_lens.device
+
+        def as_device_tensor(values: tuple[int, ...]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        cached = {
+            "layout": layout,
+            "q_offsets": as_device_tensor(layout.q_offsets),
+            "q_slice_get": as_device_tensor(layout.q_slice_get),
+            "q_slice_fill": as_device_tensor(layout.q_slice_fill),
+            "res_slice_get_to_buffer_output": as_device_tensor(
+                layout.res_slice_get_to_buffer_output
+            ),
+            "res_slice_fill_to_buffer_output": as_device_tensor(
+                layout.res_slice_fill_to_buffer_output
+            ),
+            "res_slice_get_to_buffer_input": as_device_tensor(
+                layout.res_slice_get_to_buffer_input
+            ),
+            "res_slice_fill_to_buffer_input": as_device_tensor(
+                layout.res_slice_fill_to_buffer_input
+            ),
+        }
+        self._fixed_sp_graph_layout_cache[key] = cached
+        return cached
+
+    def _copy_fixed_sp_context_to_graph_vars(
+        self,
+        graph_vars: dict[str, torch.Tensor | None],
+        *,
+        master_bs: int,
+        context,
+    ) -> None:
+        """Materialize legal dense metadata for a fixed-full-SP Graph replay.
+
+        A completed request is replaced by a rank-local control dummy.  C++
+        metadata therefore packs a different number of attention rows on
+        different ranks, while a fixed Graph must replay the same dense shape.
+        Every dense row receives an explicit Q and a legal read-only attention
+        page.  Real zero-length shards remain masked out of Res/LSE transport
+        and global reduction, and graph-only input rows retain slot_mapping=-1.
+        """
+
+        dist_context = get_dist_context()
+        sp_rank = dist_context.attn_sp_rank
+        sp_world_size = dist_context.attn_sp_world_size
+        device_layout = self._get_fixed_sp_graph_device_layout(
+            master_bs, context
+        )
+        layout = device_layout["layout"]
+        attention_bs = layout.attention_bs
+        master_batch_sizes = context.sp_master_batch_sizes
+        if len(master_batch_sizes) != sp_world_size:
+            raise RuntimeError(
+                "fixed SP graph master batch metadata has the wrong size: "
+                f"got={len(master_batch_sizes)} expected={sp_world_size}"
+            )
+        if any(batch_size > master_bs for batch_size in master_batch_sizes):
+            raise RuntimeError(
+                "fixed SP graph master batch does not fit selected bucket: "
+                f"batch_sizes={master_batch_sizes} master_bs={master_bs}"
+            )
+
+        graph_context_lens = graph_vars["context_lens"]
+        graph_context_lens.zero_()
+        graph_context_lens.copy_(context.context_lens)
+        graph_global_context_lens = graph_vars["global_context_lens"]
+        graph_global_context_lens.zero_()
+        graph_global_context_lens.copy_(context.global_context_lens)
+
+        # A graph-only local input needs one finite local partial so the
+        # combine kernel never reduces an all-empty row.  It is never sampled.
+        local_batch_size = master_batch_sizes[sp_rank]
+        if local_batch_size < master_bs:
+            graph_context_lens[
+                sp_rank, local_batch_size:master_bs
+            ].fill_(1)
+            graph_global_context_lens[
+                sp_rank, local_batch_size:master_bs
+            ].fill_(1)
+
+        # Send every dense query explicitly.  This prevents an absent shard
+        # from leaving stale data in the persistent DLSlime receive buffer.
+        graph_q_mask = graph_vars["q_mask"]
+        graph_q_mask.zero_()
+        graph_q_mask[:, :master_bs].fill_(1)
+        graph_q_mask[sp_rank, :master_bs].zero_()
+
+        # Results remain sparse: zero-length real shards and remote padding
+        # partials must not enter the owning master's attention reduction.
+        graph_res_lse_mask = graph_vars["res_lse_mask"]
+        graph_res_lse_mask.zero_()
+        graph_res_lse_mask[:, :master_bs].copy_(
+            graph_context_lens[:, :master_bs]
+        )
+        graph_res_lse_mask.clamp_(min=0, max=1)
+        graph_res_lse_mask[sp_rank, :master_bs].zero_()
+
+        packed_row_to_dense = context.sp_graph_packed_row_to_dense
+        packed_attention_rows = context.context_lens_for_attn.shape[0]
+        if packed_row_to_dense.numel() != packed_attention_rows:
+            raise RuntimeError(
+                "fixed SP graph row map changed within a decode quantum: "
+                f"map_rows={packed_row_to_dense.numel()} "
+                f"attention_rows={packed_attention_rows}"
+            )
+        if context.block_tables.size(0) != packed_attention_rows:
+            raise RuntimeError(
+                "fixed SP graph block-table rows do not match attention rows: "
+                f"block_rows={context.block_tables.size(0)} "
+                f"attention_rows={packed_attention_rows}"
+            )
+        if packed_attention_rows == 0 or context.block_tables.size(1) == 0:
+            raise RuntimeError(
+                "fixed SP graph replay requires at least one valid KV page"
+            )
+
+        # FlashMLA cannot execute a zero-length graph row.  Invalid rows borrow
+        # the first valid page with context_len=1.  Their result is discarded by
+        # the sparse masks above, and slot_mapping=-1 prevents any KV write.
+        graph_context_lens_for_attn = graph_vars["context_lens_for_attn"]
+        graph_context_lens_for_attn.zero_()
+        graph_context_lens_for_attn[:attention_bs].fill_(1)
+        graph_context_lens_for_attn[:attention_bs].index_copy_(
+            0,
+            packed_row_to_dense,
+            context.context_lens_for_attn,
+        )
+
+        graph_block_tables = graph_vars["block_tables"]
+        graph_block_tables.fill_(-1)
+        block_table_width = context.block_tables.size(1)
+        dense_block_tables = graph_block_tables[
+            :attention_bs, :block_table_width
+        ]
+        dense_block_tables.copy_(
+            context.block_tables[0:1].expand(attention_bs, -1)
+        )
+        dense_block_tables.index_copy_(
+            0,
+            packed_row_to_dense,
+            context.block_tables,
+        )
+
+        graph_vars["q_slice_get"].fill_(-1)
+        graph_vars["q_slice_fill"].fill_(-1)
+        graph_vars["q_copy_mask"].zero_()
+        graph_vars["q_slice_get"][:master_bs].copy_(
+            device_layout["q_slice_get"]
+        )
+        graph_vars["q_slice_fill"][:master_bs].copy_(
+            device_layout["q_slice_fill"]
+        )
+        graph_vars["q_copy_mask"][:master_bs].fill_(1)
+
+        graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
+        graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
+        graph_vars["res_to_buffer_output_mask"].zero_()
+        graph_vars["res_slice_get_to_buffer_output"][:master_bs].copy_(
+            device_layout["res_slice_get_to_buffer_output"]
+        )
+        graph_vars["res_slice_fill_to_buffer_output"][:master_bs].copy_(
+            device_layout["res_slice_fill_to_buffer_output"]
+        )
+        graph_vars["res_to_buffer_output_mask"][:master_bs].copy_(
+            graph_context_lens[sp_rank, :master_bs]
+        )
+        graph_vars["res_to_buffer_output_mask"].clamp_(min=0, max=1)
+
+        graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
+        graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
+        graph_vars["res_to_buffer_input_mask"].zero_()
+        remote_rows = (sp_world_size - 1) * master_bs
+        graph_vars["res_slice_get_to_buffer_input"][:remote_rows].copy_(
+            device_layout["res_slice_get_to_buffer_input"]
+        )
+        graph_vars["res_slice_fill_to_buffer_input"][:remote_rows].copy_(
+            device_layout["res_slice_fill_to_buffer_input"]
+        )
+        mask_offset = 0
+        for master in range(sp_world_size):
+            if master == sp_rank:
+                continue
+            graph_vars["res_to_buffer_input_mask"][
+                mask_offset : mask_offset + master_bs
+            ].copy_(graph_context_lens[master, :master_bs])
+            mask_offset += master_bs
+        graph_vars["res_to_buffer_input_mask"].clamp_(min=0, max=1)
+
+        graph_vars["q_offsets"].zero_()
+        graph_vars["q_offsets"].copy_(device_layout["q_offsets"])
 
     def _build_graph_master_rank_bs(self, max_bs: int) -> list[int]:
         graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -1084,22 +1338,6 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
 
         context = get_context()
-        sp_world_size = get_dist_context().attn_sp_world_size
-        fixed_full_sp_graph = (
-            context.use_sp_a2a
-            and sp_world_size > 1
-            and self.config.fixed_sp_size == sp_world_size
-        )
-        if fixed_full_sp_graph and not context.sp_graph_batch_uniform:
-            if not self._logged_nonuniform_sp_graph_fallback:
-                logger.warning(
-                    "Falling back to eager decode because the fixed-full-SP "
-                    "batch contains a sequence that does not participate on "
-                    "every SP rank; all ranks use the shared placement "
-                    "metadata to make this decision"
-                )
-                self._logged_nonuniform_sp_graph_fallback = True
-            return self.model.compute_logits(self.model(input_ids, positions))
 
         if self.cuda_graph_mode == "piecewise":
             return self.run_model_piecewise_cudagraph(input_ids, positions)
@@ -1129,7 +1367,7 @@ class ModelRunner:
 
         graph_vars = self.graph_vars
         self._copy_decode_context_to_graph_vars(
-            graph_vars, input_ids, positions, bs, context
+            graph_vars, input_ids, positions, bs, master_bs, context
         )
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -1147,8 +1385,14 @@ class ModelRunner:
         graph_vars = self.piecewise_graph_vars[master_bs]
 
         self._copy_decode_context_to_graph_vars(
-            graph_vars, input_ids, positions, bs, context
+            graph_vars, input_ids, positions, bs, master_bs, context
         )
+
+        attention_compute_bs = context.attention_compute_bs
+        if context.sp_graph_master_bs == master_bs:
+            attention_compute_bs = (
+                get_dist_context().attn_sp_world_size * master_bs
+            )
 
         temp_context_fields = {
             "slot_mapping": graph_vars["slot_mapping"][:master_bs],
@@ -1178,7 +1422,7 @@ class ModelRunner:
                 "res_slice_fill_to_buffer_input"
             ],
             "res_to_buffer_input_mask": graph_vars["res_to_buffer_input_mask"],
-            "attention_compute_bs": context.attention_compute_bs,
+            "attention_compute_bs": attention_compute_bs,
             "sp_comm_bs": master_bs,
             "q_offsets": graph_vars["q_offsets"],
             "context_lens_for_attn": graph_vars["context_lens_for_attn"],

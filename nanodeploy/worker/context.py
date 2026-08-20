@@ -46,7 +46,9 @@ class Context:
     res_to_buffer_input_mask: Optional[torch.Tensor] = None
     attention_compute_bs: Optional[int] = None
     sp_comm_bs: Optional[int] = None
-    sp_graph_batch_uniform: bool = True
+    sp_graph_master_bs: Optional[int] = None
+    sp_graph_packed_row_to_dense: torch.Tensor | None = None
+    sp_master_batch_sizes: tuple[int, ...] | None = None
 
     # used for all2all q transfer
     q_offsets: torch.Tensor | None = None
@@ -90,7 +92,9 @@ def set_context(
     res_to_buffer_input_mask: Optional[torch.Tensor] = None,
     attention_compute_bs: Optional[int] = None,
     sp_comm_bs: Optional[int] = None,
-    sp_graph_batch_uniform: bool = True,
+    sp_graph_master_bs: Optional[int] = None,
+    sp_graph_packed_row_to_dense: Optional[torch.Tensor] = None,
+    sp_master_batch_sizes: tuple[int, ...] | None = None,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None,
@@ -125,7 +129,9 @@ def set_context(
         res_to_buffer_input_mask=res_to_buffer_input_mask,
         attention_compute_bs=attention_compute_bs,
         sp_comm_bs=sp_comm_bs,
-        sp_graph_batch_uniform=sp_graph_batch_uniform,
+        sp_graph_master_bs=sp_graph_master_bs,
+        sp_graph_packed_row_to_dense=sp_graph_packed_row_to_dense,
+        sp_master_batch_sizes=sp_master_batch_sizes,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
         prefill_cu_seqlens_q_host=prefill_cu_seqlens_q_host,
