@@ -10,7 +10,8 @@ _LONG_PROMPT_BUCKET_POLICY = (
     "1:1-512;5:513-768;6:769-1024;7:1025-1280;8:1281-4096"
 )
 _PROMPT_LENGTHS = (2048, 1792, 1536, 1280, 1024, 768, 512, 500)
-_EXPECTED_SP_SIZES = (8, 8, 8, 7, 6, 5, 1, 1)
+_PREFILL_COMPLETION_TOKENS = 1
+_EXPECTED_SP_SIZES = (8, 8, 8, 8, 7, 6, 5, 1)
 
 
 def _make_scheduler() -> Scheduler:
@@ -41,9 +42,12 @@ def _schedule_mixed_bucket_batch():
     scheduler = _make_scheduler()
     sequences = []
     for request_index, prompt_length in enumerate(_PROMPT_LENGTHS):
+        # The prefill engine produces one completion token before handing the
+        # shared Sequence to decode, so bucket selection sees prompt + 1.
+        handoff_length = prompt_length + _PREFILL_COMPLETION_TOKENS
         token_base = 10_000 * (request_index + 1)
         sequence = Sequence(
-            [token_base + offset for offset in range(prompt_length)],
+            [token_base + offset for offset in range(handoff_length)],
             1e-5,
             128,
             True,
@@ -74,7 +78,7 @@ def test_long_prompt_bucket_policy_activates_all_requested_sp_sizes():
 
     assert tuple(actual_sp_sizes) == _EXPECTED_SP_SIZES
     histogram = list(decode.sp_size_hist_per_dp[0])
-    assert histogram == [0, 2, 0, 0, 0, 1, 1, 1, 3]
+    assert histogram == [0, 1, 0, 0, 0, 1, 1, 1, 4]
 
 
 def test_mixed_bucket_decode_metadata_keeps_only_participating_rows():
