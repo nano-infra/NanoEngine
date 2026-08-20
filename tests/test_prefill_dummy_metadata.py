@@ -13,7 +13,9 @@ _BLOCK_SIZE = 64
 _MAX_NUM_SEQS = 8
 
 
-def _make_scheduler(mode: str = "prefill") -> Scheduler:
+def _make_scheduler(
+    mode: str = "prefill", block_size: int = _BLOCK_SIZE
+) -> Scheduler:
     return Scheduler(
         "prefill-test",
         1,
@@ -24,7 +26,7 @@ def _make_scheduler(mode: str = "prefill") -> Scheduler:
         _ATTENTION_DP,
         _ATTENTION_SP,
         1024,
-        _BLOCK_SIZE,
+        block_size,
         mode,
         1.0,
         512,
@@ -35,6 +37,49 @@ def _make_scheduler(mode: str = "prefill") -> Scheduler:
         "RoundRobin",
         0,
     )
+
+
+def _make_noncontiguous_two_page_sequence() -> Sequence:
+    sequence = Sequence(list(range(65)), 0.1, 8, True)
+    sequence.active("metadata-test", _ATTENTION_SP, 1)
+    context = sequence.block_ctx(BlockContextSlot.ACTIVE)
+    context.master_sp_idx = 0
+    context.num_dispatched_tokens = [65]
+    context.sp_block_table[0].append(1)
+    context.sp_block_table[0].append(3)
+    return sequence
+
+
+def test_prefill_metadata_uses_explicit_block_size_in_worker_process():
+    _make_scheduler(block_size=256)
+    assert Sequence.block_size == 256
+
+    metadata = prepare_prefill_cpp(
+        [_make_noncontiguous_two_page_sequence()],
+        0,
+        _ATTENTION_SP,
+        _BLOCK_SIZE,
+        _MAX_NUM_SEQS,
+    )
+
+    assert Sequence.block_size == _BLOCK_SIZE
+    assert metadata.slot_mapping == list(range(64, 128)) + [192]
+
+
+def test_decode_metadata_uses_explicit_block_size_in_worker_process():
+    _make_scheduler(block_size=256)
+    assert Sequence.block_size == 256
+
+    metadata = prepare_decode_cpp(
+        [_make_noncontiguous_two_page_sequence()],
+        0,
+        _ATTENTION_SP,
+        _BLOCK_SIZE,
+        _MAX_NUM_SEQS,
+    )
+
+    assert Sequence.block_size == _BLOCK_SIZE
+    assert metadata.slot_mapping == [192]
 
 
 def test_prefill_empty_lanes_do_not_receive_decode_control_dummies():

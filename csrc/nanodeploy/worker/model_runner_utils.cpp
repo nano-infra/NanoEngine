@@ -1,11 +1,23 @@
 #include <algorithm>
 #include <iostream>
+#include <stdexcept>
 
 #include "nanodeploy/sequence/sequence.h"
 
 #include "model_runner_utils.h"
 
 namespace nanodeploy {
+
+static void sync_sequence_block_size(int block_size)
+{
+    if (block_size <= 0) {
+        throw std::invalid_argument("KV cache block size must be positive");
+    }
+
+    // Scheduler and ModelRunner live in different processes. Keep the
+    // process-local Sequence page helpers aligned with the runtime KV layout.
+    Sequence::block_size = block_size;
+}
 
 static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
                                       int                           sp_rank,
@@ -106,6 +118,8 @@ static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
 PrefillMetadata
 prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs)
 {
+    sync_sequence_block_size(block_size);
+
     PrefillMetadata meta;
     meta.cu_seqlens_q.push_back(0);
     meta.cu_seqlens_k.push_back(0);
@@ -170,6 +184,8 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
                                   int                           block_size,
                                   int                           max_num_seqs)
 {
+    sync_sequence_block_size(block_size);
+
     DecodeMetadata meta;
 
     for (auto* seq : dp_seqs) {
