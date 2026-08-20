@@ -6,6 +6,7 @@ the synchronization barrier before KV-transfer setup begins.
 """
 
 import argparse
+import itertools
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,7 @@ import ray
 from transformers import AutoTokenizer
 
 from nanodeploy import LLM, SamplingParams
+from nanodeploy.engine.sequence import Sequence
 
 import pd_disagg_deepseek_v3 as serial_example
 
@@ -29,6 +31,17 @@ DEFAULT_BATCH_PROMPTS = (
     "请给出三个提高 Python 程序运行效率的通用方法。",
     "假设你要设计一个可靠的分布式服务，应优先考虑哪些故障场景？",
 )
+
+def parse_positive_int_csv(value: str) -> tuple[int, ...]:
+    try:
+        result = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of integers"
+        ) from exc
+    if not result or any(item <= 0 for item in result):
+        raise argparse.ArgumentTypeError("all token lengths must be positive")
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +69,16 @@ def parse_args() -> argparse.Namespace:
             "stops each request."
         ),
     )
+    parser.add_argument(
+        "--prompt-token-lengths",
+        type=parse_positive_int_csv,
+        default=(),
+        help=(
+            "Optional exact prompt-token lengths, one per request. Padding is "
+            "inserted before the assistant marker. The short five-bucket "
+            "smoke uses 1024,768,512,256,64."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -72,6 +95,7 @@ def select_prompts(args: argparse.Namespace) -> list[str]:
 
 def build_decode(args: argparse.Namespace) -> LLM:
     attention_dp, attention_sp, fixed_sp_size = serial_example.decode_topology(args)
+    dynamic_sp_kwargs = serial_example.decode_dynamic_sp_kwargs(args)
     print(
         "Creating decode engine concurrently:",
         args.decode_master_address,
@@ -101,6 +125,7 @@ def build_decode(args: argparse.Namespace) -> LLM:
         dummy_prefill=False,
         dummy_weight=args.dummy_weight,
         fixed_sp_size=fixed_sp_size,
+        **dynamic_sp_kwargs,
         sp_backend=args.sp_backend,
         optimize_decode_block_table=args.optimize_decode_block_table,
         kvcache_block_size=64,
@@ -159,6 +184,40 @@ def _timed_build(
     elapsed = time.perf_counter() - begin
     print(f"{label} engine initialized in {elapsed:.2f}s", flush=True)
     return engine, elapsed
+
+
+def make_sequence_with_token_length(
+    tokenizer,
+    prompt: str,
+    sampling_params: SamplingParams,
+    target_length: int,
+) -> Sequence:
+    prompt_token_ids = list(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    )
+    if target_length < len(prompt_token_ids):
+        raise ValueError(
+            "--prompt-token-lengths entry is shorter than its tokenized "
+            f"prompt: target={target_length}, actual={len(prompt_token_ids)}"
+        )
+
+    missing = target_length - len(prompt_token_ids)
+    filler_token_ids = tokenizer.encode("\n", add_special_tokens=False)
+    if not filler_token_ids:
+        raise RuntimeError("Tokenizer produced no token for the prompt filler")
+    filler = list(itertools.islice(itertools.cycle(filler_token_ids), missing))
+    # DeepSeek's final chat-template token is the assistant marker. Keep all
+    # special-token ordering intact and place harmless newlines immediately
+    # before it.
+    prompt_token_ids[-1:-1] = filler
+    if len(prompt_token_ids) != target_length:
+        raise AssertionError("Failed to construct the requested prompt length")
+    print(f"Prompt tokens: {len(prompt_token_ids)}", flush=True)
+    return Sequence(prompt_token_ids, sampling_params=sampling_params)
 
 
 def build_engines_parallel(
@@ -222,6 +281,24 @@ def main() -> None:
             "--num-requests cannot exceed --max-num-seqs: "
             f"{args.num_requests} > {args.max_num_seqs}"
         )
+    if args.prompt_token_lengths and (
+        len(args.prompt_token_lengths) != args.num_requests
+    ):
+        raise ValueError(
+            "--prompt-token-lengths must contain exactly --num-requests "
+            f"entries: got {len(args.prompt_token_lengths)} lengths for "
+            f"{args.num_requests} requests"
+        )
+    if (
+        args.prompt_token_lengths
+        and max(args.prompt_token_lengths) > args.max_model_len
+    ):
+        raise ValueError(
+            "--prompt-token-lengths cannot exceed --max-model-len: "
+            f"max={max(args.prompt_token_lengths)}, "
+            f"max_model_len={args.max_model_len}"
+        )
+    serial_example.decode_dynamic_sp_kwargs(args)
     if args.temperature <= 1e-10:
         raise ValueError(
             "NanoDeploy does not support temperature=0; use a small positive value"
@@ -256,14 +333,29 @@ def main() -> None:
     prompts = select_prompts(args)
     for request_index, prompt in enumerate(prompts):
         print(f"Request[{request_index}] prompt: {prompt}", flush=True)
-    sequences = [
-        serial_example.make_sequence(
-            tokenizer,
-            prompt,
-            sampling_params,
-        )
-        for prompt in prompts
-    ]
+    if args.prompt_token_lengths:
+        sequences = [
+            make_sequence_with_token_length(
+                tokenizer,
+                prompt,
+                sampling_params,
+                target_length,
+            )
+            for prompt, target_length in zip(
+                prompts,
+                args.prompt_token_lengths,
+                strict=True,
+            )
+        ]
+    else:
+        sequences = [
+            serial_example.make_sequence(
+                tokenizer,
+                prompt,
+                sampling_params,
+            )
+            for prompt in prompts
+        ]
     print(
         f"Submitting {len(sequences)} requests in one batch",
         flush=True,

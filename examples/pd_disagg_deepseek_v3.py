@@ -57,11 +57,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decode-loop-count", type=int, default=1)
     parser.add_argument(
         "--decode-topology",
-        choices=("dp8", "sp8"),
+        choices=("dp8", "sp8", "bucket-sp8"),
         default="sp8",
         help=(
             "Decode attention topology: dp8 uses DP8/SP1 and isolates local "
-            "decode/CUDA Graph; sp8 uses the production-like DP1/SP8 path."
+            "decode/CUDA Graph; sp8 uses fixed DP1/SP8; bucket-sp8 uses "
+            "DP1/SP8 with dynamic SP bucket scheduling."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-sp-bucket-policy",
+        default="",
+        help=(
+            "Explicit scheduler policy for --decode-topology bucket-sp8, for "
+            "example '1:1-127;5:128-383;6:384-639;7:640-895;"
+            "8:896-4096'."
+        ),
+    )
+    parser.add_argument(
+        "--non-uniform-split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable non-uniform KV placement for bucket-sp8 (default: "
+            "enabled). Use --no-non-uniform-split only for comparison."
         ),
     )
     parser.add_argument(
@@ -110,7 +129,29 @@ def parse_args() -> argparse.Namespace:
 def decode_topology(args: argparse.Namespace) -> tuple[int, int, int]:
     if args.decode_topology == "dp8":
         return 8, 1, 0
-    return 1, 8, 8
+    if args.decode_topology == "sp8":
+        return 1, 8, 8
+    return 1, 8, 0
+
+
+def decode_dynamic_sp_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    if args.decode_topology != "bucket-sp8":
+        return {
+            "dynamic_sp_size_strategy": "legacy",
+            "dynamic_sp_bucket_policy": "",
+            "enable_non_uniform_split": False,
+        }
+    policy = args.dynamic_sp_bucket_policy.strip()
+    if not policy:
+        raise ValueError(
+            "--dynamic-sp-bucket-policy is required with "
+            "--decode-topology bucket-sp8"
+        )
+    return {
+        "dynamic_sp_size_strategy": "bucket",
+        "dynamic_sp_bucket_policy": policy,
+        "enable_non_uniform_split": args.non_uniform_split,
+    }
 
 
 def configure_driver_environment() -> dict[str, str]:
@@ -169,6 +210,7 @@ def validate_ray_cluster(
 
 def build_decode(args: argparse.Namespace) -> LLM:
     attention_dp, attention_sp, fixed_sp_size = decode_topology(args)
+    dynamic_sp_kwargs = decode_dynamic_sp_kwargs(args)
     print(
         "Creating decode engine first:",
         args.decode_master_address,
@@ -198,6 +240,7 @@ def build_decode(args: argparse.Namespace) -> LLM:
         dummy_prefill=False,
         dummy_weight=args.dummy_weight,
         fixed_sp_size=fixed_sp_size,
+        **dynamic_sp_kwargs,
         sp_backend=args.sp_backend,
         optimize_decode_block_table=args.optimize_decode_block_table,
         kvcache_block_size=64,
