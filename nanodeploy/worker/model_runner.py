@@ -7,8 +7,6 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-import flash_mla
-
 
 from nanodeploy._cpp import (
     BlockContextSlot,
@@ -47,6 +45,7 @@ from nanodeploy.worker.ep_context import (
     set_ep_context,
 )
 from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.mla_metadata import prepare_decode_mla_metadata
 from nanodeploy.worker.prefill_logits import compute_prefill_logits
 from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
@@ -853,18 +852,6 @@ class ModelRunner:
                 packed_rows, dtype=torch.int64, pin_memory=True
             ).cuda(non_blocking=True)
 
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads == 1:
-            # new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-            #     context_lens_for_attn.view(-1),
-            #     hf_config.num_attention_heads // hf_config.num_key_value_heads,
-            #     hf_config.num_key_value_heads,
-            # )
-            new_tile_scheduler_metadata, new_num_splits = None, None
-        else:
-            new_tile_scheduler_metadata, new_num_splits = None, None
-
         set_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
@@ -892,8 +879,8 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
-            tile_scheduler_metadata=new_tile_scheduler_metadata,
-            num_splits=new_num_splits,
+            tile_scheduler_metadata=None,
+            num_splits=None,
         )
 
         return input_ids, positions
@@ -1025,12 +1012,6 @@ class ModelRunner:
 
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = context.slot_mapping  # type: ignore
-
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads == 1 and graph_vars.get("tile_scheduler_metadata") is not None:
-            graph_vars["tile_scheduler_metadata"].zero_()
-            graph_vars["num_splits"].zero_()
 
         fixed_full_sp_graph = (
             context.use_sp_a2a
@@ -1334,10 +1315,19 @@ class ModelRunner:
         if is_prefill:
             return compute_prefill_logits(self.model, input_ids, positions)
 
-        if self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-
         context = get_context()
+        if self.enforce_eager or input_ids.size(0) > 512:
+            attention_compute_bs = context.attention_compute_bs or input_ids.size(0)
+            if context.context_lens_for_attn is None:
+                raise RuntimeError("Decode context is missing FlashMLA sequence lengths")
+            (
+                context.tile_scheduler_metadata,
+                context.num_splits,
+            ) = prepare_decode_mla_metadata(
+                self.config.hf_config,
+                context.context_lens_for_attn[:attention_compute_bs],
+            )
+            return self.model.compute_logits(self.model(input_ids, positions))
 
         if self.cuda_graph_mode == "piecewise":
             return self.run_model_piecewise_cudagraph(input_ids, positions)
@@ -1363,11 +1353,18 @@ class ModelRunner:
 
             graph = self.sp_graphs[(master_bs, attn_bs)]
         else:
+            attn_bs = master_bs
             graph = self.local_graphs[master_bs]
 
         graph_vars = self.graph_vars
         self._copy_decode_context_to_graph_vars(
             graph_vars, input_ids, positions, bs, master_bs, context
+        )
+        prepare_decode_mla_metadata(
+            self.config.hf_config,
+            graph_vars["context_lens_for_attn"][:attn_bs],
+            graph_vars["tile_scheduler_metadata"],
+            graph_vars["num_splits"],
         )
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -1394,6 +1391,13 @@ class ModelRunner:
                 get_dist_context().attn_sp_world_size * master_bs
             )
 
+        if attention_compute_bs is None:
+            attention_compute_bs = bs
+        tile_scheduler_metadata, num_splits = prepare_decode_mla_metadata(
+            self.config.hf_config,
+            graph_vars["context_lens_for_attn"][:attention_compute_bs],
+        )
+
         temp_context_fields = {
             "slot_mapping": graph_vars["slot_mapping"][:master_bs],
             "context_lens": graph_vars["context_lens"],
@@ -1401,8 +1405,8 @@ class ModelRunner:
             "global_context_lens": graph_vars["global_context_lens"],
             "q_mask": graph_vars["q_mask"],
             "res_lse_mask": graph_vars["res_lse_mask"],
-            "tile_scheduler_metadata": graph_vars["tile_scheduler_metadata"],
-            "num_splits": graph_vars["num_splits"],
+            "tile_scheduler_metadata": tile_scheduler_metadata,
+            "num_splits": num_splits,
             "q_slice_get": graph_vars["q_slice_get"][:master_bs],
             "q_slice_fill": graph_vars["q_slice_fill"][:master_bs],
             "q_copy_mask": graph_vars["q_copy_mask"][:master_bs],
@@ -1843,12 +1847,13 @@ class ModelRunner:
 
         if hf_config.num_key_value_heads == 1:
             tile_scheduler_metadata_buffer, num_splits_buffer = (
-                flash_mla.get_mla_metadata(
+                prepare_decode_mla_metadata(
+                    hf_config,
                     torch.ones(
-                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
+                        max_attention_comp_seqs,
+                        dtype=torch.int32,
+                        device="cuda",
                     ),
-                    hf_config.num_attention_heads // hf_config.num_key_value_heads,
-                    hf_config.num_key_value_heads,
                 )
             )
         else:
@@ -1863,6 +1868,14 @@ class ModelRunner:
 
         def capture_graph(master_bs: int, attn_bs: int, use_sp_a2a: bool):
             graph = torch.cuda.CUDAGraph()
+            context_lens_for_attn.zero_()
+            context_lens_for_attn[:attn_bs].fill_(1)
+            tile_scheduler_metadata, num_splits = prepare_decode_mla_metadata(
+                hf_config,
+                context_lens_for_attn[:attn_bs],
+                tile_scheduler_metadata_buffer,
+                num_splits_buffer,
+            )
             set_context(
                 is_prefill=False,
                 max_bs=self.config.max_num_seqs,
@@ -1890,8 +1903,8 @@ class ModelRunner:
                 sp_comm_bs=master_bs,
                 context_lens_for_attn=context_lens_for_attn,
                 q_offsets=q_offsets,
-                tile_scheduler_metadata=tile_scheduler_metadata_buffer,
-                num_splits=num_splits_buffer,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
             )
 
             outputs[:master_bs] = self.model(

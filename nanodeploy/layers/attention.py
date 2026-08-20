@@ -456,22 +456,26 @@ class FlashMLAImpl:
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                # tile_scheduler_metadata = context.tile_scheduler_metadata
-                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
             else:
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                # tile_scheduler_metadata = context.tile_scheduler_metadata
-                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
 
-            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-                context_lens,
-                self.num_heads // self.num_kv_heads,
-                self.num_kv_heads,
-            )
+            tile_scheduler_metadata = context.tile_scheduler_metadata
+            num_splits = context.num_splits
+            if tile_scheduler_metadata is None or num_splits is None:
+                raise RuntimeError(
+                    "FlashMLA decode metadata must be prepared once before "
+                    "running transformer layers"
+                )
+            expected_num_splits = context_lens.numel() + 1
+            if num_splits.numel() != expected_num_splits:
+                raise RuntimeError(
+                    "FlashMLA decode split metadata has the wrong batch shape: "
+                    f"got={num_splits.numel()} expected={expected_num_splits}"
+                )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),
