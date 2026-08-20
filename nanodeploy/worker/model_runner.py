@@ -51,6 +51,7 @@ from nanodeploy.worker.prefill_logits import compute_prefill_logits
 from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
+from nanodeploy.worker.sp_graph_policy import is_full_sp_graph_batch_uniform
 
 logger = get_logger()
 
@@ -93,6 +94,7 @@ class ModelRunner:
         self._deepep_enabled = False
         self._deepep_destroyed = False
         self._exited = False
+        self._logged_nonuniform_sp_graph_fallback = False
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -818,6 +820,9 @@ class ModelRunner:
         attention_compute_bs = (
             context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
         )
+        sp_graph_batch_uniform = is_full_sp_graph_batch_uniform(
+            dp_seqs, sp_size
+        )
 
         config = self.config
         hf_config = config.hf_config
@@ -845,6 +850,7 @@ class ModelRunner:
             context_lens_for_attn=context_lens_for_attn,
             attention_compute_bs=attention_compute_bs,
             sp_comm_bs=sp_comm_bs,
+            sp_graph_batch_uniform=sp_graph_batch_uniform,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
             q_copy_mask=q_copy_mask,
@@ -1077,11 +1083,28 @@ class ModelRunner:
         if self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
 
+        context = get_context()
+        sp_world_size = get_dist_context().attn_sp_world_size
+        fixed_full_sp_graph = (
+            context.use_sp_a2a
+            and sp_world_size > 1
+            and self.config.fixed_sp_size == sp_world_size
+        )
+        if fixed_full_sp_graph and not context.sp_graph_batch_uniform:
+            if not self._logged_nonuniform_sp_graph_fallback:
+                logger.warning(
+                    "Falling back to eager decode because the fixed-full-SP "
+                    "batch contains a sequence that does not participate on "
+                    "every SP rank; all ranks use the shared placement "
+                    "metadata to make this decision"
+                )
+                self._logged_nonuniform_sp_graph_fallback = True
+            return self.model.compute_logits(self.model(input_ids, positions))
+
         if self.cuda_graph_mode == "piecewise":
             return self.run_model_piecewise_cudagraph(input_ids, positions)
 
         bs = input_ids.size(0)
-        context = get_context()
         master_bs = self._select_decode_graph_master_bs(bs, context)
 
         if context.use_sp_a2a:

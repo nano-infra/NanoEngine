@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decode_cpp
+from nanodeploy.worker.sp_graph_policy import is_full_sp_graph_batch_uniform
 
 
 _SP_SIZE = 8
@@ -329,3 +330,45 @@ def test_fixed_sp8_batch_metadata_roundtrips_distinct_request_identities():
             assert combined_by_master[master][participant][1:] == [None] * (
                 _MAX_NUM_SEQS - 1
             )
+
+
+def test_fixed_sp8_graph_policy_falls_back_consistently_after_eos():
+    """A rank-local control dummy must disable Graph replay on every rank.
+
+    Before EOS, each of the eight requests has KV on all eight SP ranks, so a
+    fixed ``attn_bs=8`` graph is valid everywhere.  Once request 0 is replaced
+    by its persistent rank-0 control dummy, rank 0 still has eight attention
+    rows while ranks 1..7 have only seven.  The Graph decision must therefore
+    come from shared placement metadata instead of either local row count.
+    """
+
+    batch = _schedule_fixed_sp_batch(8)
+    assert is_full_sp_graph_batch_uniform(batch.scheduled, _SP_SIZE)
+
+    remaining = [
+        sequence
+        for sequence in batch.scheduled
+        if sequence.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx != 0
+    ]
+    rank_zero_dummy = batch.scheduler.worker_state[0].dummy_seqs[0]
+    after_eos = tuple(remaining + [rank_zero_dummy])
+
+    attention_rows_by_rank = [
+        len(
+            prepare_decode_cpp(
+                list(after_eos),
+                sp_rank,
+                _SP_SIZE,
+                _BLOCK_SIZE,
+                _MAX_NUM_SEQS,
+            ).context_lens_for_attn
+        )
+        for sp_rank in range(_SP_SIZE)
+    ]
+    assert attention_rows_by_rank == [8] + [7] * 7
+
+    decisions = [
+        is_full_sp_graph_batch_uniform(after_eos, _SP_SIZE)
+        for _ in range(_SP_SIZE)
+    ]
+    assert decisions == [False] * _SP_SIZE

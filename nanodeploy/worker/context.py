@@ -46,6 +46,7 @@ class Context:
     res_to_buffer_input_mask: Optional[torch.Tensor] = None
     attention_compute_bs: Optional[int] = None
     sp_comm_bs: Optional[int] = None
+    sp_graph_batch_uniform: bool = True
 
     # used for all2all q transfer
     q_offsets: torch.Tensor | None = None
@@ -89,6 +90,7 @@ def set_context(
     res_to_buffer_input_mask: Optional[torch.Tensor] = None,
     attention_compute_bs: Optional[int] = None,
     sp_comm_bs: Optional[int] = None,
+    sp_graph_batch_uniform: bool = True,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None,
@@ -123,6 +125,7 @@ def set_context(
         res_to_buffer_input_mask=res_to_buffer_input_mask,
         attention_compute_bs=attention_compute_bs,
         sp_comm_bs=sp_comm_bs,
+        sp_graph_batch_uniform=sp_graph_batch_uniform,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
         prefill_cu_seqlens_q_host=prefill_cu_seqlens_q_host,
