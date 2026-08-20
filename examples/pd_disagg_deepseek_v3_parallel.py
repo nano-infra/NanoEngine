@@ -6,7 +6,6 @@ the synchronization barrier before KV-transfer setup begins.
 """
 
 import argparse
-import itertools
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +15,6 @@ import ray
 from transformers import AutoTokenizer
 
 from nanodeploy import LLM, SamplingParams
-from nanodeploy.engine.sequence import Sequence
 
 import pd_disagg_deepseek_v3 as serial_example
 
@@ -31,6 +29,50 @@ DEFAULT_BATCH_PROMPTS = (
     "请给出三个提高 Python 程序运行效率的通用方法。",
     "假设你要设计一个可靠的分布式服务，应优先考虑哪些故障场景？",
 )
+
+LONG_PROMPT_BACKGROUNDS = (
+    (
+        "天体在引力作用下运动时仍保有沿轨道切线方向的速度。理解轨道需要"
+        "区分引力、惯性、向心加速度、轨道速度和能量守恒，并说明持续自由"
+        "落体与直接撞向地面的区别。"
+    ),
+    (
+        "太阳光进入水滴后会经历折射、色散、内部反射和再次折射。不同波长"
+        "的光偏折角度不同，观察者、太阳和水滴之间的几何关系也会影响彩虹"
+        "的可见位置、颜色顺序和亮度。"
+    ),
+    (
+        "空气能够容纳的水蒸气数量与温度有关。靠近冰水杯的空气被冷却后，"
+        "相对湿度会上升；当温度低于露点时，水蒸气会在杯壁表面形成液态"
+        "小水滴，这与杯内液体渗漏是不同过程。"
+    ),
+    (
+        "评价太阳能和风能时，需要同时考虑资源波动、地域差异、建设周期、"
+        "土地利用、设备寿命、储能需求、电网调节能力以及全生命周期成本，"
+        "不能只比较发电阶段是否产生碳排放。"
+    ),
+    (
+        "随着海拔升高，大气压和氧分压会下降。人体可能通过加快呼吸、提高"
+        "心率以及长期增加红细胞数量来适应，但适应速度和个体差异会影响"
+        "缺氧症状，高原反应也需要与普通疲劳区分。"
+    ),
+    (
+        "机会成本描述为了选择一个方案而放弃的最佳替代方案价值。分析生活"
+        "决策时，应明确可选方案、时间和资金约束，并避免把已经无法收回的"
+        "沉没成本误当作机会成本。"
+    ),
+    (
+        "优化 Python 程序前应先通过基准测试和性能分析定位瓶颈，再考虑改进"
+        "算法复杂度、选择合适的数据结构、减少重复计算和对象分配、使用"
+        "向量化或并行工具，并用测试确认优化没有改变结果。"
+    ),
+    (
+        "可靠的分布式服务需要考虑进程崩溃、机器宕机、网络分区、消息重复或"
+        "乱序、依赖超时、磁盘故障、时钟偏差和流量突增。设计时还要明确一致"
+        "性目标、幂等边界、重试策略、容量余量、观测手段和故障恢复流程。"
+    ),
+)
+
 
 def parse_positive_int_csv(value: str) -> tuple[int, ...]:
     try:
@@ -74,8 +116,9 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_int_csv,
         default=(),
         help=(
-            "Optional exact prompt-token lengths, one per request. Padding is "
-            "inserted before the assistant marker. The eight-request bucket "
+            "Optional exact prompt-token lengths, one per request. Long textual "
+            "background material is generated before normal chat tokenization; "
+            "token IDs are never injected as padding. The eight-request bucket "
             "smoke uses 2048,1792,1536,1280,1024,768,512,500."
         ),
     )
@@ -186,38 +229,102 @@ def _timed_build(
     return engine, elapsed
 
 
-def make_sequence_with_token_length(
-    tokenizer,
-    prompt: str,
-    sampling_params: SamplingParams,
-    target_length: int,
-) -> Sequence:
-    prompt_token_ids = list(
+def _chat_prompt_token_ids(tokenizer, prompt: str) -> list[int]:
+    return list(
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=True,
             add_generation_prompt=True,
         )
     )
-    if target_length < len(prompt_token_ids):
+
+
+def make_long_prompt_with_token_length(
+    tokenizer,
+    prompt: str,
+    background: str,
+    target_length: int,
+) -> str:
+    """Build real long-form text whose chat-template length is exact."""
+
+    introduction = (
+        "请阅读下面的背景材料，然后回答文末问题。\n\n"
+        f"原始问题：{prompt}\n\n"
+        "背景材料：\n"
+    )
+    conclusion = (
+        "\n\n请只依据上述材料，用清晰、准确的语言回答原始问题："
+        f"{prompt}"
+    )
+    minimum_length = len(
+        _chat_prompt_token_ids(tokenizer, introduction + conclusion)
+    )
+    if target_length < minimum_length:
         raise ValueError(
-            "--prompt-token-lengths entry is shorter than its tokenized "
-            f"prompt: target={target_length}, actual={len(prompt_token_ids)}"
+            "--prompt-token-lengths entry is too short for the textual prompt: "
+            f"target={target_length}, minimum={minimum_length}"
         )
 
-    missing = target_length - len(prompt_token_ids)
-    filler_token_ids = tokenizer.encode("\n", add_special_tokens=False)
-    if not filler_token_ids:
-        raise RuntimeError("Tokenizer produced no token for the prompt filler")
-    filler = list(itertools.islice(itertools.cycle(filler_token_ids), missing))
-    # DeepSeek's final chat-template token is the assistant marker. Keep all
-    # special-token ordering intact and place harmless newlines immediately
-    # before it.
-    prompt_token_ids[-1:-1] = filler
-    if len(prompt_token_ids) != target_length:
-        raise AssertionError("Failed to construct the requested prompt length")
-    print(f"Prompt tokens: {len(prompt_token_ids)}", flush=True)
-    return Sequence(prompt_token_ids, sampling_params=sampling_params)
+    paragraphs: list[str] = []
+    paragraph_index = 1
+    while True:
+        paragraphs.append(
+            f"第{paragraph_index:04d}段：{background}\n"
+        )
+        material = "".join(paragraphs)
+        candidate = introduction + material + conclusion
+        if len(_chat_prompt_token_ids(tokenizer, candidate)) >= target_length + 128:
+            break
+        paragraph_index += 1
+
+    # Select a textual prefix near the target. Token length is almost
+    # monotonic in character count, but BPE merges can skip an individual
+    # length. Small, meaningful textual suffixes bridge those rare gaps.
+    low = 0
+    high = len(material)
+    while low < high:
+        middle = (low + high) // 2
+        candidate = introduction + material[:middle] + conclusion
+        if len(_chat_prompt_token_ids(tokenizer, candidate)) < target_length:
+            low = middle + 1
+        else:
+            high = middle
+
+    adjustments = (
+        "",
+        "请",
+        "补充",
+        "务必",
+        "以上。",
+        "请注意。",
+        "请核对条件。",
+        "不要遗漏条件。",
+    )
+    first_offset = min(len(material), low + 8)
+    last_offset = max(0, low - 128)
+    for offset in range(first_offset, last_offset - 1, -1):
+        material_prefix = material[:offset]
+        for adjustment in adjustments:
+            candidate = (
+                introduction
+                + material_prefix
+                + adjustment
+                + conclusion
+            )
+            if len(_chat_prompt_token_ids(tokenizer, candidate)) == target_length:
+                return candidate
+
+    raise RuntimeError(
+        "Could not construct real prompt text with the requested token length: "
+        f"target={target_length}"
+    )
+
+
+def prompt_preview(prompt: str, limit: int = 160) -> str:
+    compact = " ".join(prompt.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
 
 
 def build_engines_parallel(
@@ -330,32 +437,51 @@ def main() -> None:
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
     )
-    prompts = select_prompts(args)
-    for request_index, prompt in enumerate(prompts):
-        print(f"Request[{request_index}] prompt: {prompt}", flush=True)
+    base_prompts = select_prompts(args)
     if args.prompt_token_lengths:
-        sequences = [
-            make_sequence_with_token_length(
+        prompts = [
+            make_long_prompt_with_token_length(
                 tokenizer,
                 prompt,
-                sampling_params,
+                background,
                 target_length,
             )
-            for prompt, target_length in zip(
-                prompts,
+            for prompt, background, target_length in zip(
+                base_prompts,
+                LONG_PROMPT_BACKGROUNDS[: len(base_prompts)],
                 args.prompt_token_lengths,
                 strict=True,
             )
         ]
     else:
-        sequences = [
-            serial_example.make_sequence(
-                tokenizer,
-                prompt,
-                sampling_params,
-            )
-            for prompt in prompts
-        ]
+        prompts = base_prompts
+
+    prompt_token_lengths = [
+        len(_chat_prompt_token_ids(tokenizer, prompt))
+        for prompt in prompts
+    ]
+    for request_index, (base_prompt, prompt, token_length) in enumerate(
+        zip(base_prompts, prompts, prompt_token_lengths, strict=True)
+    ):
+        print(
+            f"Request[{request_index}] question: {base_prompt}",
+            flush=True,
+        )
+        print(
+            f"Request[{request_index}] actual prompt: "
+            f"tokens={token_length}, chars={len(prompt)}, "
+            f"preview={prompt_preview(prompt)}",
+            flush=True,
+        )
+
+    sequences = [
+        serial_example.make_sequence(
+            tokenizer,
+            prompt,
+            sampling_params,
+        )
+        for prompt in prompts
+    ]
     print(
         f"Submitting {len(sequences)} requests in one batch",
         flush=True,
@@ -403,8 +529,8 @@ def main() -> None:
             )
         prefill.free_to_be_migrated(sequences)
 
-        for request_index, (prompt, sequence) in enumerate(
-            zip(prompts, sequences, strict=True)
+        for request_index, (base_prompt, prompt, sequence) in enumerate(
+            zip(base_prompts, prompts, sequences, strict=True)
         ):
             completion_token_ids = list(sequence.completion_token_ids)
             completion_length = len(completion_token_ids)
@@ -424,8 +550,14 @@ def main() -> None:
                 skip_special_tokens=True,
             )
             print(
-                f"Request[{request_index}] prompt:",
-                prompt,
+                f"Request[{request_index}] question:",
+                base_prompt,
+                flush=True,
+            )
+            print(
+                f"Request[{request_index}] actual prompt:",
+                f"tokens={len(sequence.prompt_token_ids)}, "
+                f"chars={len(prompt)}, preview={prompt_preview(prompt)}",
                 flush=True,
             )
             print(
