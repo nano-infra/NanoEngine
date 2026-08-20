@@ -6,10 +6,10 @@
 
 ## Build, Test, and Development Commands
 
-- `python -m pip install -v -e .` builds the CMake/Ninja extension and installs NanoDeploy in editable mode. Re-run it after changing C++ or bindings.
-- `python -m pytest tests/test_hierarchical_control_plane.py` runs a focused CPU-friendly test module.
-- `python -m pytest tests` runs test discovery; expect some suites to require CUDA, Ray, compiled extensions, or project-specific dependencies.
-- `python tests/test_sequence_proxy.py` runs the standalone sequence proxy checks without pytest.
+- `python3 -m pip install -v -e .` builds the CMake/Ninja extension and installs NanoDeploy in editable mode. Re-run it after changing C++ or bindings.
+- `python3 -m pytest tests/test_hierarchical_control_plane.py` runs a focused CPU-friendly test module.
+- `python3 -m pytest tests` runs test discovery; expect some suites to require CUDA, Ray, compiled extensions, or project-specific dependencies.
+- `python3 tests/test_sequence_proxy.py` runs the standalone sequence proxy checks without pytest.
 - `torchrun --nproc_per_node=4 tests/test_mla_sp_backend_correctness.py --mode eager` exercises the distributed SP backend on four visible GPUs. Adjust process count to the intended SP size.
 
 ## Coding Style & Naming Conventions
@@ -22,6 +22,7 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
 
 ## Agent-Specific Repository Instructions
 
+- Use `python3` for all Python commands. Do not invoke `python` or `uv run`, and do not create or modify a virtual environment unless the user explicitly requests it.
 - Use these local model snapshots for DeepSeek V3 and Kimi K2 Instruct 0905:
 
   ```text
@@ -52,7 +53,7 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
   export SLIME_QP_NUM=4
   ```
 
-- After changing C++ sources, reinstall with `pip install -v -e .` before running the full project.
+- After changing C++ sources, reinstall with `python3 -m pip install -v -e .` before running the full project.
 - Modify NanoDeploy code only; do not patch external dependency libraries.
 - Save useful interim reasoning or research notes under `docs-dev/` for later reference.
 - Subagents may be used for suitable independent work.
