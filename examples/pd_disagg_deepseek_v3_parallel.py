@@ -19,6 +19,57 @@ from nanodeploy import LLM, SamplingParams
 import pd_disagg_deepseek_v3 as serial_example
 
 
+DEFAULT_BATCH_PROMPTS = (
+    "请用三句话解释月亮为什么不会掉到地球上。",
+    "请说明彩虹是怎样形成的，并解释为什么通常能看到多种颜色。",
+    "如果一个水杯装满冰水，杯子外壁为什么会出现水珠？",
+    "请比较太阳能和风能各自的主要优点与局限。",
+    "为什么人在高海拔地区更容易感到呼吸困难？",
+    "请用一个简单的生活例子解释什么是机会成本。",
+    "请给出三个提高 Python 程序运行效率的通用方法。",
+    "假设你要设计一个可靠的分布式服务，应优先考虑哪些故障场景？",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = serial_example.build_arg_parser()
+    parser.description = (
+        "Run concurrent DeepSeek-V3 requests through a two-node "
+        "prefill/decode-disaggregated deployment with parallel engine "
+        "initialization."
+    )
+    parser.add_argument(
+        "--num-requests",
+        type=int,
+        default=1,
+        help=(
+            "Number of requests to enqueue together. Batches use distinct "
+            "built-in prompts (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Continue decoding after EOS until --max-tokens. By default EOS "
+            "stops each request."
+        ),
+    )
+    return parser.parse_args()
+
+
+def select_prompts(args: argparse.Namespace) -> list[str]:
+    if args.num_requests == 1:
+        return [args.prompt]
+    if args.num_requests > len(DEFAULT_BATCH_PROMPTS):
+        raise ValueError(
+            "--num-requests exceeds the number of built-in batch prompts: "
+            f"{args.num_requests} > {len(DEFAULT_BATCH_PROMPTS)}"
+        )
+    return list(DEFAULT_BATCH_PROMPTS[: args.num_requests])
+
+
 def build_decode(args: argparse.Namespace) -> LLM:
     attention_dp, attention_sp, fixed_sp_size = serial_example.decode_topology(args)
     print(
@@ -161,9 +212,16 @@ def build_engines_parallel(
 
 
 def main() -> None:
-    args = serial_example.parse_args()
+    args = parse_args()
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive")
+    if args.num_requests <= 0:
+        raise ValueError("--num-requests must be positive")
+    if args.num_requests > args.max_num_seqs:
+        raise ValueError(
+            "--num-requests cannot exceed --max-num-seqs: "
+            f"{args.num_requests} > {args.max_num_seqs}"
+        )
     if args.temperature <= 1e-10:
         raise ValueError(
             "NanoDeploy does not support temperature=0; use a small positive value"
@@ -193,12 +251,22 @@ def main() -> None:
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
-        ignore_eos=True,
+        ignore_eos=args.ignore_eos,
     )
-    sequence = serial_example.make_sequence(
-        tokenizer,
-        args.prompt,
-        sampling_params,
+    prompts = select_prompts(args)
+    for request_index, prompt in enumerate(prompts):
+        print(f"Request[{request_index}] prompt: {prompt}", flush=True)
+    sequences = [
+        serial_example.make_sequence(
+            tokenizer,
+            prompt,
+            sampling_params,
+        )
+        for prompt in prompts
+    ]
+    print(
+        f"Submitting {len(sequences)} requests in one batch",
+        flush=True,
     )
 
     decode: LLM | None = None
@@ -209,47 +277,83 @@ def main() -> None:
         serial_example.connect_kv_transfer(prefill, decode)
 
         prefill_begin = time.perf_counter()
-        prefill.add_request(sequence)
+        prefill.add_request(sequences)
         prefill.generate(use_tqdm=False)
         print(
             f"Prefill completed in {time.perf_counter() - prefill_begin:.3f}s",
             flush=True,
         )
-        prefill_token_count = serial_example.report_completion_stage(
-            tokenizer,
-            sequence,
-            "Prefill",
-        )
+        prefill_token_counts = [
+            serial_example.report_completion_stage(
+                tokenizer,
+                sequence,
+                f"Prefill request[{request_index}]",
+            )
+            for request_index, sequence in enumerate(sequences)
+        ]
 
         decode_begin = time.perf_counter()
-        decode.add_request(sequence)
+        decode.add_request(sequences)
         decode.generate(use_tqdm=False)
         print(
             "KV migration and decode completed in "
             f"{time.perf_counter() - decode_begin:.3f}s",
             flush=True,
         )
-        serial_example.report_completion_stage(
-            tokenizer,
-            sequence,
-            "Decode",
-            previous_count=prefill_token_count,
-        )
-        prefill.free_to_be_migrated(sequence)
-
-        completion_token_ids = list(sequence.completion_token_ids)
-        if len(completion_token_ids) != args.max_tokens:
-            raise RuntimeError(
-                "Unexpected completion length: "
-                f"expected {args.max_tokens}, got {len(completion_token_ids)}"
+        for request_index, (sequence, prefill_token_count) in enumerate(
+            zip(sequences, prefill_token_counts, strict=True)
+        ):
+            serial_example.report_completion_stage(
+                tokenizer,
+                sequence,
+                f"Decode request[{request_index}]",
+                previous_count=prefill_token_count,
             )
-        completion = tokenizer.decode(
-            completion_token_ids,
-            skip_special_tokens=True,
+        prefill.free_to_be_migrated(sequences)
+
+        for request_index, (prompt, sequence) in enumerate(
+            zip(prompts, sequences, strict=True)
+        ):
+            completion_token_ids = list(sequence.completion_token_ids)
+            completion_length = len(completion_token_ids)
+            if not 0 < completion_length <= args.max_tokens:
+                raise RuntimeError(
+                    f"Request[{request_index}] invalid completion length: "
+                    f"expected 1..{args.max_tokens}, got {completion_length}"
+                )
+            if args.ignore_eos and completion_length != args.max_tokens:
+                raise RuntimeError(
+                    f"Request[{request_index}] completion length mismatch "
+                    "with --ignore-eos: "
+                    f"expected {args.max_tokens}, got {completion_length}"
+                )
+            completion = tokenizer.decode(
+                completion_token_ids,
+                skip_special_tokens=True,
+            )
+            print(
+                f"Request[{request_index}] prompt:",
+                prompt,
+                flush=True,
+            )
+            print(
+                f"Request[{request_index}] completion token IDs:",
+                completion_token_ids,
+                flush=True,
+            )
+            print(
+                f"Request[{request_index}] completion:",
+                completion,
+                flush=True,
+            )
+        print(
+            "DeepSeek-V3 parallel-init P/D smoke passed:",
+            f"requests={len(sequences)}",
+            f"max_tokens_per_request={args.max_tokens}",
+            "completion_lengths="
+            f"{[len(sequence.completion_token_ids) for sequence in sequences]}",
+            flush=True,
         )
-        print("Completion token IDs:", completion_token_ids, flush=True)
-        print("Completion:", completion, flush=True)
-        print("DeepSeek-V3 parallel-init P/D smoke passed", flush=True)
     finally:
         serial_example.close_engine(prefill, "prefill")
         serial_example.close_engine(decode, "decode")

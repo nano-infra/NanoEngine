@@ -31,7 +31,7 @@ RDMA_ENV_DEFAULTS = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one DeepSeek-V3 request through a two-node "
@@ -100,7 +100,11 @@ def parse_args() -> argparse.Namespace:
             "default for the first correctness smoke."
         ),
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_arg_parser().parse_args()
 
 
 def decode_topology(args: argparse.Namespace) -> tuple[int, int, int]:
