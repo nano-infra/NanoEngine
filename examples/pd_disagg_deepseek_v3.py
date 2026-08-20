@@ -70,8 +70,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Explicit scheduler policy for --decode-topology bucket-sp8, for "
-            "example '1:1-127;5:128-383;6:384-639;7:640-895;"
-            "8:896-4096'."
+            "example '1:1-512;5:513-768;6:769-1024;7:1025-1280;"
+            "8:1281-4096'."
         ),
     )
     parser.add_argument(

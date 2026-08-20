@@ -6,11 +6,11 @@ from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decod
 _SP_SIZE = 8
 _MAX_NUM_SEQS = 8
 _BLOCK_SIZE = 64
-_SHORT_BUCKET_POLICY = (
-    "1:1-127;5:128-383;6:384-639;7:640-895;8:896-4096"
+_LONG_PROMPT_BUCKET_POLICY = (
+    "1:1-512;5:513-768;6:769-1024;7:1025-1280;8:1281-4096"
 )
-_PROMPT_LENGTHS = (1024, 768, 512, 256, 64)
-_EXPECTED_SP_SIZES = (8, 7, 6, 5, 1)
+_PROMPT_LENGTHS = (2048, 1792, 1536, 1280, 1024, 768, 512, 500)
+_EXPECTED_SP_SIZES = (8, 8, 8, 7, 6, 5, 1, 1)
 
 
 def _make_scheduler() -> Scheduler:
@@ -30,7 +30,7 @@ def _make_scheduler() -> Scheduler:
         65536,
         "bucket",
         True,
-        _SHORT_BUCKET_POLICY,
+        _LONG_PROMPT_BUCKET_POLICY,
         True,
         "LeastBatch",
         0,
@@ -60,8 +60,8 @@ def _schedule_mixed_bucket_batch():
     return scheduler, tuple(sequences), tuple(decode.dp_seqs[0]), decode
 
 
-def test_short_bucket_policy_activates_all_production_sp_sizes():
-    """The compressed policy must exercise real SP1/5/6/7/8 placement."""
+def test_long_prompt_bucket_policy_activates_all_requested_sp_sizes():
+    """The 500--2K prompt mix must exercise real SP1/5/6/7/8 placement."""
 
     _, sequences, _, decode = _schedule_mixed_bucket_batch()
     actual_sp_sizes = []
@@ -74,7 +74,7 @@ def test_short_bucket_policy_activates_all_production_sp_sizes():
 
     assert tuple(actual_sp_sizes) == _EXPECTED_SP_SIZES
     histogram = list(decode.sp_size_hist_per_dp[0])
-    assert histogram == [0, 1, 0, 0, 0, 1, 1, 1, 1]
+    assert histogram == [0, 2, 0, 0, 0, 1, 1, 1, 3]
 
 
 def test_mixed_bucket_decode_metadata_keeps_only_participating_rows():

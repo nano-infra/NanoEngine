@@ -75,8 +75,8 @@ def parse_args() -> argparse.Namespace:
         default=(),
         help=(
             "Optional exact prompt-token lengths, one per request. Padding is "
-            "inserted before the assistant marker. The short five-bucket "
-            "smoke uses 1024,768,512,256,64."
+            "inserted before the assistant marker. The eight-request bucket "
+            "smoke uses 2048,1792,1536,1280,1024,768,512,500."
         ),
     )
     return parser.parse_args()
