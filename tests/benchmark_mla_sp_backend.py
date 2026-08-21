@@ -24,7 +24,8 @@ BACKEND_CHOICES: tuple[SPBackend, ...] = (
     "nccl",
 )
 PAYLOAD_CHOICES = ("Q", "Res", "Lse")
-PATTERN_CHOICES = ("fan_out", "uniform", "fan_in")
+PATTERN_CHOICES = ("fan_out", "uniform", "fan_in", "dynamic_bucket")
+Q_ROUTING_CHOICES = ("legacy", "destination_rows")
 
 DEFAULT_NUM_HEADS = 128
 DEFAULT_KV_LORA_RANK = 512
@@ -65,8 +66,9 @@ class PayloadCase:
 @dataclass
 class BuiltPayload:
     x: torch.Tensor
-    mask: torch.Tensor
+    mask: torch.Tensor | None
     offsets: torch.Tensor | None
+    dst_row_indices: torch.Tensor | None
     expected: torch.Tensor
     local_owned_seqs: int
     local_compute_slots: int
@@ -110,8 +112,9 @@ class BufferRunner(BaseRunner):
         inner_iters: int,
         buffer,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         offsets: torch.Tensor | None,
+        dst_row_indices: torch.Tensor | None,
         is_transpose: bool,
     ) -> None:
         super().__init__(
@@ -124,6 +127,7 @@ class BufferRunner(BaseRunner):
         self.x = x
         self.mask = mask
         self.offsets = offsets
+        self.dst_row_indices = dst_row_indices
         self.is_transpose = is_transpose
         self.output: torch.Tensor | None = None
 
@@ -135,6 +139,7 @@ class BufferRunner(BaseRunner):
                 is_transpose=self.is_transpose,
                 mask=self.mask,
                 offsets=self.offsets,
+                dst_row_indices=self.dst_row_indices,
             )
 
 
@@ -256,6 +261,25 @@ class FanInPattern(BaseTrafficPattern):
         return [self.master_rank]
 
 
+class DynamicBucketPattern(BaseTrafficPattern):
+    @property
+    def name(self) -> str:
+        return "dynamic_bucket"
+
+    def owner_ranks(self) -> list[int]:
+        return list(range(self.sp_size))
+
+    def owned_seq_count(self, owner_rank: int) -> int:
+        return self.batch_size if 0 <= owner_rank < self.sp_size else 0
+
+    def participants_for(self, owner_rank: int, seq_idx: int) -> list[int]:
+        if not 0 <= owner_rank < self.sp_size or not 0 <= seq_idx < self.batch_size:
+            return []
+        spans = (8, 8, 8, 8, 7, 6, 5, 1)
+        span = min(self.sp_size, spans[(owner_rank + seq_idx) % len(spans)])
+        return sorted((owner_rank + offset) % self.sp_size for offset in range(span))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -286,6 +310,13 @@ def parse_args():
         type=str,
         default="Q,Res,Lse",
         help="Comma-separated payloads to benchmark.",
+    )
+    parser.add_argument(
+        "--q-routing",
+        type=str,
+        default="legacy",
+        choices=Q_ROUTING_CHOICES,
+        help="Q routing metadata passed to hao_basic.",
     )
     parser.add_argument(
         "--batch-sizes",
@@ -460,6 +491,8 @@ def create_traffic_pattern(
         return UniformPattern(**common_kwargs)
     if pattern_name == "fan_in":
         return FanInPattern(**common_kwargs)
+    if pattern_name == "dynamic_bucket":
+        return DynamicBucketPattern(**common_kwargs)
     raise ValueError(f"Unsupported pattern: {pattern_name}")
 
 
@@ -650,6 +683,7 @@ def build_q_case_strided(
         x=x,
         mask=mask,
         offsets=None,
+        dst_row_indices=None,
         expected=expected,
         local_owned_seqs=local_owned_seqs,
         local_compute_slots=local_compute_slots,
@@ -739,6 +773,83 @@ def build_q_case(
         x=x,
         mask=mask,
         offsets=offsets,
+        dst_row_indices=None,
+        expected=expected,
+        local_owned_seqs=local_owned_seqs,
+        local_compute_slots=local_compute_slots,
+        local_send_tokens=local_send_tokens,
+        local_send_targets=local_send_targets,
+    )
+
+
+def build_q_case_destination_rows(
+    pattern: BaseTrafficPattern,
+    buffer,
+    dtype: torch.dtype,
+    device: torch.device,
+    feature_dim: int,
+) -> BuiltPayload:
+    rank = pattern.rank
+    x = torch.zeros((pattern.max_num_seqs, feature_dim), dtype=dtype, device=device)
+    dst_row_indices = torch.full(
+        (pattern.sp_size, pattern.max_num_seqs),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    expected = torch.zeros(
+        (pattern.sp_size * pattern.max_num_seqs, feature_dim),
+        dtype=dtype,
+        device=device,
+    )
+
+    buffer.local_buffer.zero_()
+    local_flat = local_buffer_view(
+        buffer,
+        world_size=pattern.sp_size,
+        max_num_seqs=pattern.max_num_seqs,
+        feature_dim=feature_dim,
+        dtype=dtype,
+    ).view(pattern.sp_size * pattern.max_num_seqs, feature_dim)
+
+    local_owned_seqs = pattern.owned_seq_count(rank)
+    for seq_idx in range(local_owned_seqs):
+        x[seq_idx].fill_(q_seq_value(rank, seq_idx))
+
+    local_send_tokens = 0
+    local_send_targets = 0
+    for dst_rank in range(pattern.sp_size):
+        packed_row = 0
+        sends_to_destination = 0
+        for src_rank in range(pattern.sp_size):
+            owned_seqs = pattern.owned_seq_count(src_rank)
+            for seq_idx in range(owned_seqs):
+                if dst_rank not in pattern.participants_for(src_rank, seq_idx):
+                    continue
+                if src_rank == rank:
+                    if dst_rank == rank:
+                        local_flat[packed_row].fill_(q_seq_value(rank, seq_idx))
+                    else:
+                        dst_row_indices[dst_rank, seq_idx] = packed_row
+                        sends_to_destination += 1
+                if dst_rank == rank:
+                    expected[packed_row].fill_(q_seq_value(src_rank, seq_idx))
+                packed_row += 1
+        if dst_rank != rank and sends_to_destination > 0:
+            local_send_targets += 1
+            local_send_tokens += sends_to_destination
+
+    local_compute_slots = sum(
+        1
+        for src_rank in range(pattern.sp_size)
+        for seq_idx in range(pattern.owned_seq_count(src_rank))
+        if rank in pattern.participants_for(src_rank, seq_idx)
+    )
+    return BuiltPayload(
+        x=x,
+        mask=None,
+        offsets=None,
+        dst_row_indices=dst_row_indices,
         expected=expected,
         local_owned_seqs=local_owned_seqs,
         local_compute_slots=local_compute_slots,
@@ -803,6 +914,7 @@ def build_reduce_case(
         x=x,
         mask=mask,
         offsets=None,
+        dst_row_indices=None,
         expected=expected,
         local_owned_seqs=local_owned_seqs,
         local_compute_slots=local_compute_slots,
@@ -846,13 +958,18 @@ def build_lse_case(
 
 
 def build_payload_cases(args) -> dict[str, PayloadCase]:
+    q_builder = (
+        build_q_case_destination_rows
+        if args.q_routing == "destination_rows"
+        else build_q_case
+    )
     return {
         "Q": PayloadCase(
             name="Q",
             buffer_name="q_buffer",
             feature_dim=args.num_heads * args.head_dim,
             is_transpose=False,
-            builder=build_q_case,
+            builder=q_builder,
         ),
         "Res": PayloadCase(
             name="Res",
@@ -1245,6 +1362,7 @@ def benchmark_payload(
         x=built.x,
         mask=built.mask,
         offsets=built.offsets,
+        dst_row_indices=built.dst_row_indices,
         is_transpose=payload.is_transpose,
     )
 
@@ -1255,7 +1373,11 @@ def benchmark_payload(
     # Synthetic fan-in Q has no direct decode equivalent: only the master rank
     # consumes the output, and native backends may choose different unused-slot
     # layouts. Keep it as a timing-only case.
-    if not (payload.name == "Q" and pattern.name == "fan_in"):
+    if not (
+        payload.name == "Q"
+        and pattern.name == "fan_in"
+        and args.q_routing == "legacy"
+    ):
         validate_output(
             name=(
                 f"{backend}/{pattern.name}/bs{pattern.batch_size}/"
@@ -1287,7 +1409,8 @@ def benchmark_payload(
             trace_dir
             / (
                 f"{backend}_cp{pattern.sp_size}_{pattern.name}_bs{pattern.batch_size}_"
-                f"{payload.name}_rank{pattern.rank}_repeat{repeat_idx}.json"
+                f"{payload.name}_{args.q_routing}_rank{pattern.rank}_"
+                f"repeat{repeat_idx}.json"
             )
         )
         trace_stats = profiler_benchmark(
@@ -1328,6 +1451,7 @@ def benchmark_payload(
     ]
     return {
         "payload": payload.name,
+        "q_routing": args.q_routing if payload.name == "Q" else None,
         "pattern": pattern.name,
         "pattern_desc": pattern.describe(),
         "cp_size": pattern.sp_size,
@@ -1484,6 +1608,7 @@ def flatten_summary_rows(summary: dict[str, object]) -> list[dict[str, object]]:
                                 "batch_size": int(batch_size),
                                 "max_num_seqs": batch_case["max_num_seqs"],
                                 "payload": payload_name,
+                                "q_routing": payload_result.get("q_routing"),
                                 "feature_dim": payload_result["feature_dim"],
                                 "bytes_per_row": payload_result["bytes_per_row"],
                                 "buffer_max_dispatch_per_msg": payload_result[
@@ -1558,6 +1683,18 @@ def main() -> None:
     backends = parse_backends(args.backends)
     pattern_names = parse_patterns(args.patterns)
     payload_names = parse_payloads(args.payloads)
+    if "Q" in payload_names:
+        if args.q_routing == "destination_rows" and any(
+            backend != "hao_basic" for backend in backends
+        ):
+            raise ValueError(
+                "--q-routing destination_rows only supports --backends hao_basic"
+            )
+        if args.q_routing == "legacy" and "dynamic_bucket" in pattern_names:
+            raise ValueError(
+                "dynamic_bucket has non-nested receiver layouts and requires "
+                "--q-routing destination_rows"
+            )
 
     rank = -1
     try:
@@ -1572,7 +1709,8 @@ def main() -> None:
             "Running MLA SP backend benchmark "
             f"(world_size={world_size}, cp_sizes={cp_sizes}, patterns={pattern_names}, "
             f"batch_sizes={batch_sizes}, backends={backends}, payloads={payload_names}, "
-            f"mode={args.mode}, dtype={args.dtype}, head_dim={args.head_dim}, "
+            f"q_routing={args.q_routing}, mode={args.mode}, dtype={args.dtype}, "
+            f"head_dim={args.head_dim}, "
             f"v_head_dim={args.v_head_dim})"
         )
 
@@ -1603,6 +1741,7 @@ def main() -> None:
                     "backends": backends,
                     "patterns": pattern_names,
                     "payloads": payload_names,
+                    "q_routing": args.q_routing,
                     "dtype": args.dtype,
                     "num_heads": args.num_heads,
                     "kv_lora_rank": args.kv_lora_rank,
