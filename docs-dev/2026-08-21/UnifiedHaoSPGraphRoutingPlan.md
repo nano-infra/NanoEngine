@@ -45,14 +45,19 @@ The implementation should:
    network;
 4. remove the fixed-full-SP dense transport layout and its packed-to-dense
    remapping;
-5. retain `fixed_sp_size` only as scheduler/admission policy;
+5. prevent `fixed_sp_size` from selecting a Q transport or Graph metadata
+   protocol; it may still determine participant capacity and Graph bucket
+   bounds;
 6. leave NCCL and Res/LSE transpose communication unchanged in the first
    patch;
 7. retain `q_mask` for NCCL, diagnostics, compatibility, and regression
    comparison even when Hao Q no longer consumes it.
 
-No new `SPGraphPaddedLayout` class is required. The preferred implementation
-is to extend the existing common Graph metadata materialization path.
+No new `SPGraphPaddedLayout` class, padding index triplet, or layout cache is
+required. The preferred implementation extends the existing common Graph
+metadata materialization path with one replay-mutable actual-row scalar and a
+small local padding primitive. The final change should remove more fixed-only
+state than it adds.
 
 ## Historical behavior
 
@@ -131,33 +136,38 @@ The shared implementation must enforce all of the following.
 - Padding initialization must not race with remote writes. Do not clear a
   persistent receive buffer concurrently with peers writing into it.
 - Actual remote rows and local padding rows must be disjoint by construction.
+- `actual_attn_bs` must be replay-mutable device state. A Python slice chosen
+  while capturing a Graph must not freeze the runtime padding boundary.
+- Piecewise Graph attention is executed eagerly and should consume the actual
+  packed row count; it does not need full-Graph FlashMLA padding merely because
+  its pre/post-attention model segments are captured.
 
 ## Proposed implementation
 
 ### 1. Establish a reproducible pre-change baseline
 
 Before changing runtime code, record the exact commit hashes and save results
-for:
+for the smallest representative cases:
 
 - the existing destination-row DLSlime microbenchmark;
-- fixed SP8 Hao full CUDA Graph with global BS8 and BS32;
+- fixed SP8 Hao full CUDA Graph with multiple local master rows;
 - fixed SP8 EOS correctness with mixed completion lengths;
-- dynamic bucket SP8 full CUDA Graph with mixed long/short requests;
-- `max_num_seqs=256`, with actual per-rank traffic reported separately from
-  configured capacity.
+- one sparse dynamic-bucket SP8 case.
 
 For latency comparisons, use `ignore_eos=True` and a fixed decode length so
 the old and new runs execute the same request topology and token count. Run a
 separate EOS-enabled test for correctness.
 
-The benchmark must report at least:
+The baseline must report:
 
 - active remote Q rows per rank;
 - Q payload bytes per rank;
-- Q all-to-all kernel latency;
-- total Q communication-region latency;
-- decode inter-token latency and effective output throughput;
-- Graph capture count, capture duration, and reserved GPU memory.
+- median decode inter-token latency and effective output throughput.
+
+Collect Q-kernel profiles only when the end-to-end result regresses. Record
+Graph capture count or reserved memory only if the patch changes bucket
+candidates or Graph allocations; those measurements are not a mandatory matrix
+when the capture set is unchanged.
 
 ### 2. Enable destination rows for all Hao Q calls
 
@@ -175,12 +185,17 @@ q_buffer.all_to_all_ll(q, dst_row_indices=q_dst_row_indices)
 Hao Q must not simultaneously pass `mask` or `offsets`. NCCL keeps its current
 mask/packing behavior.
 
-### 3. Generalize the existing Graph metadata copier
+### 3. Materialize packed full-Graph metadata with one runtime boundary
 
-Extend the common Graph copy operation so it knows both:
+Extend the common Graph copy operation so the full-Graph call supplies:
 
+- `bs` and `master_bs` for model-input padding;
 - `actual_attn_bs`: number of receiver-local real packed rows;
 - `graph_attn_bs`: attention batch shape captured by the selected Graph.
+
+Store `actual_attn_bs` in one persistent device scalar read by the captured
+padding operation. Do not encode the tail as a new layout object or as
+source/destination/mask index triplets.
 
 The common copier should materialize:
 
@@ -190,9 +205,16 @@ The common copier should materialize:
 - sparse Res/LSE mappings only for actual rows;
 - legal local combine metadata for Graph-only master slots.
 
+For every Graph-only local master slot, append one enabled local Res/LSE mapping
+to a deterministic finite attention row. The same finite row may be reused for
+multiple Graph-only slots because those outputs are outside the sampling slice;
+there is no need to assign each slot a dense attention identity. Require at
+least one valid attention row, as the current fixed Graph path already does.
+
 The current fixed-only `_copy_fixed_sp_context_to_graph_vars` behavior should
-be decomposed into generic padding operations rather than selected by
-`fixed_sp_size`.
+be decomposed into one small generic metadata-padding helper rather than copied
+into the already-large common copier. Selection must depend on
+`actual_attn_bs < graph_attn_bs` or `bs < master_bs`, not on `fixed_sp_size`.
 
 ### 4. Initialize padding Q locally and race-free
 
@@ -202,8 +224,9 @@ whole persistent receive buffer.
 Preferred design:
 
 1. destination-aware A2A writes only real rows;
-2. a captured local operation writes deterministic finite values only to the
-   known padding-row indices on the receiver;
+2. a captured local operation reads the replay-mutable `actual_attn_bs` scalar
+   and writes deterministic finite values only to
+   `[actual_attn_bs, graph_attn_bs)` on the receiver;
 3. padding-row indices are disjoint from every valid destination row;
 4. this local initialization completes before FlashMLA consumes the Q buffer.
 
@@ -211,9 +234,15 @@ The local operation may copy one valid local Q row or write zero values. The
 chosen dummy Q value does not affect real output because its attention result
 is masked, but it must remain finite and deterministic.
 
-The implementation must include a multi-rank test that intentionally skews
-rank progress to catch reset/write races; the earlier test-only buffer reset
-race must not be reintroduced.
+The permanent regression should deterministically assert that the local
+operation cannot modify the real prefix. Run a rank-skewed multi-rank stress
+case once during acceptance to exercise asynchronous progress; do not add a
+timing-sensitive skew test to the default pytest suite. The earlier test-only
+whole-buffer reset race must not be reintroduced.
+
+Piecewise Graph attention runs outside its captured pre/post segments. It
+should use `actual_attn_bs` directly and therefore needs neither a padded Q tail
+nor a fixed-full-SP attention shape.
 
 ### 5. Remove fixed-only dense transport state
 
@@ -227,10 +256,15 @@ whose sole purpose is dense transport:
 - `_get_fixed_sp_graph_device_layout`;
 - `_copy_fixed_sp_context_to_graph_vars`;
 - `sp_graph_master_bs` and `sp_graph_packed_row_to_dense`, if they no longer
-  serve any non-transport purpose.
+  serve any non-transport purpose;
+- `sp_master_batch_sizes` in `Context`, if `sp_comm_bs` remains sufficient for
+  Graph bucket selection;
+- `nanodeploy/worker/sp_graph_policy.py` itself if no generic policy remains.
 
 Do not delete scheduler/admission handling for `fixed_sp_size` in this change.
-That option still controls how many ranks receive KV for a request.
+That option still controls how many ranks receive KV for a request and may
+provide a capacity bound for Graph bucket selection. It must not choose a
+communication or metadata-materialization path.
 
 ### 6. Keep Graph bucket selection separate from correctness
 
@@ -262,47 +296,57 @@ Run the smallest tests first, reinstalling NanoDeploy after any C++ change.
 
 ### CPU and metadata tests
 
-- Existing scheduler and packed-row semantic tests.
-- A common fixed/dynamic destination-row oracle asserting no collision and no
-  missing real row.
-- EOS transition tests covering receiver row counts such as `8/7/7/...`.
-- Padding tests asserting legal context lengths/block tables, finite dummy Q,
-  zero Res/LSE contribution, and unchanged real-row ordering.
-- Tests showing fixed-full and an equivalent constant-participant bucket policy
-  produce the same communication metadata.
+- Refactor the existing destination-row oracle to cover fixed-full, dynamic,
+  and fixed-after-EOS inputs without duplicating the oracle implementation.
+  Assert no collision, no missing row, stable packed ordering, and the
+  `8/7/7/...` transition.
+- Add one focused common materializer test for `actual_attn_bs < graph_attn_bs`
+  and `bs < master_bs`. Assert the packed prefix is unchanged, the tail has
+  legal context lengths/block tables, real Res/LSE mappings remain sparse, and
+  every Graph-only local output receives one finite local partial.
+- Reuse existing scheduler assertions. Do not compare fixed and bucket
+  schedulers: different allocation policies need not produce identical context
+  lengths even when their participant counts match.
 
-### Single-node SP8 GPU tests
+### Focused GPU regression
 
-- Hao eager: fixed SP8 and dynamic bucket.
-- Hao full CUDA Graph: fixed SP8 and dynamic bucket.
-- Hao piecewise CUDA Graph if that mode remains supported.
-- Global BS8 where each rank owns one request.
-- Multiple local master rows per rank.
-- Mixed EOS order: one early EOS, several later EOS, and at least one request
-  reaching `max_tokens`.
-- Verify generated token IDs against eager or a recorded trusted baseline, not
-  only output lengths.
-- Re-run NCCL regressions to ensure retained masks and offsets remain valid.
+- Extend the existing Hao destination-row eager/CUDA Graph transport test with
+  a second replay that changes the actual packed row count. Assert real rows are
+  correct and the padding tail is deterministic without resetting the whole
+  receive buffer.
+- Run one fixed SP8 full-Graph case with mixed EOS order and compare generated
+  token IDs against eager or a recorded trusted baseline. This case must cover
+  an early EOS and surviving requests; use multiple local master rows in either
+  this run or the matched performance run.
+- Re-run the existing sparse dynamic Hao test and the focused NCCL regression;
+  do not cross-product backend, policy, batch size, and Graph mode.
+- Run one piecewise smoke only if the mode remains supported. It is a regression
+  command, not a new permanent test matrix, because attention itself is eager.
 
 ### P/D acceptance
 
-Run the two-node P/D scenario with Hao, SP8 decode, full CUDA Graph, BS8, and
-mixed long/short prompts. Verify that early EOS requests finish normally and
-survivors continue producing coherent tokens. Preserve the complete command,
-topology, generated sequences, per-step latency, and SP participant histogram.
+After the functional patch is complete, run the two-node P/D scenario once
+with Hao, SP8 decode, full CUDA Graph, BS8, and mixed long/short prompts. Verify
+that early EOS requests finish normally and survivors continue producing
+coherent tokens. Preserve the complete command, topology, generated sequences,
+and SP participant histogram. This is final acceptance, not a requirement after
+each intermediate commit.
 
 ## Performance validation and acceptance gates
 
 Compare pre-change and post-change results on the same node allocation and
 driver environment.
 
-Mandatory matched tests:
+Mandatory matched performance tests:
 
-1. fixed SP8 full Graph, global BS8, fixed decode length;
-2. fixed SP8 full Graph, global BS32 or higher;
-3. dynamic bucket with 20-30 active remote Q rows per rank;
-4. `max_num_seqs=256` with actual traffic substantially below capacity;
-5. EOS-enabled tail where the number of live requests decreases over time.
+1. dense fixed SP8 full Graph with multiple local master rows and a fixed decode
+   length;
+2. sparse dynamic bucket with representative active remote Q rows per rank.
+
+The EOS tail is a correctness case, not a separate performance gate.
+Configured capacity such as `max_num_seqs=256` is covered by reporting actual
+row and byte counts independently from capacity; it does not require another
+end-to-end benchmark unless allocation size or kernel launch bounds change.
 
 Acceptance criteria:
 
@@ -314,8 +358,9 @@ Acceptance criteria:
   reviewed tradeoff;
 - dynamic sparse performance remains within noise of the current
   destination-row baseline;
-- if a regression exceeds 1%, repeat enough runs to establish confidence and
-  profile before merging.
+- compare at least five paired post-warmup runs by median; if a regression
+  exceeds 1% or the established run-to-run spread, repeat and profile before
+  merging.
 
 The already-recorded uniform SP8 Q microbenchmark shows destination rows within
 approximately 0.6% of the legacy fixed route across the tested batch sizes,
@@ -327,20 +372,20 @@ the design but does not replace the production-level before/after test above.
 Keep changes reviewable and independently testable:
 
 1. `test: cover common SP graph padding semantics`
-   - add CPU row/padding oracles and any benchmark instrumentation needed for
-     configured capacity versus active rows;
-2. `refactor: unify Hao Q routing across SP policies`
-   - enable destination rows for fixed-full SP and use the common metadata
-     path without deleting the old fixed helper yet;
-3. `fix: make SP graph padding locally safe`
-   - add race-free local Q padding and legal attention metadata;
-4. `refactor: remove fixed SP dense transport layout`
+   - refactor the existing CPU oracle and add one materializer test;
+2. `fix: unify Hao Q routing and SP graph padding`
+   - atomically enable destination rows for fixed-full SP, switch it to the
+     common packed metadata path, and add replay-mutable race-free local Q
+     padding. Do not leave an intermediate commit where packed destination rows
+     are paired with the old dense metadata copier;
+3. `refactor: remove fixed SP dense transport layout`
    - delete fixed-only transport state after all correctness tests pass;
-5. optional performance patch only if profiling identifies a measured issue.
+4. optional performance patch only if profiling identifies a measured issue.
 
-After every patch, record exact commands and results. Do not combine a
-performance optimization with the first correctness refactor unless the
-benchmark demonstrates it is necessary.
+Run the focused CPU tests after every patch and the GPU acceptance cases after
+the functional and cleanup milestones. Record exact commands and results. Do
+not combine a performance optimization with the correctness refactor unless
+the benchmark demonstrates it is necessary.
 
 ## Rollback and review checkpoints
 
@@ -360,6 +405,8 @@ benchmark demonstrates it is necessary.
 After completion:
 
 - scheduling policy determines participants;
+- scheduling/capacity policy may bound Graph candidates but does not select a
+  Q transport or metadata protocol;
 - one receiver-local packed metadata protocol represents both fixed and
   dynamic SP;
 - every Hao Q uses destination-aware rows;
