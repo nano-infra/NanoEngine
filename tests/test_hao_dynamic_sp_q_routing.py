@@ -106,11 +106,14 @@ def _prepare_local_buffer(
     q_slice_get: torch.Tensor,
     q_slice_fill: torch.Tensor,
     q_copy_mask: torch.Tensor,
+    *,
+    reset: bool,
 ) -> torch.Tensor:
     local = buffer.local_buffer.view(_DTYPE)[:
         _SP_SIZE * _MAX_NUM_SEQS * _FEATURE_DIM
     ].view(_SP_SIZE * _MAX_NUM_SEQS, 1, _FEATURE_DIM)
-    local.fill_(_SENTINEL)
+    if reset:
+        local.fill_(_SENTINEL)
     copy_batch_indexed_triton(
         x.view(x.size(0), 1, _FEATURE_DIM),
         local,
@@ -200,8 +203,14 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
         buffer.connect_full_mesh(dist.group.WORLD)
 
         _prepare_local_buffer(
-            buffer, x, q_slice_get, q_slice_fill, q_copy_mask
+            buffer,
+            x,
+            q_slice_get,
+            q_slice_fill,
+            q_copy_mask,
+            reset=True,
         )
+        torch.cuda.synchronize(device)
         dist.barrier()
         eager_output = buffer.all_to_all_ll(
             x,
@@ -214,14 +223,37 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
         graph = torch.cuda.CUDAGraph()
         for _ in range(3):
             _prepare_local_buffer(
-                buffer, x, q_slice_get, q_slice_fill, q_copy_mask
+                buffer,
+                x,
+                q_slice_get,
+                q_slice_fill,
+                q_copy_mask,
+                reset=True,
             )
+            torch.cuda.synchronize(device)
+            dist.barrier()
             buffer.all_to_all_ll(x, dst_row_indices=dst_row_indices)
+            torch.cuda.synchronize(device)
+            dist.barrier()
+
+        _prepare_local_buffer(
+            buffer,
+            x,
+            q_slice_get,
+            q_slice_fill,
+            q_copy_mask,
+            reset=True,
+        )
         torch.cuda.synchronize(device)
         dist.barrier()
         with torch.cuda.graph(graph):
             _prepare_local_buffer(
-                buffer, x, q_slice_get, q_slice_fill, q_copy_mask
+                buffer,
+                x,
+                q_slice_get,
+                q_slice_fill,
+                q_copy_mask,
+                reset=False,
             )
             graph_output = buffer.all_to_all_ll(
                 x,
@@ -230,7 +262,16 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
         torch.cuda.synchronize(device)
         dist.barrier()
 
-        buffer.local_buffer.fill_(0)
+        _prepare_local_buffer(
+            buffer,
+            x,
+            q_slice_get,
+            q_slice_fill,
+            q_copy_mask,
+            reset=True,
+        )
+        torch.cuda.synchronize(device)
+        dist.barrier()
         graph.replay()
         torch.cuda.synchronize(device)
         dist.barrier()
