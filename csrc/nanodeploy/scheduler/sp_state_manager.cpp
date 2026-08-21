@@ -531,6 +531,36 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                 }
             }
 
+            // The sequence already includes the sampled token that will be
+            // consumed by the first decode forward. Its KV slot must live on
+            // the master rank. Under load, non-uniform water-filling can give
+            // every existing token to ranks with more free blocks and leave
+            // the selected master at zero. Move one pending-token slot back
+            // to the master while preserving the total placement size.
+            if (block_ctx.num_dispatched_tokens[master_rank] == 0) {
+                int donor_rank = -1;
+                for (int sp_idx : top_most_free_ranks) {
+                    if (sp_idx == master_rank) {
+                        continue;
+                    }
+                    if (
+                        donor_rank < 0
+                        || block_ctx.num_dispatched_tokens[sp_idx]
+                            > block_ctx.num_dispatched_tokens[donor_rank]
+                    ) {
+                        donor_rank = sp_idx;
+                    }
+                }
+                if (
+                    donor_rank < 0
+                    || block_ctx.num_dispatched_tokens[donor_rank] <= 0
+                ) {
+                    return false;
+                }
+                block_ctx.num_dispatched_tokens[donor_rank]--;
+                block_ctx.num_dispatched_tokens[master_rank] = 1;
+            }
+
             // Reservation Check
             std::vector<int> master_req_counts(attention_sp_, 0);
             for (const auto& running_seq : running) {

@@ -2,6 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from nanodeploy import SamplingParams
+from nanodeploy._cpp import DefaultIntDict, SPStateManager
+from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.cache import _plan_kv_migration_ranges
 
 
@@ -78,3 +81,49 @@ def test_pd_migration_rejects_different_cached_token_counts():
 
     with pytest.raises(RuntimeError, match="different cached-token counts"):
         _plan_kv_migration_ranges(remote_ctx, local_ctx, 64, 0)
+
+
+def test_nonuniform_dynamic_sp_keeps_pending_token_on_master():
+    state = SPStateManager(
+        "decode",
+        8,
+        64,
+        64,
+        64,
+        10_000,
+        64,
+        1.0,
+        65_536,
+        "bucket",
+        True,
+        "5:1-4096",
+        True,
+        "LeastBatch",
+        0,
+    )
+
+    # Make rank 0 less cache-rich without increasing its master count. The
+    # next LeastBatch master is still rank 0, and uncorrected water-filling
+    # assigns all 513 tokens to the four richer receiver ranks.
+    load = Sequence([1] * 1024, SamplingParams(max_tokens=2))
+    load.active("decode", 8, 1)
+    state.apply_planned_placement(
+        load,
+        master_sp_idx=1,
+        dispatched_tokens=[1024, 0, 0, 0, 0, 0, 0, 0],
+    )
+    state.allocate(load)
+
+    sequence = Sequence([2] * 513, SamplingParams(max_tokens=2))
+    sequence.active("decode", 8, 1)
+    assert state.can_allocate(
+        sequence,
+        DefaultIntDict(),
+        DefaultIntDict(),
+    )
+
+    placement = sequence.block_ctx()
+    master_sp_rank = placement.master_sp_idx
+    assert master_sp_rank == 0
+    assert placement.num_dispatched_tokens[master_sp_rank] == 1
+    assert sum(placement.num_dispatched_tokens) == sequence.num_tokens
