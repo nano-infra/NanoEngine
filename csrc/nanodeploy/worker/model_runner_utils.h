@@ -53,6 +53,10 @@ struct DecodeMetadata {
 
     std::vector<int> q_output_stride;
     std::vector<int> q_offsets;
+    // Flattened [sp_size * max_num_seqs]. For each destination and local
+    // sender row, stores the absolute row in that destination's packed Q
+    // receive buffer. A negative value means that no remote write is needed.
+    std::vector<int> q_dst_row_indices_flat;
 };
 
 PrefillMetadata

@@ -819,6 +819,22 @@ class ModelRunner:
         q_offsets = torch.tensor(
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        use_hao_destination_rows = (
+            sp_size > 1
+            and self.config.sp_backend == "hao_basic"
+            and self.config.fixed_sp_size != sp_size
+        )
+        q_dst_row_indices = None
+        if use_hao_destination_rows:
+            q_dst_row_indices = (
+                torch.tensor(
+                    meta.q_dst_row_indices_flat,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                .reshape(sp_size, self.config.max_num_seqs)
+                .cuda(non_blocking=True)
+            )
         attention_compute_bs = (
             context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
         )
@@ -879,6 +895,7 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
+            q_dst_row_indices=q_dst_row_indices,
             tile_scheduler_metadata=None,
             num_splits=None,
         )
@@ -952,6 +969,7 @@ class ModelRunner:
             return
 
         dist_context = get_dist_context()
+        q_dst_row_indices = getattr(context, "q_dst_row_indices", None)
         logger.info(
             {
                 "mode": "decode_a2a_masks",
@@ -967,6 +985,11 @@ class ModelRunner:
                 "is_dummy": is_dummy,
                 "mask_encoding": "bit_b64",
                 "q_offsets": context.q_offsets.detach().cpu().tolist(),
+                "q_dst_row_indices": (
+                    q_dst_row_indices.detach().cpu().tolist()
+                    if q_dst_row_indices is not None
+                    else None
+                ),
                 "q_mask": self._pack_binary_mask(context.q_mask),
                 "res_lse_mask": self._pack_binary_mask(context.res_lse_mask),
             }
@@ -1012,6 +1035,12 @@ class ModelRunner:
 
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = context.slot_mapping  # type: ignore
+
+        graph_q_dst_row_indices = graph_vars.get("q_dst_row_indices")
+        if graph_q_dst_row_indices is not None:
+            graph_q_dst_row_indices.fill_(-1)
+            if context.q_dst_row_indices is not None:
+                graph_q_dst_row_indices.copy_(context.q_dst_row_indices)
 
         fixed_full_sp_graph = (
             context.use_sp_a2a
@@ -1404,6 +1433,11 @@ class ModelRunner:
             "block_tables": graph_vars["block_tables"],
             "global_context_lens": graph_vars["global_context_lens"],
             "q_mask": graph_vars["q_mask"],
+            "q_dst_row_indices": (
+                graph_vars["q_dst_row_indices"]
+                if context.q_dst_row_indices is not None
+                else None
+            ),
             "res_lse_mask": graph_vars["res_lse_mask"],
             "tile_scheduler_metadata": tile_scheduler_metadata,
             "num_splits": num_splits,
@@ -1802,6 +1836,11 @@ class ModelRunner:
         )
         max_bs = min(self.config.max_num_seqs, 512)
         fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        use_hao_destination_rows = (
+            sp_world_size > 1
+            and config.sp_backend == "hao_basic"
+            and config.fixed_sp_size != sp_world_size
+        )
         max_attention_comp_seqs = (
             sp_world_size * max_bs
             if fixed_sp_graph
@@ -1823,6 +1862,9 @@ class ModelRunner:
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        q_dst_row_indices = torch.full(
+            (sp_world_size, config.max_num_seqs), -1, dtype=torch.int32
+        )
         res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
             max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
@@ -1884,6 +1926,9 @@ class ModelRunner:
                 block_tables=block_tables,
                 global_context_lens=global_context_lens,
                 q_mask=q_mask,
+                q_dst_row_indices=(
+                    q_dst_row_indices if use_hao_destination_rows else None
+                ),
                 res_lse_mask=res_lse_mask,
                 use_sp_a2a=use_sp_a2a,
                 q_slice_get=q_slice_get[:master_bs],
@@ -1972,6 +2017,7 @@ class ModelRunner:
             global_context_lens=global_context_lens,
             outputs=outputs,
             q_mask=q_mask,
+            q_dst_row_indices=q_dst_row_indices,
             res_lse_mask=res_lse_mask,
             tile_scheduler_metadata=tile_scheduler_metadata_buffer,
             num_splits=num_splits_buffer,
@@ -2001,6 +2047,11 @@ class ModelRunner:
         )
         max_bs = min(self.config.max_num_seqs, 512)
         fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        use_hao_destination_rows = (
+            sp_world_size > 1
+            and config.sp_backend == "hao_basic"
+            and config.fixed_sp_size != sp_world_size
+        )
         max_attention_comp_seqs = (
             sp_world_size * max_bs
             if fixed_sp_graph
@@ -2043,6 +2094,9 @@ class ModelRunner:
                     sp_world_size, max_bs, dtype=torch.int32
                 ),
                 q_mask=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
+                q_dst_row_indices=torch.full(
+                    (sp_world_size, config.max_num_seqs), -1, dtype=torch.int32
+                ),
                 res_lse_mask=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
                 tile_scheduler_metadata=None,
                 num_splits=None,
@@ -2080,6 +2134,11 @@ class ModelRunner:
                 block_tables=graph_vars["block_tables"],
                 global_context_lens=graph_vars["global_context_lens"],
                 q_mask=graph_vars["q_mask"],
+                q_dst_row_indices=(
+                    graph_vars["q_dst_row_indices"]
+                    if use_hao_destination_rows
+                    else None
+                ),
                 res_lse_mask=graph_vars["res_lse_mask"],
                 use_sp_a2a=False,
                 q_slice_get=graph_vars["q_slice_get"][:master_bs],

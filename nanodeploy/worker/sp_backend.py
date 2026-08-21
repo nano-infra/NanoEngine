@@ -23,6 +23,7 @@ class MLAAllToAllBufferProtocol(Protocol):
         is_transpose: bool = False,
         mask: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
+        dst_row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
 
@@ -51,6 +52,13 @@ def _resolve_hao_symbols():
     import dlslime
 
     return getattr(dlslime, "AllToAllBuffer", None), getattr(dlslime, "KernelImpl", None)
+
+
+@lru_cache(maxsize=1)
+def _resolve_hao_dst_row_indices_version() -> int:
+    import dlslime
+
+    return int(getattr(dlslime, "ALLTOALL_DST_ROW_INDICES_VERSION", 0))
 
 
 def _group_size(group: dist.ProcessGroup) -> int:
@@ -97,6 +105,7 @@ class HaoAllToAllBufferAdapter:
         self.buffer_size_bytes = buffer_size_bytes
         self._buffer = buffer_cls(rank, world_size, max_bs, buffer_size_bytes)
         self._kernel_impl = kernel_impl.Basic
+        self._dst_row_indices_version = _resolve_hao_dst_row_indices_version()
         self._native_local_buffer = _maybe_get_local_buffer(self._buffer)
         self._compat_mode = self._native_local_buffer is None
         self._non_transpose_input_scratch: torch.Tensor | None = None
@@ -128,7 +137,27 @@ class HaoAllToAllBufferAdapter:
         is_transpose: bool = False,
         mask: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
+        dst_row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if dst_row_indices is not None:
+            if self._compat_mode:
+                raise NotImplementedError(
+                    "hao_basic dst_row_indices require a native DLSlime build; "
+                    "compat mode is unsupported."
+                )
+            if self._dst_row_indices_version < 1:
+                raise RuntimeError(
+                    "hao_basic destination-aware Q routing requires a DLSlime "
+                    "build with ALLTOALL_DST_ROW_INDICES_VERSION >= 1."
+                )
+            if is_transpose:
+                raise NotImplementedError(
+                    "hao_basic dst_row_indices only support non-transpose all-to-all."
+                )
+            if mask is not None or offsets is not None:
+                raise ValueError(
+                    "hao_basic dst_row_indices cannot be combined with mask or offsets."
+                )
         if offsets is not None and self._compat_mode:
             raise NotImplementedError(
                 "hao_basic offsets require a native DLSlime build; compat mode is unsupported."
@@ -157,13 +186,23 @@ class HaoAllToAllBufferAdapter:
                 backend_x = self._collapse_transposed_input(x, mask)
                 backend_is_transpose = False
 
-        output = self._buffer.all_to_all(
-            backend_x,
-            impl=self._kernel_impl,
-            is_transpose=backend_is_transpose,
-            mask=backend_mask,
-            offsets=backend_offsets,
-        )
+        if dst_row_indices is None:
+            output = self._buffer.all_to_all(
+                backend_x,
+                impl=self._kernel_impl,
+                is_transpose=backend_is_transpose,
+                mask=backend_mask,
+                offsets=backend_offsets,
+            )
+        else:
+            output = self._buffer.all_to_all(
+                backend_x,
+                impl=self._kernel_impl,
+                is_transpose=backend_is_transpose,
+                mask=None,
+                offsets=None,
+                dst_row_indices=dst_row_indices,
+            )
 
         if self._compat_mode and mask is not None:
             self._patch_self_slice(output)
@@ -290,7 +329,12 @@ class NcclStaticAllToAllBufferAdapter:
         is_transpose: bool = False,
         mask: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
+        dst_row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if dst_row_indices is not None:
+            raise NotImplementedError(
+                "NCCL static all-to-all does not use DLSlime dst_row_indices."
+            )
         if self._group is None:
             raise RuntimeError("NCCL static all-to-all buffer is not connected to a group.")
         if x.ndim != 2:

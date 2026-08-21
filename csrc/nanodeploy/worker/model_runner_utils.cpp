@@ -343,6 +343,28 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
         meta.q_offsets[i + 1] = meta.q_offsets[i] + sp_valid_request_counts[i];
     }
 
+    // Destination-aware packed Q rows. Each receiver packs participating
+    // requests in (master/source rank, sequence index) order, so a sender must
+    // use the receiver's row rather than its own receiver-local q_offsets.
+    // Self-owned rows are populated locally through q_slice_fill and remain -1
+    // here to avoid an unnecessary self copy in the all-to-all kernel.
+    meta.q_dst_row_indices_flat.assign(sp_size * max_num_seqs, -1);
+    for (int dst_rank = 0; dst_rank < sp_size; ++dst_rank) {
+        int packed_row = 0;
+        for (int src_rank = 0; src_rank < sp_size; ++src_rank) {
+            const auto& batch_seqs = sp_seqs[src_rank];
+            for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
+                if (batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, dst_rank) <= 0) {
+                    continue;
+                }
+                if (src_rank == sp_rank && dst_rank != sp_rank) {
+                    meta.q_dst_row_indices_flat[dst_rank * max_num_seqs + seq_id] = packed_row;
+                }
+                packed_row++;
+            }
+        }
+    }
+
     return meta;
 }
 

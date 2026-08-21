@@ -39,7 +39,8 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("res_slice_get_to_buffer_input", &DecodeMetadata::res_slice_get_to_buffer_input)
         .def_readonly("res_slice_fill_to_buffer_input", &DecodeMetadata::res_slice_fill_to_buffer_input)
         .def_readonly("res_to_buffer_input_mask", &DecodeMetadata::res_to_buffer_input_mask)
-        .def_readonly("q_offsets", &DecodeMetadata::q_offsets);
+        .def_readonly("q_offsets", &DecodeMetadata::q_offsets)
+        .def_readonly("q_dst_row_indices_flat", &DecodeMetadata::q_dst_row_indices_flat);
 
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,

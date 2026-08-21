@@ -52,6 +52,7 @@ class Context:
 
     # used for all2all q transfer
     q_offsets: torch.Tensor | None = None
+    q_dst_row_indices: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None
     prefill_has_prefix: bool = False
@@ -96,6 +97,7 @@ def set_context(
     sp_graph_packed_row_to_dense: Optional[torch.Tensor] = None,
     sp_master_batch_sizes: tuple[int, ...] | None = None,
     q_offsets: Optional[torch.Tensor] = None,
+    q_dst_row_indices: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
     prefill_cu_seqlens_q_host: tuple[int, ...] | None = None,
     prefill_has_prefix: bool = False,
@@ -133,6 +135,7 @@ def set_context(
         sp_graph_packed_row_to_dense=sp_graph_packed_row_to_dense,
         sp_master_batch_sizes=sp_master_batch_sizes,
         q_offsets=q_offsets,
+        q_dst_row_indices=q_dst_row_indices,
         context_lens_for_attn=context_lens_for_attn,
         prefill_cu_seqlens_q_host=prefill_cu_seqlens_q_host,
         prefill_has_prefix=prefill_has_prefix,

@@ -24,13 +24,24 @@ class _FakeCompatHaoBuffer:
     def connect_full_mesh(self, all_handles):
         self.all_handles = all_handles
 
-    def all_to_all(self, x, impl, is_transpose, mask, offsets=None):
+    def all_to_all(
+        self,
+        x,
+        impl,
+        is_transpose,
+        mask,
+        offsets=None,
+        dst_row_indices=None,
+    ):
         self.last_call = {
             "x": x.clone(),
             "impl": impl,
             "is_transpose": is_transpose,
             "mask": None if mask is None else mask.clone(),
             "offsets": None if offsets is None else offsets.clone(),
+            "dst_row_indices": (
+                None if dst_row_indices is None else dst_row_indices.clone()
+            ),
         }
         return torch.zeros(
             self.world_size,
@@ -62,7 +73,14 @@ class _FakeCreatedBuffer:
     def connect_full_mesh(self, group):
         self.connected_group = group
 
-    def all_to_all_ll(self, x, is_transpose=False, mask=None, offsets=None):
+    def all_to_all_ll(
+        self,
+        x,
+        is_transpose=False,
+        mask=None,
+        offsets=None,
+        dst_row_indices=None,
+    ):
         return x
 
 
@@ -212,6 +230,61 @@ def test_hao_adapter_native_mode_passes_offsets_without_padding(monkeypatch):
     assert torch.equal(call["x"], x)
     assert torch.equal(call["mask"], mask)
     assert torch.equal(call["offsets"], offsets)
+
+
+def test_hao_adapter_native_mode_passes_destination_rows(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeNativeHaoBuffer, _FakeKernelImpl)
+    )
+    monkeypatch.setattr(sp_backend, "_resolve_hao_dst_row_indices_version", lambda: 1)
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=4,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    dst_row_indices = torch.tensor(
+        [[-1, -1, -1, -1], [2, -1, 5, -1]], dtype=torch.int32
+    )
+
+    adapter.all_to_all_ll(
+        x,
+        is_transpose=False,
+        dst_row_indices=dst_row_indices,
+    )
+    call = adapter._buffer.last_call
+
+    assert call is not None
+    assert call["is_transpose"] is False
+    assert torch.equal(call["x"], x)
+    assert call["mask"] is None
+    assert call["offsets"] is None
+    assert torch.equal(call["dst_row_indices"], dst_row_indices)
+
+
+def test_hao_adapter_rejects_destination_rows_without_dlslime_capability(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeNativeHaoBuffer, _FakeKernelImpl)
+    )
+    monkeypatch.setattr(sp_backend, "_resolve_hao_dst_row_indices_version", lambda: 0)
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=4,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    with pytest.raises(RuntimeError, match="ALLTOALL_DST_ROW_INDICES_VERSION"):
+        adapter.all_to_all_ll(
+            torch.ones((2, 2), dtype=torch.float32),
+            dst_row_indices=torch.full((2, 4), -1, dtype=torch.int32),
+        )
 
 
 def test_hao_adapter_compat_mode_rejects_offsets(monkeypatch):

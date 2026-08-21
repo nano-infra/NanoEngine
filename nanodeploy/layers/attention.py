@@ -101,6 +101,11 @@ class FlashAttentionImpl:
                     if _uses_nccl_comm_bs(sp_context)
                     else context.q_mask
                 )
+                q_dst_row_indices = (
+                    context.q_dst_row_indices
+                    if sp_context.backend == "hao_basic"
+                    else None
+                )
                 q_buffer = sp_context.q_buffer
 
                 # Q copy
@@ -124,8 +129,9 @@ class FlashAttentionImpl:
 
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=q_mask,
-                    offsets=context.q_offsets,
+                    mask=None if q_dst_row_indices is not None else q_mask,
+                    offsets=None if q_dst_row_indices is not None else context.q_offsets,
+                    dst_row_indices=q_dst_row_indices,
                 ).view([sp_size * comm_bs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]
@@ -430,6 +436,11 @@ class FlashMLAImpl:
                     if _uses_nccl_comm_bs(sp_context)
                     else context.q_mask
                 )
+                q_dst_row_indices = (
+                    context.q_dst_row_indices
+                    if sp_context.backend == "hao_basic"
+                    else None
+                )
                 q_buffer = sp_context.q_buffer
 
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
@@ -447,8 +458,9 @@ class FlashMLAImpl:
 
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=q_mask,
-                    offsets=context.q_offsets,
+                    mask=None if q_dst_row_indices is not None else q_mask,
+                    offsets=None if q_dst_row_indices is not None else context.q_offsets,
+                    dst_row_indices=q_dst_row_indices,
                 ).view([sp_size * comm_bs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]
