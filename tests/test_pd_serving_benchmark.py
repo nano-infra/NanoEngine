@@ -124,10 +124,10 @@ def test_pd_driver_preserves_metric_and_releases_prefill_kv():
         ignore_eos=True,
     )
 
-    _, sequence_map = pd_serving.run_pd_benchmark(
+    _, sequence_map, workload_by_sequence = pd_serving.run_pd_benchmark(
         prefill,
         decode,
-        [([1] * 16, sampling_params)],
+        [pd_serving.WorkloadRequest([1] * 16, sampling_params)],
         [0.0],
         show_progress=False,
     )
@@ -140,6 +140,56 @@ def test_pd_driver_preserves_metric_and_releases_prefill_kv():
     assert metric.first_token_time < metric.completion_time
     assert metric.num_generated_tokens == 2
     assert prefill.freed == {sequence.seq_id}
+    assert workload_by_sequence[sequence.seq_id].prompt_token_ids == [1] * 16
+
+
+class _FakeTokenizer:
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+    ):
+        assert tokenize and add_generation_prompt
+        return [1, 2, 3] + list(range(len(messages[0]["content"].split())))
+
+    def encode(self, text, *, add_special_tokens):
+        assert not add_special_tokens
+        return list(range(len(text.split())))
+
+
+def test_sharegpt_uses_first_valid_human_to_gpt_pair_and_real_text():
+    record = {
+        "id": "conversation-1",
+        "conversations": [
+            {"from": "gpt", "value": "orphan answer"},
+            {"from": "human", "value": "real user prompt"},
+            {"from": "gpt", "value": "one two three four"},
+        ],
+    }
+
+    pair = pd_serving._first_sharegpt_pair(record)
+    requests = pd_serving.build_sharegpt_requests(
+        [pair],
+        _FakeTokenizer(),
+        count=2,
+        max_model_len=32,
+        max_request_tokens=0,
+        max_output_tokens=2,
+        temperature=0.6,
+    )
+
+    assert pair == (
+        "real user prompt",
+        "one two three four",
+        "conversation-1",
+    )
+    assert len(requests) == 2
+    assert requests[0].prompt_text == "real user prompt"
+    assert requests[0].reference_text == "one two three four"
+    assert requests[0].sampling_params.max_tokens == 2
+    assert not requests[0].sampling_params.ignore_eos
 
 
 def test_pd_serving_rejects_nonpositive_duration():

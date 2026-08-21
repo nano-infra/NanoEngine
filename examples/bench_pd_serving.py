@@ -9,17 +9,21 @@ one token per scheduler iteration (``loop_count=1``).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import time
 from collections.abc import Iterable, Iterator, Sequence as SequenceABC
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 
 import numpy as np
 import ray
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
 from nanodeploy import LLM, SamplingParams
 from nanodeploy._cpp import SequenceStatus
@@ -36,6 +40,16 @@ DEFAULT_REQUEST_RATE = 8.0
 DEFAULT_WARMUP_REQUESTS = 8
 WARMUP_PROMPT_LEN = 512
 WARMUP_OUTPUT_LEN = 32
+DEFAULT_SHAREGPT_MAX_OUTPUT_TOKENS = 1024
+
+
+@dataclass(frozen=True)
+class WorkloadRequest:
+    prompt_token_ids: list[int]
+    sampling_params: SamplingParams
+    prompt_text: str | None = None
+    reference_text: str | None = None
+    dataset_id: str | None = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -62,7 +76,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     serving_group.add_argument("--seed", type=int, default=serving.SEED)
     serving_group.add_argument(
         "--dataset",
-        choices=("random", "csv"),
+        choices=("random", "csv", "sharegpt"),
         default="random",
     )
     serving_group.add_argument(
@@ -70,18 +84,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CSV containing prompt_len and output_len columns.",
     )
     serving_group.add_argument(
+        "--sharegpt-path",
+        help="ShareGPT JSON containing id and conversations fields.",
+    )
+    serving_group.add_argument(
+        "--sharegpt-max-output-tokens",
+        type=int,
+        default=DEFAULT_SHAREGPT_MAX_OUTPUT_TOKENS,
+        help="Cap generation per ShareGPT request; 0 uses reference length.",
+    )
+    serving_group.add_argument(
+        "--temperature",
+        type=float,
+        default=0.6,
+        help="Sampling temperature for real ShareGPT prompts.",
+    )
+    serving_group.add_argument(
         "--max-request-tokens",
         type=int,
         default=serving.DEFAULT_MAX_REQUEST_TOKENS,
         help=(
-            "Drop CSV rows whose prompt_len + output_len exceeds this limit; "
-            "0 disables the filter."
+            "CSV length filter and ShareGPT context limit; 0 disables the "
+            "additional limit."
         ),
     )
     serving_group.add_argument(
         "--itl-log-path",
         default="pd_itl_samples.jsonl",
         help="JSONL output for per-request ITL samples; empty disables it.",
+    )
+    serving_group.add_argument(
+        "--text-output-path",
+        default="pd_generated_text.jsonl",
+        help=(
+            "JSONL output containing ShareGPT prompt, reference, and "
+            "generated text; empty disables it."
+        ),
     )
     serving_group.add_argument(
         "--warmup-requests",
@@ -162,6 +200,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup-requests must be non-negative")
     if args.max_request_tokens < 0:
         raise ValueError("--max-request-tokens must be non-negative")
+    if args.sharegpt_max_output_tokens < 0:
+        raise ValueError("--sharegpt-max-output-tokens must be non-negative")
+    if args.temperature <= 1e-10:
+        raise ValueError("--temperature must be greater than 1e-10")
     if args.max_model_len <= 0:
         raise ValueError("--max-model-len must be positive")
     if args.max_num_seqs <= 0:
@@ -173,6 +215,15 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--csv-path is required with --dataset=csv")
         if not os.path.isfile(args.csv_path):
             raise FileNotFoundError(f"CSV file not found: {args.csv_path}")
+    if args.dataset == "sharegpt":
+        if not args.sharegpt_path:
+            raise ValueError(
+                "--sharegpt-path is required with --dataset=sharegpt"
+            )
+        if not os.path.isfile(args.sharegpt_path):
+            raise FileNotFoundError(
+                f"ShareGPT file not found: {args.sharegpt_path}"
+            )
     pd_example.decode_dynamic_sp_kwargs(args)
 
 
@@ -200,6 +251,169 @@ def generate_poisson_arrival_times(
         arrival_times.append(arrival_time)
 
 
+def _first_sharegpt_pair(
+    record: object,
+) -> tuple[str, str, str | None] | None:
+    if not isinstance(record, dict):
+        return None
+    conversations = record.get("conversations")
+    if not isinstance(conversations, list):
+        return None
+    for first, second in zip(conversations, conversations[1:]):
+        if not isinstance(first, dict) or not isinstance(second, dict):
+            continue
+        first_role = str(first.get("from", "")).strip().lower()
+        second_role = str(second.get("from", "")).strip().lower()
+        if first_role not in {"human", "user"}:
+            continue
+        if second_role not in {"gpt", "assistant"}:
+            continue
+        prompt = first.get("value")
+        reference = second.get("value")
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        if not isinstance(reference, str) or not reference.strip():
+            continue
+        dataset_id = record.get("id")
+        return (
+            prompt,
+            reference,
+            str(dataset_id) if dataset_id is not None else None,
+        )
+    return None
+
+
+def sample_sharegpt_pairs(
+    path: str,
+    count: int,
+    rng: random.Random,
+) -> list[tuple[str, str, str | None]]:
+    """Reservoir-sample valid human-to-assistant pairs from a large JSON."""
+    try:
+        import ijson
+    except ImportError as exc:
+        raise RuntimeError(
+            "ShareGPT streaming requires ijson; install it with "
+            "`python3 -m pip install ijson`"
+        ) from exc
+
+    reservoir: list[tuple[str, str, str | None]] = []
+    valid_count = 0
+    with open(path, "rb") as stream:
+        for record in ijson.items(stream, "item"):
+            pair = _first_sharegpt_pair(record)
+            if pair is None:
+                continue
+            valid_count += 1
+            if len(reservoir) < count:
+                reservoir.append(pair)
+                continue
+            replacement = rng.randrange(valid_count)
+            if replacement < count:
+                reservoir[replacement] = pair
+
+    if not reservoir:
+        raise ValueError("ShareGPT dataset has no valid human/gpt pairs")
+    print(
+        "ShareGPT scan completed:",
+        f"valid_pairs={valid_count}",
+        f"sampled_pairs={len(reservoir)}",
+        flush=True,
+    )
+    return reservoir
+
+
+def build_sharegpt_requests(
+    pairs: SequenceABC[tuple[str, str, str | None]],
+    tokenizer,
+    *,
+    count: int,
+    max_model_len: int,
+    max_request_tokens: int,
+    max_output_tokens: int,
+    temperature: float,
+) -> list[WorkloadRequest]:
+    context_limit = max_model_len
+    if max_request_tokens > 0:
+        context_limit = min(context_limit, max_request_tokens)
+
+    usable: list[WorkloadRequest] = []
+    skipped = 0
+    for prompt, reference, dataset_id in pairs:
+        prompt_token_ids = list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+        available_output_tokens = context_limit - len(prompt_token_ids)
+        if available_output_tokens <= 0:
+            skipped += 1
+            continue
+
+        reference_token_ids = tokenizer.encode(
+            reference,
+            add_special_tokens=False,
+        )
+        output_tokens = min(len(reference_token_ids), available_output_tokens)
+        if max_output_tokens > 0:
+            output_tokens = min(output_tokens, max_output_tokens)
+        if output_tokens <= 0:
+            skipped += 1
+            continue
+
+        usable.append(
+            WorkloadRequest(
+                prompt_token_ids=prompt_token_ids,
+                sampling_params=SamplingParams(
+                    temperature=temperature,
+                    ignore_eos=False,
+                    max_tokens=output_tokens,
+                ),
+                prompt_text=prompt,
+                reference_text=reference,
+                dataset_id=dataset_id,
+            )
+        )
+
+    if not usable:
+        raise ValueError(
+            "No sampled ShareGPT request fits the configured context limit"
+        )
+    if len(usable) < count:
+        print(
+            "Warning: cycling usable ShareGPT requests:",
+            f"usable={len(usable)}",
+            f"requested={count}",
+            f"skipped={skipped}",
+            flush=True,
+        )
+
+    requests = [usable[index % len(usable)] for index in range(count)]
+    prompt_lengths = np.asarray(
+        [len(request.prompt_token_ids) for request in requests]
+    )
+    print(
+        "Prepared ShareGPT requests:",
+        f"count={len(requests)}",
+        f"prompt_tokens_p50={np.percentile(prompt_lengths, 50):.0f}",
+        f"p90={np.percentile(prompt_lengths, 90):.0f}",
+        f"p99={np.percentile(prompt_lengths, 99):.0f}",
+        f"max={prompt_lengths.max()}",
+        f"skipped={skipped}",
+        flush=True,
+    )
+    return requests
+
+
+def _length_only_requests(
+    requests: Iterable[tuple[list[int], SamplingParams]],
+) -> Iterator[WorkloadRequest]:
+    for prompt_token_ids, sampling_params in requests:
+        yield WorkloadRequest(prompt_token_ids, sampling_params)
+
+
 def _attach_end_to_end_metric(decode: LLM, sequence: Sequence) -> None:
     """Add a migrated sequence to decode without resetting its P/D metric."""
     metric = sequence.metric
@@ -214,16 +428,20 @@ def _attach_end_to_end_metric(decode: LLM, sequence: Sequence) -> None:
     metric.record_decode_arrival()
 
 
-def _warmup_requests(count: int) -> list[tuple[list[int], SamplingParams]]:
+def _warmup_requests(count: int) -> list[WorkloadRequest]:
     sampling_params = SamplingParams(
         temperature=0.6,
         ignore_eos=True,
         max_tokens=WARMUP_OUTPUT_LEN,
     )
     return [
-        (
-            np.random.randint(0, 10_000, size=WARMUP_PROMPT_LEN).tolist(),
-            sampling_params,
+        WorkloadRequest(
+            prompt_token_ids=np.random.randint(
+                0,
+                10_000,
+                size=WARMUP_PROMPT_LEN,
+            ).tolist(),
+            sampling_params=sampling_params,
         )
         for _ in range(count)
     ]
@@ -237,16 +455,21 @@ def _completed_output_ids(step_result: tuple) -> tuple[int, ...]:
 def run_pd_benchmark(
     prefill: LLM,
     decode: LLM,
-    requests: Iterable[tuple[list[int], SamplingParams]],
+    requests: Iterable[WorkloadRequest],
     arrival_times: SequenceABC[float],
     *,
     description: str = "P/D requests",
     show_progress: bool = True,
-) -> tuple[float, dict[int, Sequence]]:
+) -> tuple[
+    float,
+    dict[int, Sequence],
+    dict[int, WorkloadRequest],
+]:
     """Drive prefill and decode concurrently until every request completes."""
-    request_iterator: Iterator[tuple[list[int], SamplingParams]] = iter(requests)
+    request_iterator = iter(requests)
     num_requests = len(arrival_times)
     sequences: dict[int, Sequence] = {}
+    workload_by_sequence: dict[int, WorkloadRequest] = {}
     prefill_pending: dict[int, Sequence] = {}
     decode_ready: deque[Sequence] = deque()
     source_kv_held: dict[int, Sequence] = {}
@@ -329,18 +552,19 @@ def run_pd_benchmark(
                     and elapsed >= arrival_times[requests_sent]
                 ):
                     try:
-                        prompt, sampling_params = next(request_iterator)
+                        workload = next(request_iterator)
                     except StopIteration as exc:
                         raise RuntimeError(
                             "Workload ended before all scheduled arrivals: "
                             f"expected={num_requests}, got={requests_sent}"
                         ) from exc
                     sequence = Sequence(
-                        token_ids=prompt,
-                        sampling_params=sampling_params,
+                        token_ids=workload.prompt_token_ids,
+                        sampling_params=workload.sampling_params,
                     )
                     prefill.add_request(sequence)
                     sequences[sequence.seq_id] = sequence
+                    workload_by_sequence[sequence.seq_id] = workload
                     prefill_pending[sequence.seq_id] = sequence
                     requests_sent += 1
                     made_progress = True
@@ -392,7 +616,57 @@ def run_pd_benchmark(
         )
     if prefill_pending or decode_ready or source_kv_held or source_release_ready:
         raise RuntimeError("P/D benchmark completed with undrained request state")
-    return time.perf_counter() - benchmark_start, sequences
+    return (
+        time.perf_counter() - benchmark_start,
+        sequences,
+        workload_by_sequence,
+    )
+
+
+def write_generated_text(
+    path: str,
+    tokenizer,
+    sequences: dict[int, Sequence],
+    workload_by_sequence: dict[int, WorkloadRequest],
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    nonempty = 0
+    with output_path.open("w", encoding="utf-8") as stream:
+        for seq_id, sequence in sequences.items():
+            workload = workload_by_sequence[seq_id]
+            if workload.prompt_text is None:
+                continue
+            generated_token_ids = list(sequence.completion_token_ids)
+            generated_text = tokenizer.decode(
+                generated_token_ids,
+                skip_special_tokens=True,
+            )
+            if generated_text.strip():
+                nonempty += 1
+            metric = sequence.metric
+            record = {
+                "seq_id": seq_id,
+                "dataset_id": workload.dataset_id,
+                "prompt": workload.prompt_text,
+                "reference": workload.reference_text,
+                "generated": generated_text,
+                "prompt_tokens": len(workload.prompt_token_ids),
+                "generated_token_ids": generated_token_ids,
+                "generated_tokens": len(generated_token_ids),
+                "ttft_ms": metric.ttft if metric else None,
+                "e2e_latency_ms": metric.e2e_latency if metric else None,
+            }
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            written += 1
+    print(
+        "Saved generated ShareGPT text:",
+        f"path={output_path}",
+        f"records={written}",
+        f"nonempty={nonempty}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -414,16 +688,46 @@ def main() -> None:
             "--duration or --request-rate"
         )
 
-    # Advance once before timing so the shared loader reads and filters CSV
-    # metadata up front. Keep token IDs lazy: materializing minutes of long
-    # prompts can consume hundreds of GB on the driver.
     args.num_requests = len(arrival_times)
-    request_generator = serving.get_dataset_generator(args)
-    try:
-        first_request = next(request_generator)
-    except StopIteration as exc:
-        raise RuntimeError("The serving dataset produced no requests") from exc
-    requests = chain((first_request,), request_generator)
+    tokenizer = None
+    if args.dataset == "sharegpt":
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path,
+            use_fast=True,
+            trust_remote_code=True,
+        )
+        pairs = sample_sharegpt_pairs(
+            args.sharegpt_path,
+            len(arrival_times),
+            random.Random(args.seed),
+        )
+        requests: Iterable[WorkloadRequest] = build_sharegpt_requests(
+            pairs,
+            tokenizer,
+            count=len(arrival_times),
+            max_model_len=args.max_model_len,
+            max_request_tokens=args.max_request_tokens,
+            max_output_tokens=args.sharegpt_max_output_tokens,
+            temperature=args.temperature,
+        )
+        if args.dummy_weight:
+            print(
+                "Warning: --dummy-weight makes generated text meaningless; "
+                "disable it for output inspection.",
+                flush=True,
+            )
+    else:
+        # Advance once before timing so the shared loader reads and filters CSV
+        # metadata up front. Keep token IDs lazy: materializing minutes of long
+        # prompts can consume hundreds of GB on the driver.
+        request_generator = serving.get_dataset_generator(args)
+        try:
+            first_request = next(request_generator)
+        except StopIteration as exc:
+            raise RuntimeError("The serving dataset produced no requests") from exc
+        requests = _length_only_requests(
+            chain((first_request,), request_generator)
+        )
 
     print(
         "P/D serving workload:",
@@ -475,7 +779,7 @@ def main() -> None:
                 flush=True,
             )
 
-        total_time, sequence_map = run_pd_benchmark(
+        total_time, sequence_map, workload_by_sequence = run_pd_benchmark(
             prefill,
             decode,
             requests,
@@ -495,6 +799,13 @@ def main() -> None:
             len(arrival_times),
             itl_log_path=args.itl_log_path or None,
         )
+        if tokenizer is not None and args.text_output_path:
+            write_generated_text(
+                args.text_output_path,
+                tokenizer,
+                sequence_map,
+                workload_by_sequence,
+            )
     finally:
         pd_example.close_engine(prefill, "prefill")
         pd_example.close_engine(decode, "decode")
