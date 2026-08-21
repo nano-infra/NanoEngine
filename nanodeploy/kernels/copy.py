@@ -3,6 +3,64 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def zero_padded_rows_kernel(
+    dst_ptr,
+    actual_rows_ptr,
+    row_numel,
+    graph_rows,
+    BLOCK_SIZE: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    actual_rows = tl.load(actual_rows_ptr)
+    tail_numel = (graph_rows - actual_rows) * row_numel
+    tail_begin = actual_rows * row_numel
+
+    for offset in tl.range(
+        program_id * BLOCK_SIZE,
+        tail_numel,
+        program_count * BLOCK_SIZE,
+    ):
+        offsets = offset + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            dst_ptr + tail_begin + offsets,
+            0.0,
+            mask=offsets < tail_numel,
+        )
+
+
+def zero_padded_rows_triton(
+    dst: torch.Tensor,
+    actual_rows: torch.Tensor,
+    graph_rows: int,
+) -> None:
+    """Zero a replay-varying row tail without changing a Graph tensor shape."""
+
+    if dst.ndim < 2 or not dst.is_contiguous():
+        raise ValueError("padded-row initialization requires a contiguous tensor")
+    if actual_rows.numel() != 1 or actual_rows.dtype != torch.int32:
+        raise ValueError("actual_rows must be one int32 device scalar")
+    if not 0 < graph_rows <= dst.size(0):
+        raise ValueError(
+            f"graph_rows must be in [1, {dst.size(0)}], got {graph_rows}"
+        )
+
+    row_numel = dst[0].numel()
+    block_size = 256
+    program_count = min(
+        128,
+        triton.cdiv(graph_rows * row_numel, block_size),
+    )
+    zero_padded_rows_kernel[(program_count,)](
+        dst,
+        actual_rows,
+        row_numel,
+        graph_rows,
+        BLOCK_SIZE=block_size,
+    )
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 64, "BLOCK_D": 256}, num_warps=8, num_stages=4),

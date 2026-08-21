@@ -3,7 +3,10 @@ import torch
 
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
-from nanodeploy.kernels.copy import copy_batch_indexed_triton
+from nanodeploy.kernels.copy import (
+    copy_batch_indexed_triton,
+    zero_padded_rows_triton,
+)
 from nanodeploy.kernels.kvcache import store_kcache, store_kvcache
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.context import get_context
@@ -30,6 +33,17 @@ def _narrow_sp_matrix_for_comm(tensor: torch.Tensor, comm_bs: int) -> torch.Tens
     if tensor.size(1) == comm_bs:
         return tensor
     return tensor[:, :comm_bs]
+
+
+def _initialize_hao_graph_q_padding(q: torch.Tensor, context) -> None:
+    actual_attn_bs = context.actual_attn_bs
+    if actual_attn_bs is None:
+        return
+    zero_padded_rows_triton(
+        q,
+        actual_attn_bs,
+        context.attention_compute_bs,
+    )
 
 
 def _remap_sp_stride_indices(
@@ -133,6 +147,8 @@ class FlashAttentionImpl:
                     offsets=None if q_dst_row_indices is not None else context.q_offsets,
                     dst_row_indices=q_dst_row_indices,
                 ).view([sp_size * comm_bs, num_head, head_dim])
+
+                _initialize_hao_graph_q_padding(q, context)
 
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
@@ -462,6 +478,8 @@ class FlashMLAImpl:
                     offsets=None if q_dst_row_indices is not None else context.q_offsets,
                     dst_row_indices=q_dst_row_indices,
                 ).view([sp_size * comm_bs, num_head, head_dim])
+
+                _initialize_hao_graph_q_padding(q, context)
 
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[

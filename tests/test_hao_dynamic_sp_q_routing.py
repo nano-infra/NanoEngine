@@ -1,4 +1,4 @@
-"""Exercise dynamic-SP Q routing through NanoDeploy and DLSlime.
+"""Exercise dynamic-SP Q routing and replay-varying Graph padding.
 
 Run with:
 
@@ -13,7 +13,10 @@ import torch
 import torch.distributed as dist
 
 from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decode_cpp
-from nanodeploy.kernels.copy import copy_batch_indexed_triton
+from nanodeploy.kernels.copy import (
+    copy_batch_indexed_triton,
+    zero_padded_rows_triton,
+)
 from nanodeploy.worker.sp_backend import HaoAllToAllBufferAdapter
 
 
@@ -128,13 +131,24 @@ def _assert_output(
     output: torch.Tensor,
     expected: torch.Tensor,
     rank: int,
+    *,
+    graph_rows: int | None = None,
 ) -> None:
     flat = output.view(_SP_SIZE * _MAX_NUM_SEQS, _FEATURE_DIM)
     assert torch.equal(flat[: expected.size(0)], expected), (
         f"rank {rank} packed Q rows differ from the receiver oracle"
     )
-    assert torch.all(flat[expected.size(0) :] == _SENTINEL), (
-        f"rank {rank} wrote outside the packed Q prefix"
+    if graph_rows is None:
+        assert torch.all(flat[expected.size(0) :] == _SENTINEL), (
+            f"rank {rank} wrote outside the packed Q prefix"
+        )
+        return
+
+    assert torch.all(flat[expected.size(0) : graph_rows] == 0), (
+        f"rank {rank} did not initialize the Graph-only Q tail"
+    )
+    assert torch.all(flat[graph_rows:] == _SENTINEL), (
+        f"rank {rank} wrote outside the captured attention rows"
     )
 
 
@@ -189,6 +203,15 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
             metadata.q_copy_mask, dtype=torch.int32, device=device
         )
         expected = _expected_receiver_rows(scheduled, rank, device)
+        expected_counts = [
+            _expected_receiver_rows(scheduled, receiver, device).size(0)
+            for receiver in range(_SP_SIZE)
+        ]
+        graph_rows = max(expected_counts)
+        actual_rows = torch.tensor(
+            expected.size(0), dtype=torch.int32, device=device
+        )
+        original_dst_row_indices = dst_row_indices.clone()
 
         buffer_size_bytes = (
             _SP_SIZE * _MAX_NUM_SEQS * _FEATURE_DIM * _DTYPE.itemsize
@@ -232,7 +255,10 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
             )
             torch.cuda.synchronize(device)
             dist.barrier()
-            buffer.all_to_all_ll(x, dst_row_indices=dst_row_indices)
+            warmup_output = buffer.all_to_all_ll(
+                x, dst_row_indices=dst_row_indices
+            ).view(_SP_SIZE * _MAX_NUM_SEQS, _FEATURE_DIM)
+            zero_padded_rows_triton(warmup_output, actual_rows, graph_rows)
             torch.cuda.synchronize(device)
             dist.barrier()
 
@@ -258,7 +284,8 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
             graph_output = buffer.all_to_all_ll(
                 x,
                 dst_row_indices=dst_row_indices,
-            )
+            ).view(_SP_SIZE * _MAX_NUM_SEQS, _FEATURE_DIM)
+            zero_padded_rows_triton(graph_output, actual_rows, graph_rows)
         torch.cuda.synchronize(device)
         dist.barrier()
 
@@ -275,7 +302,35 @@ def test_dynamic_sp_destination_rows_eager_and_cudagraph():
         graph.replay()
         torch.cuda.synchronize(device)
         dist.barrier()
-        _assert_output(graph_output, expected, rank)
+        _assert_output(graph_output, expected, rank, graph_rows=graph_rows)
+
+        second_counts = [max(1, count - 1) for count in expected_counts]
+        second_dst_row_indices = original_dst_row_indices.clone()
+        for receiver, receiver_count in enumerate(second_counts):
+            receiver_rows = second_dst_row_indices[receiver]
+            receiver_rows[receiver_rows >= receiver_count] = -1
+        dst_row_indices.copy_(second_dst_row_indices)
+        actual_rows.fill_(second_counts[rank])
+
+        _prepare_local_buffer(
+            buffer,
+            x,
+            q_slice_get,
+            q_slice_fill,
+            q_copy_mask,
+            reset=True,
+        )
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        _assert_output(
+            graph_output,
+            expected[: second_counts[rank]],
+            rank,
+            graph_rows=graph_rows,
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

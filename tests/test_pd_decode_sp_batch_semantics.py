@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decode_cpp
-from nanodeploy.worker.sp_graph_policy import (
-    build_fixed_sp_graph_layout,
-    packed_attention_rows_to_dense,
+from nanodeploy.worker.sp_graph_policy import materialize_sp_graph_padding
+from tests.sp_routing_oracle import (
+    assert_destination_rows_match_packed_receivers,
 )
 
 
@@ -264,15 +266,13 @@ def test_fixed_sp8_batch_metadata_roundtrips_distinct_request_identities():
         )
         for master in range(_SP_SIZE):
             source_metadata = metadata_by_rank[master]
-            source_global_lens = _matrix(
-                source_metadata.global_context_lens_flat
-            )
-            source_q_mask = _binary_mask(source_global_lens, master)
             if participant == master:
                 destination_row = list(source_metadata.q_slice_fill)[0]
             else:
-                assert source_q_mask[participant][0] == 1
-                destination_row = list(metadata.q_offsets)[master]
+                destination_row = list(
+                    source_metadata.q_dst_row_indices_flat
+                )[participant * _MAX_NUM_SEQS]
+                assert destination_row >= 0
 
             assert received_queries[destination_row] is None
             received_queries[destination_row] = by_master[master].seq_id
@@ -335,17 +335,16 @@ def test_fixed_sp8_batch_metadata_roundtrips_distinct_request_identities():
             )
 
 
-def test_fixed_sp8_graph_layout_stays_dense_after_eos():
-    """Graph padding must preserve dense identities after a request exits.
-
-    Request 0 is replaced by a rank-0-only control dummy.  Ranks 1..7 then
-    receive seven packed C++ attention rows, but the fixed graph must keep the
-    same eight-row master-major layout.  The absent row gets an explicit Q and
-    a legal throw-away attention row; its Res/LSE mask remains zero so it
-    cannot enter request 0's reduction.
-    """
+def test_fixed_sp8_packed_graph_padding_after_eos():
+    """Fixed SP keeps packed real rows and pads only Graph-only tails."""
 
     batch = _schedule_fixed_sp_batch(8)
+    assert_destination_rows_match_packed_receivers(
+        batch.scheduled,
+        sp_size=_SP_SIZE,
+        max_num_seqs=_MAX_NUM_SEQS,
+        block_size=_BLOCK_SIZE,
+    )
     remaining = [
         sequence
         for sequence in batch.scheduled
@@ -353,6 +352,12 @@ def test_fixed_sp8_graph_layout_stays_dense_after_eos():
     ]
     rank_zero_dummy = batch.scheduler.worker_state[0].dummy_seqs[0]
     after_eos = tuple(remaining + [rank_zero_dummy])
+    assert_destination_rows_match_packed_receivers(
+        after_eos,
+        sp_size=_SP_SIZE,
+        max_num_seqs=_MAX_NUM_SEQS,
+        block_size=_BLOCK_SIZE,
+    )
 
     for sp_rank in range(_SP_SIZE):
         metadata = prepare_decode_cpp(
@@ -362,55 +367,111 @@ def test_fixed_sp8_graph_layout_stays_dense_after_eos():
             _BLOCK_SIZE,
             _MAX_NUM_SEQS,
         )
-        layout = build_fixed_sp_graph_layout(
+        actual_attn_bs = len(metadata.context_lens_for_attn)
+        assert actual_attn_bs == (_SP_SIZE if sp_rank == 0 else _SP_SIZE - 1)
+
+        actual_block_tables = torch.tensor(
+            metadata.block_tables_flat,
+            dtype=torch.int32,
+        ).reshape(actual_attn_bs, metadata.max_num_blocks)
+        # Rank 0 also covers piecewise attention, where eager attention uses
+        # the exact packed row count and only the master batch is padded.
+        graph_attn_bs = (
+            actual_attn_bs if sp_rank == 0 else 2 * _SP_SIZE
+        )
+        graph_master_bs = 2
+        graph_vars = {
+            "context_lens": torch.tensor(
+                metadata.context_lens_flat,
+                dtype=torch.int32,
+            ).reshape(_SP_SIZE, _MAX_NUM_SEQS),
+            "global_context_lens": torch.tensor(
+                metadata.global_context_lens_flat,
+                dtype=torch.int32,
+            ).reshape(_SP_SIZE, _MAX_NUM_SEQS),
+            "context_lens_for_attn": torch.zeros(
+                graph_attn_bs,
+                dtype=torch.int32,
+            ),
+            "block_tables": torch.full(
+                (graph_attn_bs, metadata.max_num_blocks),
+                -1,
+                dtype=torch.int32,
+            ),
+            "res_slice_get_to_buffer_output": torch.full(
+                (graph_master_bs,), -1, dtype=torch.int32
+            ),
+            "res_slice_fill_to_buffer_output": torch.full(
+                (graph_master_bs,), -1, dtype=torch.int32
+            ),
+            "res_to_buffer_output_mask": torch.zeros(
+                graph_master_bs, dtype=torch.int32
+            ),
+        }
+        graph_vars["context_lens_for_attn"][:actual_attn_bs].copy_(
+            torch.tensor(metadata.context_lens_for_attn, dtype=torch.int32)
+        )
+        graph_vars["block_tables"][:actual_attn_bs].copy_(actual_block_tables)
+        local_result_rows = len(metadata.res_slice_get_to_buffer_output)
+        graph_vars["res_slice_get_to_buffer_output"][:local_result_rows].copy_(
+            torch.tensor(
+                metadata.res_slice_get_to_buffer_output,
+                dtype=torch.int32,
+            )
+        )
+        graph_vars["res_slice_fill_to_buffer_output"][:local_result_rows].copy_(
+            torch.tensor(
+                metadata.res_slice_fill_to_buffer_output,
+                dtype=torch.int32,
+            )
+        )
+        graph_vars["res_to_buffer_output_mask"][:local_result_rows].copy_(
+            torch.tensor(
+                metadata.res_to_buffer_output_mask,
+                dtype=torch.int32,
+            )
+        )
+        packed_contexts = graph_vars["context_lens_for_attn"][
+            :actual_attn_bs
+        ].clone()
+        packed_blocks = graph_vars["block_tables"][:actual_attn_bs].clone()
+
+        materialize_sp_graph_padding(
+            graph_vars,
+            actual_block_tables=actual_block_tables,
+            actual_attn_bs=actual_attn_bs,
+            graph_attn_bs=graph_attn_bs,
+            actual_master_bs=1,
+            graph_master_bs=graph_master_bs,
+            local_result_rows=local_result_rows,
             sp_rank=sp_rank,
-            sp_world_size=_SP_SIZE,
             max_num_seqs=_MAX_NUM_SEQS,
-            master_bs=1,
-        )
-        packed_to_dense = packed_attention_rows_to_dense(
-            metadata.context_lens_flat,
-            sp_world_size=_SP_SIZE,
-            max_num_seqs=_MAX_NUM_SEQS,
-            master_bs=1,
         )
 
-        assert layout.attention_bs == _SP_SIZE
-        assert layout.q_offsets == tuple(range(_SP_SIZE + 1))
-        assert layout.q_slice_get == (0,)
-        assert layout.q_slice_fill == (sp_rank,)
-        assert layout.res_slice_get_to_buffer_output == (sp_rank,)
-        assert layout.res_slice_fill_to_buffer_output == (
-            sp_rank * _MAX_NUM_SEQS,
+        torch.testing.assert_close(
+            graph_vars["context_lens_for_attn"][:actual_attn_bs],
+            packed_contexts,
         )
-
-        if sp_rank == 0:
-            assert len(metadata.context_lens_for_attn) == _SP_SIZE
-            assert packed_to_dense == tuple(range(_SP_SIZE))
-        else:
-            assert len(metadata.context_lens_for_attn) == _SP_SIZE - 1
-            assert packed_to_dense == tuple(range(1, _SP_SIZE))
-
-        dense_context_lens = [1] * layout.attention_bs
-        for packed_row, dense_row in enumerate(packed_to_dense):
-            dense_context_lens[dense_row] = metadata.context_lens_for_attn[
-                packed_row
-            ]
-        assert all(context_len > 0 for context_len in dense_context_lens)
-
-        # Transport every dense Q so no persistent receive-buffer row is
-        # stale.  Only real local KV shards return Res/LSE contributions.
-        q_mask = [
-            0 if destination == sp_rank else 1
-            for destination in range(_SP_SIZE)
+        torch.testing.assert_close(
+            graph_vars["block_tables"][:actual_attn_bs],
+            packed_blocks,
+        )
+        assert torch.equal(
+            graph_vars["context_lens_for_attn"][actual_attn_bs:graph_attn_bs],
+            torch.ones(graph_attn_bs - actual_attn_bs, dtype=torch.int32),
+        )
+        assert torch.equal(
+            graph_vars["block_tables"][actual_attn_bs:graph_attn_bs],
+            actual_block_tables[0:1].expand(graph_attn_bs - actual_attn_bs, -1),
+        )
+        assert graph_vars["context_lens"][sp_rank, 1].item() == 1
+        assert graph_vars["global_context_lens"][sp_rank, 1].item() == 1
+        assert graph_vars["res_slice_get_to_buffer_output"].tolist() == [
+            metadata.res_slice_get_to_buffer_output[0],
+            actual_attn_bs if actual_attn_bs < graph_attn_bs else 0,
         ]
-        assert sum(q_mask) == _SP_SIZE - 1
-
-        response_mask = [
-            int(_matrix(metadata.context_lens_flat)[master][0] > 0)
-            for master in range(_SP_SIZE)
+        assert graph_vars["res_slice_fill_to_buffer_output"].tolist() == [
+            metadata.res_slice_fill_to_buffer_output[0],
+            sp_rank * _MAX_NUM_SEQS + 1,
         ]
-        if sp_rank == 0:
-            assert response_mask == [1] * _SP_SIZE
-        else:
-            assert response_mask == [0] + [1] * (_SP_SIZE - 1)
+        assert graph_vars["res_to_buffer_output_mask"].tolist() == [1, 1]
