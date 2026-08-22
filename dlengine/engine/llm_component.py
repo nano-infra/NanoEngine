@@ -77,7 +77,7 @@ class LLMComponent(LLM):
         having to replicate architecture-specific split policies (e.g.
         Gemma4 reserves its shared-KV suffix for the last stage).
         """
-        from dlengine.models.pp_utils import (
+        from dlengine.runtime.models.pp_utils import (
             get_gemma4_shared_kv_source_start,
             pp_layer_partition,
         )
@@ -99,7 +99,7 @@ class LLMComponent(LLM):
 
     def _pp_cache_layer_indices(self) -> list[list[int]]:
         """Global primary-cache layer indices owned by each PP stage."""
-        from dlengine.models.pp_utils import (
+        from dlengine.runtime.models.pp_utils import (
             cache_layer_indices,
             partition_layer_indices,
         )
@@ -115,7 +115,7 @@ class LLMComponent(LLM):
 
     def _pp_dsv4_ratio_layer_indices(self) -> dict[int, list[list[int]]]:
         """Global DSv4 compressed-layer indices by ratio and PP stage."""
-        from dlengine.models.pp_utils import partition_layer_indices
+        from dlengine.runtime.models.pp_utils import partition_layer_indices
 
         ranges = [tuple(value) for value in self._pp_layer_ranges()]
         ratios = list(getattr(self.config.hf_config, "compress_ratios", None) or [])

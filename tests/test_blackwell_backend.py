@@ -1,7 +1,7 @@
-import dlengine.layers as layers
+import dlengine.runtime.layers as layers
 import torch
-from dlengine.context.batch import reset_batch_context, set_batch_context
-from dlengine.layers.blackwell import attention, BlackwellBackendFactory
+from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
+from dlengine.runtime.layers.blackwell import attention, BlackwellBackendFactory
 
 
 def teardown_function():

@@ -3,15 +3,15 @@ import json
 from dlengine._rust.config import CachePlan, RoutingStrategy, SchedulerConfig
 from dlengine._rust.core import Scheduler as RustScheduler
 from dlengine.config import Config
-from dlengine.context.cache.plan import (
+from dlengine.logging import get_logger
+from dlengine.runtime.context.cache.plan import (
     deepseek_mla_cache_plan,
     gqa_cache_plan,
     gqa_hisparse_cache_plan,
     hca_csa_cache_plan,
     qwen35_cache_plan,
 )
-from dlengine.logging import get_logger
-from dlengine.models.trait import has_gdn_component, has_hca_csa_cache
+from dlengine.runtime.models.trait import has_gdn_component, has_hca_csa_cache
 
 logger = get_logger("dlengine")
 
@@ -86,7 +86,7 @@ def _build_cache_plan_with_reason(config: Config) -> tuple[CachePlan, str]:
         return plan, "hf_config.compress_ratios declares HCA/CSA compressed cache"
 
     if arch == "KimiK3ForConditionalGeneration":
-        from dlengine.context.cache.plan import kimi_k3_cache_plan
+        from dlengine.runtime.context.cache.plan import kimi_k3_cache_plan
 
         return kimi_k3_cache_plan(), "K3 combines MLA with KDA linear state"
 

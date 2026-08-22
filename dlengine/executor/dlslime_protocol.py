@@ -78,7 +78,7 @@ class ModelRunnerRpcService:
         # worker, same as step_timing). INFO so it is visible without flooding
         # the logs with unrelated DEBUG output.
         if not is_prefill:
-            from dlengine.worker.runner_config import get_runner_config
+            from dlengine.runtime.runner.runner_config import get_runner_config
 
             if get_runner_config().dlslime_timing:
                 from dlengine.logging import get_logger

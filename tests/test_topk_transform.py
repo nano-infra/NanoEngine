@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(
 def test_topk_transform_matches_torch(top_k):
     pytest.importorskip("tvm_ffi")
 
-    from dlengine.kernel.jit.sgl.deepseek_v4 import topk_transform
+    from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import topk_transform
 
     torch.manual_seed(0)
     page_size = 64

@@ -1,9 +1,8 @@
 import pytest
 import torch
-
-from dlengine.layers.backends.megamoe import MegaMoEExperts
-from dlengine.layers.blackwell import BlackwellBackendFactory
-from dlengine.models.quant_config import QuantizationConfig
+from dlengine.runtime.layers.backends.megamoe import MegaMoEExperts
+from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
+from dlengine.runtime.models.quant_config import QuantizationConfig
 
 
 def mxfp4_config():
@@ -117,9 +116,7 @@ def test_k3_packed_expert_loader_uses_ep_only_and_merges_w1_w3():
         ("w3", "weight_scale", s3),
         ("w2", "weight_scale", s2),
     ):
-        assert experts.load_expert_weight(
-            4, projection, kind, tensor, ep_rank=1
-        )
+        assert experts.load_expert_weight(4, projection, kind, tensor, ep_rank=1)
 
     assert torch.equal(experts.gate_up_proj[0, :32], w1)
     assert torch.equal(experts.gate_up_proj[0, 32:], w3)

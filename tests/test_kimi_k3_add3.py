@@ -1,7 +1,6 @@
 import pytest
 import torch
-
-from dlengine.kernel.jit.sgl.add3 import add3
+from dlengine.runtime.kernel.jit.sgl.add3 import add3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

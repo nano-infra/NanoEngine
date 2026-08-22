@@ -1,6 +1,6 @@
 import pytest
-from dlengine.context.cache.hca import DSV4_BYTES_PER_TOKEN
-from dlengine.disagg.p2p.cache_layout import CacheTensorLayout
+from dlengine.runtime.context.cache.hca import DSV4_BYTES_PER_TOKEN
+from dlengine.runtime.disagg.p2p.cache_layout import CacheTensorLayout
 
 
 def _layout(**overrides):

@@ -8,9 +8,9 @@ import torch
 # We need to mock distributed + dlslime since CacheContext.__post_init__ calls them.
 # Instead, we test allocate_kvcache directly.
 
-from dlengine.context.cache import CacheContext
-from dlengine.context.cache.mla import get_mla_block_bytes
-from dlengine.disagg.p2p.cache_layout import CacheTensorLayout
+from dlengine.runtime.context.cache import CacheContext
+from dlengine.runtime.context.cache.mla import get_mla_block_bytes
+from dlengine.runtime.disagg.p2p.cache_layout import CacheTensorLayout
 
 
 class TestCacheContextFP8:

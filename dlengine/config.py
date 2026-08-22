@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig, PretrainedConfig
 
 from dlengine.logging import get_logger
-from dlengine.models.trait import apply_hf_config_compatibility_fixes
+from dlengine.runtime.models.trait import apply_hf_config_compatibility_fixes
 
 logger = get_logger("dlengine")
 
@@ -260,7 +260,7 @@ class Config(BaseModel):
         try:
             from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-            from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
+            from dlengine.runtime.models.deepseek_v4.configuration_deepseek_v4 import (
                 DeepseekV4Config,
             )
 
@@ -290,7 +290,7 @@ class Config(BaseModel):
             elif config_dict.get("model_type") != "deepseek_v4":
                 raise
             else:
-                from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
+                from dlengine.runtime.models.deepseek_v4.configuration_deepseek_v4 import (
                     DeepseekV4Config,
                 )
 
@@ -593,7 +593,9 @@ class Config(BaseModel):
                     f"pp cannot exceed num_hidden_layers ({num_hidden_layers})"
                 )
             if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
-                from dlengine.models.pp_utils import get_gemma4_shared_kv_source_start
+                from dlengine.runtime.models.pp_utils import (
+                    get_gemma4_shared_kv_source_start,
+                )
 
                 source_start = get_gemma4_shared_kv_source_start(self.hf_config)
                 if source_start is not None and source_start < self.pp - 1:

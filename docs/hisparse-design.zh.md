@@ -272,7 +272,7 @@ dummy-prefill 的正确性目标是“服务链路能跑通并且 graph replay �
 - backup 新产生的 decode tokens 到 host；
 - DSv4 c4/c128 compressed-cache variants。
 
-CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个小的 Python wrapper 调用。风格和现有 `dlengine/kernel/jit/sgl` 下引入的 SGLang JIT kernels 保持一致。
+CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个小的 Python wrapper 调用。风格和现有 `dlengine/runtime/kernel/jit/sgl` 下引入的 SGLang JIT kernels 保持一致。
 
 ## 文件级集成点
 
@@ -287,22 +287,22 @@ CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个
   - 把新配置串到 `LLMEngine`、Ray、DLSLime workers；
   - Phase 1 只在 decode workers 初始化 HiSparse；
   - 为后续 host memory registration 保留 `destroy()` 生命周期钩子。
-- `dlengine/worker/`
+- `dlengine/runtime/runner/`
   - 在 `ModelRunner` 初始化 `HiSparseContext`；
   - `CacheContext` 存在后、CUDA graph capture 前完成 cache wiring；
   - eager decode 和 graph replay 前调用 coordinator refresh；
   - `InputPreparer` 继续负责把 C++ aux data 转为 CUDA tensors。
-- `dlengine/context/`
+- `dlengine/runtime/context/`
   - 给 `BatchContext` 增加 runtime tensors；
   - 在 `context/cache` 下增加 persistent HiSparse cache/coordinator tensors；
   - 接入现有 context reset 路径。
-- `dlengine/kernel/`
+- `dlengine/runtime/kernel/`
   - 增加 `hisparse.cuh` 和 graph-safe top-k remap Python wrapper；
   - 第一版 kernel 保持小而确定，先不加入 host swap-in。
 - `dlengine-proto/`
   - Phase 1 就增加 `hisparse_slot`，不要复用 `state_slot`；
   - 后续 PD direct host-pool metadata 和这个 request slot 分开设计。
-- `dlengine/models/deepseek_v2/`
+- `dlengine/runtime/models/deepseek_v2/`
   - 第一版只 gate DSV3.2 attention path；
   - 把 `Indexer` top-k 输出在 sparse FlashMLA 前接入 HiSparse；
   - FP8 KV/indexer writes 使用 HiSparse-remapped output slots。

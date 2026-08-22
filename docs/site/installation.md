@@ -38,7 +38,7 @@ For an editable developer build:
 pip install -e .
 ```
 
-GPU kernels are maintained under `dlengine/kernel`; users should not separately install the vendored DeepEP, DeepGEMM, or FlashMLA source trees.
+GPU kernels are maintained under `dlengine/runtime/kernel`; users should not separately install the vendored DeepEP, DeepGEMM, or FlashMLA source trees.
 
 ## Router build
 

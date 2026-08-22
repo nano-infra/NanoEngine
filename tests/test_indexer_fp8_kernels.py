@@ -15,7 +15,7 @@ def _reference_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def test_indexer_query_quant_matches_reference():
-    from dlengine.kernel.triton.hopper.block_gemm_fp8 import quant_fp8
+    from dlengine.runtime.kernel.triton.hopper.block_gemm_fp8 import quant_fp8
 
     torch.manual_seed(0)
     query = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
@@ -34,7 +34,7 @@ def test_indexer_query_quant_matches_reference():
 
 
 def test_indexer_key_store_matches_split_page_layout():
-    from dlengine.kernel.triton.generic.fp8_ue8m0_quant import (
+    from dlengine.runtime.kernel.triton.generic.fp8_ue8m0_quant import (
         store_indexer_key_fp8_fused,
     )
 

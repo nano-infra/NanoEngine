@@ -2,13 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from dlengine.layers.indexer import _expand_decode_context_lens
-from dlengine.models.deepseek_v2.deepseek_v2 import (
+from dlengine.runtime.layers.indexer import _expand_decode_context_lens
+from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
     _can_use_fused_indexer_topk,
     _get_indexer_mode,
     _IndexerTopKState,
 )
-from dlengine.models.trait import apply_hf_config_compatibility_fixes
+from dlengine.runtime.models.trait import apply_hf_config_compatibility_fixes
 
 GLM52_INDEXER_TYPES = [
     "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared"

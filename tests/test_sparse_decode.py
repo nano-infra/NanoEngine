@@ -27,8 +27,8 @@ def _init_backend():
     import os
 
     import torch.distributed as dist
-    from dlengine.context.distributed import set_dist_context
-    from dlengine.layers import _backend, init_backend
+    from dlengine.runtime.context.distributed import set_dist_context
+    from dlengine.runtime.layers import _backend, init_backend
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -44,7 +44,7 @@ def _init_backend():
 
 @pytest.fixture()
 def indexer_cache():
-    from dlengine.layers.indexer import IndexerCache
+    from dlengine.runtime.layers.indexer import IndexerCache
 
     return IndexerCache(
         num_layers=2,
@@ -58,7 +58,7 @@ def indexer_cache():
 @pytest.fixture()
 def indexer(indexer_cache):
     """Create an Indexer with random weights and attached cache."""
-    from dlengine.layers.indexer import Indexer
+    from dlengine.runtime.layers.indexer import Indexer
 
     prev_device = torch.get_default_device()
     prev_dtype = torch.get_default_dtype()
@@ -97,7 +97,7 @@ class TestTopkIndicesToPhysical:
 
     def test_basic_conversion(self):
         """Verify logical→physical mapping matches manual calculation."""
-        from dlengine.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
 
         block_size = 64
         # block_table: batch=1, 4 blocks with physical IDs [5, 10, 2, 8]
@@ -126,7 +126,7 @@ class TestTopkIndicesToPhysical:
 
     def test_negative_padding(self):
         """Padding entries (-1) are preserved as -1."""
-        from dlengine.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
 
         block_table = torch.tensor([[3, 7]], dtype=torch.int32, device="cuda")
         topk_indices = torch.tensor(
@@ -145,7 +145,7 @@ class TestTopkIndicesToPhysical:
 
     def test_multi_batch(self):
         """Multi-batch conversion works correctly."""
-        from dlengine.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
 
         block_table = torch.tensor([[1, 2], [5, 6]], dtype=torch.int32, device="cuda")
         topk_indices = torch.tensor(

@@ -1,5 +1,5 @@
 import pytest
-from dlengine.layers.backend_selection import (
+from dlengine.runtime.layers.backend_selection import (
     BackendSelection,
     resolve_backend_selection,
 )

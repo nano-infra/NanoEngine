@@ -1,15 +1,11 @@
 import pytest
 import torch
-
-from dlengine.kernel.triton.generic.fused_topk import (
-    fused_sigmoid_biased_topk,
-)
-from dlengine.kernel.triton.generic.rmsnorm_gated import (
+from dlengine.runtime.kernel.triton.generic.fused_topk import fused_sigmoid_biased_topk
+from dlengine.runtime.kernel.triton.generic.rmsnorm_gated import (
     sigmoid_rms_norm_gated_triton,
 )
-from dlengine.kernel.triton.generic.sigmoid_mul import sigmoid_mul_triton
-from dlengine.kernel.triton.generic.situ import situ_and_mul_triton
-
+from dlengine.runtime.kernel.triton.generic.sigmoid_mul import sigmoid_mul_triton
+from dlengine.runtime.kernel.triton.generic.situ import situ_and_mul_triton
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -26,7 +22,8 @@ def test_sigmoid_rms_norm_gated_matches_reference():
     actual = sigmoid_rms_norm_gated_triton(x, gate, weight, eps)
     xf = x.float()
     expected = (
-        xf * torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
+        xf
+        * torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
         * weight.float()
         * torch.sigmoid(gate.float())
     ).to(x.dtype)
@@ -41,7 +38,9 @@ def test_situ_and_mul_matches_reference(linear_beta):
     beta = 3.0
     gate, up = x.float().chunk(2, dim=-1)
     expected_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    expected_up = up if linear_beta is None else linear_beta * torch.tanh(up / linear_beta)
+    expected_up = (
+        up if linear_beta is None else linear_beta * torch.tanh(up / linear_beta)
+    )
     expected = (expected_gate * expected_up).to(x.dtype)
 
     actual = situ_and_mul_triton(x, beta=beta, linear_beta=linear_beta)

@@ -1,4 +1,4 @@
-from dlengine.models.gemma4.gemma4_loader import _is_unused_shared_kv_weight
+from dlengine.runtime.models.gemma4.gemma4_loader import _is_unused_shared_kv_weight
 from torch import nn
 
 

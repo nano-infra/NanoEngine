@@ -1,9 +1,7 @@
 import pytest
 import torch
-
-from dlengine.kernel.triton.generic.k3_causal_conv import k3_causal_conv_update
-from dlengine.kernel.triton.generic.k3_output_norm import k3_output_norm
-
+from dlengine.runtime.kernel.triton.generic.k3_causal_conv import k3_causal_conv_update
+from dlengine.runtime.kernel.triton.generic.k3_output_norm import k3_output_norm
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -42,16 +40,15 @@ def test_k3_causal_conv_updates_indexed_state_and_is_graph_safe():
 def test_k3_output_norm_accepts_strided_gate_and_is_graph_safe():
     batch, heads, dim = 4, 12, 128
     x = torch.randn(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
-    backing = torch.randn(
-        batch, 4 * heads * dim, device="cuda", dtype=torch.bfloat16
-    )
+    backing = torch.randn(batch, 4 * heads * dim, device="cuda", dtype=torch.bfloat16)
     gate = backing[:, 3 * heads * dim :].view(batch, heads, dim)
     assert not gate.is_contiguous()
     weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
     eps = 1e-6
     xf = x.float()
     expected = (
-        xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+        xf
+        * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
         * weight.float()
         * torch.sigmoid(gate.float())
     ).to(x.dtype)

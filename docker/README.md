@@ -60,7 +60,7 @@ docker run --gpus all --rm -it --network host --ipc=host \
 ```
 
 Inside the container, install DLEngine from the mounted checkout (the GPU
-compute kernels ship inside the `dlengine.kernel` subpackage):
+compute kernels ship inside the `dlengine.runtime.kernel` subpackage):
 
 ```bash
 python3 -m pip install --break-system-packages --no-build-isolation -v -e .

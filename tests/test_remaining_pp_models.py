@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-import dlengine.models.deepseek_v4.deepseek_v4 as deepseek_v4_module
-import dlengine.models.gemma4.gemma4 as gemma4_module
-from dlengine.models import pp_utils
+import dlengine.runtime.models.deepseek_v4.deepseek_v4 as deepseek_v4_module
+import dlengine.runtime.models.gemma4.gemma4 as gemma4_module
+from dlengine.runtime.models import pp_utils
 from torch import nn
 
 

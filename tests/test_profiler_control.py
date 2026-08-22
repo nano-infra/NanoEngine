@@ -6,13 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 from dlengine.engine.llm_engine import LLMEngine
+from dlengine.runtime.runner.model_runner import ModelRunner
 from dlengine.server.engine_server import (
     _ACTION_START_PROFILER,
     _ACTION_STOP_PROFILER,
     BackendService,
 )
 from dlengine.server.zmq_engine_client import ZmqEngineWorker
-from dlengine.worker.model_runner import ModelRunner
 
 
 class _FakeProfiler:
