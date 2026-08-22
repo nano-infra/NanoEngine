@@ -31,8 +31,8 @@ def _init_backend():
     import os
 
     import torch.distributed as dist
-    from dlengine.context.distributed import set_dist_context
-    from dlengine.layers import _backend, init_backend
+    from dlengine.runtime.context.distributed import set_dist_context
+    from dlengine.runtime.layers import _backend, init_backend
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -48,7 +48,7 @@ def _init_backend():
 
 @pytest.fixture()
 def indexer_cache():
-    from dlengine.layers.indexer import IndexerCache
+    from dlengine.runtime.layers.indexer import IndexerCache
 
     num_layers = 2
     num_pages = 16
@@ -64,7 +64,7 @@ def indexer_cache():
 @pytest.fixture()
 def indexer(indexer_cache):
     """Create an Indexer with random weights and attached cache."""
-    from dlengine.layers.indexer import Indexer
+    from dlengine.runtime.layers.indexer import Indexer
 
     prev_device = torch.get_default_device()
     prev_dtype = torch.get_default_dtype()
@@ -270,8 +270,8 @@ class TestIndexerCacheAllocation:
         """Verify allocate_indexer_cache creates an IndexerCache with correct params."""
         from types import SimpleNamespace
 
-        from dlengine.context.cache import CacheContext
-        from dlengine.layers.indexer import IndexerCache
+        from dlengine.runtime.context.cache import CacheContext
+        from dlengine.runtime.layers.indexer import IndexerCache
 
         hf_config = SimpleNamespace(index_head_dim=128)
 

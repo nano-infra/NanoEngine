@@ -14,7 +14,7 @@ is a pattern the model never saw during training, so once a sequence exceeds
 
 Key components:
 
-- `Indexer` (`dlengine/layers/indexer.py`): scores cached KV blocks via the FP8
+- `Indexer` (`dlengine/runtime/layers/indexer.py`): scores cached KV blocks via the FP8
   lightning indexer and selects the per-query top-k.
 - `IndexerCache.store_key_fp8`: quantizes indexer keys to FP8 + per-token scale
   and writes them into the paged buffer.

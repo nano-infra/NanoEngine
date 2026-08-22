@@ -10,7 +10,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("num_tokens", [1, 16, 513])
 def test_moe_fused_gate_matches_single_group_reference(num_tokens):
     pytest.importorskip("tvm_ffi")
-    from dlengine.kernel.jit.sgl.moe_fused_gate import moe_fused_gate
+    from dlengine.runtime.kernel.jit.sgl.moe_fused_gate import moe_fused_gate
 
     torch.manual_seed(0)
     logits = torch.randn(num_tokens, 256, device="cuda", dtype=torch.float32)

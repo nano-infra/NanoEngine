@@ -333,7 +333,7 @@ Future kernels:
 
 The CUDA header should live under the JIT/kernel tree as `hisparse.cuh` and be
 called through a small Python wrapper, matching the style of the imported SGLang
-JIT kernels already under `dlengine/kernel/jit/sgl`.
+JIT kernels already under `dlengine/runtime/kernel/jit/sgl`.
 
 ## File-level integration points
 
@@ -349,24 +349,24 @@ layout:
   - thread new config fields through `LLMEngine`, Ray, and DLSLime workers;
   - initialize HiSparse only on decode workers in Phase 1;
   - keep lifecycle hooks for `destroy()` once host memory registration lands.
-- `dlengine/worker/`
+- `dlengine/runtime/runner/`
   - initialize `HiSparseContext` in `ModelRunner`;
   - wire cache allocation after `CacheContext` exists and before CUDA graph
     capture;
   - call coordinator refresh before eager decode and before graph replay;
   - keep `InputPreparer` responsible for converting C++ aux data into CUDA
     tensors.
-- `dlengine/context/`
+- `dlengine/runtime/context/`
   - add runtime tensors to `BatchContext`;
   - add persistent HiSparse cache/coordinator tensors under `context/cache`;
   - reset HiSparse runtime state from the existing context reset path.
-- `dlengine/kernel/`
+- `dlengine/runtime/kernel/`
   - add `hisparse.cuh` and a Python wrapper for graph-safe top-k remapping;
   - keep the first kernel small and deterministic before adding host swap-in.
 - `dlengine-proto/`
   - add `hisparse_slot` in Phase 1; do not reuse `state_slot`;
   - keep future PD direct host-pool metadata separate from this request slot.
-- `dlengine/models/deepseek_v2/`
+- `dlengine/runtime/models/deepseek_v2/`
   - gate only the DSV3.2 attention path first;
   - route `Indexer` top-k output through HiSparse before sparse FlashMLA;
   - use HiSparse-remapped output slots for FP8 KV/indexer writes.

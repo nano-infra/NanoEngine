@@ -1,21 +1,21 @@
 # Supported Models
 
-DLEngine is designed primarily for large-model inference on multi-GPU and multi-node clusters. The canonical support boundary is the lazy architecture registry in [`dlengine/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/models/registry.py); model names are less reliable than the `architectures` value in the checkpoint configuration.
+DLEngine is designed primarily for large-model inference on multi-GPU and multi-node clusters. The canonical support boundary is the lazy architecture registry in [`dlengine/runtime/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/runtime/models/registry.py); model names are less reliable than the `architectures` value in the checkpoint configuration.
 
 ## Text model families
 
-| Model family | Checkpoint architecture | Core design | Notable DLEngine paths |
-| --- | --- | --- | --- |
-| Qwen3 dense | `Qwen3ForCausalLM` | GQA + dense FFN | TP/DP execution, paged KV cache, chunked prefill |
-| Qwen3 MoE | `Qwen3MoeForCausalLM` | GQA + MoE | Wide EP, packed FP8 weights, distributed serving |
-| Qwen3.5 dense | `Qwen3_5ForConditionalGeneration` | Full attention + GDN + dense FFN | Mixed-attention KV/GDN state management |
-| Qwen3.5 MoE | `Qwen3_5MoeForConditionalGeneration` | Full attention + GDN + MoE | Mixed-attention state, wide EP, optional model-native MTP |
-| DeepSeek-V3 | `DeepseekV3ForCausalLM` | MLA + MoE | Wide EP, FP8 KV/cache paths, optional MTP |
-| DeepSeek-V3.2 | `DeepseekV32ForCausalLM` | MLA + MoE + NSA | Indexer cache, sparse attention, HiSparse decode |
-| DeepSeek-V4 | `DeepseekV4ForCausalLM` | MLA/DSA/SWA + MoE | Compressed cache, Hyper-Connection, mega-MoE paths |
-| GLM-5 family | `GlmMoeDsaForCausalLM` | MLA + MoE + DSA/NSA | GLM Indexer, long-context prefill/decode, HiSparse |
-| Gemma4 text | `Gemma4ForCausalLM` or `Gemma4ForConditionalGeneration` | Sliding-window + global GQA | HiSparse ring buffer and graph-safe decode |
-| Kimi-K2 compatible checkpoints | compatible `DeepseekV3ForCausalLM` config | MLA + MoE | Uses the DeepSeek-V3-compatible model path |
+| Model family                   | Checkpoint architecture                                 | Core design                      | Notable DLEngine paths                                    |
+| ------------------------------ | ------------------------------------------------------- | -------------------------------- | --------------------------------------------------------- |
+| Qwen3 dense                    | `Qwen3ForCausalLM`                                      | GQA + dense FFN                  | TP/DP execution, paged KV cache, chunked prefill          |
+| Qwen3 MoE                      | `Qwen3MoeForCausalLM`                                   | GQA + MoE                        | Wide EP, packed FP8 weights, distributed serving          |
+| Qwen3.5 dense                  | `Qwen3_5ForConditionalGeneration`                       | Full attention + GDN + dense FFN | Mixed-attention KV/GDN state management                   |
+| Qwen3.5 MoE                    | `Qwen3_5MoeForConditionalGeneration`                    | Full attention + GDN + MoE       | Mixed-attention state, wide EP, optional model-native MTP |
+| DeepSeek-V3                    | `DeepseekV3ForCausalLM`                                 | MLA + MoE                        | Wide EP, FP8 KV/cache paths, optional MTP                 |
+| DeepSeek-V3.2                  | `DeepseekV32ForCausalLM`                                | MLA + MoE + NSA                  | Indexer cache, sparse attention, HiSparse decode          |
+| DeepSeek-V4                    | `DeepseekV4ForCausalLM`                                 | MLA/DSA/SWA + MoE                | Compressed cache, Hyper-Connection, mega-MoE paths        |
+| GLM-5 family                   | `GlmMoeDsaForCausalLM`                                  | MLA + MoE + DSA/NSA              | GLM Indexer, long-context prefill/decode, HiSparse        |
+| Gemma4 text                    | `Gemma4ForCausalLM` or `Gemma4ForConditionalGeneration` | Sliding-window + global GQA      | HiSparse ring buffer and graph-safe decode                |
+| Kimi-K2 compatible checkpoints | compatible `DeepseekV3ForCausalLM` config               | MLA + MoE                        | Uses the DeepSeek-V3-compatible model path                |
 
 A checkpoint is supported only when its architecture and tensor layout match the corresponding loader. A marketing model name alone does not guarantee compatibility.
 
@@ -56,14 +56,14 @@ python -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("archite
   /path/to/model/config.json
 ```
 
-Then compare the architecture with [`dlengine/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/models/registry.py). DLEngine also validates unsupported parallel, cache, HiSparse, and MTP combinations during `Config` construction and should fail before worker execution.
+Then compare the architecture with [`dlengine/runtime/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/runtime/models/registry.py). DLEngine also validates unsupported parallel, cache, HiSparse, and MTP combinations during `Config` construction and should fail before worker execution.
 
 ## Documentation maintenance
 
 When adding a model family:
 
 1. Add or reuse a model implementation and weight loader.
-2. Register the Hugging Face architecture string in `dlengine/models/registry.py`.
+2. Register the Hugging Face architecture string in `dlengine/runtime/models/registry.py`.
 3. Add focused loader and inference tests.
 4. Record supported parallel/cache features and known constraints here.
 5. Add a serving or offline validation command using a representative checkpoint.

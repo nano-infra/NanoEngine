@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-import dlengine.models.deepseek_v2.deepseek_v2 as deepseek_module
-from dlengine.models import pp_utils
+import dlengine.runtime.models.deepseek_v2.deepseek_v2 as deepseek_module
+from dlengine.runtime.models import pp_utils
 from torch import nn
 
 

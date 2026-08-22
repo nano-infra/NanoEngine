@@ -3,7 +3,7 @@
 import flash_mla
 import pytest
 import torch
-from dlengine.kernel.triton.hopper.fp8_utils import (
+from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
     D_NOPE,
     D_TOTAL,
     dequantize_and_unpack_mla,

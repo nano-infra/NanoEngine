@@ -7,7 +7,7 @@ from dlengine.config import Config
 from dlengine.engine.scheduler import ensure_cache_plan, init_scheduler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.metrics.dump import EngineMetricDumper
-from dlengine.models.trait import load_tokenizer_and_eos
+from dlengine.runtime.models.trait import load_tokenizer_and_eos
 
 logger = get_logger()
 _TRACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

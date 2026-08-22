@@ -29,7 +29,7 @@ repos:
     rev: v2.1.0
     hooks:
       - id: codespell
-        args: ["-L", "CANN,cann,csa,crate,hsa,nd"]
+        args: ["-L", "CANN,cann,csa,crate,hist,hsa,nd"]
         exclude: >
           (?x)^(
               .*/docs/imgs/.*|

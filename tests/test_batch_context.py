@@ -1,5 +1,5 @@
 import torch
-from dlengine.context.batch import reset_batch_context, set_batch_context
+from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
 
 
 def teardown_function():

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-import dlengine.worker.loader as loader
+import dlengine.runtime.runner.loader as loader
 import torch
 
 

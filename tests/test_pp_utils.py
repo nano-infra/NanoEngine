@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-import dlengine.models.pp_utils as pp_utils
+import dlengine.runtime.models.pp_utils as pp_utils
 import pytest
 from torch import nn
 

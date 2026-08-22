@@ -1,6 +1,5 @@
 import pytest
-
-from dlengine.layers.backends.selector import (
+from dlengine.runtime.layers.backends.selector import (
     AttentionBackendPlan,
     GDNBackendPlan,
     resolve_attention_plan,

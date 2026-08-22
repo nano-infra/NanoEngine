@@ -10,7 +10,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_indexer_layer_norm_bf16_matches_torch():
-    from dlengine.kernel.triton.generic.indexer_transform import indexer_layer_norm_bf16
+    from dlengine.runtime.kernel.triton.generic.indexer_transform import (
+        indexer_layer_norm_bf16,
+    )
 
     torch.manual_seed(0)
     x = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda")
@@ -23,8 +25,10 @@ def test_indexer_layer_norm_bf16_matches_torch():
 
 
 def test_indexer_qk_rope_inplace_matches_torch():
-    from dlengine.kernel.triton.generic.indexer_transform import indexer_qk_rope_inplace
-    from dlengine.layers.rotary_embedding import RotaryEmbedding
+    from dlengine.runtime.kernel.triton.generic.indexer_transform import (
+        indexer_qk_rope_inplace,
+    )
+    from dlengine.runtime.layers.rotary_embedding import RotaryEmbedding
 
     torch.manual_seed(1)
     tokens, heads, head_dim, rope_dim = 4, 8, 128, 64
@@ -68,8 +72,10 @@ def test_indexer_qk_rope_inplace_matches_torch():
 def test_indexer_q_rope_hadamard_quant_matches_reference():
     pytest.importorskip("tvm_ffi")
 
-    from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
-    from dlengine.layers.rotary_embedding import RotaryEmbedding
+    from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import (
+        indexer_q_rope_hadamard_quant,
+    )
+    from dlengine.runtime.layers.rotary_embedding import RotaryEmbedding
     from fast_hadamard_transform import hadamard_transform
 
     torch.manual_seed(2)
@@ -111,10 +117,10 @@ def test_indexer_q_rope_hadamard_quant_matches_reference():
 
 
 def test_indexer_k_transform_store_matches_reference():
-    from dlengine.kernel.triton.generic.indexer_transform import (
+    from dlengine.runtime.kernel.triton.generic.indexer_transform import (
         indexer_k_transform_store_fp8,
     )
-    from dlengine.layers.rotary_embedding import RotaryEmbedding
+    from dlengine.runtime.layers.rotary_embedding import RotaryEmbedding
     from fast_hadamard_transform import hadamard_transform
 
     torch.manual_seed(3)

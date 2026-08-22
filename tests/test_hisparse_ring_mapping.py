@@ -1,12 +1,14 @@
 import pytest
 import torch
-from dlengine.context.batch import set_batch_context
-from dlengine.context.cache.hisparse import (
+from dlengine.runtime.context.batch import set_batch_context
+from dlengine.runtime.context.cache.hisparse import (
     initialize_hisparse_context,
     reset_hisparse_context,
 )
-from dlengine.kernel.jit.sgl.hisparse import build_ring_slot_mapping
-from dlengine.layers.generic.attention import _hisparse_prefill_fresh_slot_mapping
+from dlengine.runtime.kernel.jit.sgl.hisparse import build_ring_slot_mapping
+from dlengine.runtime.layers.generic.attention import (
+    _hisparse_prefill_fresh_slot_mapping,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="HiSparse ring mapping requires CUDA"

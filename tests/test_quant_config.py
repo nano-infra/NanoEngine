@@ -1,6 +1,5 @@
 import pytest
-
-from dlengine.models.quant_config import QuantizationConfig
+from dlengine.runtime.models.quant_config import QuantizationConfig
 
 
 def test_compressed_tensors_mxfp4_is_detected():

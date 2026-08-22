@@ -1,5 +1,5 @@
 import pytest
-from dlengine.context.cache._backend import (
+from dlengine.runtime.context.cache._backend import (
     CacheKind,
     resolve_cache_backend,
     supported_cache_kinds,

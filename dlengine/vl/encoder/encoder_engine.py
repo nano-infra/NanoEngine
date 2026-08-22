@@ -27,8 +27,8 @@ from typing import Optional
 import torch
 from dlslime.ctrl import NanoCtrlClient
 
-from dlengine.context.cache.emb import EmbeddingPool
 from dlengine.logging import get_logger
+from dlengine.runtime.context.cache.emb import EmbeddingPool
 from dlengine.vl.encoder.encoder_config import EncoderConfig
 from dlengine.vl.vision.encoder import VisionEncoder
 
@@ -224,7 +224,7 @@ class EncoderEngine:
 
     def get_engine_info(self) -> dict:
         if self.config.host in ("0.0.0.0", ""):
-            from dlengine.context.distributed import get_local_ip
+            from dlengine.runtime.context.distributed import get_local_ip
 
             host = get_local_ip()
         else:

@@ -64,7 +64,7 @@ The current code already provides most of the sparse attention surface.
 
 ### 4.1 NSA Indexer
 
-`dlengine/layers/indexer.py` owns the decode-time selector:
+`dlengine/runtime/layers/indexer.py` owns the decode-time selector:
 
 - Computes query/key features for the lightning indexer.
 - Stores indexer keys in `IndexerCache`.
@@ -77,7 +77,7 @@ be able to score the full context even when the main MLA KV is offloaded.
 
 ### 4.2 Sparse MLA Decode
 
-`dlengine/layers/hopper/attention.py::FlashMLAImpl` supports sparse FP8 decode:
+`dlengine/runtime/layers/hopper/attention.py::FlashMLAImpl` supports sparse FP8 decode:
 
 - Receives `sparse_indices`.
 - Reshapes them to `[bs, ntps, topk]`.

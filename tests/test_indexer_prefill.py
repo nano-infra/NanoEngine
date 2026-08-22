@@ -18,8 +18,8 @@ class _FixedWeights(nn.Module):
 
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
-    import dlengine.layers.indexer as indexer_module
-    from dlengine.layers.indexer import Indexer, _interleaved_to_half
+    import dlengine.runtime.layers.indexer as indexer_module
+    from dlengine.runtime.layers.indexer import _interleaved_to_half, Indexer
 
     class CaptureRope(nn.Module):
         def __init__(self):
@@ -51,7 +51,7 @@ def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_relu_mqa_scores_matches_dense_reference():
-    from dlengine.layers.indexer import _weighted_relu_mqa_scores
+    from dlengine.runtime.layers.indexer import _weighted_relu_mqa_scores
 
     torch.manual_seed(17)
     query = torch.randn(7, 6, 128, device="cuda", dtype=torch.bfloat16)
@@ -67,7 +67,7 @@ def test_weighted_relu_mqa_scores_matches_dense_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_relu_cannot_be_replaced_by_folded_query():
-    from dlengine.layers.indexer import _weighted_relu_mqa_scores
+    from dlengine.runtime.layers.indexer import _weighted_relu_mqa_scores
 
     query = torch.tensor([[[2.0], [-1.0]]], device="cuda")
     weights = torch.tensor([[1.0, 3.0]], device="cuda")
@@ -82,7 +82,7 @@ def test_weighted_relu_cannot_be_replaced_by_folded_query():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
-    from dlengine.layers.indexer import Indexer, IndexerCache
+    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
     torch.manual_seed(23)
     device = torch.device("cuda")
@@ -112,9 +112,7 @@ def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
     block_table = torch.tensor([[3, 1], [4, 0]], dtype=torch.int32, device=device)
 
     cached_source = torch.randn(5, head_dim, dtype=torch.bfloat16, device=device)
-    cached_slots = torch.tensor(
-        [12, 13, 14, 16, 17], dtype=torch.int32, device=device
-    )
+    cached_slots = torch.tensor([12, 13, 14, 16, 17], dtype=torch.int32, device=device)
     indexer.indexer_cache.store_key_fp8(0, cached_source, cached_slots)
     cached_keys = indexer._gather_cached_prefix_keys(
         block_table, cached_lens, cu_cached, dtype=torch.float32
@@ -156,9 +154,9 @@ def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
             per_head = torch.einsum(
                 "hd,kd->hk", query[q_start + local_q].float(), seq_keys
             )
-            scores = (
-                per_head.relu() * scaled_weights[q_start + local_q, :, None]
-            ).sum(dim=0)
+            scores = (per_head.relu() * scaled_weights[q_start + local_q, :, None]).sum(
+                dim=0
+            )
             visible = cached_len + local_q + 1
             k = min(topk, visible)
             selected = scores[:visible].topk(k).indices.to(torch.int32)
@@ -170,8 +168,8 @@ def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
-    import dlengine.layers.indexer as indexer_module
-    from dlengine.layers.indexer import Indexer, IndexerCache
+    import dlengine.runtime.layers.indexer as indexer_module
+    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
     indexer = Indexer.__new__(Indexer)
@@ -207,19 +205,28 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
         indexer_module,
         "quant_fp8",
         lambda value, *args, **kwargs: (
-            value, torch.ones(value.shape[0], 1, device=device)
+            value,
+            torch.ones(value.shape[0], 1, device=device),
         ),
     )
     seen_context_lens = []
 
     def fake_paged_logits(
-        tiled_q, kv_cache, weights, context_lens, page_tables, schedule,
-        max_context_len, **kwargs
+        tiled_q,
+        kv_cache,
+        weights,
+        context_lens,
+        page_tables,
+        schedule,
+        max_context_len,
+        **kwargs,
     ):
         seen_context_lens.append(context_lens.flatten().tolist())
-        return torch.arange(
-            max_context_len, dtype=torch.float32, device=device
-        ).expand(tiled_q.shape[0], -1).clone()
+        return (
+            torch.arange(max_context_len, dtype=torch.float32, device=device)
+            .expand(tiled_q.shape[0], -1)
+            .clone()
+        )
 
     monkeypatch.setattr(
         indexer_module.deep_gemm, "fp8_paged_mqa_logits", fake_paged_logits
@@ -230,13 +237,19 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
     block_table = torch.tensor([[3, 1], [4, 0]], dtype=torch.int32, device=device)
     dummy = torch.empty(5, 1, dtype=torch.bfloat16, device=device)
     actual = indexer.compute_prefill_topk_paged(
-        dummy, dummy, torch.arange(5, device=device), cu_q, cu_k, block_table,
+        dummy,
+        dummy,
+        torch.arange(5, device=device),
+        cu_q,
+        cu_k,
+        block_table,
         query_chunk=2,
     )
 
     expected = torch.tensor(
         [[3, 2, 1], [4, 3, 2], [7, 6, 5], [8, 7, 6], [9, 8, 7]],
-        dtype=torch.int32, device=device,
+        dtype=torch.int32,
+        device=device,
     )
     assert torch.equal(actual, expected)
     assert seen_context_lens == [[4, 5], [3, 4], [5]]
@@ -245,8 +258,8 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
     """Paged scoring must preserve exact causal TopK beyond 64K."""
-    import dlengine.layers.indexer as indexer_module
-    from dlengine.layers.indexer import Indexer, IndexerCache
+    import dlengine.runtime.layers.indexer as indexer_module
+    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
     indexer = Indexer.__new__(Indexer)
@@ -286,10 +299,11 @@ def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
     monkeypatch.setattr(
         indexer_module.deep_gemm,
         "fp8_paged_mqa_logits",
-        lambda tiled_q, kv_cache, weights, context_lens, page_tables,
-        schedule, max_context_len, **kwargs: torch.arange(
+        lambda tiled_q, kv_cache, weights, context_lens, page_tables, schedule, max_context_len, **kwargs: torch.arange(
             max_context_len, dtype=torch.float32, device=device
-        ).expand(tiled_q.shape[0], -1).clone(),
+        )
+        .expand(tiled_q.shape[0], -1)
+        .clone(),
     )
 
     cu_q = torch.tensor([0, 2], dtype=torch.int32, device=device)

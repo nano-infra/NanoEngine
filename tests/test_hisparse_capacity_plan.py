@@ -1,4 +1,4 @@
-from dlengine.context.cache import plan_mla_hisparse_capacity
+from dlengine.runtime.context.cache import plan_mla_hisparse_capacity
 
 
 def _plan(*, gpu_cache_budget: int, host_cache_budget: int):

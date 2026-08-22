@@ -11,7 +11,7 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from dlengine._rust.proto import RunnerOut
 from dlengine.config import Config
 from dlengine.logging import get_logger
-from dlengine.worker.model_runner import ModelRunner
+from dlengine.runtime.runner.model_runner import ModelRunner
 
 logger = get_logger()
 
