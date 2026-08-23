@@ -17,6 +17,9 @@ class HiSparseContext(BaseContext):
     block_size: int = 0
     hot_blocks_per_seq: int = 0
     resident_tokens: torch.Tensor | None = None
+    union_hash_entries: torch.Tensor | None = None
+    union_hash_values: torch.Tensor | None = None
+    union_hash_capacity: int = 0
     slot_owner_ids: list[int] | None = None
     num_real_reqs: torch.Tensor | None = None
 
@@ -39,6 +42,9 @@ class HiSparseContext(BaseContext):
         self.block_size = 0
         self.hot_blocks_per_seq = 0
         self.resident_tokens = None
+        self.union_hash_entries = None
+        self.union_hash_values = None
+        self.union_hash_capacity = 0
         self.slot_owner_ids = None
         self.num_real_reqs = None
 
@@ -119,6 +125,28 @@ def initialize_mla_hisparse_cache(
         dtype=torch.uint8,
         device=ctx.num_real_reqs.device,
     )
+    # Long-context speculative verify presents one DSA top-k row per target
+    # token. A graph-safe hash table canonicalizes the per-request union so
+    # duplicate selections share one hot slot and one H2D copy. The table is
+    # reused by every layer; the kernel's sequence/layer/phase epoch makes old
+    # entries invisible without a memset between layers or decode steps.
+    max_union_entries = max(1, ctx.device_buffer_size)
+    hash_capacity = 1
+    while hash_capacity < 2 * max_union_entries:
+        hash_capacity <<= 1
+    ctx.union_hash_capacity = hash_capacity
+    ctx.union_hash_entries = torch.zeros(
+        max_num_seqs,
+        hash_capacity,
+        dtype=torch.int64,
+        device=ctx.num_real_reqs.device,
+    )
+    ctx.union_hash_values = torch.zeros(
+        max_num_seqs,
+        hash_capacity,
+        dtype=torch.int32,
+        device=ctx.num_real_reqs.device,
+    )
     ctx.slot_owner_ids = [-1] * max_num_seqs
     return ctx.hot_kv_cache
 
@@ -130,6 +158,9 @@ def stage_mla_sparse_indices(
     hisparse_slots: torch.Tensor,
     output_slots: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    num_tokens_per_seq: int = 1,
+    phase_id: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load top-k tokens into their request slot using a graph-safe CUDA kernel."""
     ctx = get_hisparse_context()
@@ -143,6 +174,22 @@ def stage_mla_sparse_indices(
             f"HiSparse top-k={sparse_indices.shape[1]} exceeds slot capacity "
             f"{ctx.device_buffer_size}"
         )
+    num_tokens_per_seq = max(1, int(num_tokens_per_seq))
+    required_union_capacity = sparse_indices.shape[1] * num_tokens_per_seq
+    if required_union_capacity > ctx.device_buffer_size:
+        raise RuntimeError(
+            "HiSparse speculative top-k union requires "
+            f"{required_union_capacity} hot slots, but only "
+            f"{ctx.device_buffer_size} are configured"
+        )
+    if num_tokens_per_seq > ctx.tokens_per_seq - ctx.device_buffer_size:
+        raise RuntimeError(
+            "HiSparse speculative output width exceeds the reserved hot page: "
+            f"width={num_tokens_per_seq}, capacity="
+            f"{ctx.tokens_per_seq - ctx.device_buffer_size}"
+        )
+    if ctx.union_hash_entries is None or ctx.union_hash_values is None:
+        raise RuntimeError("MLA HiSparse union workspace is not initialized")
     if not sparse_indices.is_cuda:
         raise RuntimeError("MLA HiSparse slot loading requires CUDA")
 
@@ -164,8 +211,58 @@ def stage_mla_sparse_indices(
         ctx.max_num_seqs,
         ctx.device_buffer_size,
         ctx.tokens_per_seq,
+        ctx.union_hash_entries,
+        ctx.union_hash_values,
+        ctx.union_hash_capacity,
+        num_tokens_per_seq,
+        int(layer_idx),
+        int(phase_id),
     )
     return result, hot_output_slots
+
+
+def map_mla_output_slots(
+    hisparse_slots: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_tokens_per_seq: int = 1,
+) -> torch.Tensor:
+    """Map appended MLA tokens without reloading an already-hot shared TopK.
+
+    Recurrent GLM MTP computes one indexer TopK and reuses it for the remaining
+    predictor iterations. Once that shared selection has been staged into
+    stable hot slots, later iterations only need a destination for their newly
+    appended KV. All inputs remain device tensors so this path is graph-safe.
+    """
+    ctx = get_hisparse_context()
+    if ctx.hot_kv_cache is None or ctx.cold_kv_cache is None:
+        raise RuntimeError("MLA HiSparse hot/cold cache is not initialized")
+    if hisparse_slots.ndim != 1 or seq_lens.ndim != 1:
+        raise ValueError("HiSparse output mapping expects flat slot/length tensors")
+    if hisparse_slots.numel() != seq_lens.numel():
+        raise ValueError("HiSparse output slots and sequence lengths must align")
+    if not hisparse_slots.is_cuda or not seq_lens.is_cuda:
+        raise RuntimeError("MLA HiSparse output mapping requires CUDA")
+
+    width = max(1, int(num_tokens_per_seq))
+    rows = hisparse_slots.numel()
+    row_ids = torch.arange(rows, dtype=torch.int64, device=hisparse_slots.device)
+    req_offsets = row_ids // width
+    token_steps = row_ids - req_offsets * width
+    slots = hisparse_slots.to(torch.int64)
+    lens = seq_lens.to(torch.int64)
+    output_positions = lens - width + token_steps
+    valid = (slots >= 0) & (slots < ctx.max_num_seqs) & (output_positions >= 0)
+    if ctx.num_real_reqs is not None:
+        valid = valid & (req_offsets < ctx.num_real_reqs[0].to(torch.int64))
+    short = (lens > 0) & (lens <= ctx.device_buffer_size)
+    offsets = torch.where(
+        short,
+        output_positions,
+        ctx.device_buffer_size + token_steps,
+    )
+    mapped = slots * ctx.tokens_per_seq + offsets
+    return torch.where(valid, mapped, mapped.new_full((), -1)).to(torch.int32)
 
 
 def reset_mla_hisparse_slots(slots: list[int]) -> None:
@@ -175,6 +272,8 @@ def reset_mla_hisparse_slots(slots: list[int]) -> None:
     valid = sorted({int(slot) for slot in slots if 0 <= int(slot) < ctx.max_num_seqs})
     if valid:
         ctx.resident_tokens[:, valid] = 0
+        if ctx.union_hash_entries is not None:
+            ctx.union_hash_entries[valid] = 0
 
 
 def update_mla_hisparse_slot_owners(slots: list[int], seq_ids: list[int]) -> None:
@@ -196,6 +295,8 @@ def writeback_mla_output_pages(
     layer_idx: int,
     logical_output_slots: torch.Tensor,
     hot_output_slots: torch.Tensor,
+    *,
+    num_tokens_per_seq: int = 1,
 ) -> None:
     """Persist freshly appended decode KV from the hot tier to host cold KV."""
     ctx = get_hisparse_context()
@@ -211,6 +312,7 @@ def writeback_mla_output_pages(
         ctx.hot_kv_cache[0, layer_idx],
         ctx.cold_kv_cache[0, layer_idx],
         ctx.num_real_reqs,
+        max(1, int(num_tokens_per_seq)),
     )
 
 

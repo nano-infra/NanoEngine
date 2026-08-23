@@ -96,15 +96,34 @@ def test_shared_indexer_state_reuses_exact_logical_and_physical_indices():
 def test_mtp_indexer_state_selects_draft_extend_seed_rows():
     logical = torch.arange(24, dtype=torch.int32).reshape(6, 4)
     physical = logical + 100
+    hisparse = logical + 200
     state = _IndexerTopKState()
     state.publish(78, logical, physical)
+    state.publish_hisparse(78, hisparse)
 
     selected = state.select_rows(torch.tensor([1, 4]))
 
     assert selected.source_layer == 78
     assert torch.equal(selected.logical_indices, logical[[1, 4]])
     assert torch.equal(selected.physical_indices, physical[[1, 4]])
+    assert torch.equal(selected.hisparse_indices, hisparse[[1, 4]])
     assert selected.logical_indices.data_ptr() != logical.data_ptr()
+
+
+def test_hisparse_indexer_mapping_only_reuses_same_physical_layer():
+    logical = torch.tensor([[7, 3]], dtype=torch.int32)
+    physical = logical + 10
+    hisparse = logical + 20
+    state = _IndexerTopKState()
+    state.publish(78, logical, physical)
+    state.publish_hisparse(78, hisparse)
+
+    assert state.require_hisparse(78, num_tokens=1, topk=2) is hisparse
+    assert state.require_hisparse(79, num_tokens=1, topk=2) is None
+    assert state.require_hisparse(78, num_tokens=2, topk=2) is None
+
+    state.publish(78, logical + 1, physical + 1)
+    assert state.hisparse_indices is None
 
 
 def test_shared_indexer_state_rejects_missing_or_stale_topk():

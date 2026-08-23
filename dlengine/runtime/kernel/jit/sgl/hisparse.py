@@ -52,6 +52,12 @@ def load_mla_slot(
     max_num_seqs: int,
     hot_capacity: int,
     slot_stride_tokens: int,
+    union_hash_entries: torch.Tensor,
+    union_hash_values: torch.Tensor,
+    union_hash_capacity: int,
+    num_tokens_per_seq: int,
+    layer_id: int,
+    phase_id: int,
 ) -> None:
     _jit_hisparse_module().load_mla_slot(
         logical_indices,
@@ -67,6 +73,12 @@ def load_mla_slot(
         max_num_seqs,
         hot_capacity,
         slot_stride_tokens,
+        union_hash_entries,
+        union_hash_values,
+        union_hash_capacity,
+        num_tokens_per_seq,
+        layer_id,
+        phase_id,
     )
 
 
@@ -76,9 +88,10 @@ def writeback_mla_slot(
     hot: torch.Tensor,
     cold: torch.Tensor,
     num_real_reqs: torch.Tensor,
+    num_tokens_per_seq: int,
 ) -> None:
     _jit_hisparse_module().writeback_mla_slot(
-        logical_slots, hot_slots, hot, cold, num_real_reqs
+        logical_slots, hot_slots, hot, cold, num_real_reqs, num_tokens_per_seq
     )
 
 

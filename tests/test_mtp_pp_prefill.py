@@ -6,6 +6,7 @@ from torch import nn
 import dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp as mtp_module
 import dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp_loader as loader_module
 from dlengine.engine.llm_component import LLMComponent
+from dlengine.runtime.runner.model_runner import _wire_mla_hisparse_modules
 
 
 class _FakeMTPLayer(nn.Module):
@@ -19,6 +20,27 @@ class _FakeMTPLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.cache_layer_idx = cache_layer_idx
+
+
+class _FakeMLACacheModule:
+    def __init__(self):
+        self.k_cache = None
+        self.v_cache = None
+
+
+def test_hisparse_wires_predictor_after_target_layers():
+    target = [_FakeMLACacheModule(), _FakeMLACacheModule()]
+    predictor = [_FakeMLACacheModule()]
+    hot = torch.empty(1, 3, 2, 4, 1, 1)
+
+    next_layer = _wire_mla_hisparse_modules(target, hot, 0, "cpu")
+    next_layer = _wire_mla_hisparse_modules(predictor, hot, next_layer, "cpu")
+
+    assert next_layer == 3
+    assert target[0].k_cache.data_ptr() == hot[0, 0].data_ptr()
+    assert target[1].k_cache.data_ptr() == hot[0, 1].data_ptr()
+    assert predictor[0].k_cache.data_ptr() == hot[0, 2].data_ptr()
+    assert predictor[0].v_cache.numel() == 0
 
 
 def test_glm_mtp_uses_final_pp_stage_local_cache_slot(monkeypatch):

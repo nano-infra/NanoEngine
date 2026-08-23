@@ -38,6 +38,7 @@ class BatchContext(BaseContext):
     hisparse_slots: torch.Tensor | None = None
     hisparse_slot_mapping: torch.Tensor | None = None
     hisparse_num_real_reqs: torch.Tensor | None = None
+    hisparse_phase_id: int = 0
     indexer_schedule_meta: torch.Tensor | tuple[torch.Tensor, ...] | None = None
 
     @classmethod
@@ -84,6 +85,7 @@ def set_batch_context(
     hisparse_slots: Optional[torch.Tensor] = None,
     hisparse_slot_mapping: Optional[torch.Tensor] = None,
     hisparse_num_real_reqs: Optional[torch.Tensor] = None,
+    hisparse_phase_id: int = 0,
     num_tokens_per_seq: int = 1,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
@@ -127,6 +129,7 @@ def set_batch_context(
         hisparse_slots=hisparse_slots,
         hisparse_slot_mapping=hisparse_slot_mapping,
         hisparse_num_real_reqs=hisparse_num_real_reqs,
+        hisparse_phase_id=hisparse_phase_id,
     )
     return _CONTEXT
 

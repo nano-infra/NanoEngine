@@ -341,10 +341,28 @@ decode-only 路径不应该改 DSv4 代码，除非是共享 utility 命名或�
 
 ### Phase 4：高级模式
 
-1. Lazy verify / MTP，即 `num_tokens_per_seq > 1`；
+1. GLM 线性 Lazy verify / MTP（`num_tokens_per_seq > 1`）已支持；tree 和其他模型仍待实现；
 2. Prefix cache 和 L3 interaction；
 3. DSv4 compressed c4/c128 pages 上的 HiSparse；
 4. Metrics 和运行时控制。
+
+### GLM 线性 MTP 组合语义
+
+GLM checkpoint 只有一个物理 predictor layer。运行时连续调用它 5 次，
+保留 5 个 draft，并让 target 一次 verify 6 个 token；不是加载 5 或 6 个
+predictor layer。predictor 因而也只占一份 MLA KV cache。
+
+- 第一次 predictor 调用计算 DSA TopK；后续 recurrent 调用共享同一个
+  `_IndexerTopKState`，不会重复运行 indexer；
+- 第一次复用时仍 stage 一次，把可能指向上一轮临时 output page 的 TopK
+  搬到稳定 hot slot；剩余调用只映射新的 output slot；
+- target verify 把 6 行 TopK 在 request 内合并去重，同时给 6 个新 KV 保留
+  独立 output slot。所需 hot capacity 下限是
+  `(num_speculative_tokens + 1) * index_topk`；
+- CUDA graph padding 行显式写 `-1`，`phase_id` 区分同一物理 layer 的 recurrent
+  调用；每个新 KV 在 attention 后写回 cold host tier；
+- sampling/rejection sampling 位于 verify 之后，所以 greedy 和
+  `temperature > 0` 使用同一套 HiSparse cache 语义。
 
 ## 测试和验收
 

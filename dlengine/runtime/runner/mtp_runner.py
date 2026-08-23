@@ -422,10 +422,12 @@ class MTPRunner:
                 self.config, self.config.hf_config
             )
             self.cached_mtp_graph_runner.capture(self.mtp_model, graph_pool)
+            torch.cuda.synchronize()
         self.lv_graph_runner = LazyVerifyGraphRunner(
             self.config, self.config.hf_config, cache_ctx
         )
         self.lv_graph_runner.capture(target_model, graph_pool, cache_ctx)
+        torch.cuda.synchronize()
 
     def cleanup(self):
         if self.lv_graph_runner is not None:
@@ -682,6 +684,7 @@ class MTPRunner:
             hisparse_slots=decode_context.hisparse_slots,
             hisparse_slot_mapping=decode_context.hisparse_slot_mapping,
             hisparse_num_real_reqs=decode_context.hisparse_num_real_reqs,
+            hisparse_phase_id=decode_context.hisparse_phase_id,
             num_tokens_per_seq=decode_context.num_tokens_per_seq,
             sampling_token_indices=decode_context.sampling_token_indices,
             sampling_seq_indices=decode_context.sampling_seq_indices,
@@ -915,6 +918,7 @@ class MTPRunner:
             hisparse_slots=context.hisparse_slots,
             hisparse_slot_mapping=context.hisparse_slot_mapping,
             hisparse_num_real_reqs=context.hisparse_num_real_reqs,
+            hisparse_phase_id=context.hisparse_phase_id,
             num_tokens_per_seq=context.num_tokens_per_seq,
             sampling_token_indices=context.sampling_token_indices,
             sampling_seq_indices=context.sampling_seq_indices,
@@ -929,6 +933,7 @@ class MTPRunner:
         source_context,
         cache_lens: torch.Tensor,
         num_seqs: int,
+        phase_id: int,
     ) -> None:
         """Expose the predictor layer to the shared page table at given lengths."""
         sp_rank = get_dist_context().attn_sp_rank
@@ -967,6 +972,9 @@ class MTPRunner:
             is_dummy=source_context.is_dummy,
             num_tokens_per_seq=1,
             paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+            hisparse_slots=source_context.hisparse_slots,
+            hisparse_num_real_reqs=source_context.hisparse_num_real_reqs,
+            hisparse_phase_id=phase_id,
         )
         if torch.cuda.get_device_capability()[0] < 10:
             import flash_mla
@@ -1050,8 +1058,10 @@ class MTPRunner:
             indexer_state = self._new_mtp_indexer_state()
         for offset in range(num_steps):
             cache_lens += 1
-            self._set_cached_mtp_context(source_context, cache_lens, num_seqs)
             step_idx = start_step + offset
+            self._set_cached_mtp_context(
+                source_context, cache_lens, num_seqs, step_idx + 1
+            )
             mtp_hidden = self._forward_cached_mtp(
                 current_ids,
                 current_positions,
@@ -1171,6 +1181,9 @@ class MTPRunner:
             is_dummy=source_context.is_dummy,
             num_tokens_per_seq=width,
             paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+            hisparse_slots=source_context.hisparse_slots,
+            hisparse_num_real_reqs=source_context.hisparse_num_real_reqs,
+            hisparse_phase_id=self.verify_width,
         )
         if torch.cuda.get_device_capability()[0] < 10:
             import flash_mla

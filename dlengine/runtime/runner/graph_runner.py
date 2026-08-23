@@ -561,6 +561,9 @@ class LazyVerifyGraphRunner:
         self._slot_mapping = torch.full(
             (max_bs * self._verify_width,), -1, dtype=torch.int32
         )
+        self._hisparse_slots = torch.full(
+            (max_bs,), config.max_num_seqs, dtype=torch.int64
+        )
         self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs * self._verify_width, hf_config.hidden_size)
@@ -618,6 +621,9 @@ class LazyVerifyGraphRunner:
                 self._sparse_sched_metas[bs] = sparse_sched_meta
                 self._context_lens[:, :bs] = 1
 
+            if get_hisparse_context().num_real_reqs is not None:
+                get_hisparse_context().num_real_reqs.fill_(bs)
+
             set_batch_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
@@ -633,6 +639,8 @@ class LazyVerifyGraphRunner:
                     if self._gdn_state_slots is not None
                     else None
                 ),
+                hisparse_slots=self._hisparse_slots[:bs],
+                hisparse_num_real_reqs=get_hisparse_context().num_real_reqs,
             )
             get_hca_context().tile_scheduler_metadata = sched_meta
             get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
@@ -683,6 +691,12 @@ class LazyVerifyGraphRunner:
         self._positions[:n] = positions
         self._slot_mapping.fill_(-1)
         self._slot_mapping[:n] = context.slot_mapping
+        self._hisparse_slots.fill_(self._max_num_seqs)
+        if context.hisparse_slots is not None:
+            self._hisparse_slots[:bs].copy_(context.hisparse_slots[:bs])
+        hisparse_ctx = get_hisparse_context()
+        if hisparse_ctx.num_real_reqs is not None:
+            hisparse_ctx.num_real_reqs.fill_(bs)
         self._context_lens.zero_()
         self._context_lens[:, : context.context_lens.shape[1]].copy_(
             context.context_lens
@@ -734,6 +748,9 @@ class CachedMTPChainGraphRunner:
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._context_lens = torch.ones(1, max_bs, dtype=torch.int32)
         self._slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        self._hisparse_slots = torch.full(
+            (max_bs,), config.max_num_seqs, dtype=torch.int64
+        )
         self._indexer_logical = torch.zeros(max_bs, index_topk, dtype=torch.int32)
         self._indexer_physical = torch.zeros(max_bs, index_topk, dtype=torch.int32)
         self._drafts = torch.zeros(
@@ -760,6 +777,8 @@ class CachedMTPChainGraphRunner:
     def _install_context(self, bs: int, cache_ctx, mtp_model):
         from dlengine.runtime.models.deepseek_v2.deepseek_v2 import _IndexerTopKState
 
+        if get_hisparse_context().num_real_reqs is not None:
+            get_hisparse_context().num_real_reqs.fill_(bs)
         set_batch_context(
             is_prefill=False,
             max_bs=self._max_num_seqs,
@@ -769,6 +788,8 @@ class CachedMTPChainGraphRunner:
             is_dummy=False,
             num_tokens_per_seq=1,
             paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+            hisparse_slots=self._hisparse_slots[:bs],
+            hisparse_num_real_reqs=get_hisparse_context().num_real_reqs,
         )
         set_expert_context(use_low_latency_ep=True)
         get_hca_context().tile_scheduler_metadata = cache_ctx[0]
@@ -783,6 +804,7 @@ class CachedMTPChainGraphRunner:
         current_ids = self._input_ids[:bs]
         current_hidden = self._hidden_states[:bs]
         for step in range(self._num_steps):
+            get_batch_context().hisparse_phase_id = step + 2
             cache_lens = self._initial_cache_lens[:bs] + step + 1
             self._context_lens[0, :bs].copy_(cache_lens)
             logical_slots = cache_lens.to(torch.long) - 1
@@ -870,6 +892,7 @@ class CachedMTPChainGraphRunner:
         self._initial_cache_lens.fill_(1)
         self._active.zero_()
         self._block_tables.zero_()
+        self._hisparse_slots.fill_(self._max_num_seqs)
         self._indexer_logical.zero_()
         self._indexer_physical.zero_()
 
@@ -881,6 +904,11 @@ class CachedMTPChainGraphRunner:
         self._block_tables[:, : block_tables.size(1), : block_tables.size(2)].copy_(
             block_tables
         )
+        if source_context.hisparse_slots is not None:
+            self._hisparse_slots[:bs].copy_(source_context.hisparse_slots[:bs])
+        hisparse_ctx = get_hisparse_context()
+        if hisparse_ctx.num_real_reqs is not None:
+            hisparse_ctx.num_real_reqs.fill_(bs)
         self._indexer_logical[:bs].copy_(indexer_state.logical_indices)
         self._indexer_physical[:bs].copy_(indexer_state.physical_indices)
 
@@ -911,12 +939,16 @@ class CachedMTPChainGraphRunner:
         self._initial_cache_lens.fill_(1)
         self._active.zero_()
         self._block_tables.zero_()
+        self._hisparse_slots.fill_(self._max_num_seqs)
         self._indexer_logical.zero_()
         self._indexer_physical.zero_()
 
         self._input_ids[:bs].copy_(input_ids)
         self._positions[:bs].copy_(positions)
         self._hidden_states[:bs].copy_(hidden_states)
+        hisparse_ctx = get_hisparse_context()
+        if hisparse_ctx.num_real_reqs is not None:
+            hisparse_ctx.num_real_reqs.zero_()
         self._graphs[master_bs].replay()
         return True
 

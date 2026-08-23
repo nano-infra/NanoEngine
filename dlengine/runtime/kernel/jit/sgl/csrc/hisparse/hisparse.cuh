@@ -55,7 +55,13 @@ struct HiSparseMLASlotLoadKernel {
                     tvm::ffi::TensorView num_real_reqs,
                     int64_t              max_num_seqs,
                     int64_t              hot_capacity,
-                    int64_t              slot_stride_tokens)
+                    int64_t              slot_stride_tokens,
+                    tvm::ffi::TensorView union_hash_entries,
+                    tvm::ffi::TensorView union_hash_values,
+                    int64_t              union_hash_capacity,
+                    int64_t              num_tokens_per_seq,
+                    int64_t              layer_id,
+                    int64_t              phase_id)
     {
         using namespace host;
         auto R    = SymbolicSize{"num_rows"};
@@ -80,6 +86,14 @@ struct HiSparseMLASlotLoadKernel {
         TensorMatcher({R}).with_dtype<int64_t>().with_device(cuda).verify(request_slots);
         TensorMatcher({R}).with_dtype<int32_t>().with_device(cuda).verify(seq_lens).verify(hot_output_slots);
         TensorMatcher({max_num_seqs, hot_capacity}).with_dtype<uint8_t>().with_device(cuda).verify(resident_tokens);
+        TensorMatcher({max_num_seqs, union_hash_capacity})
+            .with_dtype<int64_t>()
+            .with_device(cuda)
+            .verify(union_hash_entries);
+        TensorMatcher({max_num_seqs, union_hash_capacity})
+            .with_dtype<int32_t>()
+            .with_device(cuda)
+            .verify(union_hash_values);
         TensorMatcher({1}).with_dtype<int32_t>().with_device(cuda).verify(num_real_reqs);
         // cold intentionally remains a CPU tensor: PeerAgent registration pins
         // and CUDA-maps it for direct kernel reads.
@@ -104,6 +118,12 @@ struct HiSparseMLASlotLoadKernel {
                                                    max_num_seqs,
                                                    hot_capacity,
                                                    slot_stride_tokens,
+                                                   static_cast<int64_t*>(union_hash_entries.data_ptr()),
+                                                   static_cast<int32_t*>(union_hash_values.data_ptr()),
+                                                   union_hash_capacity,
+                                                   num_tokens_per_seq,
+                                                   layer_id,
+                                                   phase_id,
                                                    P.unwrap(),
                                                    cold.strides()[0] * element_bytes,
                                                    cold.strides()[1] * element_bytes,
@@ -119,7 +139,8 @@ struct HiSparseMLASlotWritebackKernel {
                     tvm::ffi::TensorView hot_slots,
                     tvm::ffi::TensorView hot,
                     tvm::ffi::TensorView cold,
-                    tvm::ffi::TensorView num_real_reqs)
+                    tvm::ffi::TensorView num_real_reqs,
+                    int64_t              num_tokens_per_seq)
     {
         using namespace host;
         auto R    = SymbolicSize{"num_rows"};
@@ -147,6 +168,7 @@ struct HiSparseMLASlotWritebackKernel {
                                                         hot.data_ptr(),
                                                         cold.data_ptr(),
                                                         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+                                                        num_tokens_per_seq,
                                                         R.unwrap(),
                                                         P.unwrap(),
                                                         hot.strides()[0] * element_bytes,

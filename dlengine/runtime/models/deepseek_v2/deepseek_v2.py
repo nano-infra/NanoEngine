@@ -131,6 +131,7 @@ class _IndexerTopKState:
 
     logical_indices: torch.Tensor | None = None
     physical_indices: torch.Tensor | None = None
+    hisparse_indices: torch.Tensor | None = None
     source_layer: int | None = None
 
     def publish(
@@ -141,7 +142,28 @@ class _IndexerTopKState:
     ) -> None:
         self.logical_indices = logical_indices
         self.physical_indices = physical_indices
+        self.hisparse_indices = None
         self.source_layer = layer_idx
+
+    def publish_hisparse(self, layer_idx: int, hisparse_indices: torch.Tensor) -> None:
+        """Cache a stable hot mapping for recurrent reuse of one physical layer."""
+        if self.source_layer != layer_idx:
+            raise RuntimeError(
+                f"Cannot publish HiSparse mapping for layer {layer_idx} from "
+                f"indexer source layer {self.source_layer}"
+            )
+        self.hisparse_indices = hisparse_indices
+
+    def require_hisparse(
+        self, layer_idx: int, num_tokens: int, topk: int
+    ) -> torch.Tensor | None:
+        """Return a reusable hot mapping only for the same physical layer."""
+        indices = self.hisparse_indices
+        if self.source_layer != layer_idx or indices is None:
+            return None
+        if tuple(indices.shape) != (num_tokens, topk):
+            return None
+        return indices
 
     def require(
         self,
@@ -182,10 +204,14 @@ class _IndexerTopKState:
         if self.logical_indices is None or self.source_layer is None:
             return _IndexerTopKState()
         physical = self.physical_indices
+        hisparse = self.hisparse_indices
         return _IndexerTopKState(
             logical_indices=self.logical_indices.index_select(0, rows),
             physical_indices=(
                 None if physical is None else physical.index_select(0, rows)
+            ),
+            hisparse_indices=(
+                None if hisparse is None else hisparse.index_select(0, rows)
             ),
             source_layer=self.source_layer,
         )
@@ -1912,6 +1938,7 @@ class DeepseekV2Attention(nn.Module):
                 if getattr(self.config, "enable_hisparse", False):
                     from dlengine.runtime.context.cache.hisparse import (
                         get_hisparse_context,
+                        map_mla_output_slots,
                         remap_sparse_indices,
                         stage_mla_sparse_indices,
                     )
@@ -1927,14 +1954,44 @@ class DeepseekV2Attention(nn.Module):
                         if ntps > 1:
                             seq_slots = seq_slots.repeat_interleave(ntps)
                             stage_seq_lens = stage_seq_lens.repeat_interleave(ntps)
-                        sparse_indices, hot_output_slots = stage_mla_sparse_indices(
-                            self.layer_idx,
-                            topk_indices,
-                            sparse_indices,
-                            seq_slots,
-                            context.slot_mapping,
-                            stage_seq_lens,
+                        cached_hot_indices = (
+                            indexer_state.require_hisparse(
+                                self.layer_idx, total_tokens, self.index_topk
+                            )
+                            if reuse_topk and indexer_state is not None
+                            else None
                         )
+                        if cached_hot_indices is not None:
+                            sparse_indices = cached_hot_indices
+                            hot_output_slots = map_mla_output_slots(
+                                seq_slots,
+                                stage_seq_lens,
+                                num_tokens_per_seq=ntps,
+                            )
+                        else:
+                            sparse_indices, hot_output_slots = stage_mla_sparse_indices(
+                                self.layer_idx,
+                                topk_indices,
+                                sparse_indices,
+                                seq_slots,
+                                context.slot_mapping,
+                                stage_seq_lens,
+                                num_tokens_per_seq=ntps,
+                                phase_id=context.hisparse_phase_id,
+                            )
+                            # The first full-indexer iteration may map its
+                            # freshly appended token through the extra page.
+                            # Stage the first reused iteration as well; that
+                            # makes every shared TopK entry stable, after which
+                            # the remaining recurrent runs can skip H2D loads.
+                            if (
+                                reuse_topk
+                                and indexer_state is not None
+                                and indexer_state.source_layer == self.layer_idx
+                            ):
+                                indexer_state.publish_hisparse(
+                                    self.layer_idx, sparse_indices
+                                )
                         # The mapping is layer-specific because every NSA layer
                         # selects a different page set. FlashMLA consumes it
                         # immediately below before the next layer replaces it.
@@ -1962,6 +2019,7 @@ class DeepseekV2Attention(nn.Module):
                         self.layer_idx,
                         context.slot_mapping,
                         context.hisparse_slot_mapping,
+                        num_tokens_per_seq=ntps,
                     )
 
             # Post-multiply by W_UV (vc BMM)

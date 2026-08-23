@@ -50,6 +50,25 @@ from dlengine.runtime.runner.runner_config import get_runner_config, set_runner_
 from dlengine.runtime.runner.vision_embed import VisionEmbedManager
 from dlengine.utils.network import get_free_port, get_local_ip
 
+
+def _wire_mla_hisparse_modules(
+    modules, hot_cache: torch.Tensor, layer_id: int, device
+) -> int:
+    """Wire consecutive paged MLA modules to target/predictor hot slices."""
+    for module in modules:
+        if not (
+            hasattr(module, "k_cache") and getattr(module, "use_paged_kv_cache", True)
+        ):
+            continue
+        if layer_id >= hot_cache.shape[1]:
+            raise RuntimeError("MLA HiSparse cache has fewer layers than the model")
+        module.k_cache = hot_cache[0, layer_id]
+        if hasattr(module, "v_cache"):
+            module.v_cache = torch.tensor([], device=device)
+        layer_id += 1
+    return layer_id
+
+
 # ─── Per-step host-critical-path timer ─────────────────────────────────────
 # Driver enables via ``Config.step_timing=True`` (threaded into RunnerConfig
 # in ModelRunner.__init__). Useful for quantifying the gap between
@@ -782,6 +801,18 @@ class ModelRunner:
                                 module.v_cache = torch.tensor(
                                     [], device=cache_context.device
                                 )
+                    if self.mtp_runner is not None:
+                        for module in self.mtp_runner.mtp_model.modules():
+                            if hasattr(module, "k_cache") and getattr(
+                                module, "use_paged_kv_cache", True
+                            ):
+                                module.k_cache = torch.tensor(
+                                    [], device=cache_context.device
+                                )
+                                if hasattr(module, "v_cache"):
+                                    module.v_cache = torch.tensor(
+                                        [], device=cache_context.device
+                                    )
                     cache_context.kv_cache = torch.tensor(
                         [], device=cache_context.device
                     )
@@ -792,16 +823,24 @@ class ModelRunner:
                         device_buffer_size=self.config.hisparse_device_buffer_size,
                     )
                     layer_id = 0
-                    for module in self.model.modules():
-                        if hasattr(module, "k_cache") and getattr(
-                            module, "use_paged_kv_cache", True
-                        ):
-                            module.k_cache = hot_cache[0][layer_id]
-                            if hasattr(module, "v_cache"):
-                                module.v_cache = torch.tensor(
-                                    [], device=cache_context.device
-                                )
-                            layer_id += 1
+                    layer_id = _wire_mla_hisparse_modules(
+                        self.model.modules(),
+                        hot_cache,
+                        layer_id,
+                        cache_context.device,
+                    )
+                    if self.mtp_runner is not None:
+                        layer_id = _wire_mla_hisparse_modules(
+                            self.mtp_runner.mtp_model.modules(),
+                            hot_cache,
+                            layer_id,
+                            cache_context.device,
+                        )
+                    if layer_id != hot_cache.shape[1]:
+                        raise RuntimeError(
+                            "MLA HiSparse cache/model layer mismatch: "
+                            f"wired={layer_id}, allocated={hot_cache.shape[1]}"
+                        )
                     # Drop the full logical GPU MLA allocation. Scheduler block
                     # IDs continue to name cold host pages; model layers and
                     # CacheContext now expose only the bounded hot tier.
@@ -1890,6 +1929,7 @@ class ModelRunner:
             hisparse_slots=context.hisparse_slots,
             hisparse_slot_mapping=context.hisparse_slot_mapping,
             hisparse_num_real_reqs=context.hisparse_num_real_reqs,
+            hisparse_phase_id=context.hisparse_phase_id,
             num_tokens_per_seq=context.num_tokens_per_seq,
             sampling_token_indices=context.sampling_token_indices,
             sampling_seq_indices=context.sampling_seq_indices,
@@ -1977,6 +2017,8 @@ class ModelRunner:
             self.mtp_runner.generate_and_store(
                 input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
             )
+        if _timer is not None:
+            _timer.mark("mtp")
 
         # --- Profiler step ---
         self._advance_profiler()
@@ -2066,6 +2108,7 @@ class ModelRunner:
 
         self.decode_graph_runner = DecodeGraphRunner(config, hf_config, cache_ctx)
         graph_pool = self.decode_graph_runner.capture(self.model, cache_ctx)
+        torch.cuda.synchronize()
 
         if self.mtp_runner is not None:
             self.mtp_runner.init_graph_runners(self.model, graph_pool, cache_ctx)
