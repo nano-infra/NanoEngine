@@ -13,6 +13,11 @@ pub struct ModelPool {
 }
 
 impl ModelPool {
+    pub fn has_http_route(&self) -> bool {
+        !self.http_hybrid_engines.is_empty()
+            || (!self.http_prefill_engines.is_empty() && !self.http_decode_engines.is_empty())
+    }
+
     pub fn get_next_http_hybrid(&self) -> Option<&str> {
         self.http_hybrid_engines.first().map(String::as_str)
     }
@@ -64,6 +69,16 @@ impl EngineManager {
 
     pub fn available_model_keys(&self) -> Vec<&str> {
         let mut keys: Vec<&str> = self.model_pools.keys().map(String::as_str).collect();
+        keys.sort();
+        keys
+    }
+
+    pub fn routable_model_keys(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self
+            .model_pools
+            .iter()
+            .filter_map(|(key, pool)| pool.has_http_route().then_some(key.as_str()))
+            .collect();
         keys.sort();
         keys
     }

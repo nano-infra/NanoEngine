@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
@@ -418,6 +419,31 @@ async fn health() -> &'static str {
     "OK"
 }
 
+async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let manager = state.engine_manager.lock().await;
+    let data = manager
+        .routable_model_keys()
+        .into_iter()
+        .map(|model_id| {
+            serde_json::json!({
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "dlengine",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+    }))
+}
+
 pub async fn start_server(
     port: u16,
     engine_manager: Arc<Mutex<EngineManager>>,
@@ -429,6 +455,7 @@ pub async fn start_server(
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
@@ -453,4 +480,69 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, stopping HTTP server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_pool(hybrid: bool, prefill: bool, decode: bool) -> ModelPool {
+        ModelPool {
+            http_hybrid_engines: hybrid
+                .then(|| "http://hybrid".to_string())
+                .into_iter()
+                .collect(),
+            http_prefill_engines: prefill
+                .then(|| "http://prefill".to_string())
+                .into_iter()
+                .collect(),
+            http_decode_engines: decode
+                .then(|| "http://decode".to_string())
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn models_lists_sorted_routable_model_aliases() {
+        let mut manager = EngineManager::new();
+        manager
+            .model_pools
+            .insert("z-hybrid".to_string(), model_pool(true, false, false));
+        manager
+            .model_pools
+            .insert("a-pd".to_string(), model_pool(false, true, true));
+        manager
+            .model_pools
+            .insert("prefill-only".to_string(), model_pool(false, true, false));
+        let state = Arc::new(AppState {
+            engine_manager: Arc::new(Mutex::new(manager)),
+            http_client: reqwest::Client::new(),
+        });
+
+        let Json(response) = models(State(state)).await;
+        assert_eq!(response["object"], "list");
+        let data = response["data"].as_array().unwrap();
+        let ids = data
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["a-pd", "z-hybrid"]);
+        for model in data {
+            assert_eq!(model["object"], "model");
+            assert_eq!(model["owned_by"], "dlengine");
+            assert!(model["created"].as_u64().unwrap() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_returns_an_empty_openai_list_without_routes() {
+        let state = Arc::new(AppState {
+            engine_manager: Arc::new(Mutex::new(EngineManager::new())),
+            http_client: reqwest::Client::new(),
+        });
+
+        let Json(response) = models(State(state)).await;
+        assert_eq!(response, serde_json::json!({"object": "list", "data": []}));
+    }
 }
