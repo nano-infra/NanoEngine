@@ -534,11 +534,6 @@ class Config(BaseModel):
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
             if self.num_speculative_tokens > 1:
-                if self.mode in ("prefill", "decode"):
-                    raise ValueError(
-                        "multi-step MTP currently requires a colocated hybrid "
-                        "engine; PD-disaggregated multi-step MTP is not supported"
-                    )
                 if arch != "GlmMoeDsaForCausalLM":
                     raise ValueError(
                         "num_speculative_tokens > 1 is currently supported only "

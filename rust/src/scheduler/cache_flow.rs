@@ -329,7 +329,11 @@ impl Scheduler {
     }
 
     pub(super) fn cache_ensure_state_slot(&mut self, _py: Python<'_>, seq_id: u64) -> PyResult<()> {
-        if self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) == 0 {
+        let needs_mtp_handoff =
+            self.config.num_speculative_tokens > 1 && self.config.mode != "hybrid";
+        if !needs_mtp_handoff
+            && self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) == 0
+        {
             return Ok(());
         }
         let Some(slot) = self.cache.ensure_state_slot(seq_id) else {

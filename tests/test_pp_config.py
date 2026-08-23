@@ -214,3 +214,24 @@ def test_pp4_allows_gemma4_hisparse_cache_layout(monkeypatch):
 
     assert config.enable_hisparse is True
     assert config.world_size == 4
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_glm_multistep_mtp_allows_pd_roles(monkeypatch, mode):
+    hf_config = _deepseek_config("GlmMoeDsaForCausalLM")
+    hf_config.num_nextn_predict_layers = 1
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: hf_config,
+    )
+
+    config = Config(
+        model="unused",
+        mode=mode,
+        num_speculative_tokens=5,
+        max_num_seqs=8,
+    )
+
+    assert config.mode == mode
+    assert config.num_speculative_tokens == 5

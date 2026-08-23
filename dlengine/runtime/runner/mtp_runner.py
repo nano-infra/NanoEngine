@@ -209,6 +209,142 @@ class MTPRunner:
         self._mtp_verified_logprobs = None
         self._mtp_num_accepted = None
 
+    def publish_disagg_handoff(
+        self, seq_ids: list[int], state_slots: list[int], num_seqs: int
+    ) -> int:
+        """Publish recurrent drafts into scheduler-slot-indexed PD rows.
+
+        Valid rows are invalidated first, so a failed or zero-length prefill
+        cannot expose stale drafts when a slot or sequence ID is reused.
+        """
+        cache_context = get_cache_context()
+        handoff = cache_context.mtp_handoff
+        if handoff is None or num_seqs <= 0:
+            return 0
+
+        entries = [
+            (idx, int(seq_ids[idx]), int(state_slots[idx]))
+            for idx in range(min(num_seqs, len(seq_ids), len(state_slots)))
+            if 0 <= int(state_slots[idx]) < handoff.shape[0]
+        ]
+        if not entries:
+            return 0
+        slot_tensor = torch.tensor(
+            [slot for _, _, slot in entries],
+            dtype=torch.long,
+            device=handoff.device,
+        )
+        handoff.index_fill_(0, slot_tensor, -1)
+
+        if (
+            not self.has_drafts
+            or self._prev_drafts.ndim != 2
+            or self._prev_drafts.shape[1] != cache_context.mtp_num_drafts
+        ):
+            return 0
+        previous = {seq_id: idx for idx, seq_id in enumerate(self._prev_seq_ids)}
+        draft_rows = [previous.get(seq_id) for _, seq_id, _ in entries]
+        if any(row is None for row in draft_rows):
+            return 0
+
+        draft_indices = torch.tensor(
+            draft_rows, dtype=torch.long, device=self._prev_drafts.device
+        )
+        drafts = self._prev_drafts.index_select(0, draft_indices).to(
+            device=handoff.device, dtype=handoff.dtype
+        )
+        handoff_rows = torch.cat(
+            (
+                torch.tensor(
+                    [seq_id for _, seq_id, _ in entries],
+                    dtype=handoff.dtype,
+                    device=handoff.device,
+                )[:, None],
+                drafts,
+            ),
+            dim=1,
+        )
+        handoff.index_copy_(0, slot_tensor, handoff_rows)
+        return len(entries)
+
+    def restore_disagg_handoff(
+        self, seq_ids: list[int], state_slots: list[int], num_seqs: int
+    ) -> bool:
+        """Merge migrated drafts with current in-process lazy-verify state.
+
+        The tiny GPU-to-host validity check only runs for sequences missing
+        from the previous local batch. Steady-state decode remains unchanged.
+        """
+        current_ids = tuple(int(seq_id) for seq_id in seq_ids[:num_seqs])
+        if len(current_ids) != num_seqs or num_seqs <= 0:
+            return False
+
+        previous = {}
+        if (
+            self.has_drafts
+            and self._prev_drafts.ndim == 2
+            and self._prev_drafts.shape[1] == self.config.num_speculative_tokens
+        ):
+            previous = {seq_id: idx for idx, seq_id in enumerate(self._prev_seq_ids)}
+        missing_positions = [
+            idx for idx, seq_id in enumerate(current_ids) if seq_id not in previous
+        ]
+        if not missing_positions:
+            return False
+
+        cache_context = get_cache_context()
+        handoff = cache_context.mtp_handoff
+        if (
+            handoff is None
+            or handoff.shape[1] != self.config.num_speculative_tokens + 1
+            or len(state_slots) < num_seqs
+        ):
+            return False
+        missing_slots = [int(state_slots[idx]) for idx in missing_positions]
+        if any(slot < 0 or slot >= handoff.shape[0] for slot in missing_slots):
+            return False
+
+        slot_tensor = torch.tensor(
+            missing_slots, dtype=torch.long, device=handoff.device
+        )
+        rows = handoff.index_select(0, slot_tensor)
+        expected_ids = torch.tensor(
+            [current_ids[idx] for idx in missing_positions],
+            dtype=handoff.dtype,
+            device=handoff.device,
+        )
+        valid = rows[:, 0].eq(expected_ids) & rows[:, 1:].ge(0).all(dim=1)
+        if not bool(valid.all().item()):
+            logger.warning(
+                "Ignoring invalid MTP PD handoff rows: seq_ids=%s slots=%s",
+                [current_ids[idx] for idx in missing_positions],
+                missing_slots,
+            )
+            return False
+
+        migrated = {
+            position: rows[row_idx, 1:]
+            for row_idx, position in enumerate(missing_positions)
+        }
+        resolved = []
+        for position, seq_id in enumerate(current_ids):
+            if position in migrated:
+                resolved.append(migrated[position])
+            else:
+                resolved.append(self._prev_drafts[previous[seq_id]])
+        self._prev_seq_ids = current_ids
+        self._prev_drafts = torch.stack(resolved, dim=0)
+        self._selected_prev_drafts = None
+        # Mark the local copy consumed. Remote prefill rows are overwritten on
+        # slot reuse; the seq-id guard protects both sides from stale state.
+        handoff[slot_tensor, 0] = -1
+        logger.info(
+            "Restored MTP PD handoff: seq_ids=%s slots=%s",
+            [current_ids[idx] for idx in missing_positions],
+            missing_slots,
+        )
+        return True
+
     def _new_mtp_indexer_state(self) -> _IndexerTopKState | None:
         return _IndexerTopKState() if self._share_mtp_indexer else None
 

@@ -85,9 +85,14 @@ impl CacheState {
             }
         }
 
-        let state_slots = if config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) != 0 {
-            let configured = config.cache_plan.gdn.state_slots;
-            configured.max(config.max_num_seqs)
+        // Recurrent MTP PD handoff reuses the same stable per-sequence slot
+        // identity as GDN/DSv4 state. The payload lives in a separate MR, so
+        // allocating slots here does not couple MTP to those model caches.
+        let needs_mtp_handoff = config.num_speculative_tokens > 1 && config.mode != "hybrid";
+        let state_slots = if needs_mtp_handoff
+            || config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) != 0
+        {
+            config.cache_plan.gdn.state_slots.max(config.max_num_seqs)
         } else {
             0
         };

@@ -32,6 +32,7 @@ logger = get_logger("dlengine")
 # PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
 _HISPARSE_COLD_KV_BUFFER_ID = "hisparse_cold_kv"
+_MTP_HANDOFF_BUFFER_ID = "mtp_handoff"
 
 # Cache TTL for engine_info from NanoCtrl (seconds); inf = never expire.
 _ENGINE_INFO_CACHE_TTL = float("inf")
@@ -81,6 +82,7 @@ def initialize_migration_state(context) -> None:
     context.remote_pp_cache_layer_indices = {}
     context.remote_pp_dsv4_ratio_layer_indices = {}
     context.remote_gdn_num_slots = {}
+    context.remote_mtp_handoff_num_drafts = {}
     context.remote_compressed_pool_pages = {}
     context.remote_dsv4_max_slots = {}
     context.remote_dsv4_num_layers_per_ratio = {}
@@ -89,6 +91,7 @@ def initialize_migration_state(context) -> None:
     context._local_indexer_mr_handler = None
     context._local_gdn_conv_mr_handler = None
     context._local_gdn_recurrent_mr_handler = None
+    context._local_mtp_handoff_mr_handler = None
     context._local_dsv4_compressed_mr_handlers = {}
     context._local_dsv4_compressor_kv_mr_handlers = {}
     context._local_dsv4_compressor_score_mr_handlers = {}
@@ -164,6 +167,25 @@ class P2PCacheTransfer:
                 f"PeerAgent started: alias={agent_alias}, server={server_url}, "
                 f"kv_cache MR handler={self._local_mr_handler}"
             )
+
+            # Predictor KV stays in the primary KV MR. Only the small draft
+            # bundle needs a separate slot-indexed PD handoff region.
+            if self.mtp_handoff is not None:
+                handoff_size = _tensor_storage_span_num_bytes(self.mtp_handoff)
+                self._local_mtp_handoff_mr_handler = peer_agent.register_memory_region(
+                    _MTP_HANDOFF_BUFFER_ID,
+                    self.mtp_handoff.data_ptr(),
+                    int(self.mtp_handoff.storage_offset()),
+                    handoff_size,
+                )
+                logger.info(
+                    "Registered MTP handoff MR: handler=%s, slots=%s, "
+                    "drafts=%s, size=%s bytes",
+                    self._local_mtp_handoff_mr_handler,
+                    self.mtp_handoff.shape[0],
+                    self.mtp_num_drafts,
+                    handoff_size,
+                )
 
             # Decode-only NSA/MLA HiSparse receives the prefill KV directly
             # into its CPU cold tier. The normal device MR remains registered
@@ -333,6 +355,7 @@ class P2PCacheTransfer:
         self.remote_pp_cache_layer_indices.pop(remote_engine_id, None)
         self.remote_pp_dsv4_ratio_layer_indices.pop(remote_engine_id, None)
         self.remote_gdn_num_slots.pop(remote_engine_id, None)
+        self.remote_mtp_handoff_num_drafts.pop(remote_engine_id, None)
         self.remote_compressed_pool_pages.pop(remote_engine_id, None)
         self.remote_dsv4_max_slots.pop(remote_engine_id, None)
         self.remote_dsv4_num_layers_per_ratio.pop(remote_engine_id, None)
@@ -502,11 +525,11 @@ class P2PCacheTransfer:
             max_num_seqs,
             gdn_num_slots,
         ) in connection_requests:
+            self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
+            self.remote_max_num_seqs[engine_id] = max_num_seqs
+            if gdn_num_slots > 0:
+                self.remote_gdn_num_slots[engine_id] = gdn_num_slots
             if peer_alias and not peer_context.is_connected(peer_alias):
-                self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
-                self.remote_max_num_seqs[engine_id] = max_num_seqs
-                if gdn_num_slots > 0:
-                    self.remote_gdn_num_slots[engine_id] = gdn_num_slots
                 remote_peers_to_connect[peer_alias] = engine_id
 
         if not remote_peers_to_connect:
@@ -524,6 +547,7 @@ class P2PCacheTransfer:
         indexer_assigns: dict[str, dict[str, list[tuple]]] | None = None,
         compressed_assigns: dict[str, dict[str, list[tuple]]] | None = None,
         compressor_state_assigns: dict[str, dict[str, list[tuple]]] | None = None,
+        mtp_handoff_assigns: dict[str, dict[str, list[tuple]]] | None = None,
     ) -> None:
         """Execute batched RDMA reads for KV cache and GDN state migration.
 
@@ -549,6 +573,8 @@ class P2PCacheTransfer:
                                 (ratio, local_ratio_layer_idx,
                                  remote_ratio_layer_idx, remote_state_slot,
                                  local_state_slot)
+            mtp_handoff_assigns: engine_id -> peer_alias -> list of
+                                 (remote_state_slot, local_state_slot)
         """
         peer_context = self.get_peer_agent_context()
         peer_agent = peer_context.agent
@@ -558,6 +584,7 @@ class P2PCacheTransfer:
             indexer_assigns or {},
             compressed_assigns or {},
             compressor_state_assigns or {},
+            mtp_handoff_assigns or {},
         )
         engine_ids = {engine_id for mapping in assignment_maps for engine_id in mapping}
         for engine_id in engine_ids:
@@ -733,6 +760,56 @@ class P2PCacheTransfer:
                     else:
                         raise RuntimeError(
                             f"Failed to get gdn_recurrent MR info for {peer_alias}"
+                        )
+
+                # Append recurrent-MTP draft handoff. Missing remote MR is a
+                # rolling-upgrade failure mode: KV migration remains valid and
+                # decode safely falls back to one target-only step.
+                mtp_batch = (
+                    (mtp_handoff_assigns or {}).get(engine_id, {}).get(peer_alias, [])
+                )
+                if mtp_batch and self.mtp_handoff is not None:
+                    remote_handoff_info = peer_agent.get_mr_info(
+                        peer_alias, _MTP_HANDOFF_BUFFER_ID
+                    )
+                    if remote_handoff_info:
+                        remote_handoff_mr = peer_agent.get_handle(
+                            _MTP_HANDOFF_BUFFER_ID, peer_alias=peer_alias
+                        )
+                        local_handoff_mr = self._local_mtp_handoff_mr_handler
+                        if local_handoff_mr is None:
+                            raise RuntimeError("Local MTP handoff MR is not registered")
+                        row_bytes = (
+                            self.mtp_handoff.stride(0) * self.mtp_handoff.element_size()
+                        )
+                        local_slots = self.mtp_handoff.shape[0]
+                        remote_slots = self.remote_max_num_seqs.get(engine_id, 0)
+                        for remote_slot, local_slot in mtp_batch:
+                            if not 0 <= local_slot < local_slots:
+                                raise RuntimeError(
+                                    f"Local MTP handoff slot {local_slot} outside "
+                                    f"[0, {local_slots})"
+                                )
+                            if remote_slots > 0 and not 0 <= remote_slot < remote_slots:
+                                raise RuntimeError(
+                                    f"Remote MTP handoff slot {remote_slot} "
+                                    f"outside [0, {remote_slots}) for {engine_id}"
+                                )
+                            rdma_ops.append(
+                                (
+                                    local_handoff_mr,
+                                    remote_handoff_mr,
+                                    remote_slot * row_bytes,
+                                    local_slot * row_bytes,
+                                    row_bytes,
+                                )
+                            )
+                    else:
+                        logger.warning(
+                            "Peer %s has no %s MR; first decode step will use "
+                            "target-only fallback",
+                            peer_alias,
+                            _MTP_HANDOFF_BUFFER_ID,
                         )
 
                 # Append DSv4 compressed cache + compressor scratch state RDMA ops.
@@ -947,6 +1024,15 @@ class P2PCacheTransfer:
                 )
             remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             remote_gdn_num_slots = engine_info.get("gdn_num_slots", 0)
+            remote_mtp_num_drafts = int(engine_info.get("mtp_handoff_num_drafts", 0))
+            local_mtp_num_drafts = int(getattr(self, "mtp_num_drafts", 0))
+            if local_mtp_num_drafts and remote_mtp_num_drafts != local_mtp_num_drafts:
+                raise RuntimeError(
+                    f"PD MTP configuration mismatch for {engine_id}: remote "
+                    f"drafts={remote_mtp_num_drafts}, local "
+                    f"drafts={local_mtp_num_drafts}"
+                )
+            self.remote_mtp_handoff_num_drafts[engine_id] = remote_mtp_num_drafts
             # PD + GQA: remember the remote engine's attention_tp so peer
             # selection can address the matching per-rank KV-head shard.
             self.remote_attention_tp[engine_id] = int(
@@ -1104,6 +1190,7 @@ class P2PCacheTransfer:
         # DSv4 (S2.6): per-ratio compressed pages + compressor scratch state.
         compressed_assigns = defaultdict(lambda: defaultdict(list))
         compressor_state_assigns = defaultdict(lambda: defaultdict(list))
+        mtp_handoff_assigns = defaultdict(lambda: defaultdict(list))
         dist_ctx = get_dist_context()
         sp_idx = dist_ctx.attn_sp_rank
         # Local TP rank. Each decode TP rank owns a distinct KV-head shard and
@@ -1395,6 +1482,26 @@ class P2PCacheTransfer:
                             )
                         )
 
+            # The scheduler transports remote and local state-slot identities;
+            # the draft payload itself stays entirely on the data plane.
+            if (
+                self.mtp_handoff is not None
+                and v.migrate_state_slot >= 0
+                and v.active_state_slot >= 0
+            ):
+                remote_inner_rank = self._remote_global_rank(
+                    v.migrate_dp_idx,
+                    remote_dp,
+                    v.migrate_group_size - 1,
+                    v.migrate_group_size,
+                    tp_idx,
+                    self.remote_attention_tp.get(engine_id, 1),
+                )
+                peer_alias = peer_addrs[remote_inner_rank]
+                mtp_handoff_assigns[engine_id][peer_alias].append(
+                    (v.migrate_state_slot, v.active_state_slot)
+                )
+
             # GDN assignments
             if (
                 self.gdn_conv_states is not None
@@ -1439,6 +1546,7 @@ class P2PCacheTransfer:
             indexer_assigns,
             compressed_assigns=compressed_assigns,
             compressor_state_assigns=compressor_state_assigns,
+            mtp_handoff_assigns=mtp_handoff_assigns,
         )
 
 

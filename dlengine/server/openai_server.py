@@ -480,6 +480,14 @@ class OpenAIServer:
             aqueue=asyncio.Queue(),
             loop=loop,
         )
+        # The prefill engine has already sampled ``first_token`` and serialized
+        # it into the migrated Sequence. Decode consumes that token as the
+        # input to its first step, so it only reports tokens sampled *after*
+        # it. Seed the serving queue here to emit the prefill token exactly
+        # once, before any decode StepOut packets. Besides fixing streaming,
+        # this also keeps non-streaming output and completion-token usage exact.
+        if first_token is not None:
+            req.aqueue.put_nowait({"tokens": [int(first_token)]})
         self.worker.submit(req)
         logger.info(f"Submitted migrated request to engine: seq_id={seq_id}")
         return req
