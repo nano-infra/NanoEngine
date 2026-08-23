@@ -446,7 +446,25 @@ class Config(BaseModel):
             if self.attention_tp != 1:
                 raise ValueError("enable_hisparse requires attention_tp == 1")
             if self.num_speculative_tokens != 0:
-                raise ValueError("enable_hisparse does not support MTP")
+                if arch != "GlmMoeDsaForCausalLM":
+                    raise ValueError(
+                        "enable_hisparse with MTP currently requires "
+                        "GlmMoeDsaForCausalLM"
+                    )
+                verify_width = self.num_speculative_tokens + 1
+                index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
+                required_hot_slots = verify_width * index_topk
+                if self.hisparse_device_buffer_size < required_hot_slots:
+                    raise ValueError(
+                        "GLM HiSparse MTP requires hisparse_device_buffer_size "
+                        ">= (num_speculative_tokens + 1) * index_topk "
+                        f"({required_hot_slots}); got "
+                        f"{self.hisparse_device_buffer_size}"
+                    )
+                if verify_width > 64:
+                    raise ValueError(
+                        "GLM HiSparse MTP verify width must fit one KV page"
+                    )
             if self.hisparse_device_buffer_size <= 0:
                 raise ValueError("hisparse_device_buffer_size must be positive")
             if self.hisparse_swap_in_block_size <= 0:

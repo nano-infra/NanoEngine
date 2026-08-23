@@ -281,3 +281,52 @@ def test_glm_multistep_mtp_rejects_pp_outside_prefill(monkeypatch, mode):
             num_speculative_tokens=5,
             max_num_seqs=8,
         )
+
+
+def _glm_hisparse_config():
+    hf_config = _deepseek_config("GlmMoeDsaForCausalLM")
+    hf_config.num_nextn_predict_layers = 1
+    hf_config.index_head_dim = 128
+    hf_config.index_topk = 2048
+    return hf_config
+
+
+def test_glm_hisparse_allows_six_token_mtp_verify(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _glm_hisparse_config(),
+    )
+
+    config = Config(
+        model="unused",
+        mode="decode",
+        dummy_prefill=True,
+        enable_hisparse=True,
+        hisparse_device_buffer_size=12288,
+        num_speculative_tokens=5,
+        max_num_seqs=8,
+    )
+
+    assert config.enable_hisparse is True
+    assert config.num_speculative_tokens == 5
+    assert config.hisparse_device_buffer_size == 12288
+
+
+def test_glm_hisparse_rejects_undersized_mtp_union(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _glm_hisparse_config(),
+    )
+
+    with pytest.raises(ValueError, match="requires hisparse_device_buffer_size"):
+        Config(
+            model="unused",
+            mode="decode",
+            dummy_prefill=True,
+            enable_hisparse=True,
+            hisparse_device_buffer_size=4096,
+            num_speculative_tokens=5,
+            max_num_seqs=8,
+        )

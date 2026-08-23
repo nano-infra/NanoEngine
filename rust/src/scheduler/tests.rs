@@ -626,6 +626,23 @@ fn speculative_decode_reserves_all_recurrent_draft_positions() {
 }
 
 #[test]
+fn decode_migration_admission_reserves_remote_mtp_lookahead() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_mtp_scheduler_with_flags(0);
+        scheduler.config.mode = "decode".to_string();
+        add_tokens(py, &mut scheduler, 704, vec![1, 2, 3]).unwrap();
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        let seq_id = scheduled[0][0];
+
+        // Remote prefill migrates prompt + N positions. Decode admission must
+        // allocate the same two pages before receiving them; allocating only
+        // the three prompt tokens would leave a one-page-short destination.
+        assert_eq!(scheduler.seq_table[&seq_id].active_block_table.len(), 2);
+    });
+}
+
+#[test]
 fn speculative_decode_reserves_verify_and_next_draft_windows() {
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {

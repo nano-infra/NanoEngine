@@ -184,11 +184,14 @@ impl Scheduler {
         tokens: i32,
         set_migrate: bool,
     ) -> PyResult<Vec<i32>> {
-        // Hybrid prefill allocates through this group-level path rather than
-        // cache_ensure_blocks_for_seq. The predictor seeds recurrent drafts
-        // before postprocess, so its lookahead pages must be present in the
-        // first RunnerIn block table.
-        let allocation_tokens = if set_migrate && self.config.mode != "decode" {
+        // Initial prefill and decode-side migration admission allocate through
+        // this group-level path rather than cache_ensure_blocks_for_seq. The
+        // predictor seeds recurrent drafts before postprocess, so prefill must
+        // migrate prompt + N positions and decode must reserve the matching
+        // destination pages before RDMA starts.
+        let needs_mtp_handoff_lookahead =
+            (set_migrate && self.config.mode != "decode") || self.config.mode == "decode";
+        let allocation_tokens = if needs_mtp_handoff_lookahead {
             tokens + self.config.num_speculative_tokens.max(0)
         } else {
             tokens
