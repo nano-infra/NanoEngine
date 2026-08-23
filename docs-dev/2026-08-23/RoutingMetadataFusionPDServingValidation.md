@@ -2,6 +2,12 @@
 
 Date: 2026-08-23 UTC
 
+> **Superseded for text validation.** This run used the Issue1% length CSV,
+> which creates random token prompts and does not retain generated text. It is
+> useful as a length-workload performance run, but it is not the requested
+> ShareGPT text validation. See
+> `RoutingMetadataFusionPDShareGPTValidation.md` for the corrected run.
+
 ## Result
 
 PASS. The production fused SP graph metadata path completed a two-node,
