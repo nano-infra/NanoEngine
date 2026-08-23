@@ -20,6 +20,7 @@ pub(super) struct WireBatch {
     pub(super) hisparse_slots: Vec<i64>,
     pub(super) seq_ids: Vec<u64>,
     pub(super) sample_mask: Vec<bool>,
+    pub(super) any_return_completion_logprobs: bool,
     pub(super) is_dummy: bool,
 }
 
@@ -166,6 +167,7 @@ impl WireBatch {
             hisparse_slots: Vec::new(),
             seq_ids: Vec::new(),
             sample_mask: Vec::new(),
+            any_return_completion_logprobs: false,
             is_dummy: false,
         }
     }
@@ -183,6 +185,7 @@ impl WireBatch {
             hisparse_slots: vec![-1],
             seq_ids: vec![0],
             sample_mask: vec![true],
+            any_return_completion_logprobs: false,
             is_dummy: true,
         }
     }
@@ -244,6 +247,8 @@ impl WireBatch {
                             is_last_fragment
                                 && self.sample_mask.get(seq_idx).copied().unwrap_or(true),
                         ],
+                        any_return_completion_logprobs: self
+                            .any_return_completion_logprobs,
                         is_dummy: false,
                     },
                     seq_idx,
@@ -288,6 +293,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
     let mut hisparse_slots = Vec::new();
     let mut seq_ids = Vec::new();
     let mut sample_mask = Vec::new();
+    let mut any_return_completion_logprobs = false;
 
     for item in seqs {
         let tokens: Vec<i64> = item.token_ids.iter().copied().map(i64::from).collect();
@@ -295,6 +301,8 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         let block_table = item.active_block_table.clone();
         let compressed_tables = item.active_compressed_block_tables.clone();
         let temperature = item.sampling_params.temperature as f32;
+        any_return_completion_logprobs |=
+            item.sampling_params.return_completion_logprobs;
 
         let should_sample;
         if is_prefill {
@@ -348,6 +356,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
             hisparse_slots,
             seq_ids,
             sample_mask,
+            any_return_completion_logprobs,
             is_dummy: false,
         },
         "run batch",
@@ -515,6 +524,7 @@ mod tests {
             hisparse_slots: vec![9, 10],
             seq_ids: vec![100, 200],
             sample_mask: vec![true, true],
+            any_return_completion_logprobs: true,
             is_dummy: false,
         };
 

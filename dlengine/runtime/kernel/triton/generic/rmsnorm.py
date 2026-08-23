@@ -141,6 +141,63 @@ def rms_norm_triton(
     return out.reshape_as(x)
 
 
+def can_use_strided_inplace_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    """Whether x can be RMS-normalized in place with a row stride.
+
+    MLA stores the normalized 512-wide compressed latent in the first part of
+    a 576-wide projection buffer. That slice is contiguous within each row,
+    but Tensor.is_contiguous() is false because the row stride remains 576.
+    Accepting that layout avoids materializing the slice and copying it back.
+    """
+    if not x.is_cuda or x.dim() != 2 or x.stride(1) != 1:
+        return False
+    if not weight.is_cuda or weight.device != x.device or not weight.is_contiguous():
+        return False
+    if x.dtype not in SUPPORTED_DTYPES or weight.dtype not in SUPPORTED_DTYPES:
+        return False
+    if x.shape[-1] > MAX_FUSED_HIDDEN_SIZE or x.shape[-1] != weight.numel():
+        return False
+    if x.numel() == 0:
+        return False
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        return False
+    return True
+
+
+def rms_norm_strided_inplace(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = False,
+) -> torch.Tensor:
+    """Apply RMSNorm to a 2-D row-strided tensor without a temporary buffer."""
+    if not can_use_strided_inplace_rms_norm(x, weight):
+        raise ValueError(
+            "rms_norm_strided_inplace requires a CUDA 2-D tensor with "
+            "stride(-1) == 1 and a matching contiguous weight"
+        )
+
+    hidden_size = x.shape[-1]
+    block_size = _next_power_of_2(hidden_size)
+    _rms_norm_kernel[(x.shape[0],)](
+        x,
+        weight,
+        x,
+        x.stride(0),
+        x.stride(0),
+        hidden_size,
+        eps,
+        add_unit_offset=add_unit_offset,
+        BLOCK_SIZE=block_size,
+        num_warps=_num_warps(hidden_size),
+        num_stages=4,
+    )
+    return x
+
+
 def add_rms_norm_triton(
     x: torch.Tensor,
     residual: torch.Tensor,

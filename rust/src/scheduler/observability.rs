@@ -148,6 +148,27 @@ impl Scheduler {
                     }
                 }
             }
+        } else if self
+            .last_step_token_ids
+            .keys()
+            .any(|seq_id| result.dp_group_seq_ids.iter().flatten().any(|id| id == seq_id))
+        {
+            let group = self.config.group_size.max(1) as usize;
+            for (group_idx, seq_ids) in result.dp_group_seq_ids.iter().enumerate() {
+                let dp_idx = group_idx / group;
+                let applied = seq_ids
+                    .iter()
+                    .map(|seq_id| {
+                        self.last_step_token_ids
+                            .get(seq_id)
+                            .map_or(0, |tokens| tokens.len() as i32)
+                    })
+                    .sum::<i32>();
+                snapshot.decode_tokens += applied;
+                if dp_idx < snapshot.decode_tokens_per_dp.len() {
+                    snapshot.decode_tokens_per_dp[dp_idx] += applied;
+                }
+            }
         } else if let Some(tokens) = dp_group_token_ids {
             snapshot.decode_tokens = tokens
                 .iter()

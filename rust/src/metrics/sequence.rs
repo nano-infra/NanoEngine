@@ -23,6 +23,8 @@ pub struct SequenceMetric {
     #[pyo3(get, set)]
     pub num_generated_tokens: i32,
     #[pyo3(get, set)]
+    pub num_output_steps: i32,
+    #[pyo3(get, set)]
     pub itl_samples: Vec<f64>,
     #[pyo3(get, set)]
     pub last_token_time: Option<f64>,
@@ -74,6 +76,10 @@ impl SequenceMetric {
         }
         self.last_token_time = Some(now);
         self.num_generated_tokens += 1;
+    }
+
+    pub(crate) fn record_output_step(&mut self) {
+        self.num_output_steps += 1;
     }
 
     pub(crate) fn record_completion(&mut self) {
@@ -161,12 +167,18 @@ impl SequenceMetric {
                 .unwrap_or_else(|| "N/A".to_string())
         }
         format!(
-            "SequenceMetric [{}...] - TTFT: {}, E2E: {}, Prompt Length: {}, Output Length: {}, Queueing Time: {}, Decode Queueing Time: {}, ITL Wo Queue: {}, ITL With Queue: {}",
+            "SequenceMetric [{}...] - TTFT: {}, E2E: {}, Prompt Length: {}, Output Length: {}, Output Steps: {}, Tokens/Step: {:.2}, Queueing Time: {}, Decode Queueing Time: {}, ITL Wo Queue: {}, ITL With Queue: {}",
             self.seq_id.to_string().chars().take(8).collect::<String>(),
             ms(self.ttft()),
             ms(self.e2e_latency()),
             self.num_prompt_tokens,
             self.num_generated_tokens,
+            self.num_output_steps,
+            if self.num_output_steps > 0 {
+                self.num_generated_tokens as f64 / self.num_output_steps as f64
+            } else {
+                0.0
+            },
             ms(self.queueing_time_ms()),
             ms(self.decode_queue_time_ms()),
             ms(self.avg_tpot_wo_queueing()),
@@ -190,6 +202,7 @@ pub(crate) fn sequence_metric_new(seq_id: u64, num_prompt_tokens: i32) -> Sequen
         completion_time: None,
         num_prompt_tokens,
         num_generated_tokens: 0,
+        num_output_steps: 0,
         itl_samples: Vec::new(),
         last_token_time: None,
         num_prefill_chunks: 0,

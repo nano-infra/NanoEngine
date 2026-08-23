@@ -348,16 +348,16 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
                 if event["is_finished"]:
                     stepout_batch.append(
-                        (seq_id, event["last_token"], SequenceStatus.FINISHED)
+                        (seq_id, event.get("token_ids", []), SequenceStatus.FINISHED)
                     )
                     service._freed_sequences.discard(seq_id)
                 elif event["is_to_be_migrated"]:
                     payload = event.get("migration_payload")
                     if payload is not None:
                         service._send_migration_payload(bytes(payload))
-                elif event["num_tokens"] > 0:
+                elif event.get("token_ids"):
                     stepout_batch.append(
-                        (seq_id, event["last_token"], SequenceStatus.RUNNING)
+                        (seq_id, event["token_ids"], SequenceStatus.RUNNING)
                     )
 
             service._send_stepout_batch(stepout_batch)

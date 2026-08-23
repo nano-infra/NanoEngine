@@ -41,6 +41,9 @@ pub struct Scheduler {
     server_metric: ServerMetric,
     runtime_metrics: RuntimeMetrics,
     sequence_metrics: HashMap<u64, Py<SequenceMetric>>,
+    /// Tokens actually committed for each sequence by the most recent step.
+    /// Speculative bundles are truncated at EOS and request/model limits.
+    last_step_token_ids: HashMap<u64, Vec<i32>>,
 }
 
 mod api;
@@ -142,6 +145,13 @@ impl Scheduler {
                 let event = PyDict::new(py);
                 event.set_item("seq_id", seq_id)?;
                 event.set_item("last_token", last_token)?;
+                event.set_item(
+                    "token_ids",
+                    self.last_step_token_ids
+                        .get(&seq_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )?;
                 event.set_item("num_tokens", num_tokens)?;
                 event.set_item("is_finished", is_finished)?;
                 event.set_item("is_to_be_migrated", is_to_be_migrated)?;

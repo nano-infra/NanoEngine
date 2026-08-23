@@ -76,6 +76,7 @@ impl Scheduler {
         dp_group_token_ids: Vec<Vec<Vec<i32>>>,
         dp_group_token_logprobs: Option<Vec<Vec<Vec<f32>>>>,
     ) {
+        self.last_step_token_ids.clear();
         let mut scheduled_ids: Vec<HashSet<u64>> = (0..self.dp()).map(|_| HashSet::new()).collect();
         for (group_idx, seq_ids) in dp_group_seq_ids.iter().enumerate() {
             let dp_idx = group_idx / self.group();
@@ -149,7 +150,22 @@ impl Scheduler {
                     self.commit_hbm_blocks(seq_id, prefill_target);
                 }
 
+                let mut applied_tokens = Vec::with_capacity(tokens.len());
+                let mut hit_terminal = false;
                 for (token_offset, token) in tokens.iter().copied().enumerate() {
+                    let can_append = self
+                        .seq_table
+                        .get(&seq_id)
+                        .map(|seq| {
+                            let generated = seq.num_tokens - seq.num_prompt_tokens;
+                            generated < seq.sampling_params.max_tokens
+                                && seq.num_tokens < self.config.max_model_len
+                        })
+                        .unwrap_or(false);
+                    if !can_append {
+                        hit_terminal = true;
+                        break;
+                    }
                     let logprob = dp_group_token_logprobs
                         .as_ref()
                         .and_then(|groups| groups.get(group_idx))
@@ -179,6 +195,30 @@ impl Scheduler {
                             metric.record_token();
                         }
                     }
+                    applied_tokens.push(token);
+
+                    let terminal_after_append = self
+                        .seq_table
+                        .get(&seq_id)
+                        .map(|seq| {
+                            let generated = seq.num_tokens - seq.num_prompt_tokens;
+                            (!seq.sampling_params.ignore_eos
+                                && self.config.eos_ids.contains(&token))
+                                || generated >= seq.sampling_params.max_tokens
+                                || seq.num_tokens >= self.config.max_model_len
+                        })
+                        .unwrap_or(true);
+                    if terminal_after_append {
+                        hit_terminal = true;
+                        break;
+                    }
+                }
+
+                self.last_step_token_ids.insert(seq_id, applied_tokens);
+                if !self.last_step_token_ids[&seq_id].is_empty() {
+                    if let Some(metric) = self.sequence_metrics.get(&seq_id) {
+                        metric.borrow_mut(py).record_output_step();
+                    }
                 }
 
                 let (max_tokens, ignore_eos, num_tokens, generated, last_token) = {
@@ -196,7 +236,7 @@ impl Scheduler {
                 let hit_eos = !ignore_eos && self.config.eos_ids.contains(&last_token);
                 let hit_limit = generated >= max_tokens || num_tokens >= self.config.max_model_len;
 
-                if hit_eos || hit_limit {
+                if hit_terminal || hit_eos || hit_limit {
                     if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                         seq.status = 2;
                     }

@@ -11,7 +11,7 @@ pub(crate) fn runner_in_aux(data: &[u8], _sp_rank: usize) -> PyResult<BatchAuxDa
         compressed_block_tables: batch.compressed_block_tables,
         hisparse_slots: batch.hisparse_slots,
         seq_ids: batch.seq_ids,
-        any_return_completion_logprobs: false,
+        any_return_completion_logprobs: batch.any_return_completion_logprobs,
     })
 }
 

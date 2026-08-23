@@ -564,3 +564,102 @@ fn runner_out_postprocess_and_metrics_entrypoints_work() {
         assert_eq!(snapshot.decode_tokens_per_dp, vec![1]);
     });
 }
+
+#[test]
+fn speculative_decode_reserves_all_recurrent_draft_positions() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_flags_and_prefix_cache(1, false);
+        scheduler.config.num_speculative_tokens = 5;
+        add_tokens(py, &mut scheduler, 700, vec![1, 2, 3]).unwrap();
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        let seq_id = scheduled[0][0];
+
+        // The predictor runs during prefill, before postprocess. With
+        // block_size=4 and num_tokens=3, N=5 must already reserve through
+        // token 8 and expose two pages in this first RunnerIn.
+        assert_eq!(scheduler.seq_table[&seq_id].active_block_table.len(), 2);
+    });
+}
+
+#[test]
+fn speculative_decode_reserves_verify_and_next_draft_windows() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_flags_and_prefix_cache(1, false);
+        scheduler.config.num_speculative_tokens = 5;
+        add_tokens(py, &mut scheduler, 703, vec![1, 2, 3]).unwrap();
+        let seq_id = run_one_prefill(py, &mut scheduler).unwrap()[0];
+
+        // Before acceptance is known, decode must cover the current K=6
+        // verify and the following recurrent draft line. With block_size=4,
+        // 3 + 2*5 tokens require four pages.
+        assert_eq!(scheduler.seq_table[&seq_id].active_block_table.len(), 4);
+    });
+}
+
+#[test]
+fn speculative_bundle_stops_at_first_eos_and_metrics_count_applied_tokens() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler();
+        scheduler.config.eos_ids = vec![9];
+        let sampling = Py::new(py, SamplingParams::new(0.8, 16, false, true)).unwrap();
+        scheduler
+            .add_request(py, 701, vec![1, 2, 3], sampling, 0, None)
+            .unwrap();
+        let seq_id = run_one_prefill(py, &mut scheduler).unwrap()[0];
+
+        scheduler.postprocess_impl(
+            py,
+            vec![vec![seq_id]],
+            vec![vec![vec![4, 9, 7, 8]]],
+            Some(vec![vec![vec![-0.1, -0.2, -0.3, -0.4]]]),
+        );
+
+        let seq = &scheduler.seq_table[&seq_id];
+        assert_eq!(seq.token_ids, vec![1, 2, 3, 4, 9]);
+        assert_eq!(seq.completion_logprobs, vec![-0.1, -0.2]);
+        assert_eq!(seq.status, 2);
+        assert_eq!(scheduler.last_step_token_ids[&seq_id], vec![4, 9]);
+
+        let result = ScheduleResult {
+            dp_group_seq_ids: vec![vec![seq_id]],
+            is_prefill: false,
+            ..ScheduleResult::default()
+        };
+        let mut metric = server_metric();
+        let snapshot = scheduler.record_step_metric_impl(
+            py,
+            &mut metric,
+            &result,
+            Some(vec![vec![vec![4, 9, 7, 8]]]),
+        );
+        assert_eq!(snapshot.decode_tokens, 2);
+        assert_eq!(snapshot.decode_tokens_per_dp, vec![2]);
+    });
+}
+
+#[test]
+fn speculative_bundle_stops_at_request_token_limit() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler();
+        let sampling = Py::new(py, SamplingParams::new(0.0, 2, true, false)).unwrap();
+        scheduler
+            .add_request(py, 702, vec![1, 2, 3], sampling, 0, None)
+            .unwrap();
+        let seq_id = run_one_prefill(py, &mut scheduler).unwrap()[0];
+
+        scheduler.postprocess_impl(
+            py,
+            vec![vec![seq_id]],
+            vec![vec![vec![4, 5, 6]]],
+            None,
+        );
+
+        assert_eq!(scheduler.seq_table[&seq_id].token_ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(scheduler.last_step_token_ids[&seq_id], vec![4, 5]);
+        assert_eq!(scheduler.seq_table[&seq_id].status, 2);
+    });
+}

@@ -38,6 +38,7 @@ impl Scheduler {
             server_metric: ServerMetric::default(),
             runtime_metrics: RuntimeMetrics::default(),
             sequence_metrics: HashMap::new(),
+            last_step_token_ids: HashMap::new(),
         }
     }
 
