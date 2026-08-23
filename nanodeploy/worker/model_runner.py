@@ -28,6 +28,7 @@ from nanodeploy.engine.worker_transport import (
     WorkerZmqConfig,
     ZmqWorkerClient,
 )
+from nanodeploy.kernels.sp_graph_metadata import warmup_sp_graph_metadata
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -1187,6 +1188,20 @@ class ModelRunner:
             phase_factory=phase_factory,
         )
 
+    def _warmup_sp_graph_metadata(self, graph_vars) -> None:
+        warmup_sp_graph_metadata(
+            graph_vars["q_dst_row_indices"],
+            graph_vars["actual_attn_bs"],
+            graph_vars["context_lens"],
+            graph_vars["global_context_lens"],
+            graph_vars["context_lens_for_attn"],
+            graph_vars["block_tables"],
+            graph_vars["res_slice_get_to_buffer_output"],
+            graph_vars["res_slice_fill_to_buffer_output"],
+            graph_vars["res_to_buffer_output_mask"],
+            self.config.max_num_seqs,
+        )
+
     def _build_graph_master_rank_bs(self, max_bs: int) -> list[int]:
         graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         graph_bs = [bs for bs in graph_bs if bs <= max_bs]
@@ -2029,6 +2044,8 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
         )
+        if use_hao_destination_rows:
+            self._warmup_sp_graph_metadata(self.graph_vars)
 
     @torch.inference_mode()
     def capture_piecewise_cudagraph(self):
@@ -2095,6 +2112,11 @@ class ModelRunner:
                         -1,
                         dtype=torch.int32,
                     )
+                    if use_hao_destination_rows
+                    else None
+                ),
+                actual_attn_bs=(
+                    torch.zeros((), dtype=torch.int32)
                     if use_hao_destination_rows
                     else None
                 ),
@@ -2173,6 +2195,8 @@ class ModelRunner:
         total_graphs = 0
         model = self.model.model
         graph_vars = make_decode_graph_vars()
+        if use_hao_destination_rows:
+            self._warmup_sp_graph_metadata(graph_vars)
         input_ids = graph_vars["input_ids"]
         positions = graph_vars["positions"]
         workspace = dict(

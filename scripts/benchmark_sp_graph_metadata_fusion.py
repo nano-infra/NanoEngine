@@ -18,8 +18,6 @@ from typing import Any
 import numpy as np
 import torch
 import triton
-import triton.language as tl
-from triton.runtime import driver as triton_driver
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -27,14 +25,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import nanodeploy
-from nanodeploy.worker.sp_graph_policy import (
-    copy_graph_actual_attn_bs,
-    copy_graph_q_dst_rows,
-    materialize_sp_graph_padding,
-)
+from nanodeploy.kernels.sp_graph_metadata import update_sp_graph_metadata
 
 
-BLOCK_SIZE = 256
 REFERENCE_RANGE = "nanodeploy.prototype.routing_metadata.reference"
 FUSED_RANGE = "nanodeploy.prototype.routing_metadata.fused"
 DESTINATION_NAMES = (
@@ -48,128 +41,6 @@ DESTINATION_NAMES = (
     "res_slice_fill_to_buffer_output",
     "res_to_buffer_output_mask",
 )
-
-
-@triton.jit(
-    do_not_specialize=[
-        "q_work",
-        "actual_attn_bs",
-        "graph_attn_bs",
-        "actual_master_bs",
-        "graph_master_bs",
-        "block_table_width",
-        "sp_rank",
-        "max_num_seqs",
-    ]
-)
-def routing_metadata_fusion_kernel(
-    q_dst_source_ptr,
-    graph_q_dst_ptr,
-    graph_actual_attn_bs_ptr,
-    actual_block_tables_ptr,
-    graph_context_lens_ptr,
-    graph_global_context_lens_ptr,
-    graph_context_lens_for_attn_ptr,
-    graph_block_tables_ptr,
-    graph_res_get_ptr,
-    graph_res_fill_ptr,
-    graph_res_mask_ptr,
-    q_work,
-    actual_attn_bs,
-    graph_attn_bs,
-    actual_master_bs,
-    graph_master_bs,
-    block_table_width,
-    sp_rank,
-    max_num_seqs,
-    actual_block_stride_row,
-    actual_block_stride_col,
-    context_lens_stride_sp,
-    context_lens_stride_row,
-    global_context_lens_stride_sp,
-    global_context_lens_stride_row,
-    context_lens_for_attn_stride,
-    graph_block_stride_row,
-    graph_block_stride_col,
-    res_get_stride,
-    res_fill_stride,
-    res_mask_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-    q_mask = offsets < q_work
-    q_values = tl.load(q_dst_source_ptr + offsets, mask=q_mask)
-    tl.store(graph_q_dst_ptr + offsets, q_values, mask=q_mask)
-
-    tl.store(
-        graph_actual_attn_bs_ptr + offsets,
-        actual_attn_bs,
-        mask=offsets == 0,
-    )
-
-    attention_tail = graph_attn_bs - actual_attn_bs
-    attention_row_mask = offsets < attention_tail
-    tl.store(
-        graph_context_lens_for_attn_ptr
-        + (actual_attn_bs + offsets) * context_lens_for_attn_stride,
-        1,
-        mask=attention_row_mask,
-    )
-
-    attention_work = attention_tail * block_table_width
-    block_mask = offsets < attention_work
-    tail_rows = offsets // block_table_width
-    columns = offsets - tail_rows * block_table_width
-    block_values = tl.load(
-        actual_block_tables_ptr
-        + 0 * actual_block_stride_row
-        + columns * actual_block_stride_col,
-        mask=block_mask,
-    )
-    tl.store(
-        graph_block_tables_ptr
-        + (actual_attn_bs + tail_rows) * graph_block_stride_row
-        + columns * graph_block_stride_col,
-        block_values,
-        mask=block_mask,
-    )
-
-    master_tail = graph_master_bs - actual_master_bs
-    master_mask = offsets < master_tail
-    master_rows = actual_master_bs + offsets
-    tl.store(
-        graph_context_lens_ptr
-        + sp_rank * context_lens_stride_sp
-        + master_rows * context_lens_stride_row,
-        1,
-        mask=master_mask,
-    )
-    tl.store(
-        graph_global_context_lens_ptr
-        + sp_rank * global_context_lens_stride_sp
-        + master_rows * global_context_lens_stride_row,
-        1,
-        mask=master_mask,
-    )
-    dummy_attention_row = tl.where(
-        actual_attn_bs < graph_attn_bs, actual_attn_bs, 0
-    )
-    tl.store(
-        graph_res_get_ptr + master_rows * res_get_stride,
-        dummy_attention_row,
-        mask=master_mask,
-    )
-    tl.store(
-        graph_res_fill_ptr + master_rows * res_fill_stride,
-        sp_rank * max_num_seqs + master_rows,
-        mask=master_mask,
-    )
-    tl.store(
-        graph_res_mask_ptr + master_rows * res_mask_stride,
-        1,
-        mask=master_mask,
-    )
 
 
 @dataclass(frozen=True)
@@ -468,23 +339,43 @@ def _reference_routing_metadata_once(
     sources: MetadataSources,
     shape: MetadataCaseShape,
 ) -> None:
-    copy_graph_q_dst_rows(
-        destinations["q_dst_row_indices"], sources.q_dst_row_indices
-    )
-    copy_graph_actual_attn_bs(
-        destinations["actual_attn_bs"], shape.actual_attn_bs
-    )
-    materialize_sp_graph_padding(
-        destinations,
-        actual_block_tables=sources.block_tables,
-        actual_attn_bs=shape.actual_attn_bs,
-        graph_attn_bs=shape.graph_attn_bs,
-        actual_master_bs=shape.actual_master_bs,
-        graph_master_bs=shape.graph_master_bs,
-        local_result_rows=shape.actual_master_bs,
-        sp_rank=shape.sp_rank,
-        max_num_seqs=shape.max_num_seqs,
-    )
+    destinations["q_dst_row_indices"].fill_(-1)
+    destinations["q_dst_row_indices"].copy_(sources.q_dst_row_indices)
+    destinations["actual_attn_bs"].fill_(shape.actual_attn_bs)
+
+    if shape.graph_attn_bs > shape.actual_attn_bs:
+        destinations["context_lens_for_attn"][
+            shape.actual_attn_bs : shape.graph_attn_bs
+        ].fill_(1)
+        destinations["block_tables"][
+            shape.actual_attn_bs : shape.graph_attn_bs,
+            : shape.block_table_width,
+        ].copy_(
+            sources.block_tables[0:1].expand(
+                shape.graph_attn_bs - shape.actual_attn_bs, -1
+            )
+        )
+
+    if shape.graph_master_bs > shape.actual_master_bs:
+        master_slice = slice(shape.actual_master_bs, shape.graph_master_bs)
+        destinations["context_lens"][shape.sp_rank, master_slice].fill_(1)
+        destinations["global_context_lens"][shape.sp_rank, master_slice].fill_(1)
+        dummy_attention_row = (
+            shape.actual_attn_bs
+            if shape.actual_attn_bs < shape.graph_attn_bs
+            else 0
+        )
+        destinations["res_slice_get_to_buffer_output"][master_slice].fill_(
+            dummy_attention_row
+        )
+        torch.arange(
+            shape.sp_rank * shape.max_num_seqs + shape.actual_master_bs,
+            shape.sp_rank * shape.max_num_seqs + shape.graph_master_bs,
+            dtype=torch.int32,
+            device=sources.q_dst_row_indices.device,
+            out=destinations["res_slice_fill_to_buffer_output"][master_slice],
+        )
+        destinations["res_to_buffer_output_mask"][master_slice].fill_(1)
 
 
 def _validate_fused_inputs(
@@ -588,64 +479,27 @@ def _prepare_fused_operation(
     shape: MetadataCaseShape,
 ) -> tuple[Callable[[], None], torch.device]:
     device = _validate_fused_inputs(destinations, sources, shape)
-    q_work = sources.q_dst_row_indices.numel()
-    attention_work = (
-        shape.graph_attn_bs - shape.actual_attn_bs
-    ) * shape.block_table_width
-    master_work = shape.graph_master_bs - shape.actual_master_bs
-    total_work = max(q_work, attention_work, master_work, 1)
-    grid = (triton.cdiv(total_work, BLOCK_SIZE),)
-    kernel_arguments = (
-        sources.q_dst_row_indices,
-        destinations["q_dst_row_indices"],
-        destinations["actual_attn_bs"],
-        sources.block_tables,
-        destinations["context_lens"],
-        destinations["global_context_lens"],
-        destinations["context_lens_for_attn"],
-        destinations["block_tables"],
-        destinations["res_slice_get_to_buffer_output"],
-        destinations["res_slice_fill_to_buffer_output"],
-        destinations["res_to_buffer_output_mask"],
-        q_work,
-        shape.actual_attn_bs,
-        shape.graph_attn_bs,
-        shape.actual_master_bs,
-        shape.graph_master_bs,
-        shape.block_table_width,
-        shape.sp_rank,
-        shape.max_num_seqs,
-        sources.block_tables.stride(0),
-        sources.block_tables.stride(1),
-        destinations["context_lens"].stride(0),
-        destinations["context_lens"].stride(1),
-        destinations["global_context_lens"].stride(0),
-        destinations["global_context_lens"].stride(1),
-        destinations["context_lens_for_attn"].stride(0),
-        destinations["block_tables"].stride(0),
-        destinations["block_tables"].stride(1),
-        destinations["res_slice_get_to_buffer_output"].stride(0),
-        destinations["res_slice_fill_to_buffer_output"].stride(0),
-        destinations["res_to_buffer_output_mask"].stride(0),
-    )
-    compiled_kernel = routing_metadata_fusion_kernel.warmup(
-        *kernel_arguments,
-        grid=grid,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=4,
-    )
-    if compiled_kernel is None:
-        raise RuntimeError("Triton warmup did not return a compiled kernel")
-    launch_grid = (grid[0], 1, 1)
-    compiled_runner = compiled_kernel[launch_grid]
-    launch_arguments = (*kernel_arguments, BLOCK_SIZE)
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    stream = triton_driver.active.get_current_stream(device_index)
 
     def operation() -> None:
-        compiled_runner(*launch_arguments, stream=stream)
+        update_sp_graph_metadata(
+            sources.q_dst_row_indices,
+            destinations["q_dst_row_indices"],
+            destinations["actual_attn_bs"],
+            sources.block_tables,
+            destinations["context_lens"],
+            destinations["global_context_lens"],
+            destinations["context_lens_for_attn"],
+            destinations["block_tables"],
+            destinations["res_slice_get_to_buffer_output"],
+            destinations["res_slice_fill_to_buffer_output"],
+            destinations["res_to_buffer_output_mask"],
+            shape.actual_attn_bs,
+            shape.graph_attn_bs,
+            shape.actual_master_bs,
+            shape.graph_master_bs,
+            shape.sp_rank,
+            shape.max_num_seqs,
+        )
 
     return operation, device
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from nanodeploy._cpp import BlockContextSlot, Scheduler, Sequence, prepare_decode_cpp
-from nanodeploy.worker.sp_graph_policy import materialize_sp_graph_padding
+from nanodeploy.kernels.sp_graph_metadata import update_sp_graph_metadata
 from tests.sp_routing_oracle import (
     assert_destination_rows_match_packed_receivers,
 )
@@ -335,6 +336,7 @@ def test_fixed_sp8_batch_metadata_roundtrips_distinct_request_identities():
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fixed_sp8_packed_graph_padding_after_eos():
     """Fixed SP keeps packed real rows and pads only Graph-only tails."""
 
@@ -359,6 +361,7 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
         block_size=_BLOCK_SIZE,
     )
 
+    device = torch.device("cuda")
     for sp_rank in range(_SP_SIZE):
         metadata = prepare_decode_cpp(
             list(after_eos),
@@ -373,6 +376,7 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
         actual_block_tables = torch.tensor(
             metadata.block_tables_flat,
             dtype=torch.int32,
+            device=device,
         ).reshape(actual_attn_bs, metadata.max_num_blocks)
         # Rank 0 also covers piecewise attention, where eager attention uses
         # the exact packed row count and only the master batch is padded.
@@ -384,32 +388,49 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
             "context_lens": torch.tensor(
                 metadata.context_lens_flat,
                 dtype=torch.int32,
+                device=device,
             ).reshape(_SP_SIZE, _MAX_NUM_SEQS),
             "global_context_lens": torch.tensor(
                 metadata.global_context_lens_flat,
                 dtype=torch.int32,
+                device=device,
             ).reshape(_SP_SIZE, _MAX_NUM_SEQS),
+            "q_dst_row_indices": torch.full(
+                (_SP_SIZE, _MAX_NUM_SEQS),
+                -2,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "actual_attn_bs": torch.zeros(
+                (), dtype=torch.int32, device=device
+            ),
             "context_lens_for_attn": torch.zeros(
                 graph_attn_bs,
                 dtype=torch.int32,
+                device=device,
             ),
             "block_tables": torch.full(
                 (graph_attn_bs, metadata.max_num_blocks),
                 -1,
                 dtype=torch.int32,
+                device=device,
             ),
             "res_slice_get_to_buffer_output": torch.full(
-                (graph_master_bs,), -1, dtype=torch.int32
+                (graph_master_bs,), -1, dtype=torch.int32, device=device
             ),
             "res_slice_fill_to_buffer_output": torch.full(
-                (graph_master_bs,), -1, dtype=torch.int32
+                (graph_master_bs,), -1, dtype=torch.int32, device=device
             ),
             "res_to_buffer_output_mask": torch.zeros(
-                graph_master_bs, dtype=torch.int32
+                graph_master_bs, dtype=torch.int32, device=device
             ),
         }
         graph_vars["context_lens_for_attn"][:actual_attn_bs].copy_(
-            torch.tensor(metadata.context_lens_for_attn, dtype=torch.int32)
+            torch.tensor(
+                metadata.context_lens_for_attn,
+                dtype=torch.int32,
+                device=device,
+            )
         )
         graph_vars["block_tables"][:actual_attn_bs].copy_(actual_block_tables)
         local_result_rows = len(metadata.res_slice_get_to_buffer_output)
@@ -417,18 +438,21 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
             torch.tensor(
                 metadata.res_slice_get_to_buffer_output,
                 dtype=torch.int32,
+                device=device,
             )
         )
         graph_vars["res_slice_fill_to_buffer_output"][:local_result_rows].copy_(
             torch.tensor(
                 metadata.res_slice_fill_to_buffer_output,
                 dtype=torch.int32,
+                device=device,
             )
         )
         graph_vars["res_to_buffer_output_mask"][:local_result_rows].copy_(
             torch.tensor(
                 metadata.res_to_buffer_output_mask,
                 dtype=torch.int32,
+                device=device,
             )
         )
         packed_contexts = graph_vars["context_lens_for_attn"][
@@ -436,18 +460,34 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
         ].clone()
         packed_blocks = graph_vars["block_tables"][:actual_attn_bs].clone()
 
-        materialize_sp_graph_padding(
-            graph_vars,
-            actual_block_tables=actual_block_tables,
-            actual_attn_bs=actual_attn_bs,
-            graph_attn_bs=graph_attn_bs,
-            actual_master_bs=1,
-            graph_master_bs=graph_master_bs,
-            local_result_rows=local_result_rows,
-            sp_rank=sp_rank,
-            max_num_seqs=_MAX_NUM_SEQS,
+        q_dst_source = torch.tensor(
+            metadata.q_dst_row_indices_flat,
+            dtype=torch.int32,
+            device=device,
+        ).reshape(_SP_SIZE, _MAX_NUM_SEQS)
+        update_sp_graph_metadata(
+            q_dst_source,
+            graph_vars["q_dst_row_indices"],
+            graph_vars["actual_attn_bs"],
+            actual_block_tables,
+            graph_vars["context_lens"],
+            graph_vars["global_context_lens"],
+            graph_vars["context_lens_for_attn"],
+            graph_vars["block_tables"],
+            graph_vars["res_slice_get_to_buffer_output"],
+            graph_vars["res_slice_fill_to_buffer_output"],
+            graph_vars["res_to_buffer_output_mask"],
+            actual_attn_bs,
+            graph_attn_bs,
+            1,
+            graph_master_bs,
+            sp_rank,
+            _MAX_NUM_SEQS,
         )
+        torch.cuda.synchronize()
 
+        assert torch.equal(graph_vars["q_dst_row_indices"], q_dst_source)
+        assert graph_vars["actual_attn_bs"].item() == actual_attn_bs
         torch.testing.assert_close(
             graph_vars["context_lens_for_attn"][:actual_attn_bs],
             packed_contexts,
@@ -458,7 +498,11 @@ def test_fixed_sp8_packed_graph_padding_after_eos():
         )
         assert torch.equal(
             graph_vars["context_lens_for_attn"][actual_attn_bs:graph_attn_bs],
-            torch.ones(graph_attn_bs - actual_attn_bs, dtype=torch.int32),
+            torch.ones(
+                graph_attn_bs - actual_attn_bs,
+                dtype=torch.int32,
+                device=device,
+            ),
         )
         assert torch.equal(
             graph_vars["block_tables"][actual_attn_bs:graph_attn_bs],

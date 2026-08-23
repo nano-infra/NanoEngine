@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from nanodeploy.kernels.sp_graph_metadata import update_sp_graph_metadata
+
 
 PhaseFactory = Callable[[str], AbstractContextManager[None]]
 
@@ -86,25 +88,6 @@ def select_decode_graph_bucket(
     return master_bs, graph_attn_bs
 
 
-def copy_graph_q_dst_rows(
-    graph_q_dst_row_indices: torch.Tensor | None,
-    q_dst_row_indices: torch.Tensor | None,
-) -> None:
-    if graph_q_dst_row_indices is None:
-        return
-    graph_q_dst_row_indices.fill_(-1)
-    if q_dst_row_indices is not None:
-        graph_q_dst_row_indices.copy_(q_dst_row_indices)
-
-
-def copy_graph_actual_attn_bs(
-    graph_actual_attn_bs: torch.Tensor | None,
-    actual_attn_bs: int,
-) -> None:
-    if graph_actual_attn_bs is not None:
-        graph_actual_attn_bs.fill_(actual_attn_bs)
-
-
 def copy_decode_context_to_graph_vars(
     graph_vars: dict[str, torch.Tensor | None],
     input_ids: torch.Tensor,
@@ -121,8 +104,7 @@ def copy_decode_context_to_graph_vars(
     """Copy decode state into persistent Graph tensors.
 
     ``phase_factory`` is disabled on the normal serving path. Runtime-overhead
-    experiments use it to delimit the three routing-specific updates without
-    duplicating the production implementation in the benchmark.
+    experiments use it to delimit the fused routing update.
     """
 
     if graph_vars.get("input_ids") is not None:
@@ -136,17 +118,6 @@ def copy_decode_context_to_graph_vars(
     graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = (  # type: ignore[index]
         context.slot_mapping
     )
-
-    graph_q_dst_row_indices = graph_vars.get("q_dst_row_indices")
-    if phase_factory is None:
-        copy_graph_q_dst_rows(
-            graph_q_dst_row_indices, context.q_dst_row_indices
-        )
-    else:
-        with phase_factory("nanodeploy.graph.metadata.q_dst_rows"):
-            copy_graph_q_dst_rows(
-                graph_q_dst_row_indices, context.q_dst_row_indices
-            )
 
     graph_vars["context_lens"].zero_()  # type: ignore[union-attr]
     graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore[union-attr]
@@ -214,127 +185,27 @@ def copy_decode_context_to_graph_vars(
         return
 
     actual_attn_bs = int(context.attention_compute_bs)
-    graph_actual_attn_bs = graph_vars.get("actual_attn_bs")
+    routing_args = (
+        context.q_dst_row_indices,
+        graph_vars["q_dst_row_indices"],
+        graph_vars["actual_attn_bs"],
+        context.block_tables,
+        graph_vars["context_lens"],
+        graph_vars["global_context_lens"],
+        graph_vars["context_lens_for_attn"],
+        graph_vars["block_tables"],
+        graph_vars["res_slice_get_to_buffer_output"],
+        graph_vars["res_slice_fill_to_buffer_output"],
+        graph_vars["res_to_buffer_output_mask"],
+        actual_attn_bs,
+        graph_attn_bs,
+        actual_master_bs,
+        graph_master_bs,
+        sp_rank,
+        max_num_seqs,
+    )
     if phase_factory is None:
-        copy_graph_actual_attn_bs(graph_actual_attn_bs, actual_attn_bs)
+        update_sp_graph_metadata(*routing_args)  # type: ignore[arg-type]
     else:
-        with phase_factory("nanodeploy.graph.metadata.actual_attn_bs"):
-            copy_graph_actual_attn_bs(graph_actual_attn_bs, actual_attn_bs)
-
-    padding_kwargs = {
-        "actual_block_tables": context.block_tables,
-        "actual_attn_bs": actual_attn_bs,
-        "graph_attn_bs": graph_attn_bs,
-        "actual_master_bs": actual_master_bs,
-        "graph_master_bs": graph_master_bs,
-        "local_result_rows": context.res_slice_get_to_buffer_output.numel(),
-        "sp_rank": sp_rank,
-        "max_num_seqs": max_num_seqs,
-    }
-    if phase_factory is None:
-        materialize_sp_graph_padding(graph_vars, **padding_kwargs)
-    else:
-        with phase_factory("nanodeploy.graph.metadata.padding"):
-            materialize_sp_graph_padding(graph_vars, **padding_kwargs)
-
-
-def materialize_sp_graph_padding(
-    graph_vars: dict[str, torch.Tensor | None],
-    *,
-    actual_block_tables: torch.Tensor,
-    actual_attn_bs: int,
-    graph_attn_bs: int,
-    actual_master_bs: int,
-    graph_master_bs: int,
-    local_result_rows: int,
-    sp_rank: int,
-    max_num_seqs: int,
-) -> None:
-    """Make packed SP metadata safe for a padded CUDA Graph replay.
-
-    Real attention rows remain packed in the leading prefix. Graph-only
-    attention rows borrow one valid read-only KV page, while Graph-only local
-    master slots reuse one finite attention partial and stay outside sampling.
-    """
-
-    if not 0 < actual_attn_bs <= graph_attn_bs:
-        raise ValueError(
-            "actual_attn_bs must be in [1, graph_attn_bs], got "
-            f"actual={actual_attn_bs} graph={graph_attn_bs}"
-        )
-    if not 0 <= actual_master_bs <= graph_master_bs:
-        raise ValueError(
-            "actual_master_bs must be in [0, graph_master_bs], got "
-            f"actual={actual_master_bs} graph={graph_master_bs}"
-        )
-    if local_result_rows != actual_master_bs:
-        raise ValueError(
-            "local result rows must match the actual master batch: "
-            f"rows={local_result_rows} actual_master_bs={actual_master_bs}"
-        )
-
-    graph_context_lens = graph_vars["context_lens"]
-    graph_global_context_lens = graph_vars["global_context_lens"]
-    graph_context_lens_for_attn = graph_vars["context_lens_for_attn"]
-    graph_block_tables = graph_vars["block_tables"]
-    graph_res_get = graph_vars["res_slice_get_to_buffer_output"]
-    graph_res_fill = graph_vars["res_slice_fill_to_buffer_output"]
-    graph_res_mask = graph_vars["res_to_buffer_output_mask"]
-    required = (
-        graph_context_lens,
-        graph_global_context_lens,
-        graph_context_lens_for_attn,
-        graph_block_tables,
-        graph_res_get,
-        graph_res_fill,
-        graph_res_mask,
-    )
-    if any(tensor is None for tensor in required):
-        raise ValueError("SP Graph padding requires complete Graph metadata")
-
-    if graph_attn_bs > actual_attn_bs:
-        if actual_block_tables.ndim != 2 or actual_block_tables.size(1) == 0:
-            raise ValueError("SP Graph padding requires one valid KV block table")
-        graph_context_lens_for_attn[
-            actual_attn_bs:graph_attn_bs
-        ].fill_(1)
-        block_width = actual_block_tables.size(1)
-        graph_block_tables[
-            actual_attn_bs:graph_attn_bs, :block_width
-        ].copy_(
-            actual_block_tables[0:1].expand(
-                graph_attn_bs - actual_attn_bs, -1
-            )
-        )
-
-    graph_only_master_rows = graph_master_bs - actual_master_bs
-    if graph_only_master_rows == 0:
-        return
-
-    graph_context_lens[
-        sp_rank, actual_master_bs:graph_master_bs
-    ].fill_(1)
-    graph_global_context_lens[
-        sp_rank, actual_master_bs:graph_master_bs
-    ].fill_(1)
-
-    mapping_begin = actual_master_bs
-    mapping_end = mapping_begin + graph_only_master_rows
-    if mapping_end > graph_res_get.numel():
-        raise ValueError(
-            "Graph-only local result mappings exceed the captured buffer: "
-            f"required={mapping_end} capacity={graph_res_get.numel()}"
-        )
-
-    dummy_attention_row = (
-        actual_attn_bs if actual_attn_bs < graph_attn_bs else 0
-    )
-    graph_res_get[mapping_begin:mapping_end].fill_(dummy_attention_row)
-    torch.arange(
-        sp_rank * max_num_seqs + actual_master_bs,
-        sp_rank * max_num_seqs + graph_master_bs,
-        dtype=graph_res_fill.dtype,
-        device=graph_res_fill.device,
-        out=graph_res_fill[mapping_begin:mapping_end],
-    )
-    graph_res_mask[mapping_begin:mapping_end].fill_(1)
+        with phase_factory("nanodeploy.graph.metadata.fused"):
+            update_sp_graph_metadata(*routing_args)  # type: ignore[arg-type]

@@ -22,11 +22,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import nanodeploy
+from nanodeploy.kernels.sp_graph_metadata import update_sp_graph_metadata
 from nanodeploy.worker.sp_graph_policy import (
     copy_decode_context_to_graph_vars,
-    copy_graph_actual_attn_bs,
-    copy_graph_q_dst_rows,
-    materialize_sp_graph_padding,
     select_decode_graph_bucket,
 )
 
@@ -393,22 +391,24 @@ def _routing_metadata_once(
     context: SimpleNamespace,
     shape: dict[str, int],
 ) -> None:
-    copy_graph_q_dst_rows(
-        graph_vars["q_dst_row_indices"], context.q_dst_row_indices
-    )
-    copy_graph_actual_attn_bs(
-        graph_vars["actual_attn_bs"], shape["actual_attn_bs"]
-    )
-    materialize_sp_graph_padding(
-        graph_vars,
-        actual_block_tables=context.block_tables,
-        actual_attn_bs=shape["actual_attn_bs"],
-        graph_attn_bs=shape["graph_attn_bs"],
-        actual_master_bs=shape["actual_master_bs"],
-        graph_master_bs=shape["graph_master_bs"],
-        local_result_rows=context.res_slice_get_to_buffer_output.numel(),
-        sp_rank=shape["sp_rank"],
-        max_num_seqs=shape["max_num_seqs"],
+    update_sp_graph_metadata(
+        context.q_dst_row_indices,
+        graph_vars["q_dst_row_indices"],
+        graph_vars["actual_attn_bs"],
+        context.block_tables,
+        graph_vars["context_lens"],
+        graph_vars["global_context_lens"],
+        graph_vars["context_lens_for_attn"],
+        graph_vars["block_tables"],
+        graph_vars["res_slice_get_to_buffer_output"],
+        graph_vars["res_slice_fill_to_buffer_output"],
+        graph_vars["res_to_buffer_output_mask"],
+        shape["actual_attn_bs"],
+        shape["graph_attn_bs"],
+        shape["actual_master_bs"],
+        shape["graph_master_bs"],
+        shape["sp_rank"],
+        shape["max_num_seqs"],
     )
 
 
