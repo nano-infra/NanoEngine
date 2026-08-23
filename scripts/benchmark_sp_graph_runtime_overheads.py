@@ -424,18 +424,30 @@ def _time_cuda_operation(
     torch.cuda.synchronize()
 
     host_us_per_call = []
+    for _ in range(repeats):
+        host_elapsed_ns = 0
+        for _ in range(iterations):
+            # Start every host sample from an idle stream.  Otherwise a long
+            # enqueue batch eventually back-pressures on device execution and
+            # the CPU timer stops measuring submission overhead.
+            torch.cuda.synchronize()
+            host_begin_ns = time.perf_counter_ns()
+            operation()
+            host_elapsed_ns += time.perf_counter_ns() - host_begin_ns
+        # Keep completion outside the timed interval while ensuring that the
+        # final operation cannot leak into the next repeat.
+        torch.cuda.synchronize()
+        host_us_per_call.append(host_elapsed_ns / iterations / 1_000)
+
     device_us_per_call = []
     for _ in range(repeats):
         begin_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         begin_event.record()
-        host_begin_ns = time.perf_counter_ns()
         for _ in range(iterations):
             operation()
-        host_elapsed_ns = time.perf_counter_ns() - host_begin_ns
         end_event.record()
         end_event.synchronize()
-        host_us_per_call.append(host_elapsed_ns / iterations / 1_000)
         device_us_per_call.append(
             begin_event.elapsed_time(end_event) * 1_000 / iterations
         )

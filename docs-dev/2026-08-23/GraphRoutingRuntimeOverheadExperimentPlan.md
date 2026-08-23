@@ -225,9 +225,11 @@ contain a latency threshold.
 ### 5.2 Metadata cases
 
 Use 200 warmup iterations and 2,000 measured iterations per repeat unless GPU
-memory or runtime makes that impractical. Record one CUDA Event pair around a
-batch of iterations and synchronize after the end event, outside the host
-enqueue timing interval.
+memory or runtime makes that impractical. Measure device time with one CUDA
+Event pair around a batch of iterations. Measure host enqueue separately: make
+the stream idle before every host sample, time only the production operation,
+and complete the operation outside the timed interval. This prevents a long
+enqueue batch from turning CUDA queue backpressure into apparent host overhead.
 
 Cases:
 
