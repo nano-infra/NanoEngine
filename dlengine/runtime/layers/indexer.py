@@ -393,7 +393,7 @@ class Indexer(nn.Module):
     def build_schedule_metadata(self, context_lens: torch.Tensor) -> torch.Tensor:
         """Build the per-step DeepGEMM schedule shared by all Indexer layers."""
         assert self.indexer_cache is not None
-        context_lens = context_lens.to(torch.int32)
+        context_lens = context_lens.to(torch.int32).contiguous()
         if context_lens.dim() == 1:
             context_lens = context_lens[:, None]
         return deep_gemm.get_paged_mqa_logits_metadata(
@@ -1076,22 +1076,52 @@ class Indexer(nn.Module):
         from dlengine.runtime.context.batch import get_batch_context
 
         schedule_meta = get_batch_context().indexer_schedule_meta
-        if schedule_meta is None:
-            schedule_meta = self.build_schedule_metadata(context_lens_for_gemm)
-
-        # Compute logits: (batch * ntps, max_context_len) FP32
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8_4d,
-            kv_cache,
-            weights,
-            context_lens_for_gemm,
-            block_tables.to(torch.int32),
-            schedule_meta,
-            max_context_len,
-            # DeepGEMM does not support clean_logits with the 2D context_lens
-            # required by the paged MQA decode path.
-            clean_logits=False,
-        )
+        block_tables_i32 = block_tables.to(torch.int32)
+        if ntps <= 2:
+            if schedule_meta is None:
+                schedule_meta = self.build_schedule_metadata(context_lens_for_gemm)
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8_4d,
+                kv_cache,
+                weights,
+                context_lens_for_gemm,
+                block_tables_i32,
+                schedule_meta,
+                max_context_len,
+                # DeepGEMM does not support clean_logits with the 2D
+                # context_lens required by the paged MQA decode path.
+                clean_logits=False,
+            )
+        else:
+            # The installed DeepGEMM kernel accepts next_n=1 or 2 only. A
+            # linear MTP verify can have a wider fixed K, so score one causal
+            # position at a time and restore sequence-major [B*K, C] layout.
+            if not isinstance(schedule_meta, tuple) or len(schedule_meta) != ntps:
+                schedule_meta = tuple(
+                    self.build_schedule_metadata(
+                        context_lens_for_gemm[:, offset : offset + 1]
+                    )
+                    for offset in range(ntps)
+                )
+            weights_3d = weights.view(batch_size, ntps, self.n_heads)
+            logits_per_position = []
+            for offset in range(ntps):
+                position_logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8_4d[:, offset : offset + 1].contiguous(),
+                    kv_cache,
+                    weights_3d[:, offset].contiguous(),
+                    context_lens_for_gemm[:, offset : offset + 1].contiguous(),
+                    block_tables_i32,
+                    schedule_meta[offset],
+                    max_context_len,
+                    clean_logits=False,
+                )
+                logits_per_position.append(
+                    position_logits.reshape(batch_size, 1, max_context_len)
+                )
+            logits = torch.cat(logits_per_position, dim=1).reshape(
+                batch_size * ntps, max_context_len
+            )
 
         # Step 9: TopK selection. On Hopper, fuse selection, invalid-index
         # handling, and logical-to-physical page translation into one kernel.

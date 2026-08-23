@@ -424,6 +424,16 @@ class ModelRunner:
         )
 
         model_architecture = hf_config.architectures[0]
+        if config.num_speculative_tokens > 1:
+            if model_architecture != "GlmMoeDsaForCausalLM":
+                raise ValueError(
+                    "multi-step MTP is currently supported only for "
+                    "GlmMoeDsaForCausalLM"
+                )
+            if backend_selection.hardware != "hopper":
+                raise ValueError(
+                    "GLM multi-step MTP currently requires the Hopper backend"
+                )
         model_loader = architecture_loaders.get(model_architecture)
         if model_loader is None:
             raise ValueError(f"Unsupported architecture {model_architecture}")
@@ -477,7 +487,12 @@ class ModelRunner:
                 load_mtp_model(mtp_model, config.model)
             # Share lm_head weights with MTP shared_head.head —
             # checkpoints either store identical copies or omit the head entirely.
-            for _layer in mtp_model.layers.values():
+            mtp_layers = (
+                mtp_model.layers.values()
+                if hasattr(mtp_model.layers, "values")
+                else mtp_model.layers
+            )
+            for _layer in mtp_layers:
                 if hasattr(_layer, "shared_head") and hasattr(
                     _layer.shared_head, "head"
                 ):
@@ -672,6 +687,28 @@ class ModelRunner:
                     allocated = True
                 if allocated:
                     layer_id += 1
+
+            # The single GLM NextN layer is a real attention layer. Recurrent
+            # MTP must retain its own MLA KV instead of running every draft as
+            # an isolated one-token prefill. Its cache slices live directly
+            # after the target-model slices so scheduler block IDs and RDMA
+            # migration remain shared.
+            if self.mtp_runner is not None:
+                for module in self.mtp_runner.mtp_model.modules():
+                    allocated = False
+                    if hasattr(module, "k_cache"):
+                        module.k_cache = cache_context.kv_cache[0][layer_id]
+                        allocated = True
+                    if hasattr(module, "v_cache"):
+                        if cache_context.kv_cache.size(0) > 1:
+                            module.v_cache = cache_context.kv_cache[1][layer_id]
+                        else:
+                            module.v_cache = torch.tensor(
+                                [], device=cache_context.device
+                            )
+                        allocated = True
+                    if allocated:
+                        layer_id += 1
         else:
             for module in self.model.modules():
                 if hasattr(module, "k_cache"):
@@ -686,6 +723,10 @@ class ModelRunner:
             for module in self.model.modules():
                 if hasattr(module, "indexer") and module.indexer is not None:
                     module.indexer.indexer_cache = cache_context.indexer_cache
+            if self.mtp_runner is not None:
+                for module in self.mtp_runner.mtp_model.modules():
+                    if hasattr(module, "indexer") and module.indexer is not None:
+                        module.indexer.indexer_cache = cache_context.indexer_cache
 
         if self.cache_plan.has_hisparse():
             hisparse_ctx = initialize_hisparse_context(
@@ -1194,6 +1235,18 @@ class ModelRunner:
             # when pp == 1, preserving the original behaviour.
             num_kv_layers = pp_end - pp_start
 
+        # One physical predictor layer is reused for all five GLM draft steps.
+        # It nevertheless needs one persistent MLA/DSA cache slice. Count the
+        # physical predictor layers, never num_speculative_tokens.
+        num_mtp_kv_layers = 0
+        if self.mtp_runner is not None and cache_plan.has_mla():
+            num_mtp_kv_layers = max(
+                1, int(getattr(self.mtp_runner.mtp_model, "num_mtp_layers", 1))
+            )
+        self._num_target_kv_layers = num_kv_layers
+        self._num_mtp_kv_layers = num_mtp_kv_layers
+        num_kv_layers += num_mtp_kv_layers
+
         # If ctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
         if config.ctrl_address and not engine_id:
@@ -1437,7 +1490,7 @@ class ModelRunner:
             # the next stage; there is nothing to sample here.
             if not is_last_pp_stage:
                 return None
-            if not is_prefill and self.mtp_runner is not None:
+            if self.mtp_runner is not None:
                 self.mtp_runner.last_hidden = hidden
             logits = self.model.compute_logits(hidden)
             self._mark_fwd("logits")
@@ -1445,9 +1498,9 @@ class ModelRunner:
         else:
             context = get_batch_context()
 
-            # Lazy verify path (seqlen_q=2): dedicated graph runner
+            # Linear lazy-verify path (seqlen_q=N+1): dedicated graph runner
             if (
-                context.num_tokens_per_seq == 2
+                context.num_tokens_per_seq > 1
                 and self.mtp_runner is not None
                 and self.mtp_runner.lv_graph_runner is not None
             ):
@@ -1759,6 +1812,7 @@ class ModelRunner:
                 self.mtp_runner is not None
                 and self.mtp_runner.has_drafts
                 and not is_dummy
+                and self.mtp_runner.can_lazy_verify(aux.seq_ids, positions, num_seqs)
             ):
                 has_lazy_verify = True
                 input_ids, positions = self.mtp_runner.prepare_lazy_verify_decode(
@@ -1822,6 +1876,7 @@ class ModelRunner:
             paged_attention_strategy=context.paged_attention_strategy,
             graph_attention_strategy=context.graph_attention_strategy,
             decode_page_plan_key=context.decode_page_plan_key,
+            mtp_draft_safe=context.mtp_draft_safe,
         )
         get_hca_context().tile_scheduler_metadata = prepared.hca_tile_scheduler_metadata
 
@@ -1846,6 +1901,7 @@ class ModelRunner:
         # --- Forward ---
         if _fwd_timer is not None:
             _fwd_timer.mark("fwd_start")
+        target_input_ids = input_ids
         logits = self.run_model(input_ids, positions, is_prefill)
         if _timer is not None:
             _timer.mark("forward")
@@ -1868,7 +1924,7 @@ class ModelRunner:
         step_logprobs = None  # [num_seqs] float32 when shipping logprobs
         if not is_prefill and has_lazy_verify:
             num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
-            input_ids = self.mtp_runner.lazy_verify_sample(
+            input_ids, step_logprobs = self.mtp_runner.lazy_verify_sample(
                 logits, aux, num_seqs, num_accepted
             )
         else:
@@ -1881,7 +1937,19 @@ class ModelRunner:
             _timer.mark("sample")
 
         # --- MTP draft generation ---
-        if self.mtp_runner is not None and not is_prefill and not is_dummy:
+        if self.mtp_runner is not None and is_prefill:
+            # Seed the predictor cache from shifted prompt tokens and target
+            # hidden states. All attention-DP ranks (including dummy ranks)
+            # enter the same number of predictor MoE collectives.
+            self.mtp_runner.generate_prefill_and_store(
+                target_input_ids, positions, input_ids, aux, num_seqs
+            )
+        elif self.mtp_runner is not None:
+            # Every rank in the FFN EP group must enter the predictor
+            # collectives in the same order. In attention-DP serving the
+            # inactive shards receive dummy batches; skipping draft generation
+            # on those ranks deadlocks the active shard inside the MTP MoE.
+            # Dummy outputs remain local and are discarded by the scheduler.
             self.mtp_runner.generate_and_store(
                 input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
             )
@@ -1909,6 +1977,10 @@ class ModelRunner:
         if self.mtp_runner is None and logprobs_per_seq is None:
             result = [[int(token)] for token in input_ids.tolist()]
         elif self.mtp_runner is not None:
+            if logprobs_per_seq is not None:
+                logprobs_per_seq = self.mtp_runner.build_output_logprobs(
+                    logprobs_per_seq
+                )
             result = self.mtp_runner.build_output_tokens(self.rank)
         else:
             result = torch.cat(batch_out.token_ids, dim=0).T.tolist()

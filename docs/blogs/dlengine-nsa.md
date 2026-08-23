@@ -370,10 +370,10 @@ Final: LM Head → logits → sample → output token
 | Runner                  | seqlen_q | 稀疏/密集 | 说明                             |
 | ----------------------- | -------- | --------- | -------------------------------- |
 | `DecodeGraphRunner`     | 1        | 稀疏      | 标准 decode（首步，无 draft 时） |
-| `LazyVerifyGraphRunner` | 2        | 稀疏      | MTP 验证 + bonus 采样            |
+| `LazyVerifyGraphRunner` | N+1      | 稀疏      | 线性 MTP chain 验证 + bonus 采样 |
 | `MTPGraphRunner`        | 1        | N/A       | 草稿生成（无 KV Cache，纯 MLP）  |
 
-LazyVerify 的 `seqlen_q=2` 模式下，Indexer 对两个 token 联合打分，产出 2 组 top-k indices，分别驱动两个位置的稀疏注意力。MTP GraphRunner 不涉及 KV Cache 操作，因此与 NSA 无交互。
+LazyVerify 的 `seqlen_q=N+1` 模式下，Indexer 为线性 chain 的每个位置生成因果可见的 top-k physical indices。MTP GraphRunner 不涉及 KV Cache，因此与 NSA cache 无交互。
 
 ### 10. 设计取舍总结
 

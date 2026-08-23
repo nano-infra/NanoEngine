@@ -93,6 +93,20 @@ def test_shared_indexer_state_reuses_exact_logical_and_physical_indices():
     assert state.source_layer == 2
 
 
+def test_mtp_indexer_state_selects_draft_extend_seed_rows():
+    logical = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+    physical = logical + 100
+    state = _IndexerTopKState()
+    state.publish(78, logical, physical)
+
+    selected = state.select_rows(torch.tensor([1, 4]))
+
+    assert selected.source_layer == 78
+    assert torch.equal(selected.logical_indices, logical[[1, 4]])
+    assert torch.equal(selected.physical_indices, physical[[1, 4]])
+    assert selected.logical_indices.data_ptr() != logical.data_ptr()
+
+
 def test_shared_indexer_state_rejects_missing_or_stale_topk():
     state = _IndexerTopKState()
     with pytest.raises(RuntimeError, match="no TopK"):

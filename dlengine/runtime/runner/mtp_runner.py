@@ -1,4 +1,4 @@
-"""MTP (Multi-Token Prediction) speculative decoding worker."""
+"""Linear model-native MTP speculative decoding worker."""
 
 from __future__ import annotations
 
@@ -10,17 +10,169 @@ from dlengine.runtime.context.batch import get_batch_context, set_batch_context
 from dlengine.runtime.context.batch_out import get_batch_out_context
 from dlengine.runtime.context.cache import get_cache_context
 from dlengine.runtime.context.cache.hca import get_hca_context
+from dlengine.runtime.context.cache.mla import get_mla_context
 from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.context.expert import set_expert_context
+from dlengine.runtime.context.graph import PagedAttentionStrategy
 from dlengine.runtime.layers.sampler import Sampler
-from dlengine.runtime.runner.graph_runner import LazyVerifyGraphRunner, MTPGraphRunner
+from dlengine.runtime.models.deepseek_v2.deepseek_v2 import _IndexerTopKState
+from dlengine.runtime.runner.graph_runner import (
+    CachedMTPChainGraphRunner,
+    LazyVerifyGraphRunner,
+    MTPGraphRunner,
+)
 from dlengine.runtime.runner.input_preparer import prepare_sample_from_aux
 
 logger = get_logger("DLENGINE")
 
 
+def _nonempty_ragged_bounds(
+    cu_seqlens: torch.Tensor, num_seqs: int
+) -> list[int] | None:
+    """Return host ragged bounds only when every requested segment is nonempty."""
+    if cu_seqlens.numel() < num_seqs + 1:
+        return None
+    bounds = [int(value) for value in cu_seqlens[: num_seqs + 1].tolist()]
+    if any(end <= start for start, end in zip(bounds, bounds[1:])):
+        return None
+    return bounds
+
+
+def _active_ragged_last_rows(cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
+    """Return last-row indices without consuming padded cu-seqlens entries."""
+    return cu_seqlens[1 : num_seqs + 1].to(torch.long) - 1
+
+
+def _localize_packed_topk(
+    logical_indices: torch.Tensor, packed_k_starts: torch.Tensor
+) -> torch.Tensor:
+    """Convert packed-ragged K offsets to positions local to each sequence."""
+    if logical_indices.shape[0] != packed_k_starts.numel():
+        raise ValueError("one packed K start is required per selected TopK row")
+    offsets = packed_k_starts.to(
+        device=logical_indices.device, dtype=logical_indices.dtype
+    ).unsqueeze(1)
+    return torch.where(logical_indices >= 0, logical_indices - offsets, -1)
+
+
+def _sample_rows(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample rows with the same temperature semantics as ``Sampler``."""
+    greedy = temperatures < 1e-5
+    safe_temperatures = torch.where(greedy, torch.ones_like(temperatures), temperatures)
+    log_probs = torch.log_softmax(
+        logits.float() / safe_temperatures.unsqueeze(-1), dim=-1
+    )
+    noise = torch.empty_like(log_probs).exponential_(1, generator=generator)
+    sampled = (log_probs - noise.clamp_min_(1e-10).log()).argmax(dim=-1)
+    return torch.where(greedy, logits.argmax(dim=-1), sampled)
+
+
+def linear_rejection_sample(
+    logits: torch.Tensor,
+    drafts: torch.Tensor,
+    temperatures: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Verify a greedy linear draft with exact target-distribution sampling.
+
+    ``logits`` is sequence-major ``[B, N+1, V]`` and ``drafts`` is ``[B, N]``.
+    The draft distribution is one-hot. At stochastic temperatures draft ``d``
+    is therefore accepted with probability ``p(d)``; on rejection the recovery
+    token is sampled from ``p`` conditioned on not being ``d``. If every draft
+    is accepted, the final target row supplies the bonus token.
+
+    Returns the next token, accepted count, original-target logprob of that next
+    token, and original-target logprobs for every draft position. The latter is
+    intentionally unmasked: completion logprobs describe the target policy,
+    not the residual rejection distribution.
+    """
+    if logits.ndim != 3 or drafts.ndim != 2:
+        raise ValueError("expected logits [B, N+1, V] and drafts [B, N]")
+    batch_size, verify_width, _ = logits.shape
+    num_drafts = drafts.shape[1]
+    if drafts.shape[0] != batch_size or verify_width != num_drafts + 1:
+        raise ValueError("linear verify width must equal num_drafts + 1")
+    if temperatures.numel() != batch_size:
+        raise ValueError("one temperature is required per sequence")
+
+    temperatures = temperatures.to(device=logits.device, dtype=torch.float32)
+    greedy = temperatures < 1e-5
+    safe_temperatures = torch.where(greedy, torch.ones_like(temperatures), temperatures)
+    target_logprobs = torch.log_softmax(
+        logits.float() / safe_temperatures[:, None, None], dim=-1
+    )
+
+    draft_logprobs = target_logprobs[:, :num_drafts].gather(2, drafts.unsqueeze(-1))[
+        ..., 0
+    ]
+    target_argmax = logits[:, :num_drafts].argmax(dim=-1)
+    coins = torch.rand(
+        (batch_size, num_drafts),
+        device=logits.device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    accepts = torch.where(
+        greedy[:, None],
+        target_argmax == drafts,
+        coins < draft_logprobs.exp(),
+    )
+
+    # A line accepts only the contiguous prefix before the first rejection.
+    # Keeping this entirely on device is important: the previous Python loop's
+    # ``Tensor.any()`` branches synchronized the CPU once or twice per draft
+    # position and left ~0.8 ms gaps between recurrent MTP forwards.
+    accepted_prefix = accepts.to(torch.int32).cumprod(dim=1)
+    accepted = accepted_prefix.sum(dim=1, dtype=torch.int64)
+
+    rows = torch.arange(batch_size, device=logits.device)
+    selected_logits = logits[rows, accepted].clone()
+    all_accepted = accepted == num_drafts
+    rejected_draft = drafts[rows, accepted.clamp_max(num_drafts - 1)]
+    selected_logits.scatter_(
+        1,
+        rejected_draft[:, None],
+        torch.where(
+            all_accepted[:, None],
+            selected_logits.gather(1, rejected_draft[:, None]),
+            selected_logits.new_full((batch_size, 1), float("-inf")),
+        ),
+    )
+    next_tokens = _sample_rows(selected_logits, temperatures, generator)
+    next_logprobs = target_logprobs[rows, accepted].gather(1, next_tokens[:, None])[
+        :, 0
+    ]
+
+    return next_tokens, accepted, next_logprobs, draft_logprobs
+
+
+def linear_greedy_verify(
+    logits: torch.Tensor,
+    drafts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Verify a top-1 line without constructing probability tensors."""
+    if logits.ndim != 3 or drafts.ndim != 2:
+        raise ValueError("expected logits [B, N+1, V] and drafts [B, N]")
+    batch_size, verify_width, _ = logits.shape
+    num_drafts = drafts.shape[1]
+    if drafts.shape[0] != batch_size or verify_width != num_drafts + 1:
+        raise ValueError("linear verify width must equal num_drafts + 1")
+
+    target_tokens = logits.argmax(dim=-1)
+    accepted_prefix = (
+        (target_tokens[:, :num_drafts] == drafts).to(torch.int32).cumprod(dim=1)
+    )
+    accepted = accepted_prefix.sum(dim=1, dtype=torch.int64)
+    next_tokens = target_tokens.gather(1, accepted[:, None])[:, 0]
+    return next_tokens, accepted
+
+
 class MTPRunner:
-    """Manages MTP speculative decoding: lazy verify, draft generation, and sampling."""
+    """Manage recurrent linear MTP drafting and target verification."""
 
     def __init__(self, config: Config, mtp_model, sampler: Sampler):
         self.config = config
@@ -28,117 +180,169 @@ class MTPRunner:
         self.sampler = sampler
         self.last_hidden: torch.Tensor | None = None
         self.mtp_graph_runner: MTPGraphRunner | None = None
+        self.cached_mtp_graph_runner: CachedMTPChainGraphRunner | None = None
         self.lv_graph_runner: LazyVerifyGraphRunner | None = None
-        self._prev_drafts: list[torch.Tensor] | None = None
-        self._prev_sampled_token: torch.Tensor | None = None
-        self._mtp_verified_tokens: torch.Tensor | None = None
+        self._prev_seq_ids: tuple[int, ...] | None = None
+        self._prev_drafts: torch.Tensor | None = None  # [B, N]
+        self._selected_prev_drafts: torch.Tensor | None = None
+        self._mtp_verified_tokens: torch.Tensor | None = None  # [N, B]
+        self._mtp_verified_logprobs: torch.Tensor | None = None  # [N, B]
         self._mtp_num_accepted: torch.Tensor | None = None
+        self._share_mtp_indexer = bool(
+            getattr(config.hf_config, "index_share_for_mtp_iteration", False)
+            and getattr(config.hf_config, "index_topk", None) is not None
+        )
 
     @property
     def has_drafts(self) -> bool:
-        return self._prev_drafts is not None
+        return self._prev_drafts is not None and self._prev_seq_ids is not None
+
+    @property
+    def verify_width(self) -> int:
+        return self.config.num_speculative_tokens + 1
 
     def reset_lazy_verify_state(self):
+        self._prev_seq_ids = None
         self._prev_drafts = None
-        self._prev_sampled_token = None
+        self._selected_prev_drafts = None
+        self._mtp_verified_tokens = None
+        self._mtp_verified_logprobs = None
+        self._mtp_num_accepted = None
+
+    def _new_mtp_indexer_state(self) -> _IndexerTopKState | None:
+        return _IndexerTopKState() if self._share_mtp_indexer else None
+
+    def _select_mtp_indexer_seed(
+        self,
+        state: _IndexerTopKState | None,
+        rows: torch.Tensor,
+        source_context,
+        num_seqs: int,
+        *,
+        packed_k_starts: torch.Tensor | None = None,
+    ) -> _IndexerTopKState | None:
+        """Select and physicalize the DSA row that seeded the first draft."""
+        if state is None or state.logical_indices is None:
+            return state
+        selected = state.select_rows(rows)
+        if selected.physical_indices is None:
+            from dlengine.runtime.layers.hopper.attention import (
+                topk_indices_to_physical,
+            )
+
+            sp_rank = get_dist_context().attn_sp_rank
+            block_tables = source_context.block_tables
+            if block_tables is None:
+                raise RuntimeError("MTP DSA IndexShare requires paged block tables")
+            if packed_k_starts is not None:
+                # Sparse prefill addresses a concatenated ragged K tensor, but
+                # page tables are sequence-local. Without removing each
+                # sequence's packed offset, sequence 2+ can gather past its
+                # allocated page-table width on a cold multi-request batch.
+                selected.logical_indices = _localize_packed_topk(
+                    selected.logical_indices, packed_k_starts
+                )
+            selected.physical_indices = topk_indices_to_physical(
+                selected.logical_indices,
+                block_tables[sp_rank, :num_seqs],
+                self.config.kvcache_block_size,
+            )
+        return selected
+
+    def can_lazy_verify(
+        self, seq_ids: list[int], positions: torch.Tensor, num_seqs: int
+    ) -> bool:
+        """Return whether stored drafts can safely verify this decode batch."""
+        if not self.has_drafts or len(seq_ids) < num_seqs:
+            return False
+        previous = {seq_id: idx for idx, seq_id in enumerate(self._prev_seq_ids)}
+        selected = [previous.get(int(seq_id)) for seq_id in seq_ids[:num_seqs]]
+        if any(idx is None for idx in selected):
+            return False
+        # The host-side input preparer already checked the worst-case next
+        # verify + draft span against max_model_len. Do not inspect the CUDA
+        # position tensor here: doing so serializes target graph replay.
+        if not get_batch_context().mtp_draft_safe:
+            return False
+        indices = torch.tensor(
+            selected, dtype=torch.long, device=self._prev_drafts.device
+        )
+        self._selected_prev_drafts = self._prev_drafts.index_select(0, indices)
+        return True
 
     def init_graph_runners(self, target_model, graph_pool, cache_ctx):
-        """Create and capture MTP + lazy-verify CUDAGraph runners."""
-        config = self.config
-        hf_config = config.hf_config
-
-        self.mtp_graph_runner = MTPGraphRunner(config, hf_config)
-        self.mtp_graph_runner.capture(self.mtp_model, graph_pool)
-
-        self.lv_graph_runner = LazyVerifyGraphRunner(config, hf_config, cache_ctx)
+        # The legacy one-step path has no predictor KV and can use the original
+        # one-token graph. GLM's recurrent top-1 path captures the N-1 decode
+        # chain, including its dynamic MLA page metadata and DSA IndexShare.
+        if self.config.num_speculative_tokens == 1:
+            self.mtp_graph_runner = MTPGraphRunner(self.config, self.config.hf_config)
+            self.mtp_graph_runner.capture(self.mtp_model, graph_pool)
+        elif (
+            self._share_mtp_indexer
+            and get_dist_context().attn_tp_world_size == 1
+            and self.config.enable_mtp_chain_graph
+        ):
+            self.cached_mtp_graph_runner = CachedMTPChainGraphRunner(
+                self.config, self.config.hf_config
+            )
+            self.cached_mtp_graph_runner.capture(self.mtp_model, graph_pool)
+        self.lv_graph_runner = LazyVerifyGraphRunner(
+            self.config, self.config.hf_config, cache_ctx
+        )
         self.lv_graph_runner.capture(target_model, graph_pool, cache_ctx)
 
     def cleanup(self):
-        """Delete graph runners to free CUDA resources."""
         if self.lv_graph_runner is not None:
             del self.lv_graph_runner
             self.lv_graph_runner = None
         if self.mtp_graph_runner is not None:
             del self.mtp_graph_runner
             self.mtp_graph_runner = None
-
-    # ------------------------------------------------------------------
-    # Lazy verify: input expansion
-    # ------------------------------------------------------------------
+        if self.cached_mtp_graph_runner is not None:
+            del self.cached_mtp_graph_runner
+            self.cached_mtp_graph_runner = None
 
     def prepare_lazy_verify_decode(
         self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expand decode from seqlen_q=1 to seqlen_q=2 for lazy verification.
-
-        Transforms:
-            input_ids:  [bs] → [bs*2] interleaved [prev_sampled_0, draft_0, ...]
-            positions:  [bs] → [bs*2] interleaved [pos_0, pos_0+1, ...]
-
-        Also updates context: slot_mapping, context_lens, num_tokens_per_seq,
-        and MLA metadata.
-        """
+        """Expand decode to sequence-major ``[base, d1, ..., dN]`` rows."""
+        if self._selected_prev_drafts is None:
+            raise RuntimeError("lazy verify requested without sequence-aligned drafts")
         sp_rank = get_dist_context().attn_sp_rank
         block_size = self.config.kvcache_block_size
         context = get_batch_context()
+        num_drafts = self.config.num_speculative_tokens
+        width = num_drafts + 1
 
-        prev_sampled = self._prev_sampled_token  # [bs] token from prev step
-        prev_draft = self._prev_drafts[0]  # [bs] draft from prev step
+        new_input_ids = torch.cat(
+            (input_ids[:num_seqs, None], self._selected_prev_drafts[:num_seqs]), dim=1
+        ).reshape(-1)
+        offsets = torch.arange(width, device=positions.device, dtype=positions.dtype)
+        new_positions = (positions[:num_seqs, None] + offsets[None, :]).reshape(-1)
 
-        # Build interleaved input_ids
-        new_input_ids = torch.empty(
-            num_seqs * 2, dtype=input_ids.dtype, device=input_ids.device
-        )
-        new_input_ids[0::2] = prev_sampled[:num_seqs]
-        new_input_ids[1::2] = prev_draft[:num_seqs]
+        old_context_lens = context.context_lens[sp_rank, :num_seqs]
+        cache_positions = old_context_lens[:, None] - 1 + offsets[None, :]
+        block_indices = (cache_positions // block_size).long()
+        max_blocks = context.block_tables.shape[2]
+        # CUDA decode was admitted by the host-side mtp_draft_safe check and
+        # the scheduler-reserved page table. Retain the explicit assertion for
+        # CPU/unit-test callers without synchronizing the production stream.
+        if not block_indices.is_cuda and bool((block_indices >= max_blocks).any()):
+            raise RuntimeError("MTP KV reservation is smaller than the verify width")
+        page_ids = context.block_tables[sp_rank, :num_seqs].gather(1, block_indices)
+        slot_mapping = page_ids * block_size + (cache_positions % block_size)
 
-        # Build interleaved positions
-        new_positions = torch.empty(
-            num_seqs * 2, dtype=positions.dtype, device=positions.device
-        )
-        new_positions[0::2] = positions[:num_seqs]
-        new_positions[1::2] = positions[:num_seqs] + 1
+        context.context_lens[sp_rank, :num_seqs] += num_drafts
+        context.slot_mapping = slot_mapping.to(torch.int32).reshape(-1)
+        context.num_tokens_per_seq = width
 
-        # Expand slot_mapping: 2 slots per seq
-        old_ctx = context.context_lens[sp_rank, :num_seqs]
-        new_slot_mapping = torch.empty(
-            num_seqs * 2, dtype=torch.int32, device=old_ctx.device
-        )
-
-        for offset in range(2):
-            pos = old_ctx - 1 + offset
-            blk_idx = (pos // block_size).long()
-            off_in_block = (pos % block_size).int()
-            row_idx = torch.arange(num_seqs, device=pos.device)
-            max_blocks = context.block_tables.shape[2]
-            blk_idx = torch.clamp(blk_idx, max=max_blocks - 1)
-            page_ids = context.block_tables[sp_rank, row_idx, blk_idx]
-            new_slot_mapping[offset::2] = (page_ids * block_size + off_in_block).int()
-
-        # +1 for the draft token
-        context.context_lens[sp_rank, :num_seqs] += 1
-
-        # Recompute MLA metadata for seqlen_q=2
-        hf_config = self.config.hf_config
-        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
-        if is_mla:
+        if getattr(self.config.hf_config, "kv_lora_rank", 0) > 0:
             import flash_mla
 
-            new_tile_sched, _ = flash_mla.get_mla_metadata()
-        else:
-            new_tile_sched = get_hca_context().tile_scheduler_metadata
-
-        # Update context for seqlen_q=2
-        context.slot_mapping = new_slot_mapping
-        context.num_tokens_per_seq = 2
-        if is_mla:
-            get_hca_context().tile_scheduler_metadata = new_tile_sched
+            tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            get_hca_context().tile_scheduler_metadata = tile_scheduler_metadata
 
         return new_input_ids, new_positions
-
-    # ------------------------------------------------------------------
-    # Lazy verify: sampling + rollback
-    # ------------------------------------------------------------------
 
     def lazy_verify_sample(
         self,
@@ -146,72 +350,89 @@ class MTPRunner:
         aux,
         num_seqs: int,
         num_accepted: torch.Tensor,
-    ) -> torch.Tensor:
-        """Sample from lazy-verify logits and rollback GDN states for rejected seqs.
-
-        Args:
-            logits: [bs*2, vocab] interleaved verify/bonus logits.
-            aux: BatchAuxData with temperatures.
-            num_seqs: number of sequences.
-            num_accepted: output tensor [num_seqs] filled with acceptance counts.
-
-        Returns:
-            input_ids: [num_seqs] newly sampled token per sequence.
-        """
-        verify_logits = logits[0::2]  # [bs, vocab]
-        bonus_logits = logits[1::2]  # [bs, vocab]
-
-        verified_tokens = torch.zeros(1, num_seqs, dtype=torch.int64, device="cuda")
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Verify all recurrent drafts and sample exactly from the target policy."""
+        width = self.verify_width
+        target_logits = logits[: num_seqs * width].reshape(
+            num_seqs, width, logits.shape[-1]
+        )
+        drafts = self._selected_prev_drafts[:num_seqs]
+        want_logprobs = bool(getattr(aux, "any_return_completion_logprobs", False))
         tp_rank = get_dist_context().attn_tp_rank
 
         if tp_rank == 0:
-            temperatures = prepare_sample_from_aux(aux)
-            target_pred = self.sampler(verify_logits, temperatures)
-            bonus_pred = self.sampler(bonus_logits, temperatures)
-            prev_draft_0 = self._prev_drafts[0]
-
-            accepted_mask = target_pred == prev_draft_0
-            verified_tokens[0] = prev_draft_0
-            num_accepted.copy_(accepted_mask.long())
-            input_ids = torch.where(accepted_mask, bonus_pred, target_pred)
+            all_greedy = all(
+                float(temperature) < 1e-5 for temperature in aux.temperatures[:num_seqs]
+            )
+            if all_greedy and not want_logprobs:
+                input_ids, accepted = linear_greedy_verify(target_logits, drafts)
+                next_logprobs = torch.empty(
+                    num_seqs, dtype=torch.float32, device=logits.device
+                )
+                draft_logprobs = torch.empty(
+                    num_seqs,
+                    self.config.num_speculative_tokens,
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
+            else:
+                temperatures = prepare_sample_from_aux(aux)
+                input_ids, accepted, next_logprobs, draft_logprobs = (
+                    linear_rejection_sample(target_logits, drafts, temperatures)
+                )
+            num_accepted.copy_(accepted)
         else:
-            input_ids = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+            input_ids = torch.zeros(num_seqs, dtype=torch.int64, device=logits.device)
+            next_logprobs = torch.zeros(
+                num_seqs, dtype=torch.float32, device=logits.device
+            )
+            draft_logprobs = torch.zeros(
+                num_seqs,
+                self.config.num_speculative_tokens,
+                dtype=torch.float32,
+                device=logits.device,
+            )
 
-        dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
-        dist.all_reduce(verified_tokens, group=get_dist_context().attn_tp_group)
-        dist.all_reduce(num_accepted, group=get_dist_context().attn_tp_group)
+        group = get_dist_context().attn_tp_group
+        dist.all_reduce(input_ids, group=group)
+        dist.all_reduce(num_accepted, group=group)
+        if want_logprobs:
+            dist.all_reduce(next_logprobs, group=group)
+            dist.all_reduce(draft_logprobs, group=group)
 
-        self._mtp_verified_tokens = verified_tokens
+        self._mtp_verified_tokens = drafts.T
+        self._mtp_verified_logprobs = draft_logprobs.T if want_logprobs else None
         self._mtp_num_accepted = num_accepted
 
-        # Rollback context_lens and GDN states for rejected sequences
+        # The target forward populated all N draft cache positions. Only the
+        # accepted prefix is logically visible to the next decode step.
         context = get_batch_context()
         sp_rank = get_dist_context().attn_sp_rank
+        rollback = self.config.num_speculative_tokens - num_accepted
+        context.context_lens[sp_rank, :num_seqs] -= rollback.to(torch.int32)
+
+        # Stateful GDN is deliberately limited to the legacy N=1 path.
         rejected_mask = num_accepted == 0
-        if rejected_mask.any():
-            context.context_lens[sp_rank, :num_seqs] -= rejected_mask.int()
+        cache_ctx = get_cache_context()
+        # Check the host-side feature gate first. GLM's MLA path has no GDN;
+        # evaluating ``rejected_mask.any()`` first forced an otherwise useless
+        # device-to-host synchronization after every verification round.
+        if cache_ctx.gdn_conv_states is not None and rejected_mask.any():
+            active_slots = context.gdn_state_slots[:num_seqs]
+            real_slot_mask = active_slots < cache_ctx.gdn_max_active_slots
+            rollback_mask = rejected_mask & real_slot_mask
+            if rollback_mask.any():
+                backup_offset = cache_ctx.gdn_max_active_slots
+                rejected_active = active_slots[rollback_mask]
+                rejected_backup = rejected_active + backup_offset
+                cache_ctx.gdn_conv_states[:, rejected_active] = (
+                    cache_ctx.gdn_conv_states[:, rejected_backup]
+                )
+                cache_ctx.gdn_recurrent_states[:, rejected_active] = (
+                    cache_ctx.gdn_recurrent_states[:, rejected_backup]
+                )
 
-            _cache_ctx = get_cache_context()
-            if _cache_ctx.gdn_conv_states is not None:
-                active_slots = context.gdn_state_slots[:num_seqs]
-                real_slot_mask = active_slots < _cache_ctx.gdn_max_active_slots
-                rollback_mask = rejected_mask & real_slot_mask
-                if rollback_mask.any():
-                    backup_offset = _cache_ctx.gdn_max_active_slots
-                    rej_active = active_slots[rollback_mask]
-                    rej_backup = rej_active + backup_offset
-                    _cache_ctx.gdn_conv_states[:, rej_active] = (
-                        _cache_ctx.gdn_conv_states[:, rej_backup]
-                    )
-                    _cache_ctx.gdn_recurrent_states[:, rej_active] = (
-                        _cache_ctx.gdn_recurrent_states[:, rej_backup]
-                    )
-
-        return input_ids
-
-    # ------------------------------------------------------------------
-    # Draft generation + context save/restore
-    # ------------------------------------------------------------------
+        return input_ids, next_logprobs if want_logprobs else None
 
     def generate_and_store(
         self,
@@ -222,39 +443,97 @@ class MTPRunner:
         has_lazy_verify: bool,
         num_accepted: torch.Tensor | None,
     ) -> None:
-        """Generate MTP drafts and save state for next-step lazy verification.
-
-        Saves and restores the decode context around MTP forward passes.
-        """
+        """Run one model-native predictor recurrently N times for next step."""
         decode_context = get_batch_context()
         saved_token_ids = get_batch_out_context().token_ids
         saved_tile_scheduler_metadata = get_hca_context().tile_scheduler_metadata
+        saved_sparse_scheduler_metadata = (
+            get_mla_context().sparse_tile_scheduler_metadata
+        )
 
-        tp_rank = get_dist_context().attn_tp_rank
-        temperatures = prepare_sample_from_aux(aux) if tp_rank == 0 else None
+        # Attention-DP shards without real requests receive a synthetic decode
+        # batch whose page table is intentionally empty. They still must enter
+        # all predictor MoE collectives, but cannot use persistent predictor KV.
+        # Run the same number of recurrent forwards on an uncached one-token
+        # batch so active and dummy EP ranks stay in lockstep.
+        if decode_context.is_dummy:
+            self.reset_lazy_verify_state()
+            self._run_uncached_collective_padding(
+                input_ids,
+                positions,
+                self.last_hidden,
+                num_seqs,
+            )
+            self._restore_batch_context(decode_context)
+            get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+            get_mla_context().sparse_tile_scheduler_metadata = (
+                saved_sparse_scheduler_metadata
+            )
+            get_batch_out_context().token_ids = saved_token_ids
+            return
 
-        # Select correct hidden states and positions for MTP input
         if has_lazy_verify:
-            h_verify = self.last_hidden[0::2]  # [bs, hidden_size]
-            h_bonus = self.last_hidden[1::2]  # [bs, hidden_size]
-            accepted_mask = num_accepted > 0
-            mtp_hidden = torch.where(accepted_mask.unsqueeze(-1), h_bonus, h_verify)
-            mtp_positions = positions[0::2] + 1 + num_accepted
+            verify_hidden = self.last_hidden.reshape(
+                num_seqs, self.verify_width, self.last_hidden.shape[-1]
+            )
+            rows = torch.arange(num_seqs, device=verify_hidden.device)
+            mtp_hidden = verify_hidden[rows, num_accepted]
+            verify_positions = positions.reshape(num_seqs, self.verify_width)
+            base_positions = verify_positions[:, 0]
+            mtp_positions = base_positions + num_accepted
         else:
+            verify_hidden = None
+            verify_positions = None
             mtp_hidden = self.last_hidden
             mtp_positions = positions
 
-        drafts = self._generate_mtp_drafts(
-            input_ids, mtp_positions, mtp_hidden, temperatures, num_seqs
-        )
+        # The recurrent predictor would otherwise produce draft tokens whose
+        # positions cannot all be consumed by the next fixed-width verify. A
+        # single near-limit sequence makes this batch use ordinary decode on
+        # the next step; keep this step's verified output state intact.
+        if not decode_context.mtp_draft_safe:
+            self._prev_seq_ids = None
+            self._prev_drafts = None
+            self._selected_prev_drafts = None
+            return
 
-        self._prev_drafts = drafts
-        self._prev_sampled_token = input_ids.clone()
+        if self.config.num_speculative_tokens > 1:
+            sp_rank = get_dist_context().attn_sp_rank
+            target_lens = decode_context.context_lens[sp_rank, :num_seqs]
+            if has_lazy_verify:
+                drafts = self._refresh_and_generate_cached_mtp_drafts(
+                    input_ids,
+                    verify_positions,
+                    verify_hidden,
+                    target_lens,
+                    num_accepted,
+                    decode_context,
+                    num_seqs,
+                )
+            else:
+                drafts = self._generate_cached_mtp_drafts(
+                    input_ids,
+                    mtp_positions + 1,
+                    mtp_hidden,
+                    target_lens - 1,
+                    decode_context,
+                    num_seqs,
+                )
+        else:
+            drafts = self._generate_mtp_drafts(
+                input_ids, mtp_positions, mtp_hidden, num_seqs
+            )
+        self._prev_seq_ids = tuple(int(seq_id) for seq_id in aux.seq_ids[:num_seqs])
+        self._prev_drafts = torch.stack(drafts, dim=1)
+        self._selected_prev_drafts = None
 
-        # Restore decode context (MTP draft gen overwrites it)
         set_batch_context(
             is_prefill=decode_context.is_prefill,
             max_bs=decode_context.max_bs,
+            cu_seqlens_q=decode_context.cu_seqlens_q,
+            cu_seqlens_k=decode_context.cu_seqlens_k,
+            max_seqlen_q=decode_context.max_seqlen_q,
+            max_seqlen_k=decode_context.max_seqlen_k,
             slot_mapping=decode_context.slot_mapping,
             context_lens=decode_context.context_lens,
             block_tables=decode_context.block_tables,
@@ -262,44 +541,210 @@ class MTPRunner:
             gdn_conv_states=decode_context.gdn_conv_states,
             gdn_recurrent_states=decode_context.gdn_recurrent_states,
             gdn_state_slots=decode_context.gdn_state_slots,
+            dsv4_state_slots=decode_context.dsv4_state_slots,
+            dsv4_compressed_block_tables=decode_context.dsv4_compressed_block_tables,
+            hisparse_slots=decode_context.hisparse_slots,
+            hisparse_slot_mapping=decode_context.hisparse_slot_mapping,
+            hisparse_num_real_reqs=decode_context.hisparse_num_real_reqs,
+            num_tokens_per_seq=decode_context.num_tokens_per_seq,
+            sampling_token_indices=decode_context.sampling_token_indices,
+            sampling_seq_indices=decode_context.sampling_seq_indices,
+            paged_attention_strategy=decode_context.paged_attention_strategy,
+            graph_attention_strategy=decode_context.graph_attention_strategy,
+            decode_page_plan_key=decode_context.decode_page_plan_key,
+            mtp_draft_safe=decode_context.mtp_draft_safe,
         )
         get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+        get_mla_context().sparse_tile_scheduler_metadata = (
+            saved_sparse_scheduler_metadata
+        )
         get_batch_out_context().token_ids = saved_token_ids
 
-    # ------------------------------------------------------------------
-    # Output assembly
-    # ------------------------------------------------------------------
+    def generate_prefill_and_store(
+        self,
+        target_input_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        sampled_ids: torch.Tensor,
+        aux,
+        num_seqs: int,
+    ) -> None:
+        """Seed persistent GLM predictor KV from the target prefill.
+
+        For target hidden state h[t], NextN consumes token x[t+1].
+        Therefore each fresh prefill segment is shifted left and terminated by
+        the target-sampled token. Predictor cache slots deliberately reuse the
+        target segment slot mapping: logical predictor slot zero represents
+        absolute token position one.
+        """
+        if self.config.num_speculative_tokens == 1:
+            self.reset_lazy_verify_state()
+            return
+
+        context = get_batch_context()
+        saved_token_ids = get_batch_out_context().token_ids
+        saved_tile_scheduler_metadata = get_hca_context().tile_scheduler_metadata
+        saved_sparse_scheduler_metadata = (
+            get_mla_context().sparse_tile_scheduler_metadata
+        )
+
+        # Selective/chunked prefill may omit a sampled token for some requests.
+        # Keep collective ordering stable but do not expose incomplete drafts.
+        can_seed = (
+            context.cu_seqlens_q is not None
+            and context.cu_seqlens_k is not None
+            and context.block_tables is not None
+            and context.sampling_token_indices is None
+            and sampled_ids.numel() >= num_seqs
+            and self.last_hidden is not None
+        )
+        if can_seed:
+            # A full prefix-cache hit may have a zero-length fresh segment.
+            # ``cu_q[1:] - 1`` would then produce -1 and crash the CUDA
+            # index-select used to seed recurrent MTP. Skip drafts for this
+            # round; ordinary decode will seed them on the next target token.
+            can_seed = (
+                _nonempty_ragged_bounds(context.cu_seqlens_q, num_seqs) is not None
+            )
+        if not can_seed:
+            self.reset_lazy_verify_state()
+            self._run_uncached_collective_padding(
+                target_input_ids,
+                target_positions,
+                self.last_hidden,
+                num_seqs,
+            )
+            self._restore_batch_context(context)
+            get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+            get_mla_context().sparse_tile_scheduler_metadata = (
+                saved_sparse_scheduler_metadata
+            )
+            get_batch_out_context().token_ids = saved_token_ids
+            return
+
+        cu_q = context.cu_seqlens_q
+        shifted_parts = []
+        for seq_idx in range(num_seqs):
+            start = int(cu_q[seq_idx].item())
+            end = int(cu_q[seq_idx + 1].item())
+            shifted_parts.append(
+                torch.cat(
+                    (
+                        target_input_ids[start + 1 : end],
+                        sampled_ids[seq_idx : seq_idx + 1],
+                    )
+                )
+            )
+        shifted_ids = torch.cat(shifted_parts)
+        shifted_positions = target_positions + 1
+
+        # Use the target prefill geometry while writing the extra predictor
+        # cache layer. This supports ordinary and prefix-cached fresh segments.
+        active_cu_q = context.cu_seqlens_q[: num_seqs + 1]
+        active_cu_k = context.cu_seqlens_k[: num_seqs + 1]
+        set_batch_context(
+            is_prefill=True,
+            max_bs=context.max_bs,
+            # InputPreparer owns max-batch-sized buffers. DSA derives its
+            # sequence count from the cu-seqlens shape, so exposing the padded
+            # suffix makes it index nonexistent MTP input rows at batch > 1.
+            cu_seqlens_q=active_cu_q,
+            cu_seqlens_k=active_cu_k,
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=context.slot_mapping,
+            block_tables=context.block_tables,
+            is_dummy=context.is_dummy,
+            num_tokens_per_seq=1,
+            paged_attention_strategy=context.paged_attention_strategy,
+        )
+        set_expert_context(use_low_latency_ep=True)
+        indexer_state = self._new_mtp_indexer_state()
+        mtp_hidden = self._forward_cached_mtp(
+            shifted_ids,
+            shifted_positions,
+            self.last_hidden,
+            0,
+            indexer_state,
+        )
+
+        # Batch contexts keep max-batch-sized cu-seqlens buffers. Consuming
+        # the padded suffix produces -1 rows and a CUDA ScatterGather OOB as
+        # soon as a rank prefills more than one request after cold start.
+        last_rows = _active_ragged_last_rows(cu_q, num_seqs)
+        last_hidden = mtp_hidden.index_select(0, last_rows)
+        last_positions = shifted_positions.index_select(0, last_rows)
+        indexer_state = self._select_mtp_indexer_seed(
+            indexer_state,
+            last_rows,
+            context,
+            num_seqs,
+            packed_k_starts=active_cu_k[:-1],
+        )
+        first_logits = self.mtp_model.compute_logits(last_hidden, spec_step_idx=0)
+        first_draft = self._greedy_draft(first_logits, sampled_ids)
+
+        total_lens = (active_cu_k[1:] - active_cu_k[:-1]).to(torch.int32)
+        drafts = [first_draft]
+        drafts.extend(
+            self._continue_cached_mtp_drafts(
+                first_draft,
+                last_positions + 1,
+                last_hidden,
+                total_lens,
+                context,
+                num_seqs,
+                self.config.num_speculative_tokens - 1,
+                start_step=1,
+                indexer_state=indexer_state,
+            )
+        )
+
+        self._prev_seq_ids = tuple(int(seq_id) for seq_id in aux.seq_ids[:num_seqs])
+        self._prev_drafts = torch.stack(drafts, dim=1)
+        self._selected_prev_drafts = None
+        self._restore_batch_context(context)
+        get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+        get_mla_context().sparse_tile_scheduler_metadata = (
+            saved_sparse_scheduler_metadata
+        )
+        get_batch_out_context().token_ids = saved_token_ids
+
+    def build_output_logprobs(
+        self, next_logprobs: list[list[float]]
+    ) -> list[list[float]]:
+        """Prepend accepted-draft target logprobs to each next-token logprob."""
+        if self._mtp_verified_logprobs is None or self._mtp_num_accepted is None:
+            return next_logprobs
+        result: list[list[float]] = []
+        for seq_idx, base in enumerate(next_logprobs):
+            accepted = int(self._mtp_num_accepted[seq_idx].item())
+            prefix = self._mtp_verified_logprobs[:accepted, seq_idx].tolist()
+            result.append([float(value) for value in prefix] + base)
+        return result
 
     def build_output_tokens(self, rank: int) -> list[list[int]]:
-        """Assemble final output tokens, interleaving verified MTP drafts."""
+        """Prepend accepted draft tokens to the newly sampled target token."""
         token_ids = get_batch_out_context().token_ids
-        if self._mtp_verified_tokens is not None:
-            base = torch.cat(token_ids, dim=0)  # [1, num_seqs]
-            verified = self._mtp_verified_tokens  # [N, num_seqs]
-            accepted = self._mtp_num_accepted  # [num_seqs]
-            result = []
-            for s in range(base.shape[1]):
-                n_acc = int(accepted[s].item())
-                seq_tokens = []
-                for j in range(n_acc):
-                    seq_tokens.append(int(verified[j, s].item()))
-                for t in range(base.shape[0]):
-                    seq_tokens.append(int(base[t, s].item()))
-                result.append(seq_tokens)
-            if rank == 0:
-                logger.debug(f"OUTPUT tokens[0]: {result[0]}")
-            self._mtp_verified_tokens = None
-            self._mtp_num_accepted = None
-            return result
-        else:
+        if self._mtp_verified_tokens is None:
             return torch.cat(token_ids, dim=0).T.tolist()
 
-    # ------------------------------------------------------------------
-    # Internal: MTP forward helpers
-    # ------------------------------------------------------------------
+        base = torch.cat(token_ids, dim=0)
+        result = []
+        for seq_idx in range(base.shape[1]):
+            accepted = int(self._mtp_num_accepted[seq_idx].item())
+            prefix = self._mtp_verified_tokens[:accepted, seq_idx].tolist()
+            result.append(
+                [int(token) for token in prefix]
+                + [int(token) for token in base[:, seq_idx].tolist()]
+            )
+        if rank == 0 and result:
+            logger.debug("MTP output tokens[0]=%s", result[0])
+        self._mtp_verified_tokens = None
+        self._mtp_verified_logprobs = None
+        self._mtp_num_accepted = None
+        return result
 
     def _set_mtp_context(self, num_seqs: int):
-        """Set context for MTP forward (prefill mode, seq_len=1, no KV cache)."""
         cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda")
         set_batch_context(
             is_prefill=True,
@@ -314,22 +759,405 @@ class MTPRunner:
         )
         set_expert_context(use_low_latency_ep=True)
 
+    def _restore_batch_context(self, context) -> None:
+        set_batch_context(
+            is_prefill=context.is_prefill,
+            max_bs=context.max_bs,
+            cu_seqlens_q=context.cu_seqlens_q,
+            cu_seqlens_k=context.cu_seqlens_k,
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=context.slot_mapping,
+            context_lens=context.context_lens,
+            block_tables=context.block_tables,
+            is_dummy=context.is_dummy,
+            gdn_conv_states=context.gdn_conv_states,
+            gdn_recurrent_states=context.gdn_recurrent_states,
+            gdn_state_slots=context.gdn_state_slots,
+            dsv4_state_slots=context.dsv4_state_slots,
+            dsv4_compressed_block_tables=context.dsv4_compressed_block_tables,
+            hisparse_slots=context.hisparse_slots,
+            hisparse_slot_mapping=context.hisparse_slot_mapping,
+            hisparse_num_real_reqs=context.hisparse_num_real_reqs,
+            num_tokens_per_seq=context.num_tokens_per_seq,
+            sampling_token_indices=context.sampling_token_indices,
+            sampling_seq_indices=context.sampling_seq_indices,
+            paged_attention_strategy=context.paged_attention_strategy,
+            graph_attention_strategy=context.graph_attention_strategy,
+            decode_page_plan_key=context.decode_page_plan_key,
+            mtp_draft_safe=context.mtp_draft_safe,
+        )
+
+    def _set_cached_mtp_context(
+        self,
+        source_context,
+        cache_lens: torch.Tensor,
+        num_seqs: int,
+    ) -> None:
+        """Expose the predictor layer to the shared page table at given lengths."""
+        sp_rank = get_dist_context().attn_sp_rank
+        block_size = self.config.kvcache_block_size
+        block_tables = source_context.block_tables
+        if block_tables is None:
+            raise RuntimeError("cached GLM MTP requires paged block tables")
+
+        logical_slots = cache_lens[:num_seqs].to(torch.long) - 1
+        block_indices = logical_slots // block_size
+        page_ids = block_tables[sp_rank, :num_seqs].gather(1, block_indices[:, None])[
+            :, 0
+        ]
+        slot_mapping = (page_ids * block_size + (logical_slots % block_size)).to(
+            torch.int32
+        )
+
+        if source_context.context_lens is not None:
+            context_lens = source_context.context_lens.clone()
+        else:
+            sp_size = block_tables.shape[0]
+            context_lens = torch.zeros(
+                sp_size,
+                self.config.max_num_seqs,
+                dtype=torch.int32,
+                device=cache_lens.device,
+            )
+        context_lens[sp_rank, :num_seqs] = cache_lens[:num_seqs].to(torch.int32)
+
+        set_batch_context(
+            is_prefill=False,
+            max_bs=source_context.max_bs,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            is_dummy=source_context.is_dummy,
+            num_tokens_per_seq=1,
+            paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+        )
+        if torch.cuda.get_device_capability()[0] < 10:
+            import flash_mla
+
+            tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            get_hca_context().tile_scheduler_metadata = tile_scheduler_metadata
+            sparse_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            get_mla_context().sparse_tile_scheduler_metadata = sparse_scheduler_metadata
+        set_expert_context(use_low_latency_ep=True)
+
+    def _greedy_draft(
+        self, logits: torch.Tensor, template_ids: torch.Tensor
+    ) -> torch.Tensor:
+        if get_dist_context().attn_tp_rank == 0:
+            draft_ids = logits.argmax(dim=-1)
+        else:
+            draft_ids = template_ids.new_zeros(logits.shape[0])
+        dist.all_reduce(draft_ids, group=get_dist_context().attn_tp_group)
+        return draft_ids
+
+    def _forward_cached_mtp(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+        indexer_state: _IndexerTopKState | None,
+        *,
+        reuse_indexer_topk: bool = False,
+    ) -> torch.Tensor:
+        """Forward a cached predictor, adding GLM-only DSA state when enabled."""
+        if indexer_state is None:
+            return self.mtp_model(
+                input_ids,
+                positions,
+                hidden_states,
+                spec_step_idx=spec_step_idx,
+            )
+        return self.mtp_model(
+            input_ids,
+            positions,
+            hidden_states,
+            spec_step_idx=spec_step_idx,
+            indexer_state=indexer_state,
+            reuse_indexer_topk=reuse_indexer_topk,
+        )
+
+    def _continue_cached_mtp_drafts(
+        self,
+        current_ids: torch.Tensor,
+        current_positions: torch.Tensor,
+        current_hidden: torch.Tensor,
+        initial_cache_lens: torch.Tensor,
+        source_context,
+        num_seqs: int,
+        num_steps: int,
+        *,
+        start_step: int,
+        indexer_state: _IndexerTopKState | None = None,
+    ) -> list[torch.Tensor]:
+        if (
+            self.cached_mtp_graph_runner is not None
+            and start_step == 1
+            and num_steps == self.config.num_speculative_tokens - 1
+        ):
+            graph_drafts = self.cached_mtp_graph_runner.run(
+                current_ids,
+                current_positions,
+                current_hidden,
+                initial_cache_lens,
+                source_context,
+                indexer_state,
+                num_seqs,
+            )
+            if graph_drafts is not None:
+                return graph_drafts
+
+        drafts = []
+        cache_lens = initial_cache_lens.to(torch.int32).clone()
+        if indexer_state is None:
+            indexer_state = self._new_mtp_indexer_state()
+        for offset in range(num_steps):
+            cache_lens += 1
+            self._set_cached_mtp_context(source_context, cache_lens, num_seqs)
+            step_idx = start_step + offset
+            mtp_hidden = self._forward_cached_mtp(
+                current_ids,
+                current_positions,
+                current_hidden,
+                step_idx,
+                indexer_state,
+                reuse_indexer_topk=(
+                    indexer_state is not None
+                    and indexer_state.logical_indices is not None
+                ),
+            )
+            mtp_logits = self.mtp_model.compute_logits(
+                mtp_hidden, spec_step_idx=step_idx
+            )
+            draft_ids = self._greedy_draft(mtp_logits, current_ids)
+            drafts.append(draft_ids)
+            current_hidden = mtp_hidden
+            current_ids = draft_ids
+            current_positions += 1
+        return drafts
+
+    def _generate_cached_mtp_drafts(
+        self,
+        sampled_ids: torch.Tensor,
+        seed_positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        initial_cache_lens: torch.Tensor,
+        source_context,
+        num_seqs: int,
+    ) -> list[torch.Tensor]:
+        return self._continue_cached_mtp_drafts(
+            sampled_ids,
+            seed_positions,
+            hidden_states,
+            initial_cache_lens,
+            source_context,
+            num_seqs,
+            self.config.num_speculative_tokens,
+            start_step=0,
+        )
+
+    def _refresh_and_generate_cached_mtp_drafts(
+        self,
+        sampled_ids: torch.Tensor,
+        verify_positions: torch.Tensor,
+        verify_hidden: torch.Tensor,
+        target_lens: torch.Tensor,
+        num_accepted: torch.Tensor,
+        source_context,
+        num_seqs: int,
+    ) -> list[torch.Tensor]:
+        """Refresh accepted predictor KV with target hidden states, then draft.
+
+        Recurrent drafting has to approximate unavailable future target hidden
+        states with predictor hidden states. After verification, replay the
+        accepted line plus the newly sampled token through NextN using the
+        exact target hidden rows. This draft-extend stage overwrites speculative
+        predictor KV before the next recurrence and is essential for GLM
+        acceptance quality.
+        """
+        if self._selected_prev_drafts is None:
+            raise RuntimeError("MTP cache refresh requires aligned verified drafts")
+
+        sp_rank = get_dist_context().attn_sp_rank
+        block_size = self.config.kvcache_block_size
+        block_tables = source_context.block_tables
+        if block_tables is None:
+            raise RuntimeError("MTP cache refresh requires paged block tables")
+
+        width = self.verify_width
+        refresh_lens = num_accepted.to(torch.int32) + 1
+        prefix_lens = target_lens.to(torch.int32) - refresh_lens
+
+        # Match the target verify geometry: replay all K rows in one causal
+        # multi-token decode and select only the row at the accepted length.
+        # Rows after the selected token are disposable; fixed width keeps MLA
+        # and DSA metadata identical across the batch.
+        refresh_candidates = torch.cat(
+            (
+                self._selected_prev_drafts[:num_seqs],
+                sampled_ids[:num_seqs, None],
+            ),
+            dim=1,
+        )
+        refresh_offsets = torch.arange(width, device=sampled_ids.device)
+        refresh_ids = torch.where(
+            refresh_offsets[None, :] < num_accepted[:num_seqs, None],
+            refresh_candidates,
+            sampled_ids[:num_seqs, None],
+        )
+
+        refresh_positions = verify_positions + 1
+        logical_slots = (
+            prefix_lens.to(torch.long)[:, None]
+            + torch.arange(
+                width,
+                dtype=torch.long,
+                device=sampled_ids.device,
+            )[None, :]
+        )
+        block_indices = logical_slots // block_size
+        page_ids = block_tables[sp_rank, :num_seqs].gather(1, block_indices)
+        slot_mapping = (page_ids * block_size + (logical_slots % block_size)).to(
+            torch.int32
+        )
+
+        refresh_context_lens = source_context.context_lens.clone()
+        full_refresh_lens = prefix_lens + width
+        refresh_context_lens[sp_rank, :num_seqs] = full_refresh_lens
+
+        set_batch_context(
+            is_prefill=False,
+            max_bs=source_context.max_bs,
+            slot_mapping=slot_mapping.reshape(-1),
+            context_lens=refresh_context_lens,
+            block_tables=block_tables,
+            is_dummy=source_context.is_dummy,
+            num_tokens_per_seq=width,
+            paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+        )
+        if torch.cuda.get_device_capability()[0] < 10:
+            import flash_mla
+
+            tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            get_hca_context().tile_scheduler_metadata = tile_scheduler_metadata
+            sparse_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+            get_mla_context().sparse_tile_scheduler_metadata = sparse_scheduler_metadata
+        set_expert_context(use_low_latency_ep=True)
+        indexer_state = self._new_mtp_indexer_state()
+        refreshed_hidden = self._forward_cached_mtp(
+            refresh_ids.reshape(-1),
+            refresh_positions.reshape(-1),
+            verify_hidden.reshape(-1, verify_hidden.shape[-1]),
+            0,
+            indexer_state,
+        )
+
+        last_rows = (
+            torch.arange(num_seqs, device=sampled_ids.device) * width + num_accepted
+        )
+        last_hidden = refreshed_hidden.index_select(0, last_rows)
+        indexer_state = self._select_mtp_indexer_seed(
+            indexer_state,
+            last_rows,
+            source_context,
+            num_seqs,
+        )
+        rows = torch.arange(num_seqs, device=sampled_ids.device)
+        last_positions = refresh_positions[rows, num_accepted]
+        first_logits = self.mtp_model.compute_logits(last_hidden, spec_step_idx=0)
+        first_draft = self._greedy_draft(first_logits, sampled_ids)
+
+        drafts = [first_draft]
+        drafts.extend(
+            self._continue_cached_mtp_drafts(
+                first_draft,
+                last_positions + 1,
+                last_hidden,
+                target_lens,
+                source_context,
+                num_seqs,
+                self.config.num_speculative_tokens - 1,
+                start_step=1,
+                indexer_state=indexer_state,
+            )
+        )
+        return drafts
+
+    def _run_uncached_collective_padding(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        num_seqs: int,
+    ) -> None:
+        """Keep EP collective counts aligned when a prefill cannot seed KV."""
+        take = max(1, num_seqs)
+        device = input_ids.device
+
+        if input_ids.numel() >= take:
+            ids = input_ids[:take]
+        else:
+            ids = torch.zeros(take, dtype=input_ids.dtype, device=device)
+            if input_ids.numel():
+                ids[: input_ids.numel()].copy_(input_ids)
+
+        if positions.numel() >= take:
+            pos = positions[:take] + 1
+        else:
+            pos = torch.ones(take, dtype=positions.dtype, device=device)
+            if positions.numel():
+                pos[: positions.numel()].copy_(positions + 1)
+
+        hidden_dtype = (
+            hidden_states.dtype
+            if hidden_states is not None
+            else torch.get_default_dtype()
+        )
+        if hidden_states is not None and hidden_states.size(0) >= take:
+            hidden = hidden_states[:take]
+        else:
+            hidden = torch.zeros(
+                take,
+                self.config.hf_config.hidden_size,
+                dtype=hidden_dtype,
+                device=device,
+            )
+            if hidden_states is not None and hidden_states.size(0):
+                count = min(hidden_states.size(0), take)
+                hidden[:count].copy_(hidden_states[:count])
+        for step in range(self.config.num_speculative_tokens):
+            self._set_mtp_context(ids.numel())
+            hidden = self.mtp_model(ids, pos, hidden, spec_step_idx=step)
+            logits = self.mtp_model.compute_logits(hidden, spec_step_idx=step)
+            ids = self._greedy_draft(logits, ids)
+            pos += 1
+            if step == 0:
+                chain_graph = getattr(self, "cached_mtp_graph_runner", None)
+                if chain_graph is not None and chain_graph.run_padding(
+                    ids, pos, hidden, ids.numel()
+                ):
+                    return
+
     def _run_mtp_step(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         spec_step_idx: int,
-        bs: int,
+        batch_size: int,
     ) -> torch.Tensor:
-        """Run one MTP speculative step. Uses CUDAGraph if captured."""
         if self.mtp_graph_runner is not None:
-            output = self.mtp_graph_runner.run(input_ids, positions, hidden_states, bs)
+            output = self.mtp_graph_runner.run(
+                input_ids,
+                positions,
+                hidden_states,
+                spec_step_idx,
+                batch_size,
+            )
             if output is not None:
                 return output
-
-        # Eager fallback
-        self._set_mtp_context(bs)
+        self._set_mtp_context(batch_size)
         return self.mtp_model(
             input_ids,
             positions,
@@ -343,10 +1171,8 @@ class MTPRunner:
         sampled_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        temperatures: torch.Tensor | None,
         num_seqs: int,
     ) -> list[torch.Tensor]:
-        """Generate draft tokens using MTP layers (decode only)."""
         drafts = []
         current_hidden = hidden_states
         current_ids = sampled_ids
@@ -356,15 +1182,12 @@ class MTPRunner:
             mtp_hidden = self._run_mtp_step(
                 current_ids, current_pos, current_hidden, step, num_seqs
             )
-
-            # Set MTP context for compute_logits (ParallelLMHead reads is_prefill)
-            self._set_mtp_context(num_seqs)
             mtp_logits = self.mtp_model.compute_logits(mtp_hidden, spec_step_idx=step)
 
-            # Sample on tp_rank 0, broadcast
-            tp_rank = get_dist_context().attn_tp_rank
-            if tp_rank == 0:
-                draft_ids = self.sampler(mtp_logits, temperatures)
+            if get_dist_context().attn_tp_rank == 0:
+                # The model-native draft policy is deliberately one-hot. This
+                # makes rejection sampling exact without retaining draft logits.
+                draft_ids = mtp_logits.argmax(dim=-1)
             else:
                 draft_ids = current_ids.new_zeros(num_seqs)
             dist.all_reduce(draft_ids, group=get_dist_context().attn_tp_group)
@@ -372,6 +1195,6 @@ class MTPRunner:
             drafts.append(draft_ids)
             current_hidden = mtp_hidden
             current_ids = draft_ids
-            current_pos = current_pos + 1
+            current_pos += 1
 
         return drafts

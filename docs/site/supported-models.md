@@ -13,7 +13,7 @@ DLEngine is designed primarily for large-model inference on multi-GPU and multi-
 | DeepSeek-V3                    | `DeepseekV3ForCausalLM`                                 | MLA + MoE                        | Wide EP, FP8 KV/cache paths, optional MTP                 |
 | DeepSeek-V3.2                  | `DeepseekV32ForCausalLM`                                | MLA + MoE + NSA                  | Indexer cache, sparse attention, HiSparse decode          |
 | DeepSeek-V4                    | `DeepseekV4ForCausalLM`                                 | MLA/DSA/SWA + MoE                | Compressed cache, Hyper-Connection, mega-MoE paths        |
-| GLM-5 family                   | `GlmMoeDsaForCausalLM`                                  | MLA + MoE + DSA/NSA              | GLM Indexer, long-context prefill/decode, HiSparse        |
+| GLM-5 family                   | `GlmMoeDsaForCausalLM`                                  | MLA + MoE + DSA/NSA              | GLM Indexer, long context, recurrent N=5/K=6 MTP          |
 | Gemma4 text                    | `Gemma4ForCausalLM` or `Gemma4ForConditionalGeneration` | Sliding-window + global GQA      | HiSparse ring buffer and graph-safe decode                |
 | Kimi-K2 compatible checkpoints | compatible `DeepseekV3ForCausalLM` config               | MLA + MoE                        | Uses the DeepSeek-V3-compatible model path                |
 
@@ -42,6 +42,7 @@ The exact combination depends on the model architecture, but DLEngine is built a
 
 - DeepSeek/GLM MLA paths require `attention_tp=1`; their KV cache block size is normalized to `64`.
 - HiSparse NSA/MLA currently targets decode mode for `DeepseekV32ForCausalLM` and `GlmMoeDsaForCausalLM`, requires a control plane for real PD migration, and does not compose with MTP.
+- GLM multi-step MTP currently targets Hopper, colocated hybrid serving with `attention_tp=attention_sp=pp=1`; `attention_dp=8, ffn_ep=8` is the primary topology. Set `num_speculative_tokens=5` for five recurrent calls to the single checkpoint predictor and a derived six-token target verification span. Tree speculation, PD/PP, and HiSparse composition are not enabled.
 - Gemma4 mixed sliding/global attention requires the HiSparse hot-buffer path when the two attention types use different head dimensions.
 - Gemma4 MoE blocks and some TP combinations are not wired yet; read runtime validation errors before assuming every Gemma4 checkpoint variant is supported.
 - Qwen3.5 checkpoints can contain text, vision, and MTP tensors. The selected server/component determines which parts are loaded.

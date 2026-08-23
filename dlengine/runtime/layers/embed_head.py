@@ -106,6 +106,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             else:
                 last_indices = context.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
+        return self.forward_all_rows(x)
+
+    def forward_all_rows(self, x: torch.Tensor):
+        """Project every hidden-state row without consulting batch context."""
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             # Use all_reduce instead of all_gather. On this hardware's MCCL

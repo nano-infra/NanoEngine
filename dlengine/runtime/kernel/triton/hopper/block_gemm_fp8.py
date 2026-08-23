@@ -1,10 +1,125 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
+
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
 from dlengine.runtime.kernel.triton.generic.utils import get_device_props
+
+_USE_PACKED_SMALL_M_QUANT = os.getenv(
+    "DLENGINE_USE_PACKED_SMALL_M_QUANT", "1"
+).lower() not in {"0", "false", "off"}
+_PACKED_QUANT_MAX_M = 64
+_PACKED_QUANT_TASKS = 16
+_PACKED_QUANT_TAIL_VALUES = 2048
+_PACKED_QUANT_TAIL_SCALES = 16
+
+
+def _should_use_packed_small_m_quant(
+    M: int,
+    group_size: int,
+    input_column_stride: int,
+    output_column_stride: int,
+) -> bool:
+    return (
+        _USE_PACKED_SMALL_M_QUANT
+        and 0 < M <= _PACKED_QUANT_MAX_M
+        and group_size == 128
+        and input_column_stride == 1
+        and output_column_stride == 1
+    )
+
+
+@triton.jit
+def _quant_fp8_packed_small_m_kernel(
+    a_ptr,
+    out_ptr,
+    scale_ptr,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    stride_am,
+    stride_om,
+    stride_sm,
+    stride_sg,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    ACTUAL_TASKS: tl.constexpr,
+    TAIL_OUT_VALUES: tl.constexpr,
+    TAIL_SCALE_VALUES: tl.constexpr,
+    TASKS_PER_PROGRAM: tl.constexpr,
+    TAIL_VALUES_PER_PROGRAM: tl.constexpr,
+    TAIL_SCALES_PER_PROGRAM: tl.constexpr,
+    ROUND_UE8M0: tl.constexpr = False,
+    MIN_ABSMAX: tl.constexpr = 1e-6,
+):
+    """Quantize small logical M while preserving DeepGEMM's padded layout.
+
+    SGLang's CUDA kernel packs several (token, group) reductions into one CTA.
+    Keep that scheduling property here instead of launching one Triton program
+    for every padded row and group. Padded rows still receive exactly the same
+    zero values and scales as ``_quant_fp8_kernel``, but use vector stores
+    rather than running redundant absmax reductions.
+    """
+    pid = tl.program_id(0)
+    rfp8_max = 1.0 / fp8_max
+
+    task_ids = pid * TASKS_PER_PROGRAM + tl.arange(0, TASKS_PER_PROGRAM)
+    task_mask = task_ids < ACTUAL_TASKS
+    m_ids = task_ids // NUM_GROUPS
+    group_ids = task_ids % NUM_GROUPS
+    group_offsets = tl.arange(0, GROUP_SIZE)
+    a_offsets = (
+        m_ids[:, None] * stride_am
+        + group_ids[:, None] * GROUP_SIZE
+        + group_offsets[None, :]
+    )
+    values = tl.load(a_ptr + a_offsets, mask=task_mask[:, None], other=0.0).to(
+        tl.float32
+    )
+    scales = tl.maximum(tl.max(tl.abs(values), axis=1), MIN_ABSMAX) * rfp8_max
+    if ROUND_UE8M0:
+        scales = tl.exp2(tl.ceil(tl.log2(scales)))
+    quantized = tl.clamp(values / scales[:, None], fp8_min, fp8_max).to(
+        out_ptr.dtype.element_ty
+    )
+    out_offsets = (
+        m_ids[:, None] * stride_om
+        + group_ids[:, None] * GROUP_SIZE
+        + group_offsets[None, :]
+    )
+    tl.store(out_ptr + out_offsets, quantized, mask=task_mask[:, None])
+    tl.store(
+        scale_ptr + m_ids * stride_sm + group_ids * stride_sg,
+        scales,
+        mask=task_mask,
+    )
+
+    tail_offsets = pid * TAIL_VALUES_PER_PROGRAM + tl.arange(0, TAIL_VALUES_PER_PROGRAM)
+    tail_rows = tail_offsets // K
+    tail_columns = tail_offsets % K
+    tl.store(
+        out_ptr + (M + tail_rows) * stride_om + tail_columns,
+        0.0,
+        mask=tail_offsets < TAIL_OUT_VALUES,
+    )
+
+    tail_scale_offsets = pid * TAIL_SCALES_PER_PROGRAM + tl.arange(
+        0, TAIL_SCALES_PER_PROGRAM
+    )
+    tail_scale_rows = tail_scale_offsets // NUM_GROUPS
+    tail_scale_groups = tail_scale_offsets % NUM_GROUPS
+    tail_scale = MIN_ABSMAX * rfp8_max
+    if ROUND_UE8M0:
+        tail_scale = tl.exp2(tl.ceil(tl.log2(tail_scale)))
+    tl.store(
+        scale_ptr + (M + tail_scale_rows) * stride_sm + tail_scale_groups * stride_sg,
+        tail_scale,
+        mask=tail_scale_offsets < TAIL_SCALE_VALUES,
+    )
 
 
 @triton.jit
@@ -87,6 +202,48 @@ def _quant_fp8_launcher(
     finfo = torch.finfo(dtype)
     fmin = finfo.min
     fmax = finfo.max
+
+    if _should_use_packed_small_m_quant(
+        M,
+        group_size,
+        A.stride(1),
+        out.stride(1),
+    ):
+        actual_tasks = M * num_groups
+        tail_rows = M_out - M
+        tail_out_values = tail_rows * K
+        tail_scale_values = tail_rows * num_groups
+        num_programs = max(
+            triton.cdiv(actual_tasks, _PACKED_QUANT_TASKS),
+            triton.cdiv(tail_out_values, _PACKED_QUANT_TAIL_VALUES),
+            triton.cdiv(tail_scale_values, _PACKED_QUANT_TAIL_SCALES),
+        )
+        _quant_fp8_packed_small_m_kernel[(num_programs,)](
+            A,
+            out,
+            scales,
+            fp8_min=fmin,
+            fp8_max=fmax,
+            stride_am=A.stride(0),
+            stride_om=out.stride(0),
+            stride_sm=scales.stride(0),
+            stride_sg=scales.stride(1),
+            M=M,
+            K=K,
+            NUM_GROUPS=num_groups,
+            GROUP_SIZE=group_size,
+            ACTUAL_TASKS=actual_tasks,
+            TAIL_OUT_VALUES=tail_out_values,
+            TAIL_SCALE_VALUES=tail_scale_values,
+            TASKS_PER_PROGRAM=_PACKED_QUANT_TASKS,
+            TAIL_VALUES_PER_PROGRAM=_PACKED_QUANT_TAIL_VALUES,
+            TAIL_SCALES_PER_PROGRAM=_PACKED_QUANT_TAIL_SCALES,
+            ROUND_UE8M0=round_ue8m0,
+            MIN_ABSMAX=min_absmax,
+            num_warps=8,
+            num_stages=1,
+        )
+        return out, scales
 
     num_warps = 1
 

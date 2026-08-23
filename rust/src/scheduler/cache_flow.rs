@@ -184,7 +184,16 @@ impl Scheduler {
         tokens: i32,
         set_migrate: bool,
     ) -> PyResult<Vec<i32>> {
-        let needed_blocks = self.blocks_needed_for_tokens(tokens);
+        // Hybrid prefill allocates through this group-level path rather than
+        // cache_ensure_blocks_for_seq. The predictor seeds recurrent drafts
+        // before postprocess, so its lookahead pages must be present in the
+        // first RunnerIn block table.
+        let allocation_tokens = if set_migrate && self.config.mode != "decode" {
+            tokens + self.config.num_speculative_tokens.max(0)
+        } else {
+            tokens
+        };
+        let needed_blocks = self.blocks_needed_for_tokens(allocation_tokens);
         let flat = self.flat_idx(dp_idx, group_id);
         let use_prefix_cache = set_migrate
             && self.group() == 1
@@ -195,7 +204,7 @@ impl Scheduler {
                 seq_id,
                 dp_idx,
                 group_id,
-                tokens,
+                allocation_tokens,
                 set_migrate,
             );
         }
@@ -207,8 +216,15 @@ impl Scheduler {
         } else {
             &[]
         };
-        let blocks = self.cache
-            .ensure_hbm_blocks(flat, seq_id, token_ids, tokens, use_prefix_cache)
+        let blocks = self
+            .cache
+            .ensure_hbm_blocks(
+                flat,
+                seq_id,
+                token_ids,
+                allocation_tokens,
+                use_prefix_cache,
+            )
             .map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={needed_blocks}"
@@ -233,10 +249,18 @@ impl Scheduler {
             };
             (s.seq_id, s.num_tokens)
         };
+        let speculative_lookahead = self.config.num_speculative_tokens.max(0);
         let needed_tokens = if is_prefill && self.config.mode != "decode" {
-            num_tokens
+            // Recurrent MTP seeds its predictor cache during the target
+            // prefill, before postprocess has a chance to allocate decode
+            // blocks. Reserve the draft lookahead here as well, especially
+            // when the prompt ends near a cache-page boundary.
+            num_tokens + speculative_lookahead
         } else {
-            num_tokens + 1
+            // A normal decode writes one new cache position. Linear MTP first
+            // verifies N drafts, then immediately builds the next N-draft
+            // line. Reserve both windows before the accepted length is known.
+            num_tokens + speculative_lookahead.saturating_mul(2).max(1)
         };
         let needed_blocks = self.blocks_needed_for_tokens(needed_tokens);
         if !is_prefill

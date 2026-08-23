@@ -17,12 +17,17 @@ from dlengine.runtime.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.runtime.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices,
 )
+from dlengine.runtime.kernel.triton.generic.rmsnorm import (
+    can_use_strided_inplace_rms_norm,
+    rms_norm_strided_inplace,
+)
 from dlengine.runtime.layers import get_backend
 from dlengine.runtime.layers.activation import SiluAndMul
 from dlengine.runtime.layers.base_backend import (
     ColumnParallelLinearBase,
     DistributedRoutedExpertsBase,
     MergedColumnParallelLinearBase,
+    PrequantizedActivation,
     RowParallelLinearBase,
 )
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -43,7 +48,20 @@ from dlengine.runtime.models.pp_utils import (
     pp_send_hidden,
 )
 from dlengine.runtime.runner.runner_config import get_runner_config
+from dlengine.runtime.stream_pool import get_cuda_stream
 from ..quant_config import QuantizationConfig
+
+try:
+    from dlengine.runtime.kernel.triton.hopper.block_gemm_fp8 import quant_fp8_tma
+except ImportError:
+    quant_fp8_tma = None
+
+try:
+    from dlengine.runtime.kernel.triton.hopper.mla_rope import (
+        fused_mla_qk_rope_half as _FUSED_MLA_QK_ROPE,
+    )
+except Exception:
+    _FUSED_MLA_QK_ROPE = None
 
 logger = get_logger()
 
@@ -152,6 +170,25 @@ class _IndexerTopKState:
                 f"shape {shape} from layer {self.source_layer}; expected {expected}"
             )
         return logical, physical
+
+    def select_rows(self, rows: torch.Tensor) -> "_IndexerTopKState":
+        """Return the per-request TopK rows selected from a packed draft extend.
+
+        GLM recurrent MTP reuses the DSA selection produced for the last
+        verified token. Prefill and draft-extend forwards contain more than
+        one row per request, so the runner must carry only the row that seeded
+        the first draft into the remaining recurrent iterations.
+        """
+        if self.logical_indices is None or self.source_layer is None:
+            return _IndexerTopKState()
+        physical = self.physical_indices
+        return _IndexerTopKState(
+            logical_indices=self.logical_indices.index_select(0, rows),
+            physical_indices=(
+                None if physical is None else physical.index_select(0, rows)
+            ),
+            source_layer=self.source_layer,
+        )
 
 
 def _pp_send_indexer_state(state: _IndexerTopKState, device: torch.device) -> None:
@@ -318,6 +355,47 @@ def _interleaved_to_half(x: torch.Tensor) -> torch.Tensor:
     return x.unflatten(-1, (-1, 2)).transpose(-1, -2).contiguous().flatten(-2)
 
 
+def _apply_fused_mla_qk_rope(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fuse interleaved-to-half conversion with Q/K RoPE in one kernel."""
+    if (
+        os.environ.get("DLENGINE_FUSE_MLA_QK_ROPE", "1") != "1"
+        or _FUSED_MLA_QK_ROPE is None
+        or getattr(rotary_emb, "cos_sin_cache", None) is None
+        or not q_pe.is_cuda
+        or q_pe.dtype != torch.bfloat16
+        or k_pe.dtype != q_pe.dtype
+        or q_pe.dim() != 3
+        or k_pe.dim() != 3
+        or q_pe.shape[0] != k_pe.shape[0]
+        or q_pe.shape[-1] != 64
+        or k_pe.shape[-1] != 64
+        or q_pe.stride(-1) != 1
+        or k_pe.stride(-1) != 1
+        or positions.dim() != 1
+        or positions.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    try:
+        pos = positions if positions.is_contiguous() else positions.contiguous()
+        return _FUSED_MLA_QK_ROPE(
+            q_pe,
+            k_pe,
+            rotary_emb.cos_sin_cache,
+            pos,
+        )
+    except Exception as exc:
+        global _FUSED_MLA_QK_ROPE_WARNED
+        if not globals().get("_FUSED_MLA_QK_ROPE_WARNED", False):
+            _FUSED_MLA_QK_ROPE_WARNED = True
+            logger.warning("fused MLA Q/K RoPE fast path bailed: %s", exc)
+        return None
+
+
 def compute_topk_ids(topk_ids, ranks, num_experts):
     shape = topk_ids.shape
     step = num_experts // ranks
@@ -394,6 +472,9 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.shared_experts = None
+        # All sequential decoder layers resolve this field to the same
+        # process-local role stream; each module keeps the reference so the
+        # steady-state forward has no pool lookup.
         self._shared_expert_stream: torch.cuda.Stream | None = None
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -502,7 +583,9 @@ class DeepseekV2MoE(nn.Module):
         shared_states = None
         if overlap_shared:
             if self._shared_expert_stream is None:
-                self._shared_expert_stream = torch.cuda.Stream()
+                self._shared_expert_stream = get_cuda_stream(
+                    "model_shared_expert", hidden_states.device
+                )
             main_stream = torch.cuda.current_stream(hidden_states.device)
             self._shared_expert_stream.wait_stream(main_stream)
             with torch.cuda.stream(self._shared_expert_stream):
@@ -647,6 +730,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         indexer_state: _IndexerTopKState | None = None,
+        reuse_indexer_topk: bool = False,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         if residual is None:
             residual = hidden_states
@@ -656,7 +740,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Self Attention
 
         hidden_states = self.self_attn(
-            positions, hidden_states, indexer_state=indexer_state
+            positions,
+            hidden_states,
+            indexer_state=indexer_state,
+            reuse_indexer_topk=reuse_indexer_topk,
         )
 
         # Fully Connected
@@ -748,9 +835,23 @@ class DeepseekV2Model(nn.Module):
                         f"context_lens={tuple(context_lens.shape)}"
                     )
                 effective_ntps = input_ids.numel() // context_lens.numel()
-                context.indexer_schedule_meta = indexer.build_schedule_metadata(
-                    _expand_decode_context_lens(context_lens, effective_ntps)
+                expanded_context_lens = _expand_decode_context_lens(
+                    context_lens, effective_ntps
                 )
+                if effective_ntps > 2:
+                    # DeepGEMM scoring currently specializes next_n to 1/2.
+                    # Build one reusable schedule per linear verify position;
+                    # every Indexer layer consumes the same tuple.
+                    context.indexer_schedule_meta = tuple(
+                        indexer.build_schedule_metadata(
+                            expanded_context_lens[:, offset : offset + 1]
+                        )
+                        for offset in range(effective_ntps)
+                    )
+                else:
+                    context.indexer_schedule_meta = indexer.build_schedule_metadata(
+                        expanded_context_lens
+                    )
 
         if self.is_first_pp_stage:
             hidden_states = self.embed_tokens(input_ids)
@@ -928,6 +1029,25 @@ class DeepseekV2Attention(nn.Module):
             config.kv_lora_rank,
             1e-6,
         )
+        self._inplace_mla_kv_norm = os.environ.get(
+            "DLENGINE_INPLACE_MLA_KV_NORM", "1"
+        ).lower() not in {"0", "false", "off"}
+        q_input_proj = self.q_proj if self.q_lora_rank is None else self.q_a_proj
+        self._share_qkv_input_quant = (
+            os.environ.get("DLENGINE_SHARE_QKV_INPUT_QUANT", "1").lower()
+            not in {"0", "false", "off"}
+            and quant_fp8_tma is not None
+            and quantization_config is not None
+            and quantization_config.quant_method == "fp8"
+            and list(quantization_config.block_size or [])[:1] == [128]
+            and hasattr(q_input_proj, "_fp8_forward")
+            and hasattr(self.kv_a_proj_with_mqa, "_fp8_forward")
+        )
+        self._input_quant_round_ue8m0 = (
+            getattr(quantization_config, "scale_fmt", None) == "ue8m0"
+            if quantization_config is not None
+            else False
+        )
         self.kc = DeepseekV2BMM(
             self.num_heads,
             config.qk_nope_head_dim,
@@ -1011,6 +1131,33 @@ class DeepseekV2Attention(nn.Module):
         else:
             self.indexer = None
 
+    def _shared_projection_input(self, hidden_states: torch.Tensor):
+        """Quantize decoder input once for the Q-A and compressed-KV linears.
+
+        Both projections consume the same normalized BF16 tensor. Reusing one
+        TMA-aligned FP8 buffer removes one quant launch per attention layer
+        while retaining the original BF16 tensor for the indexer and residual
+        path.
+        """
+        if (
+            not self._share_qkv_input_quant
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or hidden_states.dim() != 2
+        ):
+            return hidden_states
+        quantized, scales = quant_fp8_tma(
+            hidden_states,
+            128,
+            dtype=self.kv_a_proj_with_mqa.weight.dtype,
+            round_ue8m0=self._input_quant_round_ue8m0,
+        )
+        return PrequantizedActivation(
+            quantized,
+            scales,
+            hidden_states.shape[0],
+        )
+
     def _q_proj_absorbed(self, hidden_states, num_heads: int):
         """Q proj with W_UK absorption (for decode).
 
@@ -1019,11 +1166,13 @@ class DeepseekV2Attention(nn.Module):
             q_pe: (q_len, H, qk_rope_head_dim)
             q_lora: (q_len, q_lora_rank) — intermediate for indexer (or None if no q_lora_rank)
         """
-        q_len = hidden_states.size(0)
+        q_len = (
+            hidden_states.num_tokens
+            if isinstance(hidden_states, PrequantizedActivation)
+            else hidden_states.size(0)
+        )
         nope_size = self.kv_lora_rank  # 512
         pe_size = self.qk_rope_head_dim  # 64
-
-        query_states = hidden_states.new_empty([q_len, num_heads, nope_size + pe_size])
 
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
@@ -1032,6 +1181,7 @@ class DeepseekV2Attention(nn.Module):
             q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states))
             q = self.q_b_proj(q_lora)
         q = q.view(q_len, num_heads, self.q_head_dim)
+        query_states = q.new_empty([q_len, num_heads, nope_size + pe_size])
 
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1044,7 +1194,11 @@ class DeepseekV2Attention(nn.Module):
 
     def _q_proj_raw(self, hidden_states, num_heads: int):
         """Q proj without absorption (for prefill)."""
-        q_len = hidden_states.size(0)
+        q_len = (
+            hidden_states.num_tokens
+            if isinstance(hidden_states, PrequantizedActivation)
+            else hidden_states.size(0)
+        )
 
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
@@ -1069,8 +1223,21 @@ class DeepseekV2Attention(nn.Module):
         # k_pe: (q_len, qk_rope_head_dim)
 
         value_states = key_states[..., :nope_size]
-        value_states = self.kv_a_layernorm(value_states)
-        key_states[..., :nope_size] = value_states
+        if self._inplace_mla_kv_norm and can_use_strided_inplace_rms_norm(
+            value_states, self.kv_a_layernorm.weight
+        ):
+            # value_states has row stride kv_lora_rank + rope_dim. Normalize
+            # that view directly so the 512-wide latent remains in the
+            # combined 576-wide KV buffer without an eager op chain or copy.
+            rms_norm_strided_inplace(
+                value_states,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.eps,
+                add_unit_offset=self.kv_a_layernorm.add_unit_offset,
+            )
+        else:
+            value_states = self.kv_a_layernorm(value_states)
+            key_states[..., :nope_size] = value_states
         # key_states: (q_len, kv_lora_rank + qk_rope_head_dim) with normalized latent
         # value_states: (q_len, kv_lora_rank) — normalized compressed latent
         return key_states, value_states, k_pe
@@ -1161,9 +1328,15 @@ class DeepseekV2Attention(nn.Module):
         q_full, _q_nope, q_pe = self._q_proj_raw(hidden_states, num_heads)
         k_pe_3d = k_pe.unsqueeze(1)
         if not self.skip_rope:
-            q_pe = _interleaved_to_half(q_pe)
-            k_pe_3d = _interleaved_to_half(k_pe_3d)
-            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            fused_rope = _apply_fused_mla_qk_rope(
+                self.rotary_emb, positions, q_pe, k_pe_3d
+            )
+            if fused_rope is None:
+                q_pe = _interleaved_to_half(q_pe)
+                k_pe_3d = _interleaved_to_half(k_pe_3d)
+                q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            else:
+                q_pe, k_pe_3d = fused_rope
             q_full[..., self.qk_nope_head_dim :] = q_pe
 
         key_states_3d = key_states.unsqueeze(1)
@@ -1238,14 +1411,16 @@ class DeepseekV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         indexer_state: _IndexerTopKState | None = None,
+        reuse_indexer_topk: bool = False,
     ):
         """Forward with separate prefill (non-absorbed) and decode (absorbed) paths."""
         num_heads = self.num_heads
         q_len = hidden_states.size(0)
         is_prefill = get_batch_context().is_prefill
+        projection_input = self._shared_projection_input(hidden_states)
 
         # KV projection (shared between prefill and decode)
-        key_states, compressed_kv, k_pe = self._kv_proj(hidden_states)
+        key_states, compressed_kv, k_pe = self._kv_proj(projection_input)
         # key_states: (q_len, kv_lora_rank + qk_rope_head_dim) = (q_len, 576)
         # compressed_kv: (q_len, kv_lora_rank) = (q_len, 512)
         # k_pe: (q_len, qk_rope_head_dim) = (q_len, 64)
@@ -1253,15 +1428,21 @@ class DeepseekV2Attention(nn.Module):
         if is_prefill:
             # === Non-absorbed prefill path ===
             # Q: original (not absorbed), shape (q_len, H, qk_nope+qk_rope) = (q_len, H, 192)
-            q_full, q_nope, q_pe = self._q_proj_raw(hidden_states, num_heads)
+            q_full, q_nope, q_pe = self._q_proj_raw(projection_input, num_heads)
 
             # Convert PE dims from interleaved to half format before RoPE
             # (DeepseekV3 uses rope_interleave=True; projections produce interleaved layout)
             k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
             if not self.skip_rope:
-                q_pe = _interleaved_to_half(q_pe)
-                k_pe_3d = _interleaved_to_half(k_pe_3d)
-                q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+                fused_rope = _apply_fused_mla_qk_rope(
+                    self.rotary_emb, positions, q_pe, k_pe_3d
+                )
+                if fused_rope is None:
+                    q_pe = _interleaved_to_half(q_pe)
+                    k_pe_3d = _interleaved_to_half(k_pe_3d)
+                    q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+                else:
+                    q_pe, k_pe_3d = fused_rope
                 q_full[..., self.qk_nope_head_dim :] = q_pe
 
             # Also write RoPE'd k_pe into key_states for KV cache storage
@@ -1326,11 +1507,15 @@ class DeepseekV2Attention(nn.Module):
             has_full_indexer = (
                 self.indexer is not None and self.indexer.indexer_cache is not None
             )
-            has_shared_indexer = self.skip_topk and indexer_state is not None
+            reuse_topk = (
+                (self.skip_topk or reuse_indexer_topk)
+                and indexer_state is not None
+                and indexer_state.logical_indices is not None
+            )
             nsa_prefill = (
                 _NSA_SPARSE_PREFILL
                 and self.is_v32
-                and (has_full_indexer or has_shared_indexer)
+                and (has_full_indexer or reuse_topk)
                 and context.cu_seqlens_q is not None
             )
             total_cached = 0
@@ -1363,7 +1548,7 @@ class DeepseekV2Attention(nn.Module):
                 ):
                     q_lora = None
                     if has_full_indexer and self.q_lora_rank is not None:
-                        q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states))
+                        q_lora = self.q_a_layernorm(self.q_a_proj(projection_input))
                     # Absorbed query: q_nope @ W_UK -> (q_len, H, 512), + RoPE'd q_pe.
                     query_states = hidden_states.new_empty(
                         [q_len, num_heads, self.kv_lora_rank + self.qk_rope_head_dim]
@@ -1409,7 +1594,7 @@ class DeepseekV2Attention(nn.Module):
                                 context.cu_seqlens_k,
                             )
 
-                    if self.skip_topk:
+                    if reuse_topk:
                         topk_indices, _ = indexer_state.require(
                             self.layer_idx,
                             q_len,
@@ -1612,15 +1797,23 @@ class DeepseekV2Attention(nn.Module):
 
             context = get_batch_context()
             # Q absorbed: q_nope @ W_UK -> (q_len, H, kv_lora_rank=512), concat with q_pe -> 576
-            query_states, q_pe, q_lora = self._q_proj_absorbed(hidden_states, num_heads)
+            query_states, q_pe, q_lora = self._q_proj_absorbed(
+                projection_input, num_heads
+            )
 
             key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
             # Convert PE dims from interleaved to half format before RoPE
             k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
             if not self.skip_rope:
-                q_pe = _interleaved_to_half(q_pe)
-                k_pe_3d = _interleaved_to_half(k_pe_3d)
-                q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+                fused_rope = _apply_fused_mla_qk_rope(
+                    self.rotary_emb, positions, q_pe, k_pe_3d
+                )
+                if fused_rope is None:
+                    q_pe = _interleaved_to_half(q_pe)
+                    k_pe_3d = _interleaved_to_half(k_pe_3d)
+                    q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+                else:
+                    q_pe, k_pe_3d = fused_rope
             query_states[..., self.kv_lora_rank :] = q_pe
             if not self.skip_rope:
                 key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
@@ -1630,7 +1823,11 @@ class DeepseekV2Attention(nn.Module):
             has_full_indexer = (
                 self.indexer is not None and self.indexer.indexer_cache is not None
             )
-            has_shared_indexer = self.skip_topk and indexer_state is not None
+            reuse_topk = (
+                (self.skip_topk or reuse_indexer_topk)
+                and indexer_state is not None
+                and indexer_state.logical_indices is not None
+            )
             has_decode_pages = (
                 context.block_tables is not None
                 and context.block_tables.dim() == 3
@@ -1639,7 +1836,7 @@ class DeepseekV2Attention(nn.Module):
             )
             if (
                 self.attn_fwd.k_cache.dtype == torch.float8_e4m3fn
-                and (has_full_indexer or has_shared_indexer)
+                and (has_full_indexer or reuse_topk)
                 and has_decode_pages
             ):
                 from dlengine.runtime.layers.hopper.attention import (
@@ -1660,7 +1857,7 @@ class DeepseekV2Attention(nn.Module):
                 bt = context.block_tables[sp_rank, :bs]
                 k_cache = self.attn_fwd.k_cache
                 block_size = k_cache.shape[1]
-                if self.skip_topk:
+                if reuse_topk:
                     topk_indices, sparse_indices = indexer_state.require(
                         self.layer_idx,
                         total_tokens,

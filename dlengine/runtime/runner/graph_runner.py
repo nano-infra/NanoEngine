@@ -81,7 +81,9 @@ class DecodeGraphRunner:
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self._returns_logits = (
-            _capture_logits_enabled() and get_dist_context().attn_tp_world_size == 1
+            _capture_logits_enabled()
+            and get_dist_context().attn_tp_world_size == 1
+            and config.num_speculative_tokens == 0
         )
         logits_dtype = getattr(hf_config, "dtype", torch.get_default_dtype())
         if getattr(logits_dtype, "is_floating_point", False) and str(
@@ -539,26 +541,29 @@ class DecodeGraphRunner:
 
 
 # ---------------------------------------------------------------------------
-# Lazy Verify (seqlen_q = 2)
+# Lazy Verify (seqlen_q = N + 1)
 # ---------------------------------------------------------------------------
 
 
 class LazyVerifyGraphRunner:
-    """CUDAGraph capture / replay for lazy verify decode (two tokens per seq)."""
+    """CUDAGraph capture/replay for fixed-width linear MTP verification."""
 
     def __init__(self, config, hf_config, cache_ctx):
         max_bs = min(config.max_num_seqs, 512)
         block_size = cache_ctx.block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        self._verify_width = config.num_speculative_tokens + 1
 
-        # Buffers sized for max_bs seqs × 2 tokens
-        self._input_ids = torch.zeros(max_bs * 2, dtype=torch.int64)
-        self._positions = torch.zeros(max_bs * 2, dtype=torch.int64)
-        self._slot_mapping = torch.full((max_bs * 2,), -1, dtype=torch.int32)
+        # Sequence-major buffers: [base, draft_1, ..., draft_N].
+        self._input_ids = torch.zeros(max_bs * self._verify_width, dtype=torch.int64)
+        self._positions = torch.zeros(max_bs * self._verify_width, dtype=torch.int64)
+        self._slot_mapping = torch.full(
+            (max_bs * self._verify_width,), -1, dtype=torch.int32
+        )
         self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
-        self._outputs = torch.zeros(max_bs * 2, hf_config.hidden_size)
+        self._outputs = torch.zeros(max_bs * self._verify_width, hf_config.hidden_size)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
         self._uses_flash_mla_sched = (
@@ -593,10 +598,13 @@ class LazyVerifyGraphRunner:
     @torch.inference_mode()
     def capture(self, model, graph_pool, cache_ctx):
         """Capture lazy-verify CUDAGraphs using the shared pool."""
-        logger.info("Capturing lazy verify CUDAGraphs (seqlen_q=2)...")
+        logger.info(
+            "Capturing linear verify CUDAGraphs (seqlen_q=%s)...",
+            self._verify_width,
+        )
 
         for bs in reversed(self._bs_list):
-            n_tokens = bs * 2
+            n_tokens = bs * self._verify_width
             logger.info(f"Capturing lazy verify graph - bs={bs} (n_tokens={n_tokens})")
 
             # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
@@ -617,7 +625,7 @@ class LazyVerifyGraphRunner:
                 context_lens=self._context_lens,
                 block_tables=self._block_tables,
                 is_dummy=False,
-                num_tokens_per_seq=2,
+                num_tokens_per_seq=self._verify_width,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
                 gdn_state_slots=(
@@ -663,12 +671,14 @@ class LazyVerifyGraphRunner:
     ) -> torch.Tensor | None:
         """Copy inputs, replay.  Returns ``None`` if no graph matches bs."""
         n_tokens = input_ids.size(0)
-        bs = n_tokens // 2
+        if n_tokens % self._verify_width != 0:
+            return None
+        bs = n_tokens // self._verify_width
         master_bs = next((x for x in self._bs_list if x >= bs), None)
         if master_bs is None or master_bs not in self._graphs:
             return None
 
-        n = bs * 2
+        n = bs * self._verify_width
         self._input_ids[:n] = input_ids
         self._positions[:n] = positions
         self._slot_mapping.fill_(-1)
@@ -699,6 +709,218 @@ class LazyVerifyGraphRunner:
 # ---------------------------------------------------------------------------
 
 
+class CachedMTPChainGraphRunner:
+    """Capture the recurrent top-1 predictor chain with persistent MLA KV.
+
+    GLM uses one NextN layer recurrently: the draft-extend forward produces
+    the first draft, then this graph produces the remaining N-1 drafts.  The
+    page-table and IndexShare inputs are copied into persistent buffers before
+    replay, while per-step context lengths and slot mappings are advanced in
+    the graph.  This mirrors SGLang's top-1 EAGLE draft graph without importing
+    any SGLang runtime code.
+    """
+
+    def __init__(self, config, hf_config):
+        max_bs = min(config.max_num_seqs, 512)
+        block_size = config.kvcache_block_size
+        max_num_blocks = (config.max_model_len + block_size - 1) // block_size
+        index_topk = int(getattr(hf_config, "index_topk", 0) or 0)
+
+        self._input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        self._positions = torch.zeros(max_bs, dtype=torch.int64)
+        self._hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
+        self._initial_cache_lens = torch.ones(max_bs, dtype=torch.int32)
+        self._active = torch.ones(max_bs, dtype=torch.bool)
+        self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
+        self._context_lens = torch.ones(1, max_bs, dtype=torch.int32)
+        self._slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        self._indexer_logical = torch.zeros(max_bs, index_topk, dtype=torch.int32)
+        self._indexer_physical = torch.zeros(max_bs, index_topk, dtype=torch.int32)
+        self._drafts = torch.zeros(
+            max_bs, config.num_speculative_tokens - 1, dtype=torch.int64
+        )
+
+        self._max_num_seqs = config.max_num_seqs
+        self._block_size = block_size
+        self._num_steps = config.num_speculative_tokens - 1
+        self._index_topk = index_topk
+        self._bs_list = _make_bs_list(max_bs)
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._sched_metas: dict[int, object] = {}
+        self._sparse_sched_metas: dict[int, object] = {}
+        self._uses_flash_mla_sched = (
+            getattr(hf_config, "kv_lora_rank", 0) > 0
+            and torch.cuda.get_device_capability()[0] < 10
+        )
+        if self._uses_flash_mla_sched:
+            import flash_mla
+
+            self._flash_mla = flash_mla
+
+    def _install_context(self, bs: int, cache_ctx, mtp_model):
+        from dlengine.runtime.models.deepseek_v2.deepseek_v2 import _IndexerTopKState
+
+        set_batch_context(
+            is_prefill=False,
+            max_bs=self._max_num_seqs,
+            slot_mapping=self._slot_mapping[:bs],
+            context_lens=self._context_lens,
+            block_tables=self._block_tables,
+            is_dummy=False,
+            num_tokens_per_seq=1,
+            paged_attention_strategy=PagedAttentionStrategy.FLASH_MLA,
+        )
+        set_expert_context(use_low_latency_ep=True)
+        get_hca_context().tile_scheduler_metadata = cache_ctx[0]
+        get_mla_context().sparse_tile_scheduler_metadata = cache_ctx[1]
+        return _IndexerTopKState(
+            logical_indices=self._indexer_logical[:bs],
+            physical_indices=self._indexer_physical[:bs],
+            source_layer=mtp_model.mtp_start_layer_idx,
+        )
+
+    def _run_chain(self, mtp_model, bs: int, indexer_state) -> None:
+        current_ids = self._input_ids[:bs]
+        current_hidden = self._hidden_states[:bs]
+        for step in range(self._num_steps):
+            cache_lens = self._initial_cache_lens[:bs] + step + 1
+            self._context_lens[0, :bs].copy_(cache_lens)
+            logical_slots = cache_lens.to(torch.long) - 1
+            block_indices = logical_slots // self._block_size
+            page_ids = self._block_tables[0, :bs].gather(1, block_indices[:, None])[
+                :, 0
+            ]
+            slots = page_ids * self._block_size + logical_slots % self._block_size
+            self._slot_mapping[:bs].copy_(
+                torch.where(self._active[:bs], slots, slots.new_full((), -1))
+            )
+
+            current_hidden = mtp_model(
+                current_ids,
+                self._positions[:bs] + step,
+                current_hidden,
+                spec_step_idx=step + 1,
+                indexer_state=indexer_state,
+                reuse_indexer_topk=True,
+            )
+            logits = mtp_model.compute_logits(current_hidden, spec_step_idx=step + 1)
+            current_ids = logits.argmax(dim=-1)
+            self._drafts[:bs, step].copy_(current_ids)
+
+    @torch.inference_mode()
+    def capture(self, mtp_model, graph_pool):
+        logger.info("Capturing cached recurrent MTP chain CUDAGraphs...")
+        ExpertContext.get_instance().transition_to_low_latency()
+
+        for bs in reversed(self._bs_list):
+            logger.info("Capturing cached MTP chain graph - bs=%s", bs)
+            sched_meta = sparse_sched_meta = None
+            if self._uses_flash_mla_sched:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+            indexer_state = self._install_context(
+                bs, (sched_meta, sparse_sched_meta), mtp_model
+            )
+            self._run_chain(mtp_model, bs, indexer_state)
+
+            if self._uses_flash_mla_sched:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sched_metas[bs] = sched_meta
+                self._sparse_sched_metas[bs] = sparse_sched_meta
+            indexer_state = self._install_context(
+                bs, (sched_meta, sparse_sched_meta), mtp_model
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, graph_pool):
+                self._run_chain(mtp_model, bs, indexer_state)
+            self._graphs[bs] = graph
+
+        reset_runtime_contexts()
+        logger.info("Finished capturing %s cached MTP chain graphs", len(self._graphs))
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        initial_cache_lens: torch.Tensor,
+        source_context: Context,
+        indexer_state,
+        bs: int,
+    ) -> list[torch.Tensor] | None:
+        master_bs = next((value for value in self._bs_list if value >= bs), None)
+        if (
+            master_bs not in self._graphs
+            or indexer_state is None
+            or indexer_state.logical_indices is None
+            or indexer_state.physical_indices is None
+        ):
+            return None
+
+        block_tables = source_context.block_tables
+        if block_tables is None:
+            return None
+
+        # Keep the conservative full initialization while validating grouped
+        # copies independently from padding-row lifetime.
+        self._input_ids.zero_()
+        self._positions.zero_()
+        self._hidden_states.zero_()
+        self._initial_cache_lens.fill_(1)
+        self._active.zero_()
+        self._block_tables.zero_()
+        self._indexer_logical.zero_()
+        self._indexer_physical.zero_()
+
+        self._input_ids[:bs].copy_(input_ids)
+        self._positions[:bs].copy_(positions)
+        self._hidden_states[:bs].copy_(hidden_states)
+        self._initial_cache_lens[:bs].copy_(initial_cache_lens[:bs])
+        self._active[:bs].fill_(True)
+        self._block_tables[:, : block_tables.size(1), : block_tables.size(2)].copy_(
+            block_tables
+        )
+        self._indexer_logical[:bs].copy_(indexer_state.logical_indices)
+        self._indexer_physical[:bs].copy_(indexer_state.physical_indices)
+
+        self._graphs[master_bs].replay()
+        return [self._drafts[:bs, step] for step in range(self._num_steps)]
+
+    def run_padding(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        bs: int,
+    ) -> bool:
+        """Replay the recurrent chain without writing predictor KV.
+
+        Attention-DP ranks with no real request still have to enter the same
+        EP collectives as active ranks. Reusing the captured chain keeps the
+        four recurrent predictor steps graph-symmetric; inactive slot mappings
+        remain -1 so this padding work cannot corrupt page zero.
+        """
+        master_bs = next((value for value in self._bs_list if value >= bs), None)
+        if master_bs not in self._graphs:
+            return False
+
+        self._input_ids.zero_()
+        self._positions.zero_()
+        self._hidden_states.zero_()
+        self._initial_cache_lens.fill_(1)
+        self._active.zero_()
+        self._block_tables.zero_()
+        self._indexer_logical.zero_()
+        self._indexer_physical.zero_()
+
+        self._input_ids[:bs].copy_(input_ids)
+        self._positions[:bs].copy_(positions)
+        self._hidden_states[:bs].copy_(hidden_states)
+        self._graphs[master_bs].replay()
+        return True
+
+
 class MTPGraphRunner:
     """CUDAGraph capture / replay for MTP speculative draft forward."""
 
@@ -711,8 +933,10 @@ class MTPGraphRunner:
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         self._max_num_seqs = config.max_num_seqs
+        self._num_speculative_tokens = config.num_speculative_tokens
+        self._num_predictors = 1
         self._bs_list = _make_bs_list(max_bs)
-        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         # Each bs gets its own cu_seqlens (must outlive graph lifetime)
         self._cu_seqlens_per_bs: dict[int, torch.Tensor] = {}
 
@@ -726,42 +950,50 @@ class MTPGraphRunner:
         # Must enter low-latency EP before MTP forward
         ExpertContext.get_instance().transition_to_low_latency()
 
-        for bs in reversed(self._bs_list):
-            logger.info(f"Capturing MTP graph - bs={bs}")
+        num_predictors = max(1, int(getattr(mtp_model, "num_mtp_layers", 1)))
+        self._num_predictors = min(self._num_speculative_tokens, num_predictors)
+        predictor_indices = range(self._num_predictors)
+        for predictor_idx in predictor_indices:
+            for bs in reversed(self._bs_list):
+                logger.info(
+                    "Capturing MTP graph - predictor=%s bs=%s",
+                    predictor_idx,
+                    bs,
+                )
 
-            cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
-            self._cu_seqlens_per_bs[bs] = cu_seqlens
+                cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+                self._cu_seqlens_per_bs[bs] = cu_seqlens
 
-            set_batch_context(
-                is_prefill=True,
-                max_bs=self._max_num_seqs,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=1,
-                max_seqlen_k=1,
-                slot_mapping=None,
-                block_tables=None,
-                is_dummy=False,
-            )
-            set_expert_context(use_low_latency_ep=True)
+                set_batch_context(
+                    is_prefill=True,
+                    max_bs=self._max_num_seqs,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=1,
+                    max_seqlen_k=1,
+                    slot_mapping=None,
+                    block_tables=None,
+                    is_dummy=False,
+                )
+                set_expert_context(use_low_latency_ep=True)
 
-            # Warmup
-            self._outputs[:bs] = mtp_model(
-                self._input_ids[:bs],
-                self._positions[:bs],
-                self._hidden_states[:bs],
-            )
-
-            # Capture
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, graph_pool):
                 self._outputs[:bs] = mtp_model(
                     self._input_ids[:bs],
                     self._positions[:bs],
                     self._hidden_states[:bs],
+                    spec_step_idx=predictor_idx,
                 )
 
-            self._graphs[bs] = graph
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, graph_pool):
+                    self._outputs[:bs] = mtp_model(
+                        self._input_ids[:bs],
+                        self._positions[:bs],
+                        self._hidden_states[:bs],
+                        spec_step_idx=predictor_idx,
+                    )
+
+                self._graphs[(predictor_idx, bs)] = graph
 
         reset_runtime_contexts()
         logger.info(f"Finished capturing {len(self._graphs)} MTP CUDAGraphs")
@@ -773,15 +1005,18 @@ class MTPGraphRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        spec_step_idx: int,
         bs: int,
     ) -> torch.Tensor | None:
         """Copy inputs, replay.  Returns ``None`` if no graph matches bs."""
         master_bs = next((x for x in self._bs_list if x >= bs), None)
-        if master_bs is None or master_bs not in self._graphs:
+        predictor_idx = spec_step_idx % self._num_predictors
+        graph_key = (predictor_idx, master_bs) if master_bs is not None else None
+        if graph_key not in self._graphs:
             return None
 
         self._input_ids[:bs] = input_ids
         self._positions[:bs] = positions
         self._hidden_states[:bs] = hidden_states
-        self._graphs[master_bs].replay()
+        self._graphs[graph_key].replay()
         return self._outputs[:bs]

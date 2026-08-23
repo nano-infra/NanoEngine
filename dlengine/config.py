@@ -153,7 +153,13 @@ class Config(BaseModel):
     executor_backend: Literal["ray", "dlslime"] = "ray"
 
     # MTP (Multi-Token Prediction) speculative decoding
-    num_speculative_tokens: int = 0  # 0 = disabled, >0 = number of draft tokens
+    # Number of recurrent model-native draft steps. Verification width is
+    # derived as N+1 (for GLM: N=5 means one predictor reused five times and a
+    # six-token target span), not a count of predictor layers.
+    num_speculative_tokens: int = 0
+    enable_mtp_chain_graph: bool = Field(
+        default_factory=lambda: os.environ.get("DLENGINE_MTP_CHAIN_GRAPH", "1") == "1"
+    )
 
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
@@ -513,7 +519,10 @@ class Config(BaseModel):
                     )
 
         # MTP validation
+        if self.num_speculative_tokens < 0:
+            raise ValueError("num_speculative_tokens must be non-negative")
         if self.num_speculative_tokens > 0:
+            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
             has_mtp = (
                 getattr(self.hf_config, "num_nextn_predict_layers", 0) > 0
                 or getattr(self.hf_config, "mtp_num_hidden_layers", 0) > 0
@@ -524,6 +533,24 @@ class Config(BaseModel):
                     f"model does not have MTP layers "
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
+            if self.num_speculative_tokens > 1:
+                if self.mode in ("prefill", "decode"):
+                    raise ValueError(
+                        "multi-step MTP currently requires a colocated hybrid "
+                        "engine; PD-disaggregated multi-step MTP is not supported"
+                    )
+                if arch != "GlmMoeDsaForCausalLM":
+                    raise ValueError(
+                        "num_speculative_tokens > 1 is currently supported only "
+                        "for GlmMoeDsaForCausalLM"
+                    )
+                verify_width = self.num_speculative_tokens + 1
+                if self.ffn_ep > 1 and self.max_num_seqs * verify_width > 128:
+                    raise ValueError(
+                        "GLM multi-step MTP exceeds the DeepEP low-latency token "
+                        f"capacity: max_num_seqs * (N+1) = "
+                        f"{self.max_num_seqs * verify_width} > 128"
+                    )
             # KV-cache reservation for the extra MTP tokens per decode step is
             # handled in the Rust scheduler directly from num_speculative_tokens;
             # nothing to inflate here. The decode loop always runs a single

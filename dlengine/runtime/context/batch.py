@@ -24,6 +24,7 @@ class BatchContext(BaseContext):
     paged_attention_strategy: PagedAttentionStrategy | None = None
     graph_attention_strategy: PagedAttentionStrategy | None = None
     decode_page_plan_key: tuple[int, ...] | None = None
+    mtp_draft_safe: bool = True
 
     # TODO(context): move these backend-specific fields to their own
     # attention contexts after all call sites use BatchContext directly.
@@ -37,7 +38,7 @@ class BatchContext(BaseContext):
     hisparse_slots: torch.Tensor | None = None
     hisparse_slot_mapping: torch.Tensor | None = None
     hisparse_num_real_reqs: torch.Tensor | None = None
-    indexer_schedule_meta: torch.Tensor | None = None
+    indexer_schedule_meta: torch.Tensor | tuple[torch.Tensor, ...] | None = None
 
     @classmethod
     def get_context_type(cls) -> str:
@@ -89,6 +90,7 @@ def set_batch_context(
     paged_attention_strategy: PagedAttentionStrategy | None = None,
     graph_attention_strategy: PagedAttentionStrategy | None = None,
     decode_page_plan_key: tuple[int, ...] | None = None,
+    mtp_draft_safe: bool = True,
 ) -> BatchContext:
     global _CONTEXT
     gdn_state_slots_i32 = None
@@ -115,6 +117,7 @@ def set_batch_context(
         paged_attention_strategy=paged_attention_strategy,
         graph_attention_strategy=graph_attention_strategy,
         decode_page_plan_key=decode_page_plan_key,
+        mtp_draft_safe=mtp_draft_safe,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,

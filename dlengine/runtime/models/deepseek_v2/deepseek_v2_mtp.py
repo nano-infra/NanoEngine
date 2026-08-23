@@ -13,7 +13,10 @@ import torch.nn as nn
 
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.runtime.layers.layernorm import RMSNorm
-from dlengine.runtime.models.deepseek_v2.deepseek_v2 import DeepseekV2DecoderLayer
+from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
+    _IndexerTopKState,
+    DeepseekV2DecoderLayer,
+)
 from dlengine.runtime.models.quant_config import QuantizationConfig
 
 
@@ -25,9 +28,16 @@ class DeepSeekMTPSharedHead(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply norm (head projection is called separately)."""
-        return self.norm(hidden_states)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Produce the normalized hidden state consumed by logits and recurrence."""
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class DeepSeekMTPLayer(nn.Module):
@@ -57,6 +67,8 @@ class DeepSeekMTPLayer(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor,
+        indexer_state: _IndexerTopKState | None = None,
+        reuse_indexer_topk: bool = False,
     ) -> torch.Tensor:
         # Normalize both inputs
         inputs_embeds = self.enorm(inputs_embeds)
@@ -69,10 +81,13 @@ class DeepSeekMTPLayer(nn.Module):
 
         # Run through full decoder layer
         hidden_states, residual = self.mtp_block(
-            hidden_states, positions, residual=None
+            hidden_states,
+            positions,
+            residual=None,
+            indexer_state=indexer_state,
+            reuse_indexer_topk=reuse_indexer_topk,
         )
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return self.shared_head(hidden_states, residual)
 
 
 class DeepSeekMTP(nn.Module):
@@ -111,10 +126,18 @@ class DeepSeekMTP(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        indexer_state: _IndexerTopKState | None = None,
+        reuse_indexer_topk: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
         layer_idx = self.mtp_start_layer_idx + (spec_step_idx % self.num_mtp_layers)
-        return self.layers[str(layer_idx)](positions, hidden_states, inputs_embeds)
+        return self.layers[str(layer_idx)](
+            positions,
+            hidden_states,
+            inputs_embeds,
+            indexer_state=indexer_state,
+            reuse_indexer_topk=reuse_indexer_topk,
+        )
 
     def compute_logits(
         self,
@@ -123,8 +146,13 @@ class DeepSeekMTP(nn.Module):
     ) -> torch.Tensor:
         layer_idx = self.mtp_start_layer_idx + (spec_step_idx % self.num_mtp_layers)
         layer = self.layers[str(layer_idx)]
-        normed = layer.shared_head(hidden_states)  # RMSNorm
-        return layer.shared_head.head(normed)  # ParallelLMHead
+        # forward already returned shared_head.norm output. Reapplying the
+        # learned RMSNorm here would distort both logits and recurrent hidden.
+        head = layer.shared_head.head
+        forward_all_rows = getattr(head, "forward_all_rows", None)
+        if forward_all_rows is not None:
+            return forward_all_rows(hidden_states)
+        return head(hidden_states)
 
     def load_weights(self, weights):
         from .deepseek_v2_mtp_loader import load_weights

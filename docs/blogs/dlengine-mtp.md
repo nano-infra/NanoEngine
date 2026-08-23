@@ -23,28 +23,27 @@ MTP（Multi-Token Prediction）是一种特殊的投机解码方案：**草稿�
 | 线性注意力状态管理复杂 | GatedDeltaNet 等 RNN-like 层的 recurrent state 在分支上需要完整快照 |
 | EP 通信放大            | 树的每个候选 token 都要参与 All-to-All 路由，通信量与分支数成正比   |
 
-DLEngine 的选择是一种更务实的策略：**Lazy Verify（惰性验证）**——每步只验证一个 draft token，通过 `seqlen_q=2` 的巧妙编码将验证融入正常 decode 流程。
+DLEngine 的选择是一种更务实的策略：**线性 Lazy Verify（惰性验证）**。每个位置只有一个 draft，不展开 tree；目标模型通过固定的 `seqlen_q=N+1` 一次验证整条线性链。
 
-#### 2.2 seqlen_q=2 的核心思路
+#### 2.2 seqlen_q=N+1 的核心思路
 
-标准 decode 是 `seqlen_q=1`：每个序列送入 1 个 token，产出 1 个 logit。Lazy verify 将其扩展为 `seqlen_q=2`：
+标准 decode 是 `seqlen_q=1`。开启 MTP 后，`num_speculative_tokens=N` 表示 predictor recurrent 运行 N 次，目标模型的验证宽度由系统推导为 `K=N+1`：
 
 ```
 标准 decode (seqlen_q=1):
   输入: [sampled_token]
   输出: [logit_for_next]
 
-Lazy verify (seqlen_q=2):
-  输入: [prev_sampled, draft_0]      ← 两个 token 交替拼接
-  输出: [verify_logit, bonus_logit]   ← 分别用于验证和奖励采样
+Linear lazy verify (seqlen_q=N+1):
+  输入: [base, draft_1, ..., draft_N]
+  输出: [verify_1, ..., verify_N, bonus]
 ```
 
-对于 batch 中的每个序列，输入从 1 个 token 扩展为 2 个 token（上一步采样的 token + MTP 预测的 draft token），interleave 排列为 `[prev_0, draft_0, prev_1, draft_1, ...]`。
+布局采用 sequence-major：`[base_0, d01, ..., d0N, base_1, d11, ...]`。如果前 `a` 个 draft 被接受，就输出这 `a` 个 draft，再输出拒绝恢复 token；如果 N 个全部接受，则追加 bonus token。
 
-输出 logits 也相应产生两组：
+GLM 是最重要的多步场景。GLM checkpoint 只有 **1 个 MTP predictor layer**；`num_speculative_tokens=5` 的含义是同一层 recurrent 运行 5 次，保留 5 个 draft，并由 target 验证 6-token span。它不是 5 个或 6 个 predictor layer。
 
-- **偶数位 `[0::2]`（verify logits）**：基于 prev_sampled 和 draft_0 的联合注意力产出，用于验证 draft_0 是否正确
-- **奇数位 `[1::2]`（bonus logits）**：如果 draft_0 被接受，直接从 bonus logits 采样下一步的 token（免费多得一个 token）
+draft 固定使用 greedy，因而 draft distribution 是 one-hot。`temperature > 0` 时，第 i 个 draft `d` 以 target 概率 `p_i(d)` 被接受；拒绝时从 `p_i` 屏蔽 `d` 后的残差分布采样。这样输出严格保持 target distribution。completion logprob 始终取原始 target distribution，而不是残差分布。
 
 #### 2.3 三阶段 Decode 流程
 
@@ -57,24 +56,25 @@ Lazy verify (seqlen_q=2):
 │  Phase 1: 验证     │  Phase 2: 采样    │  Phase 3: 草稿生成       │
 │  Lazy Verify       │  Sample           │  MTP Draft Generation   │
 │                   │                  │                          │
-│  拼接 seqlen_q=2   │  verify_logit:    │  取 last_hidden          │
-│  input_ids =      │    accepted?      │  走 MTP 层 forward       │
-│  [prev, draft]    │  bonus_logit:     │  产出 N 个 draft token   │
+│  拼接 seqlen_q=N+1 │  逐位 rejection   │  取接受前缀末端 hidden    │
+│  input_ids =      │  sampling；全接受  │  recurrent 运行 MTP 层    │
+│  [base,d1,...,dN] │  时采 bonus        │  产出 N 个 greedy draft   │
 │                   │    free token!    │  保存到 _prev_drafts     │
 │  Target Model     │  GDN rollback     │                          │
 │  Forward          │  if rejected      │  保存/恢复 decode 上下文   │
 └───────────────────┴──────────────────┴──────────────────────────┘
 ```
 
-**Phase 1（输入准备 + Forward）**：将上一步的 `prev_sampled_token` 和 `prev_draft[0]` 交替拼接，走 `LazyVerifyGraphRunner` 做 `seqlen_q=2` 的 forward。
+**Phase 1（输入准备 + Forward）**：按 `seq_id` 对齐上一步保存的 draft chain，拼成 sequence-major 的 `[base,d1,...,dN]`，走 `LazyVerifyGraphRunner` 做 `seqlen_q=N+1` forward。
 
 **Phase 2（采样 + 状态回滚）**：
 
-- 从 verify logits 采样 `target_pred`，与 `prev_draft[0]` 比较
-- 如果 `target_pred == prev_draft[0]`：接受！从 bonus logits 采样下一个 token（免费多获得一个 token）
-- 如果不匹配：拒绝，使用 `target_pred` 作为新的采样结果，并回滚 GDN 线性注意力状态
+- greedy target 下逐位比较 argmax；stochastic target 下执行精确 one-hot rejection sampling
+- 接受长度可以是 `0..N`；全接受时从最后一行 target logits 采 bonus
+- target forward 虽然写入全部 K 个位置，但下一步只把 base 和接受前缀标为逻辑可见
+- N=1 的 GDN 路径在拒绝时恢复快照；N>1 首先支持无 recurrent state 的 GLM DSA/MLA
 
-**Phase 3（MTP 草稿生成）**：利用 target model 的 `last_hidden_states`，通过 MTP 层快速生成下一批草稿 token，储存起来供下一个 decode step 使用。
+**Phase 3（MTP 草稿生成）**：先用 target verify 的精确 hidden replay 接受前缀和新采样 token，刷新 predictor KV；再把 `shared_head.norm(hidden, residual)` 的输出同时用于 logits 和下一次 recurrent 输入。GLM 配置开启 `index_share_for_mtp_iteration` 时，从 draft-extend 选出每个请求的最后一行 DSA TopK，并在余下递归中复用。
 
 ### 3. 关键工程挑战与解法
 
@@ -112,49 +112,45 @@ if rollback_mask.any():
 
 > **attention_dp > 1 的陷阱**：在多路 DP 场景下，并非所有 DP rank 都拥有某个序列的真实 GDN slot。非 owner rank 的 `gdn_state_slots` 指向 dummy slot，回滚前必须用 `real_slot_mask = slots < gdn_max_active_slots` 过滤，否则会越界写入 dummy 区域，造成状态污染。
 
-#### 3.2 三路 CUDAGraph 捕获
+#### 3.2 CUDAGraph 捕获
 
 为了最大化 decode 性能，DLEngine 对三种不同的 forward 模式分别捕获 CUDAGraph：
 
-| 模式        | Runner                  | seqlen_q | 特点                                                            |
-| ----------- | ----------------------- | -------- | --------------------------------------------------------------- |
-| 标准 Decode | `DecodeGraphRunner`     | 1        | 常规自回归解码                                                  |
-| 惰性验证    | `LazyVerifyGraphRunner` | 2        | 输入 buffer 为 `max_bs * 2`，tile scheduler 按双倍 q-heads 计算 |
-| MTP 草稿    | `MTPGraphRunner`        | 1        | 以 prefill 模式运行（无 KV Cache），使用低延迟 EP 模式          |
+| 模式        | Runner                      | seqlen_q | 特点                                                                  |
+| ----------- | --------------------------- | -------- | --------------------------------------------------------------------- |
+| 标准 Decode | `DecodeGraphRunner`         | 1        | 常规自回归解码                                                        |
+| 惰性验证    | `LazyVerifyGraphRunner`     | N+1      | 固定 K 的 sequence-major 输入，支持 DSA/MLA 稀疏验证                  |
+| N=1 草稿    | `MTPGraphRunner`            | 1        | 兼容既有无 cache predictor 路径                                       |
+| GLM 草稿链  | `CachedMTPChainGraphRunner` | 1        | draft-extend 后，将同一 predictor 的余下 N-1 次 recurrent 合并 replay |
 
 三个 Runner 共享同一个 `torch.cuda.graphs.MemPool`——由 `DecodeGraphRunner` 首次 capture 时分配，随后传给其他 Runner。这保证了 graph replay 之间可以零拷贝地复用临时显存。
 
-每个 Runner 预先捕获一组离散的 batch size（`[1, 2, 4, 8, 16, 32, ...]`），运行时自动向上取整到最近的已捕获 batch size。
+每个 Runner 预先捕获一组离散的 batch size（`[1, 2, 4, 8, 16, 32, ...]`），运行时自动向上取整到最近的已捕获 batch size。GLM N=5 的第一次 draft-extend 需要刷新 predictor KV 和 DSA TopK，仍然 eager 执行；后续 4 次复用同一个 IndexShare 状态，由一个 cached-chain graph replay 完成。可通过 `DLENGINE_MTP_CHAIN_GRAPH=0` 回退 eager 路径做 A/B。
 
 > **关键细节**：所有 capture 方法都必须在 `@torch.inference_mode()` 下执行。这是因为 GDN 层内部调用了 flashinfer 的 cutlass DSL kernel，其中的 `from_dlpack()` 会拒绝 `requires_grad=True` 的张量，在非推理模式下会触发 `BufferError`。
 
-#### 3.3 MTP 草稿生成的上下文切换
+#### 3.3 MTP 草稿生成的上下文切换与持久化 KV
 
-MTP forward 和标准 decode forward 使用完全不同的上下文配置：
+N=1 兼容路径和 GLM 多步路径使用不同的 predictor 上下文：
 
-- **Decode**：`is_prefill=False`，需要 KV Cache（slot_mapping, block_tables, context_lens）
-- **MTP**：`is_prefill=True`（伪 prefill），不需要 KV Cache，仅需 cu_seqlens
+- **N=1**：使用 `is_prefill=True` 的无 cache predictor forward。
+- **GLM N=5**：为唯一的物理 predictor layer 分配独立 MLA/DSA cache slice；prefill 用 shifted token/target hidden 建 cache，decode 和 draft-extend 使用共享 page table 与独立 layer index 持久更新。
 
-由于 DLEngine 使用全局 Context 单例来传递模型执行上下文，MTP 在做 forward 前必须：
+由于 DLEngine 使用全局 Context 单例传递模型执行上下文，predictor forward 前后必须保存并恢复 target 的 batch context、dense MLA metadata 和 sparse DSA metadata。attention-DP 的 dummy rank 没有有效 page table，但仍需执行相同次数的无 cache predictor padding，以保证 8 路 EP collective 顺序一致。完整 prefix-cache 命中会产生零长度 fresh segment；该轮不使用 `cu_seqlens_q - 1` 提取末行，而是安全退回普通 decode，并让空 rank 继续执行 5 次最小 dummy predictor forward，避免 CUDA gather 越界或 EP collective 失配。
 
-1. **保存**当前的 decode context（slot_mapping, block_tables 等）
-2. **切换**到 MTP context（cu_seqlens, 无 KV Cache，低延迟 EP 模式）
-3. 执行 MTP forward
-4. **恢复** decode context
-
-这个 save/restore 过程由 `MTPWorker.generate_and_store()` 负责，确保 MTP 的上下文不会泄漏到后续的 decode step。
+GLM checkpoint 只有一个 predictor layer，因此额外 cache 层数是 1，而不是 5 或 6。
 
 #### 3.4 KV Cache 预算与调度协同
 
-MTP 每步只运行 1 次 decode，但可能产出 1 + N 个 token（1 个采样 + N 个被接受的草稿）。调度器必须提前预留足够的 KV Cache block：
+MTP 每步只运行 1 次 target decode，但可能提交 1 到 N+1 个 token。prefill 需要为首批 draft 预留 N 个 lookahead token；decode 最坏情况下既要写入 N 个 verify 位置，又要为下一批 N 个 recurrent draft 保留位置，因此预留 2N：
 
 ```cpp
-// scheduler.cpp —— 直接由 num_speculative_tokens 推导每步预留的 token 数
-kv_reserve_tokens_ = num_speculative_tokens > 0 ? num_speculative_tokens + 2 : 1;
-// 例: num_speculative_tokens=1 → 每步预留 3 个 token 的 block
+prefill_needed = num_tokens + N;
+decode_needed = num_tokens + 2 * N;
+// 例: 当前 num_tokens=100、N=5 → decode 预留到 token 110
 ```
 
-C++ 调度器用 `kv_reserve_tokens_` 计算 block 需求（普通 decode 为 1），保证 KV Cache 不会 OOM。decode 循环本身恒为单次执行——MTP 在这一次执行内产出额外的 token，无需任何多轮循环。
+Rust 调度器同时在 EOS、`max_tokens` 和 `max_model_len` 的第一个终止点截断 speculative bundle，事件回传、completion logprob 和 decode-token metrics 都只使用实际提交的前缀。
 
 ### 4. 模块化代码架构
 
@@ -166,7 +162,7 @@ ModelRunner (编排者, ~590 行)
   │     prepare_prefill_bytes()
   │     prepare_decode_bytes()
   │
-  ├── MTPWorker           (MTP 生命周期, ~385 行)
+  ├── MTPRunner           (MTP 生命周期与精确采样)
   │     prepare_lazy_verify_decode()
   │     lazy_verify_sample()
   │     generate_and_store()
@@ -177,15 +173,25 @@ ModelRunner (编排者, ~590 行)
   │     inject()
   │
   ├── DecodeGraphRunner    (标准 decode 图)
-  ├── LazyVerifyGraphRunner(验证 decode 图)  ← 由 MTPWorker 持有
-  └── MTPGraphRunner       (草稿生成图)      ← 由 MTPWorker 持有
+  ├── LazyVerifyGraphRunner(验证 decode 图)  ← 由 MTPRunner 持有
+  ├── MTPGraphRunner       (N=1 草稿图)      ← 由 MTPRunner 持有
+  └── CachedMTPChainGraphRunner (GLM recurrent 草稿链图)
 ```
 
 `ModelRunner` 作为顶层编排者，通过持有各组件实例来协调整个 decode 流程。每个组件职责单一、高内聚低耦合，可以独立理解和修改。
 
 ### 5. 端到端执行流程
 
-以 Qwen3.5-397B-A17B-FP8 在 8×H200（attention_dp=8, ffn_ep=8）上的一次完整推理为例：
+以 GLM-5.2-FP8 在 8×H100/H200（attention_dp=8, ffn_ep=8, `num_speculative_tokens=5`）上的一次完整推理为例：
+
+```bash
+dlengine serve /nvmedata/GLM-5.2-FP8 \
+  --attention_dp 8 \
+  --ffn_ep 8 \
+  --ctrl_address 127.0.0.1:4479 \
+  --executor_backend dlslime \
+  --num_speculative_tokens 5
+```
 
 ```
 请求到达
@@ -193,17 +199,13 @@ ModelRunner (编排者, ~590 行)
   ▼
 Prefill Phase
   │  标准 prefill forward → 采样 token_0
-  │  MTP: generate_and_store() → 产出 draft_1
-  │  保存 _prev_drafts = [draft_1], _prev_sampled = token_0
+  │  MTP: 同一个 predictor recurrent 5 次 → [draft_1, ..., draft_5]
   │
   ▼
 Decode Step 1 (有 draft)
-  │  Phase 1: 拼接 [token_0, draft_1] → seqlen_q=2 → LazyVerifyGraphRunner.replay()
-  │  Phase 2: verify_logit 采样 target_pred
-  │           target_pred == draft_1?
-  │           ├─ Yes: 接受! 从 bonus_logit 采样 token_2, 输出 [draft_1, token_2]
-  │           └─ No:  拒绝, 回滚 GDN 状态, 输出 [target_pred]
-  │  Phase 3: MTP generate_and_store() → 产出新的 draft
+  │  Phase 1: 拼接 [token_0,d1,...,d5] → seqlen_q=6 → target graph replay
+  │  Phase 2: 精确验证，接受 a∈[0,5]，输出 [d1,...,da,next]
+  │  Phase 3: 从接受前缀末端 hidden recurrent 生成新的 5-token draft chain
   │
   ▼
 Decode Step 2 (有 draft)
@@ -215,29 +217,39 @@ Decode Step 2 (有 draft)
 
 ### 6. 性能表现
 
-在 Qwen3.5-397B-A17B-FP8（8×H200, attention_dp=8, ffn_ep=8, `num_speculative_tokens=1`）上的单请求测试：
+GLM-5.2-FP8、8×Hopper、attention_dp=8、ffn_ep=8、dlslime，单请求生成 256 tokens。MTP 使用同一个 predictor layer recurrent 5 次，target K=6：
 
-| 指标                          | 数值      |
-| ----------------------------- | --------- |
-| ITL（Token 间延迟，不含排队） | ~17 ms    |
-| Decode 吞吐                   | ~71 tok/s |
-| E2E 延迟（131 tokens）        | ~3.26 s   |
+| Python merge-sort 编码任务 |          墙钟 |            ITL | Tokens/Step | 相对无 MTP |
+| -------------------------- | ------------: | -------------: | ----------: | ---------: |
+| 无 MTP                     |     约 6.88 s |       约 24 ms |        1.00 |      1.00× |
+| N=5 eager recurrent        |     约 3.41 s |     约 10.5 ms |        3.94 |   约 2.02× |
+| N=5 cached-chain graph     |   2.91–2.96 s | 10.22–10.43 ms |        3.94 |   约 2.35× |
+| N=5 target/MTP kernel 优化 | 2.274–2.294 s |   7.77–7.85 ms |        4.00 |   约 3.01× |
+| N=5 row-strided KV RMSNorm | 1.940–2.029 s |   6.45–6.82 ms |        4.74 |   约 3.49× |
 
-CUDAGraph capture：5 decode graphs + 5 MTP graphs + 5 lazy verify graphs，所有 8 个 worker 均无报错，capture 耗时约 15 秒。
+cached-chain graph 相比 eager MTP 再减少约 14% 墙钟。在此基础上，inactive attention-DP rank 也执行对称 recurrent graph，small-M FP8 quant 使用 packed reduction，Q-A/KV-A 共享一次输入量化，并用单个 Triton kernel 融合 interleaved-to-half 转换和 Q/K RoPE。最后加入 row-strided compressed-KV RMSNorm 后，8 次无 profiler 编码请求平均 1.974 s、ITL 平均 6.56 ms，最终相较无 MTP 约 3.49×。不同 rank 的 FP8 MoE 数值路径可能改变 draft 内容和接受长度，因此性能比较看 target-policy 语义与统计指标，不要求生成文本逐字一致。
+
+最后一个 target 热点来自 MLA compressed KV：576-wide projection 的前 512 维是 row-strided view，旧通用 RMSNorm 因为要求整块 contiguous，每层退回 `float → pow → mean → rsqrt → cast → mul → copy-back` 的 eager 链。现在 `rms_norm_strided_inplace` 直接在 stride=576 的 view 上原地归一化，可通过 `DLENGINE_INPLACE_MLA_KV_NORM=0` 回退旧路径。
+
+新 profiler 中 active target verify 从 3829 降到 3205 kernels，恰好减少 78 层 × 8 kernels；rank 0 GPU span p50 从 26.80 ms 降到 23.96 ms，八卡汇总 p50 为 24.94 ms。4-step recurrent chain 从 241 降到 237 kernels，八卡 p50 为 3.37 ms。作为参考，同机 SGLang 单-rank trace 的 target/recurrent 分别是 3317 kernels、24.19 ms 和 290 kernels、3.37 ms：Nano active target 已少 112 kernels，GPU 时间在单-rank和八卡口径下都处于同档；非 active attention-DP rank 的 padded verify 为 2987 kernels。完整时间线和 kernel summary 持久化在 `/mnt/h_public/majinming/timeline/nano`，没有依赖容器 `/tmp`。
+
+`temperature=0.7` 的 128-token Python 编码请求也完成了 exact rejection 路径；原地 KV RMSNorm 后复测 3/3 返回 128 tokens，接受长度为 4.00–4.74。16 路并发和连续两轮 8 路请求均通过。
 
 ### 7. 设计取舍总结
 
-| 设计决策                       | 取舍                  | 理由                                       |
-| ------------------------------ | --------------------- | ------------------------------------------ |
-| seqlen_q=2 而非树状推测        | 每步只验证 1 个 draft | 状态管理简洁，CUDAGraph 友好，无指数级膨胀 |
-| 独立的三路 Graph Runner        | 额外的 buffer 显存    | 职责清晰，capture/replay 解耦，便于调试    |
-| GDN 双倍状态池                 | 2× 显存开销           | 快照/回滚零重计算，无需 recompile          |
-| MTP 低延迟 EP 模式             | 上下文切换开销        | 确保 draft 生成的专家路由延迟最小          |
-| 按 num_speculative_tokens 预留 | 调度器多分配 block    | 提前预留 KV Cache，运行时无 OOM 风险       |
-| 组合模式拆分                   | 多文件、多类          | 高内聚低耦合，单文件可读，便于独立修改     |
+| 设计决策                       | 取舍                  | 理由                                     |
+| ------------------------------ | --------------------- | ---------------------------------------- |
+| 线性 chain 而非树状推测        | 每位置只有 1 个 draft | 固定 shape，CUDAGraph 友好，无指数级膨胀 |
+| 独立的三路 Graph Runner        | 额外的 buffer 显存    | 职责清晰，capture/replay 解耦，便于调试  |
+| GDN 双倍状态池                 | 2× 显存开销           | 快照/回滚零重计算，无需 recompile        |
+| MTP 低延迟 EP 模式             | 上下文切换开销        | 确保 draft 生成的专家路由延迟最小        |
+| 按 num_speculative_tokens 预留 | 调度器多分配 block    | 提前预留 KV Cache，运行时无 OOM 风险     |
+| 组合模式拆分                   | 多文件、多类          | 高内聚低耦合，单文件可读，便于独立修改   |
 
-### 8. 未来方向
+### 8. 当前能力边界与未来方向
 
-- **多 draft 验证 (num_speculative_tokens > 1)**：当前 lazy verify 每步验证 1 个 draft，后续可探索 seqlen_q=N+1 的多 token 并行验证
+- **已支持**：N=1 的既有 MTP；GLM DSA/MLA 在 Hopper 上的 N=5/K=6 线性多步路径；greedy 与 `temperature > 0`；completion logprob；batch reorder/shrink。
+- **暂不支持**：tree、HiSparse+MTP、GLM multi-step 的 PD/PP、非 Hopper multi-step、GDN multi-step、DeepSeek/Qwen multi-step。
+- **下一性能热点**：recurrent 与 active target verify 的 kernel 数和 GPU p50 均已达到 SGLang 同档；下一阶段优先降低 profiler 外的 CPU 调度抖动、DeepEP 长尾和 cold prefill/routing 开销，而不是为了计数继续拆改 recurrent 或 verify 控制流
 - **自适应投机深度**：根据运行时接受率动态调整 draft 数量，在高接受率时激进投机，低接受率时退回标准 decode
 - **与 EPLB 协同**：将 MTP 的 draft token 纳入专家负载均衡（EPLB）的统计，优化 EP 场景下的热点专家调度

@@ -240,6 +240,16 @@ class InputPreparer:
             (int(seq_len) + block_size - 1) // block_size
             for seq_len in local_context_lens
         )
+        # Positions originate in RunnerIn on the host. Decide the rare
+        # near-model-limit MTP fallback here so the decode hot path never has
+        # to call ``Tensor.any().item()`` after launching the target graph.
+        local_positions = meta.positions[: aux.num_group_seqs]
+        max_position = max(local_positions, default=-1)
+        num_drafts = self.config.num_speculative_tokens
+        mtp_draft_safe = (
+            num_drafts == 0
+            or max_position + 2 * num_drafts + 1 < self.config.max_model_len
+        )
 
         if len(meta.block_tables_flat) == 0:
             block_tables = torch.empty((1, 0, 0), dtype=torch.int32).cuda(
@@ -376,6 +386,7 @@ class InputPreparer:
                 )
             ),
             decode_page_plan_key=decode_page_plan_key,
+            mtp_draft_safe=mtp_draft_safe,
         )
         get_hca_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 
