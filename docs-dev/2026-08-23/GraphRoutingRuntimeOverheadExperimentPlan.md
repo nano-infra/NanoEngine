@@ -445,7 +445,7 @@ SCHEDULER_ARCH=legacy_global ROUTING=LeastBatch \
 DYNAMIC_SP_SIZE_STRATEGY=bucket DYNAMIC_SP_BUCKET_PRESET=deepseek_v3 \
 MAX_MODEL_LEN=1000000 MAX_INPUT_LEN=1000000 \
 DURATION_SECONDS=180 ENABLE_PROFILER=1 PROFILER_MODE=runtime_overhead \
-PROFILER_START_STEP=320 PROFILING_STEP=8 \
+PROFILER_START_STEP=3200 PROFILING_STEP=8 \
 PROFILER_RANKS=1,17 \
 PROFILER_DIR=bench_logs/graph_runtime_overhead/issue1_trace \
 RUN_TAG=graph_runtime_overhead_issue1_profile \
@@ -457,10 +457,11 @@ Historical flattened attention ranks 1 and 17 correspond respectively to a
 final-HEAD tuple recorded on those ranks is authoritative; change the rank
 filter for a retry if their new shapes are not representative.
 
-`PROFILER_START_STEP=320` means 20 outer decode batches with the current
-`LOOP_COUNT=16`; verify this assumption in the run log. If the profiled window
-does not reach a steady decode phase, change only the start step and record it.
-Keep `PROFILING_STEP` at 4–8 inner steps to limit trace size.
+`PROFILER_START_STEP=3200` means 200 outer decode batches with the current
+`LOOP_COUNT=16`. The 2026-08-23 calibration run showed that step 320 still
+selected a 6-to-8 local Graph, while step 3200 selected the representative
+70-to-80 master bucket and 70/76-to-80 attention buckets. Verify this mapping
+in the run log. Keep `PROFILING_STEP` at 4–8 inner steps to limit trace size.
 
 Run this once. A second identical run is only needed if the trace is incomplete
 or the selected window is not representative.
