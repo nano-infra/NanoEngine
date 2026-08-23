@@ -472,6 +472,13 @@ class LLMComponent(LLM):
             "p2p_port": self.p2p_port if self.p2p_port else 0,
             "max_num_seqs": self.config.max_num_seqs,
             "gdn_num_slots": gdn_num_slots,
+            # Payload is transported by PeerAgent; this is only the fixed
+            # row-width compatibility contract between the two PD roles.
+            "mtp_handoff_num_drafts": (
+                self.config.num_speculative_tokens
+                if self.config.num_speculative_tokens > 1
+                else 0
+            ),
             "model_path": self.config.model,  # tokenizer directory = model directory
             # Cache/topology compatibility contract consumed by PD migration.
             # Keep these explicit: equal world_size is insufficient to prove

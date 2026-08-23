@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+
+import dlengine.runtime.runner.mtp_runner as mtp_module
 from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
 from dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp import (
     DeepSeekMTP,
@@ -254,3 +256,67 @@ def test_collective_padding_reuses_cached_recurrent_chain():
     assert positions.tolist() == [13]
     assert hidden.tolist() == [[2.0, 2.0, 2.0]]
     assert bs == 1
+
+
+def test_pd_handoff_publish_restore_merges_mixed_batch(monkeypatch):
+    handoff = torch.full((4, 6), -1, dtype=torch.int64)
+    cache_context = SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5)
+    monkeypatch.setattr(mtp_module, "get_cache_context", lambda: cache_context)
+
+    prefill = object.__new__(MTPRunner)
+    prefill.config = SimpleNamespace(num_speculative_tokens=5)
+    prefill._prev_seq_ids = (11, 22)
+    prefill._prev_drafts = torch.tensor(
+        [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=torch.int64
+    )
+    prefill._selected_prev_drafts = None
+
+    assert prefill.publish_disagg_handoff([22, 11], [3, 1], 2) == 2
+    assert handoff[3].tolist() == [22, 6, 7, 8, 9, 10]
+    assert handoff[1].tolist() == [11, 1, 2, 3, 4, 5]
+
+    decode = object.__new__(MTPRunner)
+    decode.config = SimpleNamespace(num_speculative_tokens=5)
+    decode._prev_seq_ids = (77,)
+    decode._prev_drafts = torch.tensor([[20, 21, 22, 23, 24]])
+    decode._selected_prev_drafts = None
+
+    assert decode.restore_disagg_handoff([77, 22], [0, 3], 2)
+    assert decode._prev_seq_ids == (77, 22)
+    assert decode._prev_drafts.tolist() == [
+        [20, 21, 22, 23, 24],
+        [6, 7, 8, 9, 10],
+    ]
+    assert handoff[3, 0].item() == -1
+
+
+def test_pd_handoff_rejects_stale_sequence_id(monkeypatch):
+    handoff = torch.full((3, 6), -1, dtype=torch.int64)
+    handoff[2] = torch.tensor([99, 1, 2, 3, 4, 5])
+    cache_context = SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5)
+    monkeypatch.setattr(mtp_module, "get_cache_context", lambda: cache_context)
+
+    runner = object.__new__(MTPRunner)
+    runner.config = SimpleNamespace(num_speculative_tokens=5)
+    runner._prev_seq_ids = None
+    runner._prev_drafts = None
+    runner._selected_prev_drafts = None
+
+    assert not runner.restore_disagg_handoff([100], [2], 1)
+    assert runner._prev_drafts is None
+    assert handoff[2, 0].item() == 99
+
+
+def test_pd_handoff_failed_prefill_invalidates_reused_slot(monkeypatch):
+    handoff = torch.tensor([[100, 1, 2, 3, 4, 5]], dtype=torch.int64)
+    cache_context = SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5)
+    monkeypatch.setattr(mtp_module, "get_cache_context", lambda: cache_context)
+
+    runner = object.__new__(MTPRunner)
+    runner.config = SimpleNamespace(num_speculative_tokens=5)
+    runner._prev_seq_ids = None
+    runner._prev_drafts = None
+    runner._selected_prev_drafts = None
+
+    assert runner.publish_disagg_handoff([100], [0], 1) == 0
+    assert handoff[0].tolist() == [-1, -1, -1, -1, -1, -1]

@@ -40,6 +40,27 @@ fn make_scheduler_with_flags_prefix_cache_and_batch_tokens(
     })
 }
 
+fn make_mtp_scheduler_with_flags(flags: u32) -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 5,
+        max_num_seqs: 8,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "prefill".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: false,
+        cache_plan: CachePlan::new(flags),
+    })
+}
+
 fn make_scheduler_with_host_blocks() -> Scheduler {
     Scheduler::new(SchedulerConfig {
         engine_id: "engine".to_string(),
@@ -562,6 +583,28 @@ fn runner_out_postprocess_and_metrics_entrypoints_work() {
             scheduler.record_step_metric_runner_outs(py, &mut metric, &result, vec![runner_out]);
         assert_eq!(snapshot.decode_tokens, 1);
         assert_eq!(snapshot.decode_tokens_per_dp, vec![1]);
+    });
+}
+
+#[test]
+fn recurrent_mtp_allocates_and_reuses_state_slot_for_mla_only_plan() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_mtp_scheduler_with_flags(1 << 1);
+        add_tokens(py, &mut scheduler, 710, vec![1, 2, 3]).unwrap();
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        let seq_id = scheduled[0][0];
+        let slot = scheduler.seq_table[&seq_id].active_state_slot;
+
+        assert!(slot >= 0);
+        assert_eq!(scheduler.seq_table[&seq_id].migrate_state_slot, slot);
+        assert_eq!(scheduler.cache.state_slot(seq_id), Some(slot));
+
+        assert!(scheduler.abort_impl(seq_id));
+        add_tokens(py, &mut scheduler, 711, vec![4, 5, 6]).unwrap();
+        let next = scheduler.schedule_prefill(py).unwrap()[0][0];
+        assert_eq!(scheduler.seq_table[&next].active_state_slot, slot);
+        assert_eq!(scheduler.seq_table[&next].migrate_state_slot, slot);
     });
 }
 

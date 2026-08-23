@@ -189,6 +189,12 @@ class CacheContext(KVCacheAllocatorMixin):
     enable_hisparse: bool = False
     max_num_seqs: int = 0
     hisparse_device_buffer_size: int = 0
+    # PD handoff for recurrent MTP. Rows are scheduler state-slot indexed and
+    # store ``[seq_id, draft_1, ..., draft_N]`` as int64. The tiny fixed
+    # buffer is registered as its own PeerAgent MR; predictor KV continues to
+    # use the ordinary KV-cache MR.
+    mtp_num_drafts: int = 0
+    mtp_handoff: torch.Tensor | None = None
     # If ctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
@@ -443,6 +449,21 @@ class CacheContext(KVCacheAllocatorMixin):
             return 0, 0
         budget_bytes = int(budget_gib * 1024**3)
         return max(0, budget_bytes // block_bytes), budget_bytes
+
+    def allocate_mtp_handoff(self, num_drafts: int) -> torch.Tensor:
+        """Allocate the per-sequence recurrent-MTP PD handoff table."""
+        if num_drafts <= 0:
+            raise ValueError("num_drafts must be positive")
+        if self.max_num_seqs <= 0:
+            raise ValueError("max_num_seqs must be positive for MTP handoff")
+        self.mtp_num_drafts = int(num_drafts)
+        self.mtp_handoff = torch.full(
+            (self.max_num_seqs, self.mtp_num_drafts + 1),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        return self.mtp_handoff
 
 
 _CACHE_CONTEXT: CacheContext

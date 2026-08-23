@@ -1339,6 +1339,8 @@ class ModelRunner:
             hisparse_device_buffer_size=config.hisparse_device_buffer_size,
             reserved_state_bytes=reserved_state_bytes,
         )
+        if config.num_speculative_tokens > 1 and config.mode in ("prefill", "decode"):
+            cache_context.allocate_mtp_handoff(config.num_speculative_tokens)
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
         self._sync_cache_plan_from_context(
             cache_plan,
@@ -1810,6 +1812,15 @@ class ModelRunner:
 
             if (
                 self.mtp_runner is not None
+                and self.config.mode == "decode"
+                and not is_dummy
+            ):
+                self.mtp_runner.restore_disagg_handoff(
+                    aux.seq_ids, aux.state_slots, num_seqs
+                )
+
+            if (
+                self.mtp_runner is not None
                 and self.mtp_runner.has_drafts
                 and not is_dummy
                 and self.mtp_runner.can_lazy_verify(aux.seq_ids, positions, num_seqs)
@@ -1944,6 +1955,10 @@ class ModelRunner:
             self.mtp_runner.generate_prefill_and_store(
                 target_input_ids, positions, input_ids, aux, num_seqs
             )
+            if self.config.mode == "prefill":
+                self.mtp_runner.publish_disagg_handoff(
+                    aux.seq_ids, aux.state_slots, num_seqs
+                )
         elif self.mtp_runner is not None:
             # Every rank in the FFN EP group must enter the predictor
             # collectives in the same order. In attention-DP serving the
