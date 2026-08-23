@@ -1,723 +1,547 @@
-# SP CUDA Graph Routing Runtime Overhead Experiment Plan
+# ASPLOS Revision: Graph Routing Runtime Overhead Experiment Plan
 
-## 1. Objective
+## 1. Scope and conclusion
 
-This experiment measures the three runtime costs requested during review of
-the unified Hao SP CUDA Graph routing change:
+This plan measures the remaining runtime-overhead gaps in the ASPLOS review:
 
-1. CUDA Graph bucket-selection CPU overhead;
-2. routing-metadata injection overhead before Graph replay;
-3. the additional padding-kernel and CUDA Graph launch/replay overhead.
+1. Graph-bucket selection on CPU;
+2. routing-metadata injection on GPU;
+3. CUDA Graph replay submission and the padding kernels contained in a replay;
+4. one production trace showing that the isolated measurements correspond to a
+   real Issue1% serving shape.
 
-The target change is `a5a01b2` (`fix: unify Hao SP graph routing`). Its direct
-parent, `6689f5d`, is the primary before-change baseline. Use these two commits
-for the isolated before/after claim. A final smoke on the current integration
-HEAD is required, but later scheduler and serving changes must not be folded
-into the overhead attributed to `a5a01b2`.
+The primary subject is the **final integration HEAD used by the paper**. The
+historical comparison `6689f5d` versus `a5a01b2` is optional regression
+validation, not the paper's main result.
 
-The experiment must produce both:
+No C++ change is required. All three boundaries are visible from Python:
 
-- stable timing numbers obtained without `torch.profiler`; and
-- production traces that explain which CPU APIs, copies, kernels, and Graph
-  nodes account for those numbers.
+- bucket selection and Graph lookup are Python operations;
+- routing metadata is updated by PyTorch/Triton calls issued from Python;
+- `graph.replay()` returns after host submission and can be timed with
+  `time.perf_counter_ns()` without synchronizing inside the measured interval.
 
-Profiler durations alone are not used as the end-to-end regression result,
-because CPU tracing, shape recording, stack collection, and memory profiling
-can materially perturb microsecond-scale host work.
+C++ instrumentation would only be justified if the paper later asks for an
+internal breakdown of a native helper such as `prepare_decode_cpp`. That is not
+part of this experiment.
 
-## 2. Definitions and measurement boundaries
+## 2. Measurement principles
 
-### 2.1 Graph bucket selection
+Use two complementary sources of evidence:
 
-The measured production operation starts at the `bs` lookup in
-`ModelRunner.run_model` and ends after looking up the selected Graph object. It
-includes:
+- **stable timing:** non-profiled microbenchmarks and non-profiled serving runs;
+- **attribution:** one or two short `torch.profiler` traces with CPU and CUDA
+  activities enabled.
 
-- selection of `master_bs` from `graph_master_rank_bs`;
-- selection of `attn_bs` from `sp_graph_map[master_bs]` for SP execution; and
-- lookup of `sp_graphs[(master_bs, attn_bs)]` or
-  `local_graphs[master_bs]`.
+Profiler durations are not the primary microsecond-scale result. In particular,
+`record_function`, stack collection, shape recording, and memory profiling can
+perturb short CPU operations.
 
-It excludes metadata copying, FlashMLA metadata construction, and Graph
-replay. The primary number is the CPU time per decode step. The reported
-overhead is:
+The following values are separate and must not be added together:
 
 ```text
-bucket overhead = (selection + graph lookup) - direct known-key graph lookup
+host metadata enqueue time
+device metadata-operation time/span
+host graph.replay() submission time
+padding-kernel device time
+full Graph device span
 ```
 
-Report the absolute production-path time as well as this adjusted value. A
-pytest unit test validates selection semantics, but a timing assertion must not
-be placed in pytest.
+Asynchronous copies, kernels, and host work may overlap. The paper should show
+component costs for attribution and use a separate non-profiled serving result
+for net runtime impact.
 
-### 2.2 Routing-metadata injection
+## 3. Exact measurement boundaries
 
-Use two nested scopes so that the review can distinguish the new routing state
-from the pre-existing full Graph-variable update:
+### 3.1 Graph-bucket selection
+
+Measure the production operation from the first bucket search through the Graph
+dictionary lookup:
 
 ```text
-graph_metadata_injection.total
-  input IDs / positions / slot mapping
-  q_dst_row_indices fill and copy
-  context/block/Q/Res/LSE metadata updates
+master_bs = smallest captured master bucket >= actual master bs
+graph_attn_bs = smallest captured attention bucket >= actual attention bs
+graph = sp_graphs[(master_bs, graph_attn_bs)]
+```
+
+The local-Graph branch performs only the master-bucket selection and
+`local_graphs[master_bs]` lookup. The primary paper number is the dynamic SP
+branch exercised by Issue1%.
+
+Exclude metadata injection, FlashMLA metadata preparation, and Graph replay.
+Report the absolute `selection + lookup` p50 and p95 in nanoseconds. A direct
+known-key lookup may be retained as an internal control, but an adjusted value
+is not needed in the paper.
+
+### 3.2 Routing-metadata injection
+
+Report two scopes:
+
+```text
+routing metadata
+  q_dst_row_indices fill/copy
   actual_attn_bs scalar update
-  SP Graph padding metadata materialization
+  materialize_sp_graph_padding(...)
+
+all Graph metadata
+  complete _copy_decode_context_to_graph_vars(...)
 ```
 
-The routing-specific component is the sum of:
+Exclude both of the following:
 
-```text
-graph_metadata_injection.q_dst_rows
-graph_metadata_injection.actual_attn_bs
-graph_metadata_injection.padding_metadata
+- `prepare_decode_mla_metadata`, which is an existing FlashMLA preparation
+  phase;
+- `copy_batch_indexed_triton`, which stages Q payload and is not metadata.
+
+For each scope report host enqueue p50/p95 and CUDA-stream elapsed p50/p95. Also
+record the copied/initialized byte count and actual versus captured row count.
+When operations overlap, report both the sum of individual device durations and
+the enclosing device span; label them explicitly.
+
+`q_dst_row_indices` currently copies its allocated capacity. Its byte count is
+therefore based on the allocated tensor, not only the active rows.
+
+### 3.3 Graph replay and padding kernels
+
+The stable host-submission measurement is:
+
+```python
+t0_ns = time.perf_counter_ns()
+graph.replay()
+t1_ns = time.perf_counter_ns()
+replay_submit_ns.append(t1_ns - t0_ns)
 ```
 
-`prepare_decode_mla_metadata` is measured in its own scope and is not included
-in routing-metadata injection. The Q payload staging kernel
-`copy_batch_indexed_triton` is also excluded: it copies Q data into the
-all-to-all buffer and is not metadata injection.
+There must be no `torch.cuda.synchronize()` between `t0_ns` and `t1_ns`.
+Synchronize before warmup and only after a measured batch when a completed
+device result is required. Measure and report an empty `perf_counter_ns()` pair
+as timer overhead, but do not silently subtract it from the headline value.
 
-For both the routing-only and total scopes report:
-
-- host enqueue time per decode step;
-- device-stream elapsed time per decode step;
-- bytes copied or initialized;
-- before/after delta where both versions implement a valid case.
-
-The persistent `q_dst_row_indices` copy currently covers its allocated
-capacity, so its reported byte count is
-`attention_sp * max_num_seqs * sizeof(int32)`, not the number of active rows.
-Report active-row count separately.
-
-### 2.3 Padding kernel and Graph launch/replay
-
-The new device operation is `zero_padded_rows_kernel`. It is captured inside
-the full model CUDA Graph and executes once per SP attention layer, even when
-`actual_attn_bs == graph_attn_bs` and the writable tail is empty.
-
-Report all of the following; they are different quantities:
+The profiler trace is used to attribute:
 
 - `cudaGraphLaunch` host API duration;
-- total device Graph span, from the earliest to latest device event carrying
-  the launch correlation ID;
+- full device Graph span associated with its correlation ID;
 - `zero_padded_rows_kernel` count per replay;
-- single-kernel p50/p95 device duration;
-- sum of padding-kernel device durations per replay;
-- before/after full-Graph span and non-profiled decode latency.
+- individual padding-kernel device p50/p95;
+- aggregate padding-kernel device duration per replay.
 
-Do not describe `cudaGraphLaunch` host API duration as Graph execution time.
-Do not report only one padding-kernel duration: the per-token cost is the
-aggregate across all attention layers.
+Do not call `cudaGraphLaunch` host API duration “Graph execution time.” The
+padding cost reported for a token/replay is the aggregate across all captured
+attention layers, not one kernel instance.
 
-## 3. Experimental controls
+## 4. Real Issue1% reference shape
 
-### 3.1 Software versions
-
-Create independent worktrees rather than checking out over the user's current
-dirty tree:
+Use the following existing production log as a read-only workload reference:
 
 ```text
-before:    6689f5d + the profiling-only instrumentation patch
-candidate: a5a01b2 + the identical profiling-only instrumentation patch
-head:      current integration HEAD, smoke only
+/mnt/nvme1n1/ml_research/chenjiefei/nano_logs/
+  issue003_then_issue001_rate5_chain_20260405_v2/
+  issue001_deepseek_v3_rate5/deepseek-v3/
+  sharegpt4o-random_geminiissue_r0.01_n60000_60k/
+  dp4sp8_seg64k_n36000_r60_bs192_LB_cen_maxin1000k/
+  20260406_091601.log
 ```
 
-The profiling patch must not change bucket candidates, tensor sizes,
-collective arguments, stream placement, or synchronization. Record the exact
-instrumentation commit in every result manifest. If the patch needs a small
-context adjustment on the old implementation, keep the range boundaries
-semantically identical and record the difference in the result note.
+The selected decode record is identifiable by:
 
-No C++ source is changed by the proposed instrumentation. Each worktree should
-still be made importable explicitly, and the run manifest must record
-`nanodeploy.__file__` so that a Ray worker cannot silently load the other
-worktree. If editable installation is used, install and run the two worktrees
-sequentially.
+```text
+timestamp:        2026-04-06 01:24:00
+ITL:              62.82 ms
+scheduler:         6.42 ms
+post-scheduler:    2.62 ms
+```
 
-### 3.2 Hardware and runtime controls
+Its per-DP/per-SP active attention-row counts are:
 
-- Use the same eight GPUs, node, clocks/power policy, Ray allocation, CUDA,
-  PyTorch, Triton, FlashMLA, and DLSlime build for every matched pair.
-- Use `hao_basic`, attention DP1/SP8/TP1, FFN DP1/EP8/TP1, and full CUDA Graph.
-- Use the repository DeepSeek-V3 snapshot:
+```python
+sp_batch_sizes = [
+    [70, 74, 76, 74, 75, 73, 72, 75],
+    [69, 73, 75, 76, 77, 72, 73, 73],
+    [77, 78, 76, 64, 78, 74, 73, 68],
+    [74, 77, 73, 77, 71, 70, 71, 75],
+]
+```
 
-  ```text
-  /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb
-  ```
+The current scheduler code defines each entry as
+`len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])`. In this log, every
+entry also equals the length of the corresponding `sp_seq_lens` list. Across
+the 32 attention workers:
 
-- Use dummy prefill and dummy weights for the component profile so model I/O
-  and checkpoint loading do not dominate turnaround. Use the same MoE routing
-  simulation and seed in every run.
-- Exclude Graph capture, Triton compilation, allocator warmup, and the first
-  two profiled decode steps from statistics.
-- Run at least five matched repeats. Alternate version order, for example
-  `before, candidate, candidate, before`, instead of running every baseline
-  many hours before every candidate.
-- Save raw artifacts under
-  `bench_logs/graph_routing_overhead_<UTC timestamp>/`; do not commit raw
-  traces. Save the reviewed summary under
-  `docs-dev/2026-08-23/GraphRoutingRuntimeOverheadResults.md`.
+```text
+minimum = 64
+median  = 74
+mean    = 73.53125
+maximum = 78
+```
 
-Before every GPU run, export all required DLSlime settings:
+Use this snapshot as a production-derived shape target:
+
+- 74 is the candidate representative attention-row count;
+- 78 is the observed upper-end candidate for the padded case;
+- the whole `64..78` range is the production-relevance acceptance window.
+
+The old log does **not** contain enough information to assert the final code's
+exact `context.attention_compute_bs`, `master_bs`, or selected `graph_attn_bs`.
+`sp_batch_sizes` is a strong proxy for the active attention rows, but do not
+equate it with any of those values without confirmation. The new final-HEAD
+trace must record this tuple explicitly on each worker:
+
+```text
+(actual_master_bs, master_bs, actual_attn_bs, graph_attn_bs)
+```
+
+The microbenchmark must use a tuple observed from that final-HEAD run. If the
+new serving run does not enter the historical `64..78` range, report the
+mismatch and choose the nearest steady-state tuple rather than claiming an
+exact replay of the old snapshot.
+
+The reference configuration encoded by the log path is DP4/SP8, batch limit
+192, segment size 64K, request rate 60, LeastBatch/central scheduling, maximum
+input length 1M, and the Issue1% ShareGPT-derived dataset. Preserve these
+settings for the production validation unless the final paper configuration
+has intentionally changed; record any difference.
+
+## 5. P0 experiment matrix
+
+| Experiment | Cases | Repeats | Primary output |
+| --- | --- | ---: | --- |
+| CPU bucket microbench | observed typical tuple; valid boundary tuple | 7 | selection + lookup ns, p50/p95 |
+| GPU metadata microbench | no padding; observed padded tuple near 74/78 rows | 5–7 | routing-only and all-metadata host/device us |
+| Graph replay submission | representative final-HEAD model Graph | 5–7 | non-profiled host submission us |
+| Production attribution trace | Issue1% dynamic case; optional exact-bucket control | 1–2 | APIs, Graph span, padding kernels, observed tuples |
+| Final-HEAD non-profiled serving | same Issue1% workload | 3–5 | ITL/throughput net result |
+
+### 5.1 Bucket cases
+
+Run 10,000 untimed warmup calls, followed by 1,000,000 measured calls per
+repeat. Pin the process to one CPU core if the host is shared. Use:
+
+1. the most frequent tuple observed in the production trace;
+2. a valid boundary case immediately above a captured bucket boundary.
+
+Timing must use the same pure selection helper called by production code. A
+pytest test verifies exact selection and failure semantics, but pytest must not
+contain a latency threshold.
+
+### 5.2 Metadata cases
+
+Use 200 warmup iterations and 2,000 measured iterations per repeat unless GPU
+memory or runtime makes that impractical. Record one CUDA Event pair around a
+batch of iterations and synchronize after the end event, outside the host
+enqueue timing interval.
+
+Cases:
+
+1. `no_padding`: `actual_attn_bs == graph_attn_bs` and
+   `actual_master_bs == master_bs`, exposing fixed metadata cost;
+2. `issue1_padded`: the observed final-HEAD tuple nearest the historical
+   median/upper range, exposing realistic padding cost.
+
+The paper table only needs `routing metadata` and `all Graph metadata`.
+Individual q-destination/scalar/padding subcomponents may be saved in JSON for
+debugging or an appendix.
+
+### 5.3 Replay submission
+
+Collect `perf_counter_ns()` samples around the actual model Graph's
+`graph.replay()` in a non-profiled run. Discard capture/warmup and the first two
+decode steps. Report per-call p50/p95 over normal serving queue state. A short
+isolated `no_tail` versus `observed_tail` padding-Graph test is P1 unless the
+production trace cannot identify the padding kernels reliably.
+
+### 5.4 Net runtime impact
+
+Use the paper's corresponding final-code control, such as the already defined
+static/AOT configuration, for end-to-end comparison. Do not define net DCP
+overhead as the sum of component timings. If the existing paper result was
+collected from the same final implementation and workload, it may be reused;
+otherwise run 3–5 non-profiled repeats.
+
+## 6. Minimal code changes
+
+Keep all instrumentation behind disabled-by-default options.
+
+### 6.1 `nanodeploy/worker/sp_graph_policy.py`
+
+Extract the current selection logic into a pure helper that returns
+`(master_bs, graph_attn_bs)` and performs the existing validation. Both
+`ModelRunner.run_model` and the CPU benchmark must call this helper. This is a
+behavior-preserving refactor, not a new selection algorithm.
+
+Keep `materialize_sp_graph_padding` reusable so the metadata benchmark calls
+the same function as production.
+
+### 6.2 `nanodeploy/config.py`
+
+Add two disabled-by-default controls:
+
+```python
+profiler_mode: Literal["default", "runtime_overhead"] = "default"
+runtime_overhead_timing: bool = False
+profiler_ranks: tuple[int, ...] | None = None
+```
+
+In `runtime_overhead` profiler mode use:
+
+```python
+activities = [
+    torch.profiler.ProfilerActivity.CPU,
+    torch.profiler.ProfilerActivity.CUDA,
+]
+record_shapes = False
+profile_memory = False
+with_stack = False
+```
+
+The default profiler behavior must remain unchanged. `profiler_ranks=None`
+keeps the existing all-rank behavior; the production overhead trace should use
+only the representative and upper-end attention ranks to avoid writing 32
+large traces.
+
+### 6.3 `nanodeploy/worker/model_runner.py`
+
+Add profiler-only ranges around:
+
+```text
+nanodeploy.graph.bucket_select
+nanodeploy.graph.metadata.all
+nanodeploy.graph.metadata.q_dst_rows
+nanodeploy.graph.metadata.actual_attn_bs
+nanodeploy.graph.metadata.padding
+nanodeploy.graph.prepare_decode_mla_metadata
+nanodeploy.graph.replay
+```
+
+Emit the four-value shape tuple in the bucket/replay range name or a small
+per-rank JSONL sidecar while profiling. Do not log it every step in normal
+serving.
+
+When `runtime_overhead_timing=True` and the profiler is off, collect
+`perf_counter_ns()` host samples around metadata injection and
+`graph.replay()`. Buffer samples in memory and write only the final aggregate or
+one compact JSON file; file I/O must not occur in the timed decode path.
+
+The profiler range durations are attribution only. The buffered non-profiled
+samples are the stable host numbers.
+
+### 6.4 `scripts/benchmark_sp_graph_runtime_overheads.py`
+
+Add one focused script with three components:
+
+```text
+--component bucket
+--component metadata
+--component replay-submit
+```
+
+The script should:
+
+- accept an observed shape tuple via CLI or JSON;
+- emit raw repeat results and summary p50/p95 as JSON;
+- record warmup/iteration/repeat counts, device, software versions, git SHA,
+  and `nanodeploy.__file__`;
+- reject impossible tuples rather than silently clipping them.
+
+The metadata path should allocate tensors with production dtypes and capacities
+and call the same routing-padding helper used by `ModelRunner`.
+
+### 6.5 `scripts/run_issue001_deepseek_v3_issue001_bucket.sh`
+
+Forward these environment-controlled arguments to
+`scripts/issue003/bench_serving_overhead.py`:
+
+```text
+ENABLE_PROFILER
+PROFILER_MODE
+PROFILER_START_STEP
+PROFILING_STEP
+PROFILER_DIR
+PROFILER_RANKS
+RUNTIME_OVERHEAD_TIMING
+DURATION_SECONDS
+```
+
+`DURATION_SECONDS` should replace the hard-coded `600` only in request-count
+calculation and default to 600, preserving existing behavior.
+
+Also replace the script's existing `python -u` launch with `python3 -u` to
+follow the repository command policy.
+
+### 6.6 Trace parser
+
+Add one lightweight script under `utils_analysis/` to correlate
+`cudaGraphLaunch` with device events and aggregate `zero_padded_rows_kernel`
+count/duration per replay. The reference-log shape has already been validated
+for this plan; a general reference-log parser is unnecessary.
+
+Do not build a general profiler framework for this revision.
+
+### 6.7 Tests
+
+Add CPU tests for:
+
+- typical, exact-boundary, next-boundary, and overflow bucket selection;
+- profiler-mode defaults, rank filtering, and validation.
+
+Trace-parser guard fixtures are P1. For P0, manually inspect a few parsed
+launches against the profiler UI before accepting its aggregate output.
+
+CUDA timing assertions are not unit tests. After any Python-only change, no
+editable rebuild is required. Reinstall with `python3 -m pip install -v -e .`
+only if the implementation unexpectedly changes C++ or bindings.
+
+## 7. Commands
+
+### 7.1 CPU bucket benchmark
+
+```bash
+python3 scripts/benchmark_sp_graph_runtime_overheads.py \
+  --component bucket \
+  --shape-json bench_logs/graph_runtime_overhead/issue1_shape.json \
+  --warmup 10000 \
+  --iterations 1000000 \
+  --repeats 7 \
+  --output bench_logs/graph_runtime_overhead/bucket.json
+```
+
+### 7.2 GPU metadata microbenchmark
+
+Before every GPU command, configure the required DLSlime/RDMA environment and
+request elevated execution permission:
 
 ```bash
 export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 export SLIME_GID_INDEX=3
 export SLIME_QP_NUM=4
+
+python3 scripts/benchmark_sp_graph_runtime_overheads.py \
+  --component metadata \
+  --shape-json bench_logs/graph_runtime_overhead/issue1_shape.json \
+  --cases no_padding,issue1_padded \
+  --warmup 200 \
+  --iterations 2000 \
+  --repeats 7 \
+  --output bench_logs/graph_runtime_overhead/metadata.json
 ```
 
-Before Ray commands or a run that connects to Ray, remove HTTP proxies:
+### 7.3 Production Issue1% profiler run
+
+Ray is the exception to the repository proxy rule, so remove proxy variables
+before connecting to the cluster:
 
 ```bash
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export SLIME_GID_INDEX=3
+export SLIME_QP_NUM=4
+export NANODEPLOY_LOG_DECODE_STEP_DETAIL=1
+
+MODEL_PATH=/mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb \
+DP=4 SP=8 EP=32 BATCH_SIZE=192 SEG=65536 LOOP_COUNT=16 \
+SCHEDULER_ARCH=legacy_global ROUTING=LeastBatch \
+DYNAMIC_SP_SIZE_STRATEGY=bucket DYNAMIC_SP_BUCKET_PRESET=deepseek_v3 \
+MAX_MODEL_LEN=1000000 MAX_INPUT_LEN=1000000 \
+DURATION_SECONDS=180 ENABLE_PROFILER=1 PROFILER_MODE=runtime_overhead \
+PROFILER_START_STEP=320 PROFILING_STEP=8 \
+PROFILER_RANKS=1,17 \
+PROFILER_DIR=bench_logs/graph_runtime_overhead/issue1_trace \
+RUN_TAG=graph_runtime_overhead_issue1_profile \
+bash scripts/run_issue001_deepseek_v3_issue001_bucket.sh 60
 ```
 
-Every GPU command must be run with elevated permission according to the
-repository instructions. CPU-only bucket tests do not require elevation.
+Historical flattened attention ranks 1 and 17 correspond respectively to a
+74-row worker and one of the 78-row workers in the supplied snapshot. The
+final-HEAD tuple recorded on those ranks is authoritative; change the rank
+filter for a retry if their new shapes are not representative.
 
-## 4. Required code changes
+`PROFILER_START_STEP=320` means 20 outer decode batches with the current
+`LOOP_COUNT=16`; verify this assumption in the run log. If the profiled window
+does not reach a steady decode phase, change only the start step and record it.
+Keep `PROFILING_STEP` at 4–8 inner steps to limit trace size.
 
-Keep the implementation in one profiling-only commit so it can be applied to
-both worktrees.
+Run this once. A second identical run is only needed if the trace is incomplete
+or the selected window is not representative.
 
-### 4.1 `nanodeploy/config.py`
+### 7.4 Non-profiled replay submission and serving result
 
-Add a profiler mode with a compatibility-preserving default:
-
-```python
-profiler_mode: Literal["default", "runtime_overhead"] = "default"
-```
-
-Validate the two allowed values. `runtime_overhead` is valid only when
-`enable_profiler=True`; either reject or ignore it otherwise, but use one
-behavior consistently and cover it with a CPU config test.
-
-Do not change the existing default profiler behavior. In runtime-overhead mode
-the ModelRunner profiler must use:
-
-```python
-activities=[
-    torch.profiler.ProfilerActivity.CPU,
-    torch.profiler.ProfilerActivity.CUDA,
-]
-record_shapes=False
-profile_memory=False
-with_stack=False
-```
-
-CPU activity is needed for `record_function`, `cudaGraphLaunch`,
-`cudaMemcpyAsync`, and kernel-launch API events. Disabling shapes, memory, and
-stacks reduces trace size and perturbation.
-
-### 4.2 `nanodeploy/worker/model_runner.py`
-
-#### Track whether ranges should be emitted
-
-Add a lightweight helper backed by `contextlib.nullcontext`:
-
-```python
-def _runtime_overhead_range(self, name: str):
-    if self._runtime_overhead_profiler_active:
-        return torch.profiler.record_function(name)
-    return nullcontext()
-```
-
-Initialize `_runtime_overhead_profiler_active=False`, set it only after
-`self.profiler.start()` succeeds, and clear it immediately before or after
-`self.profiler.stop()`. This prevents `record_function` overhead during normal
-serving and during non-profiled warmup.
-
-#### Make the bucket path directly benchmarkable
-
-Refactor the existing selection statements, without changing their search
-algorithm, into:
-
-```python
-def _select_decode_graph(
-    self,
-    bs: int,
-    context,
-) -> tuple[int, int, torch.cuda.CUDAGraph]:
-    ...
-```
-
-The helper must contain the existing master-bucket selection, attention-bucket
-selection, and Graph dictionary lookup. `run_model` calls this helper once.
-Keeping the existing ordered linear search avoids mixing an optimization into
-the measurement patch.
-
-The production trace may wrap this helper with
-`nanodeploy::graph_bucket_selection` for correlation, but its traced duration
-must not be used as the primary bucket timing because the annotation itself is
-larger than the operation. The standalone CPU benchmark described below is
-the source of record.
-
-#### Add metadata ranges
-
-At the full-Graph call site in `run_model`, add the following static ranges:
+Use the same command and workload with:
 
 ```text
-nanodeploy::graph_metadata_injection.total
-nanodeploy::flash_mla_metadata
-nanodeploy::cuda_graph_replay
+ENABLE_PROFILER=0
+RUNTIME_OVERHEAD_TIMING=1
 ```
 
-Inside `_copy_decode_context_to_graph_vars`, add:
-
-```text
-nanodeploy::graph_metadata_injection.q_dst_rows
-nanodeploy::graph_metadata_injection.actual_attn_bs
-nanodeploy::graph_metadata_injection.padding_metadata
-```
-
-Also wrap the complete post-selection region with a dynamic, outer annotation
-that records shape context without copying tensor contents to the CPU:
-
-```text
-nanodeploy::decode_graph_step/
-bs=<int>/master_bs=<int>/actual_attn_bs=<int>/graph_attn_bs=<int>
-```
-
-All four values already exist as Python integers on this path. Do not call
-`.item()`, `.cpu()`, or synchronize to build the annotation.
-
-Do not add CUDA Events or a `torch.cuda.synchronize()` to production
-`run_model`. Device timing for the production path comes from trace
-correlations; synchronized CUDA-Event timing belongs in the standalone
-microbenchmark.
-
-### 4.3 `scripts/benchmark_sp_graph_runtime_overheads.py` (new)
-
-Implement three subcommands and write machine-readable JSON.
-
-#### `bucket`
-
-- CPU only; no Ray and no CUDA initialization.
-- Construct a lightweight `ModelRunner` with fake Graph objects and the real
-  production bucket lists/maps.
-- Call `_select_decode_graph` so the benchmark cannot drift from production.
-- Pre-generate the input cases outside the timed loop.
-- Disable Python GC during samples and restore it afterward.
-- Warm up for at least 10,000 calls.
-- Measure at least 1,000,000 calls per repeat and seven repeats.
-- Run a direct-known-key lookup control with the same input iteration and
-  result consumption.
-- Include two distributions:
-  - `steady`: the same hot bucket on each call;
-  - `boundary_mix`: cycle exact boundaries, just-over-boundary values, and the
-    largest legal bucket.
-- Cover local Graph, fixed-full SP, and dynamic sparse SP maps.
-- Output raw repeat samples, p50/p95, absolute ns/call, and control-adjusted
-  ns/call.
-
-#### `metadata`
-
-- One GPU; no Ray or communication is required.
-- Construct representative graph variables and context tensors with the same
-  dtypes, devices, shapes, and contiguous layouts used by ModelRunner.
-- Invoke the production `_copy_decode_context_to_graph_vars` method through a
-  lightweight runner and a fake rank context; do not duplicate its tensor
-  operations in the benchmark.
-- Time `total` and the three routing-only components separately.
-- Measure host enqueue time in batches with `time.perf_counter_ns()` and one
-  synchronization after the timed batch.
-- Measure device elapsed time with CUDA Event pairs around the timed batch and
-  divide by the number of iterations.
-- Warm up first, use at least 1,000 measured iterations per repeat, and collect
-  seven repeats.
-- Cases:
-  - `no_padding`: `actual_attn_bs == graph_attn_bs` and
-    `actual_master_bs == graph_master_bs`;
-  - `attn_padding`: a non-empty attention tail;
-  - `master_padding`: both attention and local-master tails;
-  - capacities `max_num_seqs=8` and the production upper bound
-    `max_num_seqs=256`.
-
-Output host and device p50/p95 independently. Include `q_dst_row_indices`
-allocated bytes, active rows, actual and Graph attention rows, master batch
-sizes, and block-table width.
-
-#### `padding-graph`
-
-- One GPU; no Ray or communication is required.
-- Use DeepSeek-V3 Q row geometry: BF16,
-  `row_numel = 128 * (512 + 64) = 73,728` elements.
-- Capture two otherwise identical CUDA Graphs:
-  - control Graph with one fixed anchor operation;
-  - candidate Graph with the same anchor followed by
-    `zero_padded_rows_triton`.
-- Use a replay-mutable device `actual_rows` scalar exactly like production.
-- Measure non-profiled replay latency with CUDA Events over batches of replays.
-- Separately collect a lightweight CPU+CUDA profiler trace to obtain
-  `cudaGraphLaunch` and `zero_padded_rows_kernel` events.
-- Cases:
-  - `no_tail`: `actual_rows == graph_rows`, isolating the unavoidable extra
-    Graph node/kernel execution;
-  - `small_tail`: one padded row;
-  - `eos_tail`: one rank-local request has disappeared;
-  - `worst_tail`: smallest legal actual row count for the selected Graph.
-- Sweep representative `graph_rows` values `8`, `16`, and `64`.
-
-The isolated Graph delta is:
-
-```text
-padding Graph replay - control Graph replay
-```
-
-It is the cleanest estimate of the new node itself, while the production
-profile below captures interaction with communication and attention.
-
-### 4.4 `scripts/profile_sp_graph_runtime_overheads.py` (new)
-
-Add a deterministic one-node DP1/SP8/EP8 driver based on the setup in
-`examples/dummy_prefill.py`. It must accept:
-
-```text
---case {fixed_dense,fixed_tail,dynamic_sparse}
---model-path
---master-address
---ray-address
---output-dir
---profiler-start-step
---profiling-step
---enable-profiler
---profiler-mode
---seed
-```
-
-It must save `manifest.json` before engine creation with:
-
-- Git commit and dirty status;
-- `nanodeploy.__file__` on the driver;
-- model path and model type;
-- CUDA/PyTorch/Triton versions;
-- Ray and master addresses;
-- topology and all Graph/SP config values;
-- request prompt/output lengths and seed;
-- relevant `SLIME_*` values;
-- profiler settings.
-
-The ModelRunner logs must also print their resolved `nanodeploy.__file__` once
-in runtime-overhead mode so worktree mistakes are visible.
-
-Use these deterministic cases:
-
-| Case | Requests | Prompt length | Output length | Policy | Purpose |
-|---|---:|---:|---:|---|---|
-| `fixed_dense` | 16 | 2,048 | 96 each | fixed SP8 | two master rows/rank, no attention tail |
-| `fixed_tail` | 16 | 2,048 | one request 16, others 96 | fixed SP8 | stable post-completion `actual < graph` tail |
-| `dynamic_sparse` | 8 | 65,536 | 96 each | DeepSeek-V3 bucket, SP5 interval | sparse destination rows and rounded attention Graph bucket |
-
-Set `loop_count=1` in all three cases so one ModelRunner `run_count` is one
-decode token step and the profiler start/stop steps below are unambiguous. Use
-RoundRobin master placement. Use `max_num_seqs=2` for the two fixed cases so
-16 requests yield two real master rows on every rank; use `max_num_seqs=1` for
-the eight-request dynamic case. Keep `max_num_recv_seqs=16` and record the
-resulting captured `master_bs` and `attn_bs` candidates in the manifest.
-
-For `fixed_tail`, start profiling after step 24 so the short request has
-completed and the surviving batch is stable. This is deterministic and does
-not depend on sampling an EOS token. Verify from the dynamic Graph-step
-annotations that `actual_attn_bs < graph_attn_bs` on at least one rank; reject
-the run otherwise.
-
-For `fixed_dense` and `dynamic_sparse`, start profiling after step 32. Profile
-16 decode steps and generate enough tokens for the profiler to stop and flush.
-Use `ignore_eos=True`, `dummy_prefill=True`, `dummy_weight=True`,
-`moe_routing_simulation_strategy="perfect_eplb"`, and seed 0.
-
-In addition to profiled runs, support `--enable-profiler` being absent. These
-non-profiled runs are used for the net decode-step/ITL comparison; the profile
-run is used only for breakdown.
-
-### 4.5 `utils_analysis/summarize_sp_graph_overhead_trace.py` (new)
-
-Parse all `*.pt.trace.json` files below one run directory and emit:
-
-```text
-summary.json
-rank_components.csv
-step_samples.csv
-```
-
-Parsing rules:
-
-1. Locate static and dynamic `nanodeploy::*` user annotations.
-2. For a metadata annotation, find CUDA runtime events on the same CPU thread
-   whose timestamps lie inside the annotation. Collect their correlation IDs,
-   then match GPU memcpy/memset/kernel events carrying those IDs.
-3. For every `cudaGraphLaunch`, collect device events with the same
-   `args.correlation`. Compute:
-   - host launch duration;
-   - sum of device durations;
-   - device span `max(end) - min(start)`;
-   - padding-kernel count and duration sum.
-4. Match launches to the enclosing `nanodeploy::cuda_graph_replay` and dynamic
-   Graph-step annotation.
-5. Discard the first two valid Graph steps in each trace.
-6. Fail loudly when:
-   - a production full-Graph trace has no `cudaGraphLaunch`;
-   - a candidate SP trace has no `zero_padded_rows_kernel`;
-   - a fixed-tail or dynamic-sparse run has no `actual < graph` annotation;
-   - rank counts, replay counts, or kernel counts vary unexpectedly.
-
-For synchronous decode, report both the median across ranks and the slowest
-rank. The slowest-rank value is the primary production number. For potentially
-overlapping device events, report both sum and span; do not present summed
-kernel durations as a critical-path latency.
-
-### 4.6 Tests
-
-Add or extend these CPU tests:
-
-- `tests/test_sp_graph_bucket_selection.py`:
-  exact boundaries, just-over-boundary cases, fixed-full candidates, dynamic
-  candidates, local Graph, and overflow errors for `_select_decode_graph`;
-- `tests/test_routing_config.py`:
-  valid/default/invalid `profiler_mode` behavior;
-- parser unit tests with a tiny synthetic Chrome trace containing one user
-  annotation, two runtime correlations, one Graph launch, and one padding
-  kernel;
-- keep the existing padding semantics in
-  `tests/test_pd_decode_sp_batch_semantics.py` unchanged except for reuse of a
-  shared test builder if the metadata microbenchmark needs it.
-
-Run the CPU regression before any GPU experiment:
-
-```bash
-python3 -m pytest \
-  tests/test_sp_graph_bucket_selection.py \
-  tests/test_routing_config.py \
-  tests/test_pd_decode_sp_batch_semantics.py
-```
-
-## 5. Experiment matrix
-
-### 5.1 CPU bucket measurement
-
-Run on both `before` and `candidate` worktrees if the extraction applies
-cleanly; otherwise run the production-equivalent helper on the candidate and
-record that the selection algorithm is unchanged across the target commit.
-
-```bash
-python3 scripts/benchmark_sp_graph_runtime_overheads.py bucket \
-  --iterations 1000000 \
-  --repeats 7 \
-  --output "$RUN_ROOT/candidate/bucket.json"
-```
-
-The minimum reported rows are:
-
-```text
-local/steady
-fixed_full/steady
-fixed_full/boundary_mix
-dynamic_sparse/steady
-dynamic_sparse/boundary_mix
-```
-
-### 5.2 One-GPU component microbenchmarks
-
-After configuring the three required `SLIME_*` variables, run with elevated
-permission:
-
-```bash
-python3 scripts/benchmark_sp_graph_runtime_overheads.py metadata \
-  --device cuda:0 \
-  --iterations 1000 \
-  --repeats 7 \
-  --output "$RUN_ROOT/candidate/metadata.json"
-
-python3 scripts/benchmark_sp_graph_runtime_overheads.py padding-graph \
-  --device cuda:0 \
-  --warmup 100 \
-  --iterations 10000 \
-  --repeats 7 \
-  --output "$RUN_ROOT/candidate/padding_graph.json" \
-  --trace-dir "$RUN_ROOT/candidate/padding_graph_traces"
-```
-
-If 10,000 worst-tail replays make one repeat excessively long, reduce only
-that case to 2,000 and record the per-case iteration count. Do not silently use
-different counts.
-
-### 5.3 Start Ray for the production profiles
-
-Use explicit site-specific addresses rather than committing a node IP:
-
-```bash
-export PROFILE_NODE_IP=<eight-GPU-node-IP>
-export PROFILE_RAY_PORT=<free-Ray-GCS-port>
-export PROFILE_MASTER_PORT=<free-torch-master-port>
-export PROFILE_RAY_ADDRESS="$PROFILE_NODE_IP:$PROFILE_RAY_PORT"
-export PROFILE_MASTER_ADDRESS="$PROFILE_NODE_IP:$PROFILE_MASTER_PORT"
-
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-ray start --head \
-  --node-ip-address "$PROFILE_NODE_IP" \
-  --port "$PROFILE_RAY_PORT" \
-  --num-gpus 8
-ray status
-```
-
-Ray commands and every following GPU run require elevated permission. Reuse
-the allocated Ray cluster across matched runs only after verifying that the
-previous engine released all actors and placement groups. Stop it at the end
-with the same proxy-free environment:
-
-```bash
-ray stop
-```
-
-### 5.4 Production profile commands
-
-For each instrumented worktree and each case:
-
-```bash
-python3 -u scripts/profile_sp_graph_runtime_overheads.py \
-  --case fixed_dense \
-  --model-path /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb \
-  --master-address "$PROFILE_MASTER_ADDRESS" \
-  --ray-address "$PROFILE_RAY_ADDRESS" \
-  --enable-profiler \
-  --profiler-mode runtime_overhead \
-  --profiler-start-step 32 \
-  --profiling-step 16 \
-  --output-dir "$RUN_ROOT/candidate/fixed_dense/repeat_0"
-
-python3 -u scripts/profile_sp_graph_runtime_overheads.py \
-  --case fixed_tail \
-  --model-path /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb \
-  --master-address "$PROFILE_MASTER_ADDRESS" \
-  --ray-address "$PROFILE_RAY_ADDRESS" \
-  --enable-profiler \
-  --profiler-mode runtime_overhead \
-  --profiler-start-step 24 \
-  --profiling-step 16 \
-  --output-dir "$RUN_ROOT/candidate/fixed_tail/repeat_0"
-
-python3 -u scripts/profile_sp_graph_runtime_overheads.py \
-  --case dynamic_sparse \
-  --model-path /mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb \
-  --master-address "$PROFILE_MASTER_ADDRESS" \
-  --ray-address "$PROFILE_RAY_ADDRESS" \
-  --enable-profiler \
-  --profiler-mode runtime_overhead \
-  --profiler-start-step 32 \
-  --profiling-step 16 \
-  --output-dir "$RUN_ROOT/candidate/dynamic_sparse/repeat_0"
-```
-
-Replace `candidate` with `before` for the matched baseline and repeat indices
-`0..4`. Use a new master port, or prove that the previous process group is
-fully gone, before starting another engine.
-
-Run the parser after every profile so a missing annotation or kernel is found
-before an expensive matrix completes:
-
-```bash
-python3 utils_analysis/summarize_sp_graph_overhead_trace.py \
-  "$RUN_ROOT/candidate/fixed_dense/repeat_0" \
-  --output-dir "$RUN_ROOT/candidate/fixed_dense/repeat_0/analysis"
-```
-
-### 5.5 Non-profiled paired latency run
-
-Repeat `fixed_dense` and `fixed_tail` at least five times on `before` and
-`candidate` with the same driver but without `--enable-profiler`. Save per-step
-latency after warmup. The primary net result is the median of paired run
-medians:
-
-```text
-delta_us = candidate decode-step median - before decode-step median
-delta_pct = delta_us / before decode-step median * 100
-```
-
-The production profile explains this delta; it does not replace it. If a
-profiled delta and non-profiled delta disagree, trust the non-profiled result
-for end-to-end impact and investigate profiler perturbation.
-
-## 6. Result tables
-
-The final note must include at least these tables.
-
-### 6.1 Bucket selection
-
-| Topology/case | Distribution | Absolute p50 ns | p95 ns | Direct-lookup control ns | Adjusted overhead ns |
-|---|---|---:|---:|---:|---:|
-
-### 6.2 Metadata injection
-
-| Version | Case | max_num_seqs | Scope | Host p50 us | Device p50 us | p95 us | Bytes | Active rows |
-|---|---|---:|---|---:|---:|---:|---:|---:|
-
-Include separate rows for `q_dst_rows`, `actual_attn_bs`,
-`padding_metadata`, routing-only sum, and total injection. Add a before/after
-delta column for the total production scope.
-
-### 6.3 Kernel and Graph launch/replay
-
-| Version | Case | Rank aggregate | cudaGraphLaunch host p50 us | Graph device span p50 us | Padding kernels/replay | Padding sum/replay us | Non-profiled step p50 us |
-|---|---|---|---:|---:|---:|---:|---:|
-
-For the isolated padding Graph, add control, no-tail, small-tail, EOS-tail, and
-worst-tail rows. For production, report the median-rank and slowest-rank rows.
-
-## 7. Validation and rejection criteria
-
-Reject and rerun a sample when any of the following holds:
-
-- the imported NanoDeploy path or Git commit is not the intended worktree;
-- fewer than eight worker traces are produced;
-- the trace contains capture/compilation in the measured window;
-- no `cudaGraphLaunch` or candidate padding kernel is found;
-- Graph-step annotations do not show the intended actual/Graph row relation;
-- the number of model Graph replays differs across ranks;
-- a request completes inside a supposedly stable measured window, except for
-  completion that occurs before the fixed-tail window;
-- CUDA errors, Ray actor restarts, OOM, request rejection, or scheduler backlog
-  are observed;
-- before and candidate use different Graph shapes or request topology for a
-  matched case.
-
-The parser must also verify that the padding-kernel count per replay is stable
-and explain it using the model's attention-layer count. A count mismatch is a
-measurement failure, not a value to average away.
-
-## 8. Interpretation rules
-
-- A CPU unit test is evidence of bucket-selection correctness, not runtime
-  overhead. Cite the standalone benchmark number.
-- A single D2D copy duration is not the whole routing-metadata cost. Cite both
-  the routing-only sum and complete injection scope.
-- The existing `profiler_traces/dst_rows_perf_20260821` traces measure a
-  communication-only Graph. They do not contain `zero_padded_rows_kernel` and
-  must not be cited for the model-level padding/Graph-launch overhead.
-- Absolute kernel time answers “how expensive is the new primitive”; the
-  before/after Graph span and non-profiled decode delta answer “how much did
-  the system slow down.” Report both.
-- If the candidate's total metadata injection is faster than the old dense
-  fixed-SP path, report the negative overhead rather than presenting only the
-  new copy cost.
-- If the end-to-end median changes by less than 1% and remains within the
-  measured run-to-run spread, describe it as within noise and still provide
-  the component microseconds.
-
-## 9. Implementation and execution sequence
-
-1. Add the profiler mode, guarded ranges, bucket-selection helper, deterministic
-   driver, component benchmark, parser, and CPU tests in one profiling-only
-   commit.
-2. Run the focused CPU tests and the CPU bucket benchmark.
-3. Run a one-GPU smoke of `metadata` and `padding-graph`; verify JSON and trace
-   parsing before increasing iterations.
-4. Apply the same instrumentation commit to `before` and `candidate`
-   worktrees.
-5. Run one `fixed_dense` production profile on each version and compare Graph
-   shapes, annotations, trace counts, and import paths.
-6. Run the remaining five-repeat profiled and non-profiled matrix in paired
-   order.
-7. Run one smoke on current integration HEAD.
-8. Write and commit the concise result note, exact commands, commit hashes,
-   topology, profiler settings, tables, and interpretation. Keep raw trace and
-   benchmark artifacts uncommitted under `bench_logs/`.
+Run 3–5 repeats for the end-to-end result. The compact timing output may report
+metadata enqueue and replay submission, but the end-to-end ITL/throughput must
+come from the normal serving metrics.
+
+## 8. Trace analysis and reporting
+
+For every `cudaGraphLaunch` event:
+
+1. read its correlation ID;
+2. collect device events belonging to that launch;
+3. compute full Graph span as `latest_end - earliest_start`;
+4. select events whose name contains `zero_padded_rows_kernel`;
+5. report their count, individual duration distribution, and summed duration;
+6. retain the associated shape tuple and worker rank.
+
+If a trace backend does not expose usable correlation IDs, fall back to the
+enclosing `nanodeploy.graph.replay` range and document that limitation. Do not
+match kernels solely by nearest timestamp without validation.
+
+The paper-facing result can be two compact tables:
+
+| Component | Case | p50 | p95 | Unit |
+| --- | --- | ---: | ---: | --- |
+| bucket selection + lookup | Issue1 typical / boundary | ... | ... | ns |
+| routing metadata host enqueue | no padding / Issue1 padded | ... | ... | us |
+| routing metadata device span | no padding / Issue1 padded | ... | ... | us |
+| all Graph metadata | no padding / Issue1 padded | ... | ... | us |
+| Graph replay host submission | Issue1 representative | ... | ... | us |
+
+| Production attribution | Value |
+| --- | ---: |
+| observed `(actual_master, graph_master, actual_attn, graph_attn)` | ... |
+| full Graph device span | ... us |
+| padding kernels per replay | ... |
+| aggregate padding-kernel time per replay | ... us |
+| non-profiled ITL / throughput | ... |
+
+Suggested paper wording:
+
+> Graph selection takes X ns at the median (Y ns at P95). Routing-specific
+> metadata injection takes A us of host enqueue time and B us of device-stream
+> span for an Issue1% production-derived shape. CUDA Graph replay submission
+> takes C us on the host. The additional padding nodes execute K times per
+> replay and account for D us in aggregate. These component values are used for
+> attribution; net runtime impact is measured separately by the non-profiled
+> serving experiment.
+
+## 9. Acceptance criteria
+
+- Primary numbers come from final integration HEAD.
+- Bucket and metadata microbenchmarks cover only typical and boundary/padded
+  cases.
+- The production profile has only 1–2 repeats and uses the real Issue1%
+  workload configuration.
+- The final trace records the actual/selected master and attention sizes; no
+  bucket is inferred from the April log.
+- Profiler timing is used for attribution, not as the sole stable result.
+- Host submission is not mislabeled as device execution.
+- Overlapping component times are not summed into net overhead.
+- No C++ source or external dependency is modified.
+
+## 10. P1 internal validation only
+
+Do these only if time remains or P0 exposes an anomaly:
+
+- `6689f5d` versus `a5a01b2` regression comparison;
+- isolated `zero_padded_rows_kernel` no-tail versus observed/worst-tail Graph;
+- detailed routing-metadata subcomponent table;
+- broader local/fixed/dynamic bucket sweeps;
+- generalized trace-parser guard tests.
+
+Raw logs and profiler traces belong under `bench_logs/` and should not be
+committed. Save the reviewed numerical summary as
+`docs-dev/2026-08-23/GraphRoutingRuntimeOverheadResults.md`.
