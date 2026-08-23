@@ -235,3 +235,49 @@ def test_glm_multistep_mtp_allows_pd_roles(monkeypatch, mode):
 
     assert config.mode == mode
     assert config.num_speculative_tokens == 5
+
+
+def test_glm_multistep_mtp_allows_pp_prefill(monkeypatch):
+    hf_config = _deepseek_config("GlmMoeDsaForCausalLM")
+    hf_config.num_nextn_predict_layers = 1
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: hf_config,
+    )
+
+    config = Config(
+        model="unused",
+        pp=8,
+        mode="prefill",
+        num_speculative_tokens=5,
+        max_num_seqs=8,
+    )
+
+    assert config.pp == 8
+    assert config.mode == "prefill"
+    assert config.num_speculative_tokens == 5
+    assert config.enforce_eager is True
+
+
+@pytest.mark.parametrize("mode", ["hybrid", "decode"])
+def test_glm_multistep_mtp_rejects_pp_outside_prefill(monkeypatch, mode):
+    hf_config = _deepseek_config("GlmMoeDsaForCausalLM")
+    hf_config.num_nextn_predict_layers = 1
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: hf_config,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="supported only for GLM prefill",
+    ):
+        Config(
+            model="unused",
+            pp=8,
+            mode=mode,
+            num_speculative_tokens=5,
+            max_num_seqs=8,
+        )

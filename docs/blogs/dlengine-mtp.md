@@ -248,8 +248,8 @@ cached-chain graph 相比 eager MTP 再减少约 14% 墙钟。在此基础上，
 
 ### 8. 当前能力边界与未来方向
 
-- **已支持**：N=1 的既有 MTP；GLM DSA/MLA 在 Hopper 上的 N=5/K=6 线性多步路径；hybrid 与 PD 分离；greedy 与 `temperature > 0`；completion logprob；batch reorder/shrink。PD 模式把 predictor KV 放在常规 KV MR 中迁移，并用独立的 `mtp_handoff` MR 按 scheduler state slot 传递 5-token draft bundle；decode 首轮可直接 verify，失配或 stale row 安全回退 target decode。
-- **暂不支持**：tree、HiSparse+MTP、GLM multi-step 的 PP、非 Hopper multi-step、GDN multi-step、DeepSeek/Qwen multi-step。
+- **已支持**：N=1 的既有 MTP；GLM DSA/MLA 在 Hopper 上的 N=5/K=6 线性多步路径；hybrid 与 PD 分离；greedy 与 `temperature > 0`；completion logprob；batch reorder/shrink；以及 `PP>1` prefill 对接 `PP=1` decode 的非对称 PD 拓扑。PP prefill 仅在最后 stage 运行 predictor，并通过常规 KV MR 和独立 `mtp_handoff` MR 迁移 predictor KV 与 5-token draft bundle；decode 首轮可直接 verify，失配或 stale row 安全回退 target decode。
+- **暂不支持**：tree、HiSparse+MTP、PP decode、非 Hopper multi-step、GDN multi-step、DeepSeek/Qwen multi-step。
 - **下一性能热点**：recurrent 与 active target verify 的 kernel 数和 GPU p50 均已达到 SGLang 同档；下一阶段优先降低 profiler 外的 CPU 调度抖动、DeepEP 长尾和 cold prefill/routing 开销，而不是为了计数继续拆改 recurrent 或 verify 控制流
 - **自适应投机深度**：根据运行时接受率动态调整 draft 数量，在高接受率时激进投机，低接受率时退回标准 decode
 - **与 EPLB 协同**：将 MTP 的 draft token 纳入专家负载均衡（EPLB）的统计，优化 EP 场景下的热点专家调度

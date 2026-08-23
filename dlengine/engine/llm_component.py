@@ -97,6 +97,24 @@ class LLMComponent(LLM):
             )
         ]
 
+    def _mtp_num_kv_layers(self) -> int:
+        """Number of physical predictor cache layers appended to target KV."""
+        if self.config.num_speculative_tokens <= 0:
+            return 0
+        hf_config = self.config.hf_config
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch not in (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ):
+            return 0
+        return max(
+            1,
+            int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0),
+            int(getattr(hf_config, "mtp_num_hidden_layers", 0) or 0),
+        )
+
     def _pp_cache_layer_indices(self) -> list[list[int]]:
         """Global primary-cache layer indices owned by each PP stage."""
         from dlengine.runtime.models.pp_utils import (
@@ -105,13 +123,21 @@ class LLMComponent(LLM):
         )
 
         ranges = [tuple(value) for value in self._pp_layer_ranges()]
-        return partition_layer_indices(
-            cache_layer_indices(
-                self.config.hf_config,
-                gemma_hisparse_only_full_attention=bool(self.config.enable_hisparse),
-            ),
+        target_cache_layers = cache_layer_indices(
+            self.config.hf_config,
+            gemma_hisparse_only_full_attention=bool(self.config.enable_hisparse),
+        )
+        layers_by_stage = partition_layer_indices(
+            target_cache_layers,
             ranges,
         )
+        mtp_layers = self._mtp_num_kv_layers()
+        if mtp_layers:
+            first_mtp_slot = len(target_cache_layers)
+            layers_by_stage[-1].extend(
+                range(first_mtp_slot, first_mtp_slot + mtp_layers)
+            )
+        return layers_by_stage
 
     def _pp_dsv4_ratio_layer_indices(self) -> dict[int, list[list[int]]]:
         """Global DSv4 compressed-layer indices by ratio and PP stage."""
@@ -163,6 +189,7 @@ class LLMComponent(LLM):
             "pp": self.config.pp,
             "num_hidden_layers": getattr(self.config.hf_config, "num_hidden_layers", 0),
             "pp_layer_ranges": self._pp_layer_ranges(),
+            "mtp_num_kv_layers": self._mtp_num_kv_layers(),
             "pp_cache_layer_indices": self._pp_cache_layer_indices(),
             "pp_dsv4_ratio_layer_indices": self._pp_dsv4_ratio_layer_indices(),
             # Per-rank KV-head shard size. The RDMA block-copy migration requires
@@ -481,6 +508,7 @@ class LLMComponent(LLM):
             ),
             "model_path": self.config.model,  # tokenizer directory = model directory
             # Cache/topology compatibility contract consumed by PD migration.
+            "mtp_num_kv_layers": self._mtp_num_kv_layers(),
             # Keep these explicit: equal world_size is insufficient to prove
             # that two DP+EP deployments shard attention/cache identically.
             "architecture": architecture,
