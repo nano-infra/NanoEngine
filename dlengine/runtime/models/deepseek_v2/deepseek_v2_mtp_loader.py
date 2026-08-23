@@ -173,20 +173,25 @@ def load_weights(
     kv_b_proj_scales: dict[str, torch.Tensor] = {}
 
     for weight_name, raw_weight_name, tensor in weights:
-        # Only process MTP layer weights
-        spec_layer = _get_spec_layer_idx(config, weight_name)
-        if spec_layer is None:
-            skipped_count += 1
-            continue
+        is_base_embedding = weight_name == "model.embed_tokens.weight"
+        if is_base_embedding:
+            spec_layer = mtp_start
+            name = "embed_tokens.weight"
+        else:
+            # Only process MTP layer weights.
+            spec_layer = _get_spec_layer_idx(config, weight_name)
+            if spec_layer is None:
+                skipped_count += 1
+                continue
 
-        # Shared weights: only load for the first MTP layer
-        is_shared = any(sn in weight_name for sn in _SHARED_WEIGHT_NAMES)
-        if is_shared and spec_layer != mtp_start:
-            skipped_count += 1
-            continue
+            # Shared weights: only load for the first MTP layer.
+            is_shared = any(sn in weight_name for sn in _SHARED_WEIGHT_NAMES)
+            if is_shared and spec_layer != mtp_start:
+                skipped_count += 1
+                continue
 
-        # Rewrite name to match model parameter layout
-        name = _rewrite_spec_layer_name(spec_layer, weight_name)
+            # Rewrite name to match model parameter layout.
+            name = _rewrite_spec_layer_name(spec_layer, weight_name)
 
         # Buffer kv_b_proj for deferred processing
         if "kv_b_proj" in name:

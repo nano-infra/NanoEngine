@@ -469,7 +469,11 @@ class ModelRunner:
 
         # --- MTP model initialization ---
         mtp_model = None
-        if config.num_speculative_tokens > 0:
+        dist_context = get_dist_context()
+        owns_mtp = config.num_speculative_tokens > 0 and (
+            config.pp == 1 or dist_context.is_last_pp_stage
+        )
+        if owns_mtp:
             mtp_loader = architecture_mtp_loaders.get(model_architecture)
             if mtp_loader is None:
                 raise ValueError(
@@ -478,7 +482,8 @@ class ModelRunner:
             mtp_cls = mtp_loader()
             mtp_model = mtp_cls(hf_config)
             target_embed = self.model.model.embed_tokens
-            mtp_model.embed_tokens = target_embed
+            if target_embed is not None:
+                mtp_model.embed_tokens = target_embed
             if hasattr(mtp_model, "lm_head") and getattr(
                 hf_config, "tie_word_embeddings", False
             ):
@@ -1339,7 +1344,11 @@ class ModelRunner:
             hisparse_device_buffer_size=config.hisparse_device_buffer_size,
             reserved_state_bytes=reserved_state_bytes,
         )
-        if config.num_speculative_tokens > 1 and config.mode in ("prefill", "decode"):
+        if (
+            self.mtp_runner is not None
+            and config.num_speculative_tokens > 1
+            and config.mode in ("prefill", "decode")
+        ):
             cache_context.allocate_mtp_handoff(config.num_speculative_tokens)
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
         self._sync_cache_plan_from_context(

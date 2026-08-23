@@ -626,9 +626,12 @@ class Config(BaseModel):
                         f"needs at least {self.pp - 1} independent prefix layers; "
                         f"got {source_start}"
                     )
-            if self.num_speculative_tokens > 0:
+            if self.num_speculative_tokens > 0 and not (
+                arch == "GlmMoeDsaForCausalLM" and self.mode == "prefill"
+            ):
                 raise ValueError(
-                    "pp > 1 does not support MTP (num_speculative_tokens must be 0)"
+                    "pp > 1 with MTP is supported only for GLM prefill; "
+                    "use pp=1 for hybrid/decode MTP"
                 )
             if self.enable_hisparse and arch not in (
                 "Gemma4ForCausalLM",

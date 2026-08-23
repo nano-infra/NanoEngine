@@ -1048,6 +1048,7 @@ class P2PCacheTransfer:
             remote_pp = int(engine_info.get("pp", 1))
             self.remote_pp[engine_id] = remote_pp
             remote_layers_total = int(engine_info.get("num_hidden_layers", 0))
+            remote_mtp_kv_layers = int(engine_info.get("mtp_num_kv_layers", 0))
             effective_remote_layers = remote_layers_total or self.num_hidden_layers
             self.remote_num_hidden_layers[engine_id] = remote_layers_total
             published_ranges = engine_info.get("pp_layer_ranges") or []
@@ -1136,12 +1137,40 @@ class P2PCacheTransfer:
                         f"PP cache layers are not in global slot order for "
                         f"{engine_id}: {cache_layers_by_stage}"
                     )
+                predictor_slots = list(
+                    range(
+                        effective_remote_layers,
+                        effective_remote_layers + remote_mtp_kv_layers,
+                    )
+                )
+                if remote_mtp_kv_layers and (
+                    flattened_cache_layers[-remote_mtp_kv_layers:] != predictor_slots
+                ):
+                    raise RuntimeError(
+                        f"PP MTP cache slots are not the global tail for "
+                        f"{engine_id}: expected={predictor_slots}, "
+                        f"actual={cache_layers_by_stage}"
+                    )
                 for stage, layers in enumerate(cache_layers_by_stage):
                     start, end = stage_ranges[stage]
-                    if any(layer < start or layer >= end for layer in layers):
+                    target_layers = [
+                        layer for layer in layers if layer < effective_remote_layers
+                    ]
+                    stage_predictor_slots = [
+                        layer for layer in layers if layer >= effective_remote_layers
+                    ]
+                    if any(layer < start or layer >= end for layer in target_layers):
                         raise RuntimeError(
                             f"PP cache layer outside stage {stage} range "
                             f"[{start}, {end}) for {engine_id}: {layers}"
+                        )
+                    if stage_predictor_slots and (
+                        stage != remote_pp - 1
+                        or stage_predictor_slots != predictor_slots
+                    ):
+                        raise RuntimeError(
+                            f"PP MTP cache must belong only to the final stage "
+                            f"for {engine_id}: {cache_layers_by_stage}"
                         )
             # The RDMA block-copy migrates whole (layer, block) regions whose
             # byte size depends on num_local_kv_heads. That only lines up when
@@ -1347,16 +1376,19 @@ class P2PCacheTransfer:
                 # Indexer cache has one slot per decoder layer. Route each
                 # global layer to its PP stage and stage-local layer index.
                 if self.indexer_cache is not None:
-                    for layer_idx in range(self.num_hidden_layers):
-                        stage = pp_stage_of_layer(layer_idx, remote_stage_ranges)
-                        stage_start, _ = remote_stage_ranges[stage]
+                    for local_layer_idx, global_layer_idx in enumerate(
+                        local_cache_layers
+                    ):
+                        stage, remote_layer_idx = remote_cache_locations[
+                            global_layer_idx
+                        ]
                         indexer_peer_alias = peer_addrs[
                             stage * remote_inner_world_size + remote_inner_rank
                         ]
                         indexer_assigns[engine_id][indexer_peer_alias].append(
                             (
-                                layer_idx,
-                                layer_idx - stage_start,
+                                local_layer_idx,
+                                remote_layer_idx,
                                 remote_block_idx,
                                 source_block_idx,
                             )
@@ -1497,7 +1529,9 @@ class P2PCacheTransfer:
                     tp_idx,
                     self.remote_attention_tp.get(engine_id, 1),
                 )
-                peer_alias = peer_addrs[remote_inner_rank]
+                peer_alias = peer_addrs[
+                    (remote_pp - 1) * remote_inner_world_size + remote_inner_rank
+                ]
                 mtp_handoff_assigns[engine_id][peer_alias].append(
                     (v.migrate_state_slot, v.active_state_slot)
                 )

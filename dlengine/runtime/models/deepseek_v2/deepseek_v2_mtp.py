@@ -18,6 +18,7 @@ from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
     DeepseekV2DecoderLayer,
 )
 from dlengine.runtime.models.quant_config import QuantizationConfig
+from dlengine.runtime.models.pp_utils import get_pp_layer_range
 
 
 class DeepSeekMTPSharedHead(nn.Module):
@@ -54,13 +55,19 @@ class DeepSeekMTPLayer(nn.Module):
         config,
         quantization_config: QuantizationConfig,
         layer_idx: int,
+        cache_layer_idx: int | None = None,
     ):
         super().__init__()
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.shared_head = DeepSeekMTPSharedHead(config)
-        self.mtp_block = DeepseekV2DecoderLayer(config, quantization_config, layer_idx)
+        self.mtp_block = DeepseekV2DecoderLayer(
+            config,
+            quantization_config,
+            layer_idx,
+            cache_layer_idx=cache_layer_idx,
+        )
 
     def forward(
         self,
@@ -105,6 +112,9 @@ class DeepSeekMTP(nn.Module):
         )
         self.num_mtp_layers = config.num_nextn_predict_layers
         self.mtp_start_layer_idx = config.num_hidden_layers
+        target_start, target_end = get_pp_layer_range(config.num_hidden_layers)
+        # Predictor cache follows the target layers local to its PP owner.
+        self.mtp_cache_start_idx = target_end - target_start
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
@@ -112,7 +122,14 @@ class DeepSeekMTP(nn.Module):
 
         self.layers = nn.ModuleDict(
             {
-                str(idx): DeepSeekMTPLayer(config, self.quantization_config, idx)
+                str(idx): DeepSeekMTPLayer(
+                    config,
+                    self.quantization_config,
+                    idx,
+                    cache_layer_idx=self.mtp_cache_start_idx
+                    + idx
+                    - self.mtp_start_layer_idx,
+                )
                 for idx in range(
                     self.mtp_start_layer_idx,
                     self.mtp_start_layer_idx + self.num_mtp_layers,
