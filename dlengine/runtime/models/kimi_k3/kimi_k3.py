@@ -29,6 +29,7 @@ from dlengine.runtime.models.pp_utils import (
     pp_send_hidden,
 )
 from dlengine.runtime.models.quant_config import QuantizationConfig
+from dlengine.runtime.stream_pool import get_cuda_stream
 
 
 class KimiMLP(nn.Module):
@@ -199,7 +200,11 @@ class KimiMoE(nn.Module):
             replicated=True,
         )
         self.register_buffer("fused_front_weight", None, persistent=False)
-        self._shared_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._shared_stream = (
+            get_cuda_stream("model_shared_expert")
+            if torch.cuda.is_available()
+            else None
+        )
         self._shared_event = torch.cuda.Event() if torch.cuda.is_available() else None
 
     def prepare_fused_front(self) -> None:

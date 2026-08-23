@@ -731,7 +731,12 @@ def _profiler_trace_files(result: dict[str, Any]) -> list[Path]:
     return traces
 
 
-def _profiler_merged_trace_path(result: dict[str, Any], traces: list[Path]) -> Path:
+def _profiler_merged_trace_path(
+    result: dict[str, Any],
+    traces: list[Path],
+    *,
+    compact_streams: bool = False,
+) -> Path:
     trace_dirs = {
         Path(worker["trace_dir"]).expanduser().resolve()
         for worker in result.get("workers", [])
@@ -740,7 +745,10 @@ def _profiler_merged_trace_path(result: dict[str, Any], traces: list[Path]) -> P
     if len(trace_dirs) > 1:
         raise ValueError("profiler workers reported different trace directories")
     trace_dir = trace_dirs.pop() if trace_dirs else traces[0].parent
-    return trace_dir / f"{trace_dir.name}_merged.trace.json.gz"
+    suffix = (
+        "_compact_merged.trace.json.gz" if compact_streams else "_merged.trace.json.gz"
+    )
+    return trace_dir / f"{trace_dir.name}{suffix}"
 
 
 def build_app(server: OpenAIServer):
@@ -815,6 +823,11 @@ def build_app(server: OpenAIServer):
             merge = body.get("merge", False)
             if type(merge) is not bool:
                 raise ValueError("merge must be a boolean")
+            compact_streams = body.get("compact_streams", False)
+            if type(compact_streams) is not bool:
+                raise ValueError("compact_streams must be a boolean")
+            if compact_streams and not merge:
+                raise ValueError("compact_streams requires merge=true")
 
             result = await server.worker.stop_profiler()
             if not result.get("ok") or not merge:
@@ -824,11 +837,14 @@ def build_app(server: OpenAIServer):
                 )
 
             traces = _profiler_trace_files(result)
-            merged_trace = _profiler_merged_trace_path(result, traces)
+            merged_trace = _profiler_merged_trace_path(
+                result, traces, compact_streams=compact_streams
+            )
             await asyncio.to_thread(
                 merge_trace_jsons_to_gzip,
                 traces,
                 merged_trace,
+                compact_streams=compact_streams,
             )
             return FileResponse(
                 merged_trace,
@@ -836,6 +852,7 @@ def build_app(server: OpenAIServer):
                 filename=merged_trace.name,
                 headers={
                     "X-DLEngine-Profiler-Trace-Count": str(len(traces)),
+                    "X-DLEngine-Profiler-Compact-Streams": str(compact_streams).lower(),
                 },
             )
         except (ValueError, json.JSONDecodeError) as e:

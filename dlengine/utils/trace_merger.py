@@ -24,6 +24,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
+from dlengine.utils.trace_compactor import StreamLaneCompactor
+
 logger = logging.getLogger(__name__)
 
 _RANK_PID_STRIDE = 100_000_000
@@ -175,6 +177,8 @@ def _trace_sort_key(path: Path) -> tuple[int, str]:
 def merge_trace_jsons(
     trace_files: Sequence[str | Path],
     output_json: str | Path,
+    *,
+    compact_streams: bool = False,
 ) -> Path:
     """Stream multiple profiler traces into one Chrome/Perfetto JSON file."""
     inputs = sorted(
@@ -211,6 +215,18 @@ def merge_trace_jsons(
         first_event = True
         for index, path in enumerate(inputs):
             logger.info("Merging profiler trace %s", path)
+            compactor = None
+            if compact_streams:
+                compactor = StreamLaneCompactor()
+                with _TraceEventStream(path) as compact_scan:
+                    for compact_event in compact_scan:
+                        compactor.observe(compact_event)
+                compacted_lanes = compactor.finalize()
+                logger.info(
+                    "Compacting %s repeated CUDA graph stream lanes in %s",
+                    compacted_lanes,
+                    path,
+                )
             with _TraceEventStream(path) as stream:
                 rank = _rank_for_trace(path, stream.prefix)
                 if rank in seen_ranks:
@@ -220,6 +236,10 @@ def merge_trace_jsons(
                     destination.write(stream.prefix)
 
                 for event in stream:
+                    if compactor is not None:
+                        event = compactor.compact(event)
+                        if event is None:
+                            continue
                     if not first_event:
                         destination.write(",")
                     json.dump(
@@ -260,6 +280,8 @@ def merge_trace_jsons(
 def merge_trace_jsons_to_gzip(
     trace_files: Sequence[str | Path],
     output_trace: str | Path,
+    *,
+    compact_streams: bool = False,
 ) -> Path:
     """Create a Perfetto-compatible gzip-compressed trace JSON."""
     output = Path(output_trace).resolve()
@@ -268,7 +290,11 @@ def merge_trace_jsons_to_gzip(
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output.with_name(output.name + ".tmp.gz")
     try:
-        merge_trace_jsons(trace_files, temporary_output)
+        merge_trace_jsons(
+            trace_files,
+            temporary_output,
+            compact_streams=compact_streams,
+        )
         temporary_output.replace(output)
     finally:
         temporary_output.unlink(missing_ok=True)
@@ -287,6 +313,11 @@ def _main() -> None:
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--compact-streams",
+        action="store_true",
+        help="collapse repeated CUDA Graph branch lanes in the merged output",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
@@ -300,7 +331,9 @@ def _main() -> None:
     output = args.output or (
         args.input_dir / f"{args.input_dir.name}_merged.trace.json.gz"
     )
-    result = merge_trace_jsons_to_gzip(inputs, output)
+    result = merge_trace_jsons_to_gzip(
+        inputs, output, compact_streams=args.compact_streams
+    )
     print(result)
 
 

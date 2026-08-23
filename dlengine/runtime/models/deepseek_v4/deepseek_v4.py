@@ -28,6 +28,7 @@ from dlengine.runtime.models.pp_utils import (
     pp_send_hidden,
 )
 from dlengine.runtime.models.quant_config import QuantizationConfig
+from dlengine.runtime.stream_pool import get_cuda_stream
 
 
 # --- Lazily-compiled helpers ----------------------------------------------
@@ -1570,15 +1571,15 @@ class DeepseekV4Attention(nn.Module):
         # 3x/step (one per unique compress_ratio) instead of 43x/step.
         self._dsv4_sched_metas: dict[int, object] = {}
 
-        # Alt stream for compressor.forward_decode_batched. Lazily allocated on
-        # first decode call (CUDA context must be initialized). Mirrors
+        # Alt stream for compressor.forward_decode_batched. Resolved lazily from
+        # the process-local role pool on the first decode call (CUDA context must be initialized). Mirrors
         # sglang's _forward_prepare_multi_stream pattern: compressor runs on
         # this stream while KV store + SWA index construction run on the main
         # stream. The main stream waits before extra-index construction (which
         # reads compressor._compressed_counts). Compressor work (~2.5 ms)
         # dominates, so the gain is hiding KV store + SWA index (~100-200 µs).
-        # CUDAGraph-safe: stream is created at warmup, sync points are CUDA
-        # events captured inside the graph.
+        # CUDAGraph-safe: the pooled stream is initialized at warmup; sync
+        # points are CUDA events captured inside the graph.
         self._compressor_stream: torch.cuda.Stream | None = None
 
         # Alt stream for the KV-side of attention prep (wkv → kv_norm →
@@ -2102,7 +2103,9 @@ class DeepseekV4Attention(nn.Module):
         compressor_running = self.compress_ratio and ntps == 1
         if compressor_running:
             if self._compressor_stream is None:
-                self._compressor_stream = torch.cuda.Stream()
+                self._compressor_stream = get_cuda_stream(
+                    "dsv4_compressor", hidden_states.device
+                )
             comp_stream = self._compressor_stream
             comp_stream.wait_stream(main_stream)
 
@@ -2386,9 +2389,9 @@ class DeepseekV4Attention(nn.Module):
         # main is the sync coordinator. Mirrors sglang's
         # ``_forward_prepare_multi_stream`` pattern.
         if self._kv_stream is None:
-            self._kv_stream = torch.cuda.Stream()
+            self._kv_stream = get_cuda_stream("attention_kv", hidden_states.device)
         if self._q_stream is None:
-            self._q_stream = torch.cuda.Stream()
+            self._q_stream = get_cuda_stream("attention_q", hidden_states.device)
         kv_stream = self._kv_stream
         q_stream = self._q_stream
         main_stream = torch.cuda.current_stream()
@@ -2564,7 +2567,7 @@ class DeepseekV4MoE(nn.Module):
         # dispatch + experts + combine). Mirrors sglang's SBO pattern: while
         # routed_experts is mostly RDMA-bound (dispatch + combine ~2 ms), the
         # shared MLP (~500 µs of FP8 GEMMs) runs concurrently on the alt
-        # stream. Lazily allocated on first forward.
+        # stream. Resolved from the process-local shared-expert role pool.
         self._shared_stream: torch.cuda.Stream | None = None
 
     def _scores(self, logits: torch.Tensor) -> torch.Tensor:
@@ -2671,7 +2674,9 @@ class DeepseekV4MoE(nn.Module):
         use_shared_stream = not is_prefill
         if use_shared_stream:
             if self._shared_stream is None:
-                self._shared_stream = torch.cuda.Stream()
+                self._shared_stream = get_cuda_stream(
+                    "model_shared_expert", hidden_states.device
+                )
             shared_stream = self._shared_stream
             main_stream = torch.cuda.current_stream()
             shared_stream.wait_stream(main_stream)
@@ -2714,7 +2719,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Alt stream for HC pre/post tilelang kernels (option 2). Sglang
         # records these on alt streams in their trace; mirroring that lets
         # the SM scheduler co-issue them with neighbouring main-stream
-        # kernels. Lazily allocated on first forward.
+        # kernels. Resolved from the process-local HC role pool.
         self._hc_stream: torch.cuda.Stream | None = None
 
     @staticmethod
@@ -2754,7 +2759,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # directly into the next op), but the SM scheduler can still
         # co-issue these tilelang kernels with main-stream work.
         if self._hc_stream is None:
-            self._hc_stream = torch.cuda.Stream()
+            self._hc_stream = get_cuda_stream("dsv4_hc", hidden_states.device)
         hc_stream = self._hc_stream
         main_stream = torch.cuda.current_stream()
 
