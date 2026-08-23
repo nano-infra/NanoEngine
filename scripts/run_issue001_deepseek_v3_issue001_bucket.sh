@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BENCH_SCRIPT="$ROOT_DIR/scripts/issue003/bench_serving_overhead.py"
 BUILD_LIB_DIR="$ROOT_DIR/build/lib"
+GIT_SHA="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
 if [[ -d "$BUILD_LIB_DIR" ]]; then
     export PYTHONPATH="$ROOT_DIR:$BUILD_LIB_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -42,6 +43,13 @@ DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-deepseek_v3}"
 DISABLE_NON_UNIFORM_SPLIT="${DISABLE_NON_UNIFORM_SPLIT:-0}"
 STOP_THRESHOLD_MS="${STOP_THRESHOLD_MS:-100}"
 DRY_RUN="${DRY_RUN:-0}"
+DURATION_SECONDS="${DURATION_SECONDS:-600}"
+ENABLE_PROFILER="${ENABLE_PROFILER:-0}"
+PROFILER_MODE="${PROFILER_MODE:-default}"
+PROFILER_START_STEP="${PROFILER_START_STEP:-40}"
+PROFILING_STEP="${PROFILING_STEP:-16}"
+PROFILER_RANKS="${PROFILER_RANKS:-}"
+RUNTIME_OVERHEAD_TIMING="${RUNTIME_OVERHEAD_TIMING:-0}"
 
 RUN_TAG="${RUN_TAG:-issue001_deepseek_v3_issue001_bucket_cp_${DYNAMIC_SP_BUCKET_PRESET}_$(date -u +%Y%m%d_%H%M%S)}"
 BASE_LOG_DIR="${BASE_LOG_DIR:-$ROOT_DIR/bench_logs/$RUN_TAG}"
@@ -90,7 +98,8 @@ is_number() {
 }
 
 rate_to_nreqs() {
-    awk "BEGIN {printf \"%d\", int(600 * $1 + 0.5)}"
+    awk -v duration="$DURATION_SECONDS" \
+        "BEGIN {printf \"%d\", int(duration * $1 + 0.5)}"
 }
 
 routing_short() {
@@ -122,12 +131,16 @@ SC_SHORT="$(scheduler_short "$SCHEDULER_ARCH")"
 SEG_SHORT="$((SEG / 1024))k"
 
 log "RUN_TAG=$RUN_TAG"
+log "GIT_SHA=$GIT_SHA"
 log "MODEL=$MODEL_PATH"
 log "DATASET=$DATASET_PATH"
 log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 log "TOPOLOGY=dp${DP}sp${SP}tp${TP}ep${EP}"
 log "DYNAMIC_SP_SIZE_STRATEGY=$DYNAMIC_SP_SIZE_STRATEGY DYNAMIC_SP_BUCKET_PRESET=$DYNAMIC_SP_BUCKET_PRESET"
 log "STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"
+log "DURATION_SECONDS=$DURATION_SECONDS"
+log "PROFILER enabled=$ENABLE_PROFILER mode=$PROFILER_MODE ranks=${PROFILER_RANKS:-all}"
+log "RUNTIME_OVERHEAD_TIMING=$RUNTIME_OVERHEAD_TIMING"
 log "RATES=${RATES[*]}"
 
 for rate in "${RATES[@]}"; do
@@ -149,6 +162,7 @@ for rate in "${RATES[@]}"; do
     strategy_str="dp${DP}sp${SP}_seg${SEG_SHORT}_n${num_reqs}_r${rate}_bs${BATCH_SIZE}_${RT_SHORT}_${SC_SHORT}_maxin$((MAX_INPUT_LEN / 1000))k${extra_tags}"
     current_log_dir="$BASE_LOG_DIR/$MODEL_NAME/$DATASET_NAME/$strategy_str"
     mkdir -p "$current_log_dir"
+    profiler_dir="${PROFILER_DIR:-$current_log_dir/profiler}"
 
     log_file="$current_log_dir/${timestamp}.log"
     json_file="$current_log_dir/${timestamp}.json"
@@ -179,6 +193,7 @@ for rate in "${RATES[@]}"; do
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --dynamic-sp-bucket-preset "$DYNAMIC_SP_BUCKET_PRESET"
         --max-input-len "$MAX_INPUT_LEN"
+        --profiler-dir "$profiler_dir"
     )
 
     if [[ "$ENFORCE_EAGER" -ne 0 ]]; then
@@ -186,6 +201,20 @@ for rate in "${RATES[@]}"; do
     fi
     if [[ "$DISABLE_NON_UNIFORM_SPLIT" -ne 0 ]]; then
         bench_args+=(--disable-non-uniform-split)
+    fi
+    if [[ "$ENABLE_PROFILER" -ne 0 ]]; then
+        bench_args+=(
+            --enable-profiler
+            --profiler-mode "$PROFILER_MODE"
+            --profiler-start-step "$PROFILER_START_STEP"
+            --profiling-step "$PROFILING_STEP"
+        )
+        if [[ -n "$PROFILER_RANKS" ]]; then
+            bench_args+=(--profiler-ranks "$PROFILER_RANKS")
+        fi
+    fi
+    if [[ "$RUNTIME_OVERHEAD_TIMING" -ne 0 ]]; then
+        bench_args+=(--runtime-overhead-timing)
     fi
 
     {
@@ -203,7 +232,7 @@ for rate in "${RATES[@]}"; do
         echo "Output Dir: $current_log_dir"
         echo ""
         echo "================= Wrapped Command ================="
-        echo "python -u \"$BENCH_SCRIPT\" ${bench_args[*]}"
+        echo "python3 -u \"$BENCH_SCRIPT\" ${bench_args[*]}"
         echo "====================================================="
         echo ""
     } > "$log_file"
@@ -218,7 +247,7 @@ for rate in "${RATES[@]}"; do
     cd "$ROOT_DIR"
     set -o pipefail
     RAY_DEDUP_LOGS=0 \
-    python -u "$BENCH_SCRIPT" "${bench_args[@]}" 2>&1 | tee -a "$log_file"
+    python3 -u "$BENCH_SCRIPT" "${bench_args[@]}" 2>&1 | tee -a "$log_file"
     exit_code=$?
     set +o pipefail
 

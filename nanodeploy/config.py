@@ -124,6 +124,9 @@ class Config:
     # Time-based profiling (in seconds). If set, will use time instead of steps.
     profiler_start_time: float | None = None  # Start profiling after N seconds
     profiling_duration: float | None = None  # Profile for N seconds
+    profiler_mode: Literal["default", "runtime_overhead"] = "default"
+    profiler_ranks: tuple[int, ...] | None = None
+    runtime_overhead_timing: bool = False
 
     # performance optimization
     use_dlslime_rpc: bool = True
@@ -160,6 +163,42 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.profiler_mode not in {"default", "runtime_overhead"}:
+            raise ValueError(
+                "profiler_mode must be one of: default, runtime_overhead"
+            )
+        if self.profiler_mode == "runtime_overhead" and not self.enable_profiler:
+            raise ValueError(
+                "profiler_mode='runtime_overhead' requires enable_profiler=True"
+            )
+        if self.runtime_overhead_timing and self.enable_profiler:
+            raise ValueError(
+                "runtime_overhead_timing cannot be combined with enable_profiler"
+            )
+        if self.profiler_ranks is not None:
+            self.profiler_ranks = tuple(self.profiler_ranks)
+            if not self.enable_profiler:
+                raise ValueError("profiler_ranks requires enable_profiler=True")
+            if not self.profiler_ranks:
+                raise ValueError("profiler_ranks must not be empty")
+            if any(
+                isinstance(rank, bool) or not isinstance(rank, int) or rank < 0
+                for rank in self.profiler_ranks
+            ):
+                raise ValueError(
+                    "profiler_ranks must contain non-negative integers"
+                )
+            if len(set(self.profiler_ranks)) != len(self.profiler_ranks):
+                raise ValueError("profiler_ranks must not contain duplicates")
+            if any(rank >= self.attn_world_size for rank in self.profiler_ranks):
+                raise ValueError(
+                    "profiler_ranks entries must be smaller than "
+                    f"attn_world_size ({self.attn_world_size})"
+                )
+        if self.profiler_start_step < 0:
+            raise ValueError("profiler_start_step must be non-negative")
+        if self.profiling_step <= 0:
+            raise ValueError("profiling_step must be positive")
         valid_moe_routing_strategies = {
             "model",
             "uniform_random",

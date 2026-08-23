@@ -119,6 +119,23 @@ def parse_args():
     parser.add_argument("--profiler-dir", type=str, default="./profiler_logs", help="Directory to save profiler logs.")
     parser.add_argument("--profiler-start-time", type=float, default=None, help="Start profiling after N seconds (time-based mode).")
     parser.add_argument("--profiling-duration", type=float, default=None, help="Profile for N seconds (time-based mode).")
+    parser.add_argument(
+        "--profiler-mode",
+        choices=["default", "runtime_overhead"],
+        default="default",
+        help="Profiler detail preset.",
+    )
+    parser.add_argument(
+        "--profiler-ranks",
+        type=str,
+        default=None,
+        help="Comma-separated global ranks to profile (default: all ranks).",
+    )
+    parser.add_argument(
+        "--runtime-overhead-timing",
+        action="store_true",
+        help="Collect non-profiled metadata and Graph submission host timing.",
+    )
     
     args = parser.parse_args()
     
@@ -129,6 +146,17 @@ def parse_args():
             parser.error(f"CSV file not found: {args.csv_path}")
     if args.max_request_tokens < 0:
         parser.error("--max-request-tokens must be non-negative")
+    if args.profiler_ranks is not None:
+        try:
+            args.profiler_ranks = tuple(
+                int(value.strip())
+                for value in args.profiler_ranks.split(",")
+                if value.strip()
+            )
+        except ValueError:
+            parser.error("--profiler-ranks must be comma-separated integers")
+        if not args.profiler_ranks:
+            parser.error("--profiler-ranks must not be empty")
 
     return args
 
@@ -534,6 +562,9 @@ def main():
         profiler_dir=args.profiler_dir,
         profiler_start_time=args.profiler_start_time,
         profiling_duration=args.profiling_duration,
+        profiler_mode=args.profiler_mode,
+        profiler_ranks=args.profiler_ranks,
+        runtime_overhead_timing=args.runtime_overhead_timing,
         enable_non_uniform_split=not args.disable_non_uniform_split,
         fixed_sp_size=args.fixed_sp_size,
         sp_backend=args.sp_backend,

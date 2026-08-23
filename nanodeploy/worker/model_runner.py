@@ -1,12 +1,17 @@
 import base64
+import json
 import os
 import time
+from collections import Counter, defaultdict
+from contextlib import contextmanager
 
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
+
+import nanodeploy
 
 from nanodeploy._cpp import (
     BlockContextSlot,
@@ -50,7 +55,11 @@ from nanodeploy.worker.prefill_logits import compute_prefill_logits
 from nanodeploy.worker.random_seed import set_random_seed
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
-from nanodeploy.worker.sp_graph_policy import materialize_sp_graph_padding
+from nanodeploy.worker.sp_graph_policy import (
+    copy_decode_context_to_graph_vars,
+    select_decode_graph_bucket,
+    select_decode_graph_master_bs,
+)
 
 logger = get_logger()
 
@@ -160,7 +169,45 @@ class ModelRunner:
         self.profiler = None
         self.profiler_start_time = None
         self.profiler_use_time = False
-        if getattr(config, "enable_profiler", False):
+        self._runtime_overhead_profiler_active = False
+        self._runtime_overhead_timing = bool(
+            getattr(config, "runtime_overhead_timing", False)
+        )
+        self._runtime_overhead_decode_steps = 0
+        self._runtime_overhead_timing_active = False
+        self._runtime_overhead_samples_ns: dict[str, list[int]] = defaultdict(list)
+        self._runtime_overhead_shapes: Counter[
+            tuple[int, int, int, int, int, int]
+        ] = Counter()
+        self._runtime_overhead_dir = getattr(
+            config, "profiler_dir", "./profiler_logs"
+        )
+        if self._runtime_overhead_timing:
+            os.makedirs(self._runtime_overhead_dir, exist_ok=True)
+            for _ in range(10_000):
+                timer_begin_ns = time.perf_counter_ns()
+                timer_end_ns = time.perf_counter_ns()
+                self._runtime_overhead_samples_ns[
+                    "perf_counter_pair"
+                ].append(timer_end_ns - timer_begin_ns)
+
+        profiler_ranks = getattr(config, "profiler_ranks", None)
+        profiler_selected = (
+            profiler_ranks is None or rank in profiler_ranks
+        )
+        self._runtime_overhead_profile = bool(
+            getattr(config, "enable_profiler", False)
+            and profiler_selected
+            and getattr(config, "profiler_mode", "default")
+            == "runtime_overhead"
+        )
+        if getattr(config, "enable_profiler", False) and not profiler_selected:
+            logger.info(
+                "Rank %d: profiler disabled by profiler_ranks=%s",
+                rank,
+                profiler_ranks,
+            )
+        if getattr(config, "enable_profiler", False) and profiler_selected:
             # Check if using time-based profiling
             profiler_start_time = getattr(config, "profiler_start_time", None)
             profiling_duration = getattr(config, "profiling_duration", None)
@@ -196,20 +243,21 @@ class ModelRunner:
             self.profiler_dir = profiler_dir
             self.profiler_worker_name = f"{self.engine_id}_rank_{self.rank}"
 
+            runtime_overhead_profile = self._runtime_overhead_profile
+            activities = [torch.profiler.ProfilerActivity.CUDA]
+            if runtime_overhead_profile:
+                activities.insert(0, torch.profiler.ProfilerActivity.CPU)
             self.profiler = torch.profiler.profile(
-                activities=[
-                    # torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=activities,
                 schedule=None,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     dir_name=profiler_dir,
                     worker_name=self.profiler_worker_name,
                     use_gzip=False,
                 ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
+                record_shapes=not runtime_overhead_profile,
+                profile_memory=not runtime_overhead_profile,
+                with_stack=not runtime_overhead_profile,
             )
 
             logger.info(
@@ -513,9 +561,151 @@ class ModelRunner:
     ):
         return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
 
+    @contextmanager
+    def _runtime_overhead_phase(self, name: str):
+        timing_active = self._runtime_overhead_timing_active
+        profile_active = self._runtime_overhead_profiler_active
+        if not timing_active and not profile_active:
+            yield
+            return
+
+        begin_ns = time.perf_counter_ns() if timing_active else 0
+        if profile_active:
+            with profiler.record_function(name):
+                yield
+        else:
+            yield
+        if timing_active:
+            self._runtime_overhead_samples_ns[name].append(
+                time.perf_counter_ns() - begin_ns
+            )
+
+    def _record_runtime_overhead_shape(
+        self,
+        *,
+        actual_master_bs: int,
+        graph_master_bs: int,
+        actual_attn_bs: int,
+        graph_attn_bs: int,
+        context,
+    ) -> None:
+        if not (
+            self._runtime_overhead_profiler_active
+            or self._runtime_overhead_timing_active
+        ):
+            return
+        block_table_rows = int(context.block_tables.size(0))
+        block_table_width = int(context.block_tables.size(1))
+        self._runtime_overhead_shapes[
+            (
+                actual_master_bs,
+                graph_master_bs,
+                actual_attn_bs,
+                graph_attn_bs,
+                block_table_rows,
+                block_table_width,
+            )
+        ] += 1
+
+    @staticmethod
+    def _summarize_runtime_samples(samples_ns: list[int]) -> dict[str, float | int]:
+        values = np.asarray(samples_ns, dtype=np.float64)
+        return {
+            "count": int(values.size),
+            "min_ns": int(values.min()),
+            "p50_ns": float(np.percentile(values, 50)),
+            "p95_ns": float(np.percentile(values, 95)),
+            "max_ns": int(values.max()),
+            "mean_ns": float(values.mean()),
+        }
+
+    def _write_runtime_overhead_summary(self) -> None:
+        if not self._runtime_overhead_timing and not self._runtime_overhead_profile:
+            return
+        os.makedirs(self._runtime_overhead_dir, exist_ok=True)
+        shape_counts = []
+        for shape, count in self._runtime_overhead_shapes.most_common():
+            (
+                actual_master_bs,
+                graph_master_bs,
+                actual_attn_bs,
+                graph_attn_bs,
+                block_table_rows,
+                block_table_width,
+            ) = shape
+            shape_counts.append(
+                {
+                    "actual_master_bs": actual_master_bs,
+                    "graph_master_bs": graph_master_bs,
+                    "actual_attn_bs": actual_attn_bs,
+                    "graph_attn_bs": graph_attn_bs,
+                    "block_table_rows": block_table_rows,
+                    "block_table_width": block_table_width,
+                    "count": count,
+                }
+            )
+
+        sample_summaries = {
+            name: self._summarize_runtime_samples(samples)
+            for name, samples in self._runtime_overhead_samples_ns.items()
+            if samples
+        }
+        graph_master_rank_bs = list(
+            getattr(self, "graph_master_rank_bs", ())
+        )
+        sp_graph_map = {
+            str(master_bs): list(attn_buckets)
+            for master_bs, attn_buckets in getattr(
+                self, "sp_graph_map", {}
+            ).items()
+        }
+        summary = {
+            "schema_version": 1,
+            "engine_id": self.engine_id,
+            "rank": self.rank,
+            "nanodeploy_file": os.path.abspath(nanodeploy.__file__),
+            "model_runner_file": os.path.abspath(__file__),
+            "profiler_mode": getattr(self.config, "profiler_mode", "default"),
+            "runtime_overhead_timing": self._runtime_overhead_timing,
+            "full_graph_decode_steps": self._runtime_overhead_decode_steps,
+            "decode_warmup_steps_excluded": min(
+                2, self._runtime_overhead_decode_steps
+            ),
+            "sample_summaries": sample_summaries,
+            "shape_counts": shape_counts,
+            "graph_master_rank_bs": graph_master_rank_bs,
+            "sp_graph_map": sp_graph_map,
+            "max_num_seqs": self.config.max_num_seqs,
+            "max_num_recv_seqs": self.config.max_num_recv_seqs,
+            "attention_sp": self.config.attention_sp,
+            "max_model_len": self.config.max_model_len,
+            "kvcache_block_size": self.config.kvcache_block_size,
+        }
+        output_path = os.path.join(
+            self._runtime_overhead_dir,
+            f"runtime_overhead_rank_{self.rank}.json",
+        )
+        temporary_path = f"{output_path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as output_file:
+            json.dump(summary, output_file, indent=2, sort_keys=True)
+            output_file.write("\n")
+        os.replace(temporary_path, output_path)
+        logger.info(
+            "Rank %d: runtime-overhead summary saved to %s",
+            self.rank,
+            output_path,
+        )
+
     def exit(self):
         if self._exited:
             return
+        try:
+            self._write_runtime_overhead_summary()
+        except Exception:
+            logger.exception(
+                "Rank %d: failed to save runtime-overhead summary",
+                self.rank,
+            )
         if not self.enforce_eager:
             if self.cuda_graph_mode == "piecewise":
                 graph_attributes = (
@@ -959,26 +1149,14 @@ class ModelRunner:
         )
 
     def _select_decode_graph_master_bs(self, bs: int, context) -> int:
-        master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
-        if (
-            context.use_sp_a2a
-            and (
-                self.config.sp_backend == "nccl"
-                or self.config.fixed_sp_size > 0
-            )
-            and context.sp_comm_bs is not None
-        ):
-            comm_min_master_bs = max(bs, context.sp_comm_bs)
-            try:
-                master_bs = next(
-                    x for x in self.graph_master_rank_bs if x >= comm_min_master_bs
-                )
-            except StopIteration:
-                raise RuntimeError(
-                    f"SP communication batch {comm_min_master_bs} exceeds "
-                    f"max captured master_bs ({self.graph_master_rank_bs[-1]})"
-                )
-        return master_bs
+        return select_decode_graph_master_bs(
+            bs,
+            graph_master_rank_bs=self.graph_master_rank_bs,
+            use_sp_a2a=context.use_sp_a2a,
+            sp_backend=self.config.sp_backend,
+            fixed_sp_size=self.config.fixed_sp_size,
+            sp_comm_bs=context.sp_comm_bs,
+        )
 
     def _copy_decode_context_to_graph_vars(
         self,
@@ -990,82 +1168,23 @@ class ModelRunner:
         graph_attn_bs: int,
         context,
     ) -> None:
-        if graph_vars.get("input_ids") is not None:
-            graph_vars["input_ids"].zero_()
-            graph_vars["input_ids"][:bs] = input_ids
-        if graph_vars.get("positions") is not None:
-            graph_vars["positions"].zero_()
-            graph_vars["positions"][:bs] = positions
-
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = context.slot_mapping  # type: ignore
-
-        graph_q_dst_row_indices = graph_vars.get("q_dst_row_indices")
-        if graph_q_dst_row_indices is not None:
-            graph_q_dst_row_indices.fill_(-1)
-            if context.q_dst_row_indices is not None:
-                graph_q_dst_row_indices.copy_(context.q_dst_row_indices)
-
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
-        graph_vars["global_context_lens"].zero_()
-        graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
-        graph_vars["q_mask"].zero_()
-        graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
-        graph_vars["res_lse_mask"].zero_()
-        graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
-        graph_vars["block_tables"].fill_(-1)
-        graph_vars["block_tables"][
-            : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
-        ] = context.block_tables
-
-        graph_vars["context_lens_for_attn"].zero_()
-        graph_vars["context_lens_for_attn"][
-            : context.context_lens_for_attn.shape[0]
-        ].copy_(context.context_lens_for_attn)  # type: ignore
-
-        graph_vars["q_slice_get"].fill_(-1)
-        graph_vars["q_slice_fill"].fill_(-1)
-        graph_vars["q_copy_mask"].zero_()
-        graph_vars["q_slice_get"][: context.q_slice_get.shape[0]] = context.q_slice_get  # type: ignore
-        graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]] = context.q_slice_fill  # type: ignore
-        graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]] = context.q_copy_mask  # type: ignore
-
-        graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
-        graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
-        graph_vars["res_to_buffer_output_mask"].zero_()
-        graph_vars["res_slice_get_to_buffer_output"][: context.res_slice_get_to_buffer_output.shape[0]] = context.res_slice_get_to_buffer_output  # type: ignore
-        graph_vars["res_slice_fill_to_buffer_output"][: context.res_slice_fill_to_buffer_output.shape[0]] = context.res_slice_fill_to_buffer_output  # type: ignore
-        graph_vars["res_to_buffer_output_mask"][: context.res_to_buffer_output_mask.shape[0]] = context.res_to_buffer_output_mask  # type: ignore
-
-        graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
-        graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
-        graph_vars["res_to_buffer_input_mask"].zero_()
-        graph_vars["res_slice_get_to_buffer_input"][: context.res_slice_get_to_buffer_input.shape[0]].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
-        graph_vars["res_slice_fill_to_buffer_input"][: context.res_slice_fill_to_buffer_input.shape[0]].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
-        graph_vars["res_to_buffer_input_mask"][: context.res_to_buffer_input_mask.shape[0]].copy_(context.res_to_buffer_input_mask)  # type: ignore
-
-        graph_vars["q_offsets"].zero_()
-        graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
-
-        if not context.use_sp_a2a:
-            return
-
-        actual_attn_bs = int(context.attention_compute_bs)
-        graph_actual_attn_bs = graph_vars.get("actual_attn_bs")
-        if graph_actual_attn_bs is not None:
-            graph_actual_attn_bs.fill_(actual_attn_bs)
-
-        materialize_sp_graph_padding(
+        phase_factory = (
+            self._runtime_overhead_phase
+            if self._runtime_overhead_profiler_active
+            or self._runtime_overhead_timing_active
+            else None
+        )
+        copy_decode_context_to_graph_vars(
             graph_vars,
-            actual_block_tables=context.block_tables,
-            actual_attn_bs=actual_attn_bs,
-            graph_attn_bs=graph_attn_bs,
-            actual_master_bs=bs,
-            graph_master_bs=master_bs,
-            local_result_rows=context.res_slice_get_to_buffer_output.numel(),
+            input_ids,
+            positions,
+            bs,
+            master_bs,
+            graph_attn_bs,
+            context,
             sp_rank=get_dist_context().attn_sp_rank,
             max_num_seqs=self.config.max_num_seqs,
+            phase_factory=phase_factory,
         )
 
     def _build_graph_master_rank_bs(self, max_bs: int) -> list[int]:
@@ -1125,46 +1244,128 @@ class ModelRunner:
             return self.run_model_piecewise_cudagraph(input_ids, positions)
 
         bs = input_ids.size(0)
-        master_bs = self._select_decode_graph_master_bs(bs, context)
-
-        if context.use_sp_a2a:
-            ac_bs = context.attention_compute_bs
-            if ac_bs is None:
-                ac_bs = bs
-            valid_attn_bs_list = self.sp_graph_map.get(master_bs)
-            if valid_attn_bs_list is None:
-                raise RuntimeError(f"No SP graph map found for master_bs={master_bs}")
-
-            try:
-                attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
-            except StopIteration:
-                raise RuntimeError(
-                    f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
-                    f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
+        self._runtime_overhead_timing_active = (
+            self._runtime_overhead_timing
+            and self._runtime_overhead_decode_steps >= 2
+        )
+        actual_attn_bs = (
+            int(context.attention_compute_bs)
+            if context.attention_compute_bs is not None
+            else bs
+        )
+        phase_factory = (
+            self._runtime_overhead_phase
+            if self._runtime_overhead_profiler_active
+            or self._runtime_overhead_timing_active
+            else None
+        )
+        if phase_factory is None:
+            master_bs, attn_bs = select_decode_graph_bucket(
+                bs,
+                actual_attn_bs,
+                graph_master_rank_bs=self.graph_master_rank_bs,
+                sp_graph_map=self.sp_graph_map,
+                use_sp_a2a=context.use_sp_a2a,
+                sp_backend=self.config.sp_backend,
+                fixed_sp_size=self.config.fixed_sp_size,
+                sp_comm_bs=context.sp_comm_bs,
+            )
+            graph = (
+                self.sp_graphs[(master_bs, attn_bs)]
+                if context.use_sp_a2a
+                else self.local_graphs[master_bs]
+            )
+        else:
+            with phase_factory("nanodeploy.graph.bucket_select"):
+                master_bs, attn_bs = select_decode_graph_bucket(
+                    bs,
+                    actual_attn_bs,
+                    graph_master_rank_bs=self.graph_master_rank_bs,
+                    sp_graph_map=self.sp_graph_map,
+                    use_sp_a2a=context.use_sp_a2a,
+                    sp_backend=self.config.sp_backend,
+                    fixed_sp_size=self.config.fixed_sp_size,
+                    sp_comm_bs=context.sp_comm_bs,
+                )
+                graph = (
+                    self.sp_graphs[(master_bs, attn_bs)]
+                    if context.use_sp_a2a
+                    else self.local_graphs[master_bs]
                 )
 
-            graph = self.sp_graphs[(master_bs, attn_bs)]
-        else:
-            attn_bs = master_bs
-            graph = self.local_graphs[master_bs]
+        if self._runtime_overhead_profile or self._runtime_overhead_timing:
+            self._record_runtime_overhead_shape(
+                actual_master_bs=bs,
+                graph_master_bs=master_bs,
+                actual_attn_bs=actual_attn_bs,
+                graph_attn_bs=attn_bs,
+                context=context,
+            )
 
         graph_vars = self.graph_vars
-        self._copy_decode_context_to_graph_vars(
-            graph_vars,
-            input_ids,
-            positions,
-            bs,
-            master_bs,
-            attn_bs,
-            context,
+        if phase_factory is None:
+            copy_decode_context_to_graph_vars(
+                graph_vars,
+                input_ids,
+                positions,
+                bs,
+                master_bs,
+                attn_bs,
+                context,
+                sp_rank=get_dist_context().attn_sp_rank,
+                max_num_seqs=self.config.max_num_seqs,
+            )
+        else:
+            with phase_factory("nanodeploy.graph.metadata.all"):
+                copy_decode_context_to_graph_vars(
+                    graph_vars,
+                    input_ids,
+                    positions,
+                    bs,
+                    master_bs,
+                    attn_bs,
+                    context,
+                    sp_rank=get_dist_context().attn_sp_rank,
+                    max_num_seqs=self.config.max_num_seqs,
+                    phase_factory=phase_factory,
+                )
+
+        if phase_factory is None:
+            prepare_decode_mla_metadata(
+                self.config.hf_config,
+                graph_vars["context_lens_for_attn"][:attn_bs],
+                graph_vars["tile_scheduler_metadata"],
+                graph_vars["num_splits"],
+            )
+        else:
+            with phase_factory(
+                "nanodeploy.graph.prepare_decode_mla_metadata"
+            ):
+                prepare_decode_mla_metadata(
+                    self.config.hf_config,
+                    graph_vars["context_lens_for_attn"][:attn_bs],
+                    graph_vars["tile_scheduler_metadata"],
+                    graph_vars["num_splits"],
+                )
+
+        replay_range_name = (
+            "nanodeploy.graph.replay["
+            f"actual_master_bs={bs},master_bs={master_bs},"
+            f"actual_attn_bs={actual_attn_bs},graph_attn_bs={attn_bs}]"
         )
-        prepare_decode_mla_metadata(
-            self.config.hf_config,
-            graph_vars["context_lens_for_attn"][:attn_bs],
-            graph_vars["tile_scheduler_metadata"],
-            graph_vars["num_splits"],
-        )
-        graph.replay()
+        if self._runtime_overhead_timing_active:
+            replay_begin_ns = time.perf_counter_ns()
+            graph.replay()
+            self._runtime_overhead_samples_ns[
+                "nanodeploy.graph.replay_submit"
+            ].append(time.perf_counter_ns() - replay_begin_ns)
+        elif self._runtime_overhead_profiler_active:
+            with profiler.record_function(replay_range_name):
+                graph.replay()
+        else:
+            graph.replay()
+        if self._runtime_overhead_timing:
+            self._runtime_overhead_decode_steps += 1
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
@@ -1371,6 +1572,9 @@ class ModelRunner:
                 )
                 try:
                     self.profiler.start()
+                    self._runtime_overhead_profiler_active = (
+                        self._runtime_overhead_profile
+                    )
                     if self.profiler_use_time:
                         self.profiler_start_timestamp = current_time
                         self.profiler_end_timestamp = current_time + self.profiling_duration
@@ -1384,6 +1588,7 @@ class ModelRunner:
                             f"(will run until step {self.profiler_end_step})"
                         )
                 except Exception as e:
+                    self._runtime_overhead_profiler_active = False
                     logger.error(
                         f"Rank {self.rank}: ✗ Failed to start profiler: {e}", exc_info=True
                     )
@@ -1499,6 +1704,7 @@ class ModelRunner:
                     )
                     try:
                         self.profiler.stop()
+                        self._runtime_overhead_profiler_active = False
                         self.profiler_stopped = True
                         # Reset timestamps to prevent further profiling attempts
                         if self.profiler_use_time:
@@ -1528,11 +1734,13 @@ class ModelRunner:
                                 f"Trace files should be in: {os.path.join(self.profiler_dir, self.profiler_worker_name)}"
                             )
                     except RuntimeError as e:
+                        self._runtime_overhead_profiler_active = False
                         logger.error(
                             f"Rank {self.rank}: ✗ Failed to stop profiler: {e}", exc_info=True
                         )
                         self.profiler_stopped = True  # Mark as stopped even if error occurred
                     except Exception as e:
+                        self._runtime_overhead_profiler_active = False
                         logger.error(
                             f"Rank {self.rank}: ✗ Unexpected error stopping profiler: {e}", exc_info=True
                         )

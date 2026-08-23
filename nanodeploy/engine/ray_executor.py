@@ -136,7 +136,12 @@ class RayExecutor:
             if config.ffn_ep > 1
             else {}
         )
-        for env_name in ("SLIME_QP_NUM", "NANODEPLOY_LOG_DECODE_A2A_MASKS"):
+        for env_name in (
+            "SLIME_VISIBLE_DEVICES",
+            "SLIME_GID_INDEX",
+            "SLIME_QP_NUM",
+            "NANODEPLOY_LOG_DECODE_A2A_MASKS",
+        ):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
         worker_runtime_env = (

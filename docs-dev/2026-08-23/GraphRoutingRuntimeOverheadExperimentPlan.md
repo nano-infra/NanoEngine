@@ -7,12 +7,11 @@ This plan measures the remaining runtime-overhead gaps in the ASPLOS review:
 1. Graph-bucket selection on CPU;
 2. routing-metadata injection on GPU;
 3. CUDA Graph replay submission and the padding kernels contained in a replay;
-4. one production trace showing that the isolated measurements correspond to a
+4. one production trace showing that the microbenchmarks correspond to a
    real Issue1% serving shape.
 
 The primary subject is the **final integration HEAD used by the paper**. The
-historical comparison `6689f5d` versus `a5a01b2` is optional regression
-validation, not the paper's main result.
+experiment does not include a historical commit comparison.
 
 No C++ change is required. All three boundaries are visible from Python:
 
@@ -245,9 +244,8 @@ debugging or an appendix.
 
 Collect `perf_counter_ns()` samples around the actual model Graph's
 `graph.replay()` in a non-profiled run. Discard capture/warmup and the first two
-decode steps. Report per-call p50/p95 over normal serving queue state. A short
-isolated `no_tail` versus `observed_tail` padding-Graph test is P1 unless the
-production trace cannot identify the padding kernels reliably.
+decode steps. Report per-call p50/p95 over normal serving queue state. Padding
+kernel attribution comes directly from the production trace.
 
 ### 5.4 Net runtime impact
 
@@ -268,12 +266,13 @@ Extract the current selection logic into a pure helper that returns
 `ModelRunner.run_model` and the CPU benchmark must call this helper. This is a
 behavior-preserving refactor, not a new selection algorithm.
 
-Keep `materialize_sp_graph_padding` reusable so the metadata benchmark calls
-the same function as production.
+Keep `materialize_sp_graph_padding` reusable and move the complete Graph
+metadata copy into a shared helper, so both metadata scopes execute the same
+operations as production.
 
 ### 6.2 `nanodeploy/config.py`
 
-Add two disabled-by-default controls:
+Add these disabled-by-default controls:
 
 ```python
 profiler_mode: Literal["default", "runtime_overhead"] = "default"
@@ -312,9 +311,8 @@ nanodeploy.graph.prepare_decode_mla_metadata
 nanodeploy.graph.replay
 ```
 
-Emit the four-value shape tuple in the bucket/replay range name or a small
-per-rank JSONL sidecar while profiling. Do not log it every step in normal
-serving.
+Emit the four-value shape tuple in the replay range name and a compact per-rank
+JSON summary while profiling. Do not log it every step in normal serving.
 
 When `runtime_overhead_timing=True` and the profiler is off, collect
 `perf_counter_ns()` host samples around metadata injection and
@@ -383,8 +381,8 @@ Add CPU tests for:
 - typical, exact-boundary, next-boundary, and overflow bucket selection;
 - profiler-mode defaults, rank filtering, and validation.
 
-Trace-parser guard fixtures are P1. For P0, manually inspect a few parsed
-launches against the profiler UI before accepting its aggregate output.
+Manually inspect a few parsed launches against the profiler UI before accepting
+the aggregate output.
 
 CUDA timing assertions are not unit tests. After any Python-only change, no
 editable rebuild is required. Reinstall with `python3 -m pip install -v -e .`
@@ -392,12 +390,15 @@ only if the implementation unexpectedly changes C++ or bindings.
 
 ## 7. Commands
 
+Run Section 7.3 first. Its per-rank summary supplies the final-HEAD shape JSON
+consumed by Sections 7.1 and 7.2.
+
 ### 7.1 CPU bucket benchmark
 
 ```bash
 python3 scripts/benchmark_sp_graph_runtime_overheads.py \
   --component bucket \
-  --shape-json bench_logs/graph_runtime_overhead/issue1_shape.json \
+  --shape-json bench_logs/graph_runtime_overhead/issue1_trace/runtime_overhead_rank_1.json \
   --warmup 10000 \
   --iterations 1000000 \
   --repeats 7 \
@@ -416,7 +417,7 @@ export SLIME_QP_NUM=4
 
 python3 scripts/benchmark_sp_graph_runtime_overheads.py \
   --component metadata \
-  --shape-json bench_logs/graph_runtime_overhead/issue1_shape.json \
+  --shape-json bench_logs/graph_runtime_overhead/issue1_trace/runtime_overhead_rank_1.json \
   --cases no_padding,issue1_padded \
   --warmup 200 \
   --iterations 2000 \
@@ -462,6 +463,10 @@ Keep `PROFILING_STEP` at 4–8 inner steps to limit trace size.
 Run this once. A second identical run is only needed if the trace is incomplete
 or the selected window is not representative.
 
+The production profile must run before the bucket and metadata commands because
+its per-rank summary supplies the authoritative final-HEAD shape and captured
+Graph candidates.
+
 ### 7.4 Non-profiled replay submission and serving result
 
 Use the same command and workload with:
@@ -469,11 +474,30 @@ Use the same command and workload with:
 ```text
 ENABLE_PROFILER=0
 RUNTIME_OVERHEAD_TIMING=1
+PROFILER_DIR=bench_logs/graph_runtime_overhead/issue1_nonprofiled_run_1
 ```
 
 Run 3–5 repeats for the end-to-end result. The compact timing output may report
 metadata enqueue and replay submission, but the end-to-end ITL/throughput must
 come from the normal serving metrics.
+
+Summarize the stable replay-submission measurements with:
+
+```bash
+python3 scripts/benchmark_sp_graph_runtime_overheads.py \
+  --component replay-submit \
+  --timing-json \
+    bench_logs/graph_runtime_overhead/issue1_nonprofiled_run_1/runtime_overhead_rank_1.json \
+  --output bench_logs/graph_runtime_overhead/replay_submit.json
+```
+
+### 7.5 Production trace parser
+
+```bash
+python3 utils_analysis/analyze_sp_graph_runtime_trace.py \
+  bench_logs/graph_runtime_overhead/issue1_trace/*/*.pt.trace.json \
+  --output bench_logs/graph_runtime_overhead/trace_summary.json
+```
 
 ## 8. Trace analysis and reporting
 
@@ -486,9 +510,8 @@ For every `cudaGraphLaunch` event:
 5. report their count, individual duration distribution, and summed duration;
 6. retain the associated shape tuple and worker rank.
 
-If a trace backend does not expose usable correlation IDs, fall back to the
-enclosing `nanodeploy.graph.replay` range and document that limitation. Do not
-match kernels solely by nearest timestamp without validation.
+The parser reports unmatched launches when a trace does not expose usable
+correlation IDs. Do not match kernels solely by nearest timestamp.
 
 The paper-facing result can be two compact tables:
 
@@ -531,16 +554,6 @@ Suggested paper wording:
 - Host submission is not mislabeled as device execution.
 - Overlapping component times are not summed into net overhead.
 - No C++ source or external dependency is modified.
-
-## 10. P1 internal validation only
-
-Do these only if time remains or P0 exposes an anomaly:
-
-- `6689f5d` versus `a5a01b2` regression comparison;
-- isolated `zero_padded_rows_kernel` no-tail versus observed/worst-tail Graph;
-- detailed routing-metadata subcomponent table;
-- broader local/fixed/dynamic bucket sweeps;
-- generalized trace-parser guard tests.
 
 Raw logs and profiler traces belong under `bench_logs/` and should not be
 committed. Save the reviewed numerical summary as
