@@ -1,5 +1,7 @@
 # DLEngine HiSparse 设计
 
+> 状态：本文保留 HiSparse 从第一版到完整数据面的分阶段设计记录。当前 GLM recurrent MTP 组合语义和部署边界以 [GLM Recurrent MTP](./site/glm-recurrent-mtp.md) 为准。
+
 ## 目标和范围
 
 这份文档描述 DLEngine 第一版 HiSparse 的实现设计。第一版目标刻意收窄：
@@ -11,15 +13,7 @@
 
 真实 prefill、PD transfer、DSv4 compressed-cache HiSparse、以及通用 HiSparse policy 都不放进第一版 patch。但这些扩展点会在文档里先留清楚，避免第一版实现把后续路堵死。
 
-设计以 SGLang 当前代码为主，不以 NSA 文档为准。关键参考代码是：
-
-- `python/sglang/srt/mem_cache/allocator/hisparse.py`
-- `python/sglang/srt/mem_cache/hisparse_memory_pool.py`
-- `python/sglang/srt/managers/hisparse_coordinator.py`
-- `python/sglang/srt/model_executor/model_runner.py`
-- `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py`
-- `sgl-kernel/python/sgl_kernel/top_k.py`
-- `sgl-kernel/csrc/common_extension.cc`
+设计约束以当前 runtime、kernel 行为和测试为准。实现调研覆盖 allocator、host memory pool、coordinator、model runner、CUDA Graph runner 与 TopK kernel，但不在公开设计中绑定外部仓库结构。
 
 ## Phase 1 流程
 
@@ -85,7 +79,7 @@ HiSparse 必须保持这些不变量：
 - `slot_mapping` 仍然表示 logical output location。需要写 KV 时，HiSparse 再把它 remap 到 device-buffer slot；
 - sparse attention 接收的是 physical device-buffer locations，不是 logical locations；
 - CUDA graph 的 padded batch entries 必须合法且便宜：使用 dummy slots 和 kernel 内 early-return guard，而不是改变 captured graph 的 Python 分支；
-- 当 NSA 文档描述和代码行为冲突时，以 SGLang kernel 和 DLEngine 现有 NSA 实现为准。
+- 当设计描述和代码行为冲突时，以当前 DLEngine kernel、runtime 校验和测试为准。
 
 ## 架构
 
@@ -128,7 +122,7 @@ context 持有长期存活的 tensors：
 
 ### Cache allocator
 
-新增 DSV3.2 allocator，等价于 SGLang 的 `HiSparseTokenToKVPoolAllocator`，但要适配 DLEngine 的 `BlockManager` / `CacheContext` 拆分。
+新增适配 DLEngine `BlockManager` / `CacheContext` 边界的 DSV3.2 allocator。
 
 allocator 暴露两个 namespace：
 
@@ -272,7 +266,7 @@ dummy-prefill 的正确性目标是“服务链路能跑通并且 graph replay �
 - backup 新产生的 decode tokens 到 host；
 - DSv4 c4/c128 compressed-cache variants。
 
-CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个小的 Python wrapper 调用。风格和现有 `dlengine/runtime/kernel/jit/sgl` 下引入的 SGLang JIT kernels 保持一致。
+CUDA header 放在 JIT/kernel tree 下，命名为 `hisparse.cuh`，再加一个小的 Python wrapper 调用，并遵循现有 JIT kernel 封装边界。
 
 ## 文件级集成点
 
@@ -337,7 +331,7 @@ decode-only 路径不应该改 DSv4 代码，除非是共享 utility 命名或�
 1. 决定 prefill 是直接把 KV 发送到 decode host pool，还是 decode 端先经 device staging 再 backup；
 2. 如果使用 direct-to-host，扩展 proto 增加 host-pool metadata；
 3. scheduler 区分 staging、ready、running HiSparse requests；
-4. 按 SGLang `collect_ready_reqs` 模式增加 TP readiness synchronization。
+4. 增加 TP readiness synchronization，保证各 rank 以一致顺序推进请求。
 
 ### Phase 4：高级模式
 

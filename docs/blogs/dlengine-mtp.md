@@ -1,5 +1,7 @@
 ## DLEngine - MTP 投机解码
 
+> 当前部署参数、支持边界和验收清单以 [GLM Recurrent MTP](../site/glm-recurrent-mtp.md) 为准。本文保留实现原理与带环境口径的历史性能快照。
+
 ### 1. 背景：为什么需要投机解码？
 
 自回归解码（Autoregressive Decoding）是大语言模型推理的核心瓶颈。每个 decode step 只产出一个 token，而 MoE 模型的一次 forward pass 需要经历完整的 All-to-All 专家路由。对于 Qwen3.5-397B-A17B 这类千亿级 MoE 模型，单步 decode 的延迟中有相当比例被跨节点通信占据。
@@ -185,7 +187,7 @@ ModelRunner (编排者, ~590 行)
 以 GLM-5.2-FP8 在 8×H100/H200（attention_dp=8, ffn_ep=8, `num_speculative_tokens=5`）上的一次完整推理为例：
 
 ```bash
-dlengine serve /nvmedata/GLM-5.2-FP8 \
+dlengine serve /path/to/GLM-5.2-FP8 \
   --attention_dp 8 \
   --ffn_ep 8 \
   --ctrl_address 127.0.0.1:4479 \
@@ -231,7 +233,7 @@ cached-chain graph 相比 eager MTP 再减少约 14% 墙钟。在此基础上，
 
 最后一个 target 热点来自 MLA compressed KV：576-wide projection 的前 512 维是 row-strided view，旧通用 RMSNorm 因为要求整块 contiguous，每层退回 `float → pow → mean → rsqrt → cast → mul → copy-back` 的 eager 链。现在 `rms_norm_strided_inplace` 直接在 stride=576 的 view 上原地归一化，可通过 `DLENGINE_INPLACE_MLA_KV_NORM=0` 回退旧路径。
 
-新 profiler 中 active target verify 从 3829 降到 3205 kernels，恰好减少 78 层 × 8 kernels；rank 0 GPU span p50 从 26.80 ms 降到 23.96 ms，八卡汇总 p50 为 24.94 ms。4-step recurrent chain 从 241 降到 237 kernels，八卡 p50 为 3.37 ms。作为参考，同机 SGLang 单-rank trace 的 target/recurrent 分别是 3317 kernels、24.19 ms 和 290 kernels、3.37 ms：Nano active target 已少 112 kernels，GPU 时间在单-rank和八卡口径下都处于同档；非 active attention-DP rank 的 padded verify 为 2987 kernels。完整时间线和 kernel summary 持久化在 `/mnt/h_public/majinming/timeline/nano`，没有依赖容器 `/tmp`。
+新 profiler 中 active target verify 从 3829 降到 3205 kernels，恰好减少 78 层 × 8 kernels；rank 0 GPU span p50 从 26.80 ms 降到 23.96 ms，八卡汇总 p50 为 24.94 ms。4-step recurrent chain 从 241 降到 237 kernels，八卡 p50 为 3.37 ms；非 active attention-DP rank 的 padded verify 为 2987 kernels。完整时间线和 kernel summary 应保存在配置的持久化 profiler 目录中。
 
 `temperature=0.7` 的 128-token Python 编码请求也完成了 exact rejection 路径；原地 KV RMSNorm 后复测 3/3 返回 128 tokens，接受长度为 4.00–4.74。16 路并发和连续两轮 8 路请求均通过。
 
@@ -253,6 +255,6 @@ cached-chain graph 相比 eager MTP 再减少约 14% 墙钟。在此基础上，
 - **已支持**：N=1 的既有 MTP；GLM DSA/MLA 在 Hopper 上的 N=5/K=6 线性多步路径；hybrid 与 PD 分离；greedy 与 `temperature > 0`；completion logprob；batch reorder/shrink；以及 `PP>1` prefill 对接 `PP=1` decode 的非对称 PD 拓扑。PP prefill 仅在最后 stage 运行 predictor，并通过常规 KV MR 和独立 `mtp_handoff` MR 迁移 predictor KV 与 5-token draft bundle；decode 首轮可直接 verify，失配或 stale row 安全回退 target decode。GLM decode 也可叠加 HiSparse：K=6 的 DSA top-k 在 request 内合并去重，六个 target 输出使用独立 hot slot，并在 verify 后完整写回 cold host cache。
 - **HiSparse 配置**：GLM N=5/K=6、`index_topk=2048` 时，decode 端添加 `--enable_hisparse true --hisparse_device_buffer_size 12288`；容量下限为 `(num_speculative_tokens + 1) * index_topk`。prefill 端保持普通 PD cache，并通过数据面把 KV 迁移到 decode cold host tier。长上下文 PP prefill 建议使用 `--max_num_batched_tokens 16384` 作为每 stage microbatch 上限；不要把完整 100K/1M prompt 合成一次巨型 GPU forward。
 - **暂不支持**：tree、非 GLM 的 HiSparse+MTP、PP decode、非 Hopper multi-step、GDN multi-step、DeepSeek/Qwen multi-step。
-- **下一性能热点**：recurrent 与 active target verify 的 kernel 数和 GPU p50 均已达到 SGLang 同档；下一阶段优先降低 profiler 外的 CPU 调度抖动、DeepEP 长尾和 cold prefill/routing 开销，而不是为了计数继续拆改 recurrent 或 verify 控制流
+- **下一性能热点**：recurrent 与 active target verify 已不再是唯一主导项；下一阶段优先降低 profiler 外的 CPU 调度抖动、专家通信长尾和 cold prefill/routing 开销，而不是为了计数继续拆改 recurrent 或 verify 控制流
 - **自适应投机深度**：根据运行时接受率动态调整 draft 数量，在高接受率时激进投机，低接受率时退回标准 decode
 - **与 EPLB 协同**：将 MTP 的 draft token 纳入专家负载均衡（EPLB）的统计，优化 EP 场景下的热点专家调度

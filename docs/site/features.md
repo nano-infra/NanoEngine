@@ -12,16 +12,16 @@ DLEngine focuses on distributed inference for state-of-the-art large models. Thi
 
 ## Distributed execution
 
-| Feature                             | Status          | Description                                                                                                                             |
-| ----------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Ray-based resource management       | Available       | Discovers cluster GPU resources and places distributed DLEngine workers across nodes.                                                   |
-| Attention data parallelism          | Available       | Replicates attention while distributing requests across attention ranks.                                                                |
-| Wide expert parallelism             | Available       | Spreads MoE experts across the full GPU set and composes with attention data parallelism.                                               |
-| Tensor parallelism                  | Available       | Shards model tensors within supported model and kernel configurations.                                                                  |
-| Prefill/decode disaggregation       | Available       | Runs prefill and decode as separate services with independent scaling policies.                                                         |
-| GPUDirect RDMA KV migration         | Available       | Transfers prefill KV state directly to decode workers through DLSlime.                                                                  |
-| Service discovery and control plane | Available       | Uses dlslime-ctrl and Redis for engine registration, heartbeat, scope isolation, and peer metadata.                                     |
-| Pipeline parallelism (PP)           | **Coming soon** | Splits decoder layers into pipeline stages; production support, correctness coverage, and performance tuning are still being completed. |
+| Feature                             | Status       | Description                                                                                                                               |
+| ----------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Ray-based resource management       | Available    | Discovers cluster GPU resources and places distributed DLEngine workers across nodes.                                                     |
+| Attention data parallelism          | Available    | Replicates attention while distributing requests across attention ranks.                                                                  |
+| Wide expert parallelism             | Available    | Spreads MoE experts across the full GPU set and composes with attention data parallelism.                                                 |
+| Tensor parallelism                  | Available    | Shards model tensors within supported model and kernel configurations.                                                                    |
+| Prefill/decode disaggregation       | Available    | Runs prefill and decode as separate services with independent scaling policies.                                                           |
+| GPUDirect RDMA KV migration         | Available    | Transfers prefill KV state directly to decode workers through DLSlime.                                                                    |
+| Service discovery and control plane | Available    | Uses dlslime-ctrl and Redis for engine registration, heartbeat, scope isolation, and peer metadata.                                       |
+| Pipeline parallelism (PP)           | Experimental | Supports bounded-microbatch prefill pipelines. Decode remains single-stage, and long-context performance validation is still in progress. |
 
 ## Scheduling, cache, and long context
 
