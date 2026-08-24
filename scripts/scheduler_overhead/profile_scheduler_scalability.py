@@ -317,6 +317,44 @@ def _validate_decode_result(case: ProfileCase, schedule_result: object) -> dict[
     return histogram
 
 
+def _populate_waiting_queue(
+    case: ProfileCase,
+    *,
+    profiled_decode_iterations: int,
+    suppress_native_setup_logs: bool,
+) -> tuple[Scheduler, float]:
+    setup_begin = time.perf_counter_ns()
+    with _native_stderr(suppress_native_setup_logs):
+        scheduler = _new_scheduler(case, profiled_decode_iterations)
+    long_indices = _long_request_indices(
+        case.total_requests,
+        case.expected_sp8_requests if case.scenario.uses_dynamic_policy else 0,
+        case.seed,
+    )
+    for request_index in range(case.total_requests):
+        context_len = (
+            case.long_context_len
+            if request_index in long_indices
+            else case.short_context_len
+        )
+        scheduler.add(
+            _profile_sequence(context_len, request_index, case.loop_count)
+        )
+    setup_ms = (time.perf_counter_ns() - setup_begin) / 1_000_000.0
+    return scheduler, setup_ms
+
+
+def _validate_admission_result(case: ProfileCase, schedule_result: object) -> None:
+    if not schedule_result.is_prefill:
+        raise RuntimeError("initial scheduler call did not admit the profiling workload")
+    admitted = sum(len(per_dp) for per_dp in schedule_result.dp_seqs)
+    if admitted != case.total_requests:
+        raise RuntimeError(
+            f"admitted {admitted} requests, expected {case.total_requests}; "
+            "increase profiling scheduler capacity"
+        )
+
+
 def _advance_decode_state(schedule_result: object, loop_count: int) -> None:
     """Advance scheduler-owned sequence lengths outside the timed interval.
 
@@ -339,45 +377,40 @@ def run_case(
     *,
     warmup_iterations: int,
     measured_iterations: int,
+    admission_iterations: int = 1,
     suppress_native_setup_logs: bool = True,
 ) -> dict[str, object]:
     if warmup_iterations < 0:
         raise ValueError("warmup_iterations must be non-negative")
     if measured_iterations <= 0:
         raise ValueError("measured_iterations must be positive")
+    if admission_iterations <= 0:
+        raise ValueError("admission_iterations must be positive")
 
     profiled_decode_iterations = 1 + warmup_iterations + measured_iterations
-    setup_begin = time.perf_counter_ns()
-    with _native_stderr(suppress_native_setup_logs):
-        scheduler = _new_scheduler(case, profiled_decode_iterations)
-    long_indices = _long_request_indices(
-        case.total_requests,
-        case.expected_sp8_requests if case.scenario.uses_dynamic_policy else 0,
-        case.seed,
-    )
-    for request_index in range(case.total_requests):
-        context_len = (
-            case.long_context_len
-            if request_index in long_indices
-            else case.short_context_len
+    admission_samples_ms: list[float] = []
+    setup_samples_ms: list[float] = []
+    scheduler: Scheduler | None = None
+    for admission_index in range(admission_iterations):
+        candidate, setup_ms = _populate_waiting_queue(
+            case,
+            profiled_decode_iterations=profiled_decode_iterations,
+            suppress_native_setup_logs=suppress_native_setup_logs,
         )
-        scheduler.add(
-            _profile_sequence(context_len, request_index, case.loop_count)
+        setup_samples_ms.append(setup_ms)
+        admission_begin = time.perf_counter_ns()
+        admission_result = candidate.schedule()
+        admission_samples_ms.append(
+            (time.perf_counter_ns() - admission_begin) / 1_000_000.0
         )
-    setup_ms = (time.perf_counter_ns() - setup_begin) / 1_000_000.0
-
-    admission_begin = time.perf_counter_ns()
-    admission_result = scheduler.schedule()
-    admission_ms = (time.perf_counter_ns() - admission_begin) / 1_000_000.0
-    if not admission_result.is_prefill:
-        raise RuntimeError("initial scheduler call did not admit the profiling workload")
-    admitted = sum(len(per_dp) for per_dp in admission_result.dp_seqs)
-    if admitted != case.total_requests:
-        raise RuntimeError(
-            f"admitted {admitted} requests, expected {case.total_requests}; "
-            "increase profiling scheduler capacity"
-        )
-    del admission_result
+        _validate_admission_result(case, admission_result)
+        del admission_result
+        if admission_index == admission_iterations - 1:
+            scheduler = candidate
+        else:
+            del candidate
+    if scheduler is None:
+        raise RuntimeError("admission profiling did not retain a scheduler")
 
     validation_result = scheduler.schedule()
     histogram = _validate_decode_result(case, validation_result)
@@ -413,6 +446,7 @@ def run_case(
 
     mean_ms = statistics.fmean(samples_ms)
     stddev_ms = statistics.pstdev(samples_ms)
+    admission_mean_ms = statistics.fmean(admission_samples_ms)
     return {
         "scenario": case.scenario.name,
         "logical_nodes": case.logical_nodes,
@@ -431,8 +465,15 @@ def run_case(
         "block_size": case.block_size,
         "loop_count": case.loop_count,
         "scheduler_thread_pool_workers": case.attention_dp,
-        "setup_ms_excluded": setup_ms,
-        "initial_admission_ms_excluded": admission_ms,
+        "setup_mean_ms_excluded": statistics.fmean(setup_samples_ms),
+        "admission_iterations": admission_iterations,
+        "admission_mean_ms": admission_mean_ms,
+        "admission_stddev_ms": statistics.pstdev(admission_samples_ms),
+        "admission_min_ms": min(admission_samples_ms),
+        "admission_p50_ms": _percentile(admission_samples_ms, 50.0),
+        "admission_p95_ms": _percentile(admission_samples_ms, 95.0),
+        "admission_p99_ms": _percentile(admission_samples_ms, 99.0),
+        "admission_max_ms": max(admission_samples_ms),
         "warmup_iterations": warmup_iterations,
         "measured_iterations": measured_iterations,
         "mean_ms": mean_ms,
@@ -491,6 +532,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-iterations", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument(
+        "--admission-iterations",
+        type=int,
+        default=10,
+        help="Fresh bulk-admission repetitions per case (default: 10).",
+    )
+    parser.add_argument(
         "--short-context-len",
         type=int,
         default=64,
@@ -529,6 +576,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error("--warmup-iterations must be non-negative")
     if args.iterations <= 0:
         parser.error("--iterations must be positive")
+    if args.admission_iterations <= 0:
+        parser.error("--admission-iterations must be positive")
     if args.block_size <= 0:
         parser.error("--block-size must be positive")
     if args.loop_count <= 0:
@@ -572,12 +621,14 @@ def main(argv: TypingSequence[str] | None = None) -> int:
                     case,
                     warmup_iterations=args.warmup_iterations,
                     measured_iterations=args.iterations,
+                    admission_iterations=args.admission_iterations,
                     suppress_native_setup_logs=not args.show_native_setup_logs,
                 )
                 records.append(record)
                 print(
-                    f"  mean={record['mean_ms']:.3f} ms "
-                    f"p50={record['p50_ms']:.3f} ms "
+                    f"  admission mean={record['admission_mean_ms']:.3f} ms "
+                    f"p99={record['admission_p99_ms']:.3f} ms | "
+                    f"decode mean={record['mean_ms']:.3f} ms "
                     f"p99={record['p99_ms']:.3f} ms",
                     flush=True,
                 )
@@ -591,9 +642,12 @@ def main(argv: TypingSequence[str] | None = None) -> int:
         "cpu_count": os.cpu_count(),
         "repo_root": str(REPO_ROOT),
         "gpus_per_logical_node": GPUS_PER_LOGICAL_NODE,
-        "timed_scope": "steady-state decode Scheduler.schedule() call only",
+        "timed_scope": (
+            "bulk waiting-request admission Scheduler.schedule() and "
+            "steady-state decode Scheduler.schedule()"
+        ),
         "excluded_scope": (
-            "scheduler construction, Sequence creation, initial admission, "
+            "scheduler construction, Sequence creation and queue insertion, "
             "ScheduleResult destruction, Ray, RDMA, and GPU execution"
         ),
         "arguments": {

@@ -21,9 +21,16 @@ python3 scripts/scheduler_overhead/profile_scheduler_scalability.py
 ```
 
 Results are written as JSON and CSV beneath
-`bench_logs/scheduler_overhead/<UTC timestamp>/`. Setup, request admission,
-Ray/RDMA communication, and GPU execution are explicitly excluded from the
-reported steady-state decode latency.
+`bench_logs/scheduler_overhead/<UTC timestamp>/`. Each case reports two
+separate scheduler costs:
+
+- bulk admission, including GPU selection and SP-degree/placement decisions
+  for all waiting requests in the configured batch;
+- steady-state decode scheduling after those requests are running.
+
+Scheduler construction, request object creation and queue insertion, Ray/RDMA
+communication, and GPU execution are excluded. Bulk admission is repeated ten
+times by default; use `--admission-iterations` to change the sample count.
 
 For a quick smoke run:
 
@@ -31,6 +38,7 @@ For a quick smoke run:
 python3 scripts/scheduler_overhead/profile_scheduler_scalability.py \
   --logical-nodes 1 \
   --batch-sizes 2 \
+  --admission-iterations 1 \
   --warmup-iterations 1 \
   --iterations 3 \
   --output-dir /tmp/nanodeploy-scheduler-overhead-smoke

@@ -78,6 +78,8 @@ def test_run_case_profiles_steady_decode_and_validates_sp_mix(
 
     assert record["scenario"] == scenario
     assert record["total_requests"] == 16
+    assert record["admission_iterations"] == 1
+    assert record["admission_mean_ms"] > 0.0
     assert record["measured_iterations"] == 3
     assert record["actual_sp8_requests"] == case.expected_sp8_requests
     assert record["actual_sp1_requests"] == (
