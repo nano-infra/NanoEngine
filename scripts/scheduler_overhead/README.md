@@ -14,6 +14,13 @@ The default decode quantum is 16 steps, matching the production serving
 configuration. Override it with `--loop-count` when evaluating another
 configuration.
 
+Dynamic scenarios use NanoDeploy's production DeepSeek-V3 bucket policy. Short
+requests contain 1,024 tokens and select SP1; long requests contain 428,033
+tokens and therefore fall in the policy's SP8 interval
+(`428033--1048576`). `dynamic_sp8_1pct` and `dynamic_sp8_5pct` control the
+fraction of these long requests. `no_sp` uses a DP-only topology, while
+`fixed_sp8` forces every request to use SP8.
+
 Run the full sweep with:
 
 ```bash
@@ -44,7 +51,7 @@ python3 scripts/scheduler_overhead/profile_scheduler_scalability.py \
   --output-dir /tmp/nanodeploy-scheduler-overhead-smoke
 ```
 
-The 64- and 512-token synthetic contexts keep the CPU benchmark compact while
-exercising the production SP1 and SP8 placement paths. They are not intended to
-model attention execution time; custom lengths can be supplied through
-`--short-context-len` and `--long-context-len`.
+The context lengths affect CPU block allocation and placement only; no
+attention kernel is executed. Custom lengths can be supplied through
+`--short-context-len` and `--long-context-len`, but dynamic lengths must remain
+inside the SP1 and SP8 intervals of the production policy.

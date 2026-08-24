@@ -43,6 +43,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanodeploy._cpp import Scheduler, Sequence, update_seqs_inner_loop  # noqa: E402
+from nanodeploy.config import DEEPSEEK_V3_BUCKET_POLICY  # noqa: E402
 
 
 GPUS_PER_LOGICAL_NODE = 8
@@ -157,6 +158,15 @@ def _parse_scenarios(value: str) -> tuple[str, ...]:
     return names
 
 
+def _bucket_sp_degree(policy: str, context_len: int) -> int | None:
+    for item in policy.split(";"):
+        degree_text, interval_text = item.split(":", maxsplit=1)
+        low_text, high_text = interval_text.split("-", maxsplit=1)
+        if int(low_text) <= context_len <= int(high_text):
+            return int(degree_text)
+    return None
+
+
 def _percentile(samples: TypingSequence[float], percentile: float) -> float:
     if not samples:
         raise ValueError("cannot calculate a percentile of no samples")
@@ -202,20 +212,41 @@ def _scheduler_capacity_blocks(
     case: ProfileCase,
     profiled_decode_iterations: int,
 ) -> int:
-    # With the default 64/512-token profiling contexts, the worst case is
-    # fixed SP8: every rank stores one partial block for every request in its
-    # eight-rank group. The factor of two also covers the scheduler's reserved
-    # master blocks and permanent control dummies.
-    blocks_per_short_request = math.ceil(case.short_context_len / case.block_size)
-    fixed_sp8_blocks_per_rank = (
-        case.batch_size_per_gpu
-        * SP8_DEGREE
-        * max(1, blocks_per_short_request)
-    )
-    no_sp_long_bound = (
-        case.batch_size_per_gpu
-        * math.ceil(case.long_context_len / case.block_size)
-    )
+    short_blocks = math.ceil(case.short_context_len / case.block_size)
+    if not case.scenario.use_sp8_topology:
+        initial_blocks_per_rank = case.batch_size_per_gpu * short_blocks
+    elif case.scenario.fixed_sp_size == SP8_DEGREE:
+        per_request_rank_tokens = math.ceil(
+            case.short_context_len / SP8_DEGREE
+        )
+        per_request_rank_blocks = math.ceil(
+            per_request_rank_tokens / case.block_size
+        )
+        initial_blocks_per_rank = (
+            case.batch_size_per_gpu
+            * SP8_DEGREE
+            * per_request_rank_blocks
+        )
+    else:
+        # Round-robin DP routing maps request i to i % attention_dp. Derive the
+        # largest long-request count assigned to any SP8 group, then reserve a
+        # per-rank share of each long request. Non-uniform placement balances
+        # free capacity, while the 10% margin below covers small rank skew.
+        long_indices = _long_request_indices(
+            case.total_requests,
+            case.expected_sp8_requests,
+            case.seed,
+        )
+        long_per_dp = [0] * case.attention_dp
+        for request_index in long_indices:
+            long_per_dp[request_index % case.attention_dp] += 1
+        max_long_per_dp = max(long_per_dp, default=0)
+        long_rank_tokens = math.ceil(case.long_context_len / SP8_DEGREE)
+        long_rank_blocks = math.ceil(long_rank_tokens / case.block_size)
+        initial_blocks_per_rank = (
+            case.batch_size_per_gpu * short_blocks
+            + max_long_per_dp * long_rank_blocks
+        )
     generated_master_blocks = (
         case.batch_size_per_gpu
         * math.ceil(
@@ -223,7 +254,8 @@ def _scheduler_capacity_blocks(
         )
     )
     return (
-        2 * max(fixed_sp8_blocks_per_rank, no_sp_long_bound)
+        math.ceil(initial_blocks_per_rank * 1.1)
+        + case.batch_size_per_gpu
         + generated_master_blocks
         + 64
     )
@@ -234,12 +266,7 @@ def _new_scheduler(
     profiled_decode_iterations: int = 0,
 ) -> Scheduler:
     dynamic = case.scenario.uses_dynamic_policy
-    bucket_policy = (
-        f"1:1-{case.short_context_len};"
-        f"8:{case.short_context_len + 1}-{case.long_context_len}"
-        if dynamic
-        else ""
-    )
+    bucket_policy = DEEPSEEK_V3_BUCKET_POLICY if dynamic else ""
     return Scheduler(
         f"scheduler-profile-{case.scenario.name}",
         case.loop_count,
@@ -462,6 +489,11 @@ def run_case(
         "actual_sp8_ratio": histogram.get(SP8_DEGREE, 0) / case.total_requests,
         "short_context_len": case.short_context_len,
         "long_context_len": case.long_context_len,
+        "dynamic_sp_bucket_policy": (
+            DEEPSEEK_V3_BUCKET_POLICY
+            if case.scenario.uses_dynamic_policy
+            else ""
+        ),
         "block_size": case.block_size,
         "loop_count": case.loop_count,
         "scheduler_thread_pool_workers": case.attention_dp,
@@ -540,14 +572,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--short-context-len",
         type=int,
-        default=64,
-        help="Synthetic SP1 request length used to construct valid KV blocks.",
+        default=1_024,
+        help="SP1 request length (default: 1024).",
     )
     parser.add_argument(
         "--long-context-len",
         type=int,
-        default=512,
-        help="Synthetic SP8 request length used to select the SP8 bucket.",
+        default=428_033,
+        help="Long request length in the DeepSeek-V3 SP8 bucket (default: 428033).",
     )
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument(
@@ -586,6 +618,24 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error(f"--short-context-len must be at least {SP8_DEGREE}")
     if args.long_context_len <= args.short_context_len:
         parser.error("--long-context-len must exceed --short-context-len")
+    short_degree = _bucket_sp_degree(
+        DEEPSEEK_V3_BUCKET_POLICY,
+        args.short_context_len,
+    )
+    if short_degree != 1:
+        parser.error(
+            "--short-context-len must fall in the DeepSeek-V3 SP1 bucket; "
+            f"got degree {short_degree}"
+        )
+    long_degree = _bucket_sp_degree(
+        DEEPSEEK_V3_BUCKET_POLICY,
+        args.long_context_len,
+    )
+    if long_degree != SP8_DEGREE:
+        parser.error(
+            "--long-context-len must fall in the DeepSeek-V3 SP8 bucket; "
+            f"got degree {long_degree}"
+        )
 
 
 def main(argv: TypingSequence[str] | None = None) -> int:
@@ -642,6 +692,7 @@ def main(argv: TypingSequence[str] | None = None) -> int:
         "cpu_count": os.cpu_count(),
         "repo_root": str(REPO_ROOT),
         "gpus_per_logical_node": GPUS_PER_LOGICAL_NODE,
+        "dynamic_sp_bucket_policy": DEEPSEEK_V3_BUCKET_POLICY,
         "timed_scope": (
             "bulk waiting-request admission Scheduler.schedule() and "
             "steady-state decode Scheduler.schedule()"

@@ -5,6 +5,7 @@ import pytest
 from scripts.scheduler_overhead.profile_scheduler_scalability import (
     SCENARIOS,
     ProfileCase,
+    _bucket_sp_degree,
     _long_request_indices,
     _percentile,
     run_case,
@@ -16,8 +17,8 @@ def _case(scenario: str) -> ProfileCase:
         scenario=SCENARIOS[scenario],
         logical_nodes=1,
         batch_size_per_gpu=2,
-        short_context_len=64,
-        long_context_len=512,
+        short_context_len=1_024,
+        long_context_len=428_033,
         block_size=64,
         loop_count=1,
         seed=0,
@@ -60,6 +61,15 @@ def test_long_request_selection_is_exact_and_deterministic() -> None:
 def test_percentile_uses_linear_interpolation() -> None:
     assert _percentile([1.0, 2.0, 3.0, 4.0], 50.0) == 2.5
     assert _percentile([1.0, 2.0, 3.0, 4.0], 100.0) == 4.0
+
+
+def test_production_bucket_boundaries_select_sp1_and_sp8() -> None:
+    from nanodeploy.config import DEEPSEEK_V3_BUCKET_POLICY
+
+    assert _bucket_sp_degree(DEEPSEEK_V3_BUCKET_POLICY, 1_024) == 1
+    assert _bucket_sp_degree(DEEPSEEK_V3_BUCKET_POLICY, 63_488) == 1
+    assert _bucket_sp_degree(DEEPSEEK_V3_BUCKET_POLICY, 428_033) == 8
+    assert _bucket_sp_degree(DEEPSEEK_V3_BUCKET_POLICY, 1_048_576) == 8
 
 
 @pytest.mark.parametrize(
