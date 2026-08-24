@@ -64,8 +64,8 @@ impl Scheduler {
                     })
                     .collect()
             },
-            used_hisparse_slots: self.cache.hisparse_slots.num_used_slots(),
-            total_hisparse_slots: self.cache.hisparse_slots.num_slots(),
+            used_hisparse_slots: self.cache.used_hisparse_slots(),
+            total_hisparse_slots: self.cache.total_hisparse_slots(),
         }
     }
 

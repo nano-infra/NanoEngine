@@ -19,8 +19,8 @@ pub(crate) struct CacheState {
     pub(crate) seq_assignment: HashMap<u64, (usize, usize)>,
     pub(crate) session_affinity: HashMap<u64, usize>,
     pub(crate) session_wait: HashMap<u64, i32>,
-    pub(crate) state_slots: SlotPool,
-    pub(crate) hisparse_slots: SlotPool,
+    pub(crate) state_slots: Vec<SlotPool>,
+    pub(crate) hisparse_slots: Vec<SlotPool>,
     pub(crate) compressed_pools: HashMap<i32, CompressedPool>,
     pub(crate) prefix_caching_allowed: bool,
     pub(crate) prefix_caching_enabled: bool,
@@ -115,8 +115,10 @@ impl CacheState {
             seq_assignment: HashMap::new(),
             session_affinity: HashMap::new(),
             session_wait: HashMap::new(),
-            state_slots: SlotPool::new(state_slots),
-            hisparse_slots: SlotPool::new(hisparse_slots),
+            state_slots: (0..dp).map(|_| SlotPool::new(state_slots)).collect(),
+            hisparse_slots: (0..dp)
+                .map(|_| SlotPool::new(hisparse_slots))
+                .collect(),
             compressed_pools,
             prefix_caching_allowed,
             prefix_caching_enabled: prefix_caching_allowed,
@@ -148,8 +150,12 @@ impl CacheState {
         for pool in &mut self.host_pools {
             pool.remove_seq(seq_id);
         }
-        self.state_slots.remove(seq_id);
-        self.hisparse_slots.remove(seq_id);
+        for pool in &mut self.state_slots {
+            pool.remove(seq_id);
+        }
+        for pool in &mut self.hisparse_slots {
+            pool.remove(seq_id);
+        }
         for pool in self.compressed_pools.values_mut() {
             if let Some(mut pages) = pool.seq_pages.remove(&seq_id) {
                 pool.free_pages.append(&mut pages);
