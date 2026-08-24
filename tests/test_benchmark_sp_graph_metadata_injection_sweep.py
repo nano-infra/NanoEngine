@@ -1,6 +1,7 @@
 import argparse
 
 import pytest
+import torch
 
 from scripts.benchmark_sp_graph_metadata_injection_sweep import (
     MnPair,
@@ -10,6 +11,7 @@ from scripts.benchmark_sp_graph_metadata_injection_sweep import (
     _shape_hint,
     _source_for_pair,
     _validate_mn_pairs,
+    _verify_fused_result,
 )
 
 
@@ -80,6 +82,31 @@ def test_fixed_capacity_reuses_configured_limits() -> None:
     source = _source()
 
     assert _source_for_pair(source, MnPair(8, 24), "fixed") is source
+
+
+def test_verify_fused_result_reports_tensor_mismatches() -> None:
+    reference = {
+        "matching": torch.tensor([1, 2]),
+        "different": torch.tensor([3, 4]),
+        "optional": None,
+    }
+    fused = {
+        "matching": torch.tensor([1, 2]),
+        "different": torch.tensor([3, 5]),
+        "optional": None,
+    }
+
+    result = _verify_fused_result(reference, fused)
+
+    assert not result["passed"]
+    assert result["tensors"]["matching"] == {
+        "passed": True,
+        "mismatch_count": 0,
+    }
+    assert result["tensors"]["different"] == {
+        "passed": False,
+        "mismatch_count": 1,
+    }
 
 
 def test_validate_pairs_enforces_remote_row_capacity() -> None:

@@ -26,6 +26,9 @@ from scripts.benchmark_sp_graph_runtime_overheads import (
     _time_cuda_operation,
     _write_json,
 )
+from scripts._sp_graph_metadata_injection_fused import (
+    copy_decode_context_to_graph_vars_fused_no_padding,
+)
 from nanodeploy.worker.sp_graph_policy import copy_decode_context_to_graph_vars
 
 
@@ -97,6 +100,16 @@ def _parse_args() -> argparse.Namespace:
             "global capacities for every pair, matching the current production "
             "allocation. 'per-pair' sets max_num_seqs=m and "
             "max_num_recv_seqs=n-m for each pair."
+        ),
+    )
+    parser.add_argument(
+        "--implementation",
+        choices=("production", "fused"),
+        default="production",
+        help=(
+            "Metadata injection implementation. 'production' calls the current "
+            "serving path; 'fused' uses a benchmark-only two-launch Triton "
+            "prototype and verifies it against production before timing."
         ),
     )
     parser.add_argument("--warmup", type=int, default=200)
@@ -280,6 +293,39 @@ def _source_manifest(
     return {name: _tensor_description(tensor) for name, tensor in tensors.items()}
 
 
+def _clone_graph_vars(
+    graph_vars: dict[str, torch.Tensor | None],
+) -> dict[str, torch.Tensor | None]:
+    return {
+        name: None if tensor is None else tensor.clone()
+        for name, tensor in graph_vars.items()
+    }
+
+
+def _verify_fused_result(
+    reference: dict[str, torch.Tensor | None],
+    fused: dict[str, torch.Tensor | None],
+) -> dict[str, Any]:
+    tensors = {}
+    all_passed = True
+    for name, reference_tensor in reference.items():
+        fused_tensor = fused[name]
+        if reference_tensor is None or fused_tensor is None:
+            passed = reference_tensor is None and fused_tensor is None
+            mismatch_count = 0 if passed else 1
+        else:
+            mismatch_count = int(
+                torch.count_nonzero(reference_tensor != fused_tensor).item()
+            )
+            passed = mismatch_count == 0
+        tensors[name] = {
+            "passed": passed,
+            "mismatch_count": mismatch_count,
+        }
+        all_passed = all_passed and passed
+    return {"passed": all_passed, "tensors": tensors}
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("full metadata injection sweep requires CUDA")
@@ -310,9 +356,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
         source_tensors = _source_manifest(context, input_ids, positions)
 
-        def inject_all_metadata() -> None:
+        def inject_production_metadata(
+            destination_vars: dict[str, torch.Tensor | None] = graph_vars,
+        ) -> None:
             copy_decode_context_to_graph_vars(
-                graph_vars,
+                destination_vars,
                 input_ids,
                 positions,
                 shape["actual_master_bs"],
@@ -322,6 +370,46 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 sp_rank=shape["sp_rank"],
                 max_num_seqs=shape["max_num_seqs"],
             )
+
+        correctness = None
+        if args.implementation == "fused":
+            reference_graph_vars = _clone_graph_vars(graph_vars)
+            inject_production_metadata(reference_graph_vars)
+            copy_decode_context_to_graph_vars_fused_no_padding(
+                graph_vars,
+                input_ids,
+                positions,
+                shape["actual_master_bs"],
+                shape["graph_master_bs"],
+                shape["graph_attn_bs"],
+                context,
+            )
+            torch.cuda.synchronize()
+            correctness = _verify_fused_result(reference_graph_vars, graph_vars)
+            del reference_graph_vars
+            if not correctness["passed"]:
+                failed = [
+                    name
+                    for name, result in correctness["tensors"].items()
+                    if not result["passed"]
+                ]
+                raise RuntimeError(
+                    f"fused metadata mismatch for ({pair.m},{pair.n}): {failed}"
+                )
+
+            def inject_all_metadata() -> None:
+                copy_decode_context_to_graph_vars_fused_no_padding(
+                    graph_vars,
+                    input_ids,
+                    positions,
+                    shape["actual_master_bs"],
+                    shape["graph_master_bs"],
+                    shape["graph_attn_bs"],
+                    context,
+                )
+
+        else:
+            inject_all_metadata = inject_production_metadata
 
         timing = _time_cuda_operation(
             inject_all_metadata,
@@ -334,6 +422,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "m": pair.m,
                 "n": pair.n,
                 "shape": shape,
+                "implementation": args.implementation,
+                "correctness_against_production": correctness,
                 "capacities": _capacities(case_source),
                 "destination_tensors": case_destinations,
                 "source_tensors": source_tensors,
@@ -362,9 +452,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "n": "actual_attn_bs == graph_attn_bs",
             "padding": False,
             "capacity_mode": args.capacity_mode,
+            "implementation": args.implementation,
             "scope": "copy_decode_context_to_graph_vars (all Graph metadata)",
         },
         "capacity_mode": args.capacity_mode,
+        "implementation": args.implementation,
         "capacities": _capacities(source),
         "persistent_destination_tensors": persistent_destinations,
         "block_table_width": block_table_width,
