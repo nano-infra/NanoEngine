@@ -16,7 +16,7 @@ In short, **Ray answers “where do the GPU workers run?”**, while **dlslime-c
 ### Request flow
 
 ```text
-OpenAI / Anthropic / Claude Code client
+OpenAI / Anthropic / Claude Code / OpenCode client
                   │
                   ▼
         dlengine-router :3001
@@ -220,6 +220,39 @@ claude --model GLM-5.2-FP8
 ```
 
 Run the command from the project directory that Claude Code should work on. `ANTHROPIC_API_KEY=dummy` is a placeholder for this local gateway; add real authentication at the network or gateway layer before exposing the endpoint outside a trusted environment.
+
+### 8. Use OpenCode through the OpenAI-compatible API
+
+OpenCode can connect directly to the router’s OpenAI-compatible `/v1` endpoint. Add a provider to `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "dlengine/GLM-5.2-FP8",
+  "provider": {
+    "dlengine": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local DLEngine",
+      "options": {
+        "baseURL": "http://127.0.0.1:3001/v1"
+      },
+      "models": {
+        "GLM-5.2-FP8": {
+          "name": "GLM-5.2-FP8"
+        }
+      }
+    }
+  }
+}
+```
+
+Run OpenCode from the project directory:
+
+```bash
+opencode
+```
+
+The top-level `model` selects the configured model by default. To override it for one invocation, use `opencode -m dlengine/GLM-5.2-FP8`. The provider model name must match the `--served-model-name` registered by both DLEngine roles. Keep the router on loopback or add authentication before exposing it outside a trusted network.
 
 ### Operational checks
 

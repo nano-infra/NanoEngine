@@ -50,7 +50,7 @@ DLEngine focuses on distributed inference for state-of-the-art large models. Thi
 
 | Feature                      | Status    | Description                                                                                              |
 | ---------------------------- | --------- | -------------------------------------------------------------------------------------------------------- |
-| OpenAI-compatible API        | Available | Serves chat completions, completions, streaming responses, and model discovery through dlengine-router.  |
+| OpenAI-compatible API        | Available | Serves chat completions, completions, streaming responses, model discovery, and the OpenCode workflow.   |
 | Anthropic-compatible API     | Available | Serves Messages and token-counting endpoints, including the Claude Code workflow.                        |
 | Tool calling                 | Available | Parses model-family tool-call formats and returns OpenAI/Anthropic-compatible tool events.               |
 | Grammar-constrained decoding | Available | Restricts generation to a supplied grammar or structured-output contract for supported serving requests. |
