@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import nanodeploy.engine.local_scheduler as local_scheduler_module
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
@@ -717,12 +718,22 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 17
 
 
-def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
+def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add(
+    monkeypatch,
+):
     config = make_hierarchical_config(
         num_kvcache_blocks=3,
         reserved_blocks_per_req=0,
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    created_sequences = []
+    sequence_type = local_scheduler_module.Sequence
+
+    def create_sequence(*args, **kwargs):
+        created_sequences.append(args[0])
+        return sequence_type(*args, **kwargs)
+
+    monkeypatch.setattr(local_scheduler_module, "Sequence", create_sequence)
 
     rejected = local.add(
         AddCommand(
@@ -740,15 +751,24 @@ def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
     assert local.cpp_scheduler.get_total_waiting_migration_size() == 0
     assert local.state_manager.num_running_seqs == 0
     assert local.admit() == ()
+    assert created_sequences == []
 
 
-def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime():
+def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime(monkeypatch):
     config = make_hierarchical_config(
         num_kvcache_blocks=3,
         reserved_blocks_per_req=0,
         segment_size=64,
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    created_sequences = []
+    sequence_type = local_scheduler_module.Sequence
+
+    def create_sequence(*args, **kwargs):
+        created_sequences.append(args[0])
+        return sequence_type(*args, **kwargs)
+
+    monkeypatch.setattr(local_scheduler_module, "Sequence", create_sequence)
 
     accepted = local.add(
         AddCommand(
@@ -767,6 +787,7 @@ def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime():
     assert local.state_manager.can_fit_lifetime(
         sequence, 1 + round_up(sequence.max_tokens)
     )
+    assert created_sequences == [list(range(120))]
 
 
 def test_local_scheduler_defers_admission_without_bootstrap_capacity():

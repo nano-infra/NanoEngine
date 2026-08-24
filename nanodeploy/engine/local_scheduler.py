@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import dataclass
 from math import ceil
 from time import perf_counter
@@ -28,6 +27,11 @@ from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.engine.sequence import SequenceStatus
 from nanodeploy.engine.topology import EngineTopology
+from nanodeploy.router.admission_planner import (
+    AdmissionPlanner,
+    AdmissionPlannerConfig,
+    AdmissionShadow,
+)
 from nanodeploy.sampling_params import SamplingParams
 
 
@@ -83,12 +87,9 @@ class LocalScheduler:
             engine_id_override=f"{config.engine_id or 'hierarchical'}:dp{self.engine_id}",
         )
         self._state_manager = self._scheduler.worker_state[0]
-        self._capacity_probe: Scheduler | None = None
-        self._capacity_probe_state = None
-        self._capacity_probe_num_blocks = 0
-        self._capacity_validation_cache: dict[
-            tuple[int, int, int], str | None
-        ] = {}
+        self._capacity_planner = AdmissionPlanner(
+            AdmissionPlannerConfig.from_config(config)
+        )
         # Keep only live requests in the hot record table. Terminal request
         # IDs retain duplicate/abort semantics through compact tombstones
         # without keeping full Sequence objects in every subsequent scan.
@@ -178,136 +179,40 @@ class LocalScheduler:
             dispatched_tokens=tuple(dispatched_tokens),
         )
 
-    def _ensure_capacity_probe(
-        self, *, prompt_len: int, total_capacity_len: int
-    ) -> None:
-        block_size = self.config.kvcache_block_size
-        control_blocks = max(
-            self._state_manager.num_control_dummy_blocks(sp_idx)
-            for sp_idx in self._state_manager.block_manager
-        )
-        reservation_blocks = ceil(self.config.reserved_blocks_per_req)
-        lifetime_blocks = (total_capacity_len + block_size - 1) // block_size
-        admission_blocks = (
-            (prompt_len + block_size - 1) // block_size
-        ) + reservation_blocks
-        required_num_blocks = control_blocks + max(
-            lifetime_blocks, admission_blocks
-        )
-        probe_num_blocks = min(
-            self.config.num_kvcache_blocks, required_num_blocks
-        )
-        if (
-            self._capacity_probe is not None
-            and self._capacity_probe_num_blocks >= probe_num_blocks
-        ):
-            return
-
-        probe_config = copy(self.config)
-        probe_config.num_kvcache_blocks = probe_num_blocks
-        self._capacity_probe_state = None
-        self._capacity_probe = None
-        self._capacity_probe = Scheduler(
-            probe_config,
-            attention_dp_override=1,
-            engine_id_override=(
-                f"{self.config.engine_id or 'hierarchical'}:"
-                f"dp{self.engine_id}:capacity-probe"
-            ),
-        )
-        self._capacity_probe_state = self._capacity_probe.worker_state[0]
-        self._capacity_probe_num_blocks = probe_num_blocks
-
-    def _validate_exclusive_lifetime(
-        self,
-        *,
-        prompt_len: int,
-        max_tokens: int,
-        total_capacity_len: int,
-        padded_completion_len: int,
-    ) -> None:
-        block_size = self.config.kvcache_block_size
-        service_blocks = [
-            block_manager.num_blocks
-            - self._state_manager.num_control_dummy_blocks(sp_idx)
-            for sp_idx, block_manager in self._state_manager.block_manager.items()
-        ]
+    def _validate_exclusive_capacity(self, command: AddCommand) -> None:
+        total_blocks = []
+        control_dummy_blocks = []
+        service_blocks = []
+        for sp_idx in range(self.topology.attention_sp):
+            block_manager = self._state_manager.block_manager[sp_idx]
+            control_blocks = self._state_manager.num_control_dummy_blocks(
+                sp_idx
+            )
+            total_blocks.append(block_manager.num_blocks)
+            control_dummy_blocks.append(control_blocks)
+            service_blocks.append(block_manager.num_blocks - control_blocks)
         if not service_blocks or min(service_blocks) <= 0:
             raise ValueError("control dummy reservation leaves no service KV blocks")
 
-        master_only_tokens = 1 + padded_completion_len
-        master_only_blocks = (
-            master_only_tokens + block_size - 1
-        ) // block_size
-        if master_only_blocks > max(service_blocks):
-            raise ValueError(
-                "request padded decode lifetime cannot fit on any master SP rank"
-            )
-
-        minimum_total_blocks = (
-            total_capacity_len + block_size - 1
-        ) // block_size
-        if minimum_total_blocks > sum(service_blocks):
-            raise ValueError(
-                "request padded lifetime exceeds the LocalEngine KV capacity"
-            )
-
-        cache_key = (prompt_len, max_tokens, padded_completion_len)
-        if cache_key in self._capacity_validation_cache:
-            cached_reason = self._capacity_validation_cache[cache_key]
-            if cached_reason is not None:
-                raise ValueError(cached_reason)
-            return
-
-        self._ensure_capacity_probe(
-            prompt_len=prompt_len,
-            total_capacity_len=total_capacity_len,
+        attention_sp = self.topology.attention_sp
+        empty_shadow = AdmissionShadow(
+            engine_id=self.engine_id,
+            free_blocks=list(service_blocks),
+            total_blocks=total_blocks,
+            control_dummy_blocks=control_dummy_blocks,
+            master_counts=[0] * attention_sp,
+            receiver_counts=[0] * attention_sp,
+            dispatched_tokens=[0] * attention_sp,
+            batch_master_counts=[0] * attention_sp,
+            batch_tokens=[0] * attention_sp,
+            queue_slots=0,
+            rr_cursor=0,
         )
-        if self._capacity_probe is None or self._capacity_probe_state is None:
-            raise RuntimeError("exclusive-capacity probe was not initialized")
-
-        probe = Sequence(
-            [0] * prompt_len,
-            sampling_params=SamplingParams(
-                temperature=1.0,
-                max_tokens=max_tokens,
-                ignore_eos=True,
-            ),
-        )
-        if self._capacity_probe.running(0):
-            raise RuntimeError("exclusive-capacity probe retained running state")
-        if self._capacity_probe.waiting_migration:
-            raise RuntimeError("exclusive-capacity probe retained waiting state")
-
-        self._capacity_probe.add(probe)
-        admitted: list[Sequence] = []
-        try:
-            admitted = list(self._capacity_probe.admit()[0])
-            fits = (
-                len(admitted) == 1
-                and admitted[0] is probe
-                and self._capacity_probe_state.can_fit_lifetime(
-                    probe, 1 + padded_completion_len
-                )
-            )
-        finally:
-            if probe in self._capacity_probe_state.running:
-                self._capacity_probe_state.running.remove(probe)
-                self._capacity_probe_state.deallocate(
-                    probe, BlockContextSlot.ACTIVE
-                )
-            if probe in self._capacity_probe.waiting_migration:
-                self._capacity_probe.waiting_migration.remove(probe)
-
-        reason = None
-        if not fits:
-            reason = (
+        if self._capacity_planner.plan(empty_shadow, command) is None:
+            raise ValueError(
                 "request padded lifetime cannot fit its exclusive "
                 "LocalEngine SP placement"
             )
-        self._capacity_validation_cache[cache_key] = reason
-        if reason is not None:
-            raise ValueError(reason)
 
     def add(self, command: AddCommand) -> AddResult:
         existing = self._records.get(command.request_id)
@@ -353,12 +258,7 @@ class LocalScheduler:
                 max_model_len=self.config.max_model_len,
                 vocab_size=self.config.hf_config.vocab_size,
             )
-            self._validate_exclusive_lifetime(
-                prompt_len=validation.original_prompt_len,
-                max_tokens=command.max_tokens,
-                total_capacity_len=validation.total_capacity_len,
-                padded_completion_len=validation.padded_completion_len,
-            )
+            self._validate_exclusive_capacity(command)
         except ValueError as exc:
             return AddResult(
                 request_id=command.request_id,
