@@ -253,7 +253,7 @@ cached-chain graph 相比 eager MTP 再减少约 14% 墙钟。在此基础上，
 ### 8. 当前能力边界与未来方向
 
 - **已支持**：N=1 的既有 MTP；GLM DSA/MLA 在 Hopper 上的 N=5/K=6 线性多步路径；hybrid 与 PD 分离；greedy 与 `temperature > 0`；completion logprob；batch reorder/shrink；以及 `PP>1` prefill 对接 `PP=1` decode 的非对称 PD 拓扑。PP prefill 仅在最后 stage 运行 predictor，并通过常规 KV MR 和独立 `mtp_handoff` MR 迁移 predictor KV 与 5-token draft bundle；decode 首轮可直接 verify，失配或 stale row 安全回退 target decode。GLM decode 也可叠加 HiSparse：K=6 的 DSA top-k 在 request 内合并去重，六个 target 输出使用独立 hot slot，并在 verify 后完整写回 cold host cache。
-- **HiSparse 配置**：GLM N=5/K=6、`index_topk=2048` 时，decode 端添加 `--enable_hisparse true --hisparse_device_buffer_size 12288`；容量下限为 `(num_speculative_tokens + 1) * index_topk`。prefill 端保持普通 PD cache，并通过数据面把 KV 迁移到 decode cold host tier。长上下文 PP prefill 建议使用 `--max_num_batched_tokens 16384` 作为每 stage microbatch 上限；不要把完整 100K/1M prompt 合成一次巨型 GPU forward。
+- **HiSparse 配置**：GLM N=5/K=6、`index_topk=2048` 时，decode 端添加 `--enable_hisparse true --hisparse_device_buffer_size 12288`；容量下限为 `(num_speculative_tokens + 1) * index_topk`。prefill 端保持普通 PD cache，并通过数据面把 KV 迁移到 decode cold host tier。长上下文 PP prefill 建议使用 `--max_num_batched_tokens 8192` 作为每 stage microbatch 上限；不要把完整 100K/1M prompt 合成一次巨型 GPU forward。
 - **暂不支持**：tree、非 GLM 的 HiSparse+MTP、PP decode、非 Hopper multi-step、GDN multi-step、DeepSeek/Qwen multi-step。
 - **下一性能热点**：recurrent 与 active target verify 已不再是唯一主导项；下一阶段优先降低 profiler 外的 CPU 调度抖动、专家通信长尾和 cold prefill/routing 开销，而不是为了计数继续拆改 recurrent 或 verify 控制流
 - **自适应投机深度**：根据运行时接受率动态调整 draft 数量，在高接受率时激进投机，低接受率时退回标准 decode

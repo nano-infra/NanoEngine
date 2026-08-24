@@ -85,7 +85,7 @@ Use the same speculative depth on both PD roles:
 # Prefill role
 --mode prefill
 --pp 8
---max_num_batched_tokens 16384
+--max_num_batched_tokens 8192
 --pp_prefill_scheduler_depth 0
 --num_speculative_tokens 5
 
