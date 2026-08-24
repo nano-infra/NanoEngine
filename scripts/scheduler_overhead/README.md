@@ -10,6 +10,10 @@ The default sweep covers:
 - active batch per GPU: 32, 64, 128;
 - no SP, fixed SP8, dynamic 1% SP8, and dynamic 5% SP8.
 
+The default decode quantum is 16 steps, matching the production serving
+configuration. Override it with `--loop-count` when evaluating another
+configuration.
+
 Run the full sweep with:
 
 ```bash

@@ -503,7 +503,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Synthetic SP8 request length used to select the SP8 bucket.",
     )
     parser.add_argument("--block-size", type=int, default=64)
-    parser.add_argument("--loop-count", type=int, default=1)
+    parser.add_argument(
+        "--loop-count",
+        type=int,
+        default=16,
+        help="Decode steps reserved by each scheduling quantum (default: 16).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output-dir",
