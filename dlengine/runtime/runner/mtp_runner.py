@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 import torch.distributed as dist
 from dlengine.config import Config
@@ -41,6 +43,36 @@ def _nonempty_ragged_bounds(
 def _active_ragged_last_rows(cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
     """Return last-row indices without consuming padded cu-seqlens entries."""
     return cu_seqlens[1 : num_seqs + 1].to(torch.long) - 1
+
+
+def _select_ragged_rows(
+    cu_seqlens: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return flattened token indices and compact cu-seqlens for selected rows.
+
+    Sampling row indices are produced in scheduler order. Keeping that order
+    lets a mixed PP prefill batch seed MTP only for completed requests without
+    synchronizing every ragged boundary back to the host.
+    """
+    if cu_seqlens.numel() <= 1 or row_indices.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=cu_seqlens.device)
+        zero = torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+        return empty, zero
+
+    row_indices = row_indices.to(device=cu_seqlens.device, dtype=torch.long)
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=cu_seqlens.device), lengths
+    )
+    selected_mask = torch.zeros(
+        lengths.numel(), dtype=torch.bool, device=cu_seqlens.device
+    )
+    selected_mask[row_indices] = True
+    token_indices = torch.nonzero(selected_mask[row_ids], as_tuple=False).flatten()
+    selected_lengths = lengths.index_select(0, row_indices)
+    compact_cu = torch.cat((cu_seqlens.new_zeros(1), selected_lengths.cumsum(0)))
+    return token_indices, compact_cu
 
 
 def _localize_packed_topk(
@@ -243,20 +275,31 @@ class MTPRunner:
         ):
             return 0
         previous = {seq_id: idx for idx, seq_id in enumerate(self._prev_seq_ids)}
-        draft_rows = [previous.get(seq_id) for _, seq_id, _ in entries]
-        if any(row is None for row in draft_rows):
+        resolved = [
+            (idx, seq_id, slot, previous[seq_id])
+            for idx, seq_id, slot in entries
+            if seq_id in previous
+        ]
+        if not resolved:
             return 0
 
         draft_indices = torch.tensor(
-            draft_rows, dtype=torch.long, device=self._prev_drafts.device
+            [row for _, _, _, row in resolved],
+            dtype=torch.long,
+            device=self._prev_drafts.device,
         )
         drafts = self._prev_drafts.index_select(0, draft_indices).to(
             device=handoff.device, dtype=handoff.dtype
         )
+        resolved_slots = torch.tensor(
+            [slot for _, _, slot, _ in resolved],
+            dtype=torch.long,
+            device=handoff.device,
+        )
         handoff_rows = torch.cat(
             (
                 torch.tensor(
-                    [seq_id for _, seq_id, _ in entries],
+                    [seq_id for _, seq_id, _, _ in resolved],
                     dtype=handoff.dtype,
                     device=handoff.device,
                 )[:, None],
@@ -264,8 +307,8 @@ class MTPRunner:
             ),
             dim=1,
         )
-        handoff.index_copy_(0, slot_tensor, handoff_rows)
-        return len(entries)
+        handoff.index_copy_(0, resolved_slots, handoff_rows)
+        return len(resolved)
 
     def restore_disagg_handoff(
         self, seq_ids: list[int], state_slots: list[int], num_seqs: int
@@ -699,6 +742,87 @@ class MTPRunner:
         )
         get_batch_out_context().token_ids = saved_token_ids
 
+    def _select_prefill_seed_batch(
+        self,
+        target_input_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        sampled_ids: torch.Tensor,
+        aux,
+        context,
+        num_seqs: int,
+    ):
+        """Compact completed rows from a mixed PP prefill microbatch."""
+        if self.last_hidden is None or sampled_ids.numel() < num_seqs:
+            return None
+
+        active_cu_q = context.cu_seqlens_q
+        active_cu_k = context.cu_seqlens_k
+        if (
+            active_cu_q is None
+            or active_cu_k is None
+            or context.block_tables is None
+            or context.slot_mapping is None
+        ):
+            return None
+
+        row_indices = context.sampling_seq_indices
+        if row_indices is None:
+            return (
+                target_input_ids,
+                target_positions,
+                sampled_ids,
+                self.last_hidden,
+                context,
+                tuple(int(seq_id) for seq_id in aux.seq_ids[:num_seqs]),
+                num_seqs,
+            )
+        if row_indices.numel() == 0:
+            return None
+
+        active_cu_q = active_cu_q[: num_seqs + 1]
+        active_cu_k = active_cu_k[: num_seqs + 1]
+        row_indices = row_indices.to(device=active_cu_q.device, dtype=torch.long)
+        token_indices, compact_cu_q = _select_ragged_rows(active_cu_q, row_indices)
+        if token_indices.numel() == 0:
+            return None
+
+        key_lengths = active_cu_k[1:] - active_cu_k[:-1]
+        compact_cu_k = torch.cat(
+            (
+                active_cu_k.new_zeros(1),
+                key_lengths.index_select(0, row_indices).cumsum(0),
+            )
+        )
+        selected_context_lens = context.context_lens
+        if selected_context_lens is not None and selected_context_lens.ndim >= 2:
+            selected_context_lens = selected_context_lens.index_select(1, row_indices)
+        selected_hisparse_slots = context.hisparse_slots
+        if selected_hisparse_slots is not None:
+            selected_hisparse_slots = selected_hisparse_slots.index_select(
+                0, row_indices
+            )
+        seed_context = replace(
+            context,
+            cu_seqlens_q=compact_cu_q,
+            cu_seqlens_k=compact_cu_k,
+            slot_mapping=context.slot_mapping.index_select(0, token_indices),
+            context_lens=selected_context_lens,
+            block_tables=context.block_tables.index_select(1, row_indices),
+            hisparse_slots=selected_hisparse_slots,
+            sampling_token_indices=None,
+            sampling_seq_indices=None,
+        )
+        host_rows = [int(row) for row in row_indices.tolist()]
+        return (
+            target_input_ids.index_select(0, token_indices),
+            target_positions.index_select(0, token_indices),
+            sampled_ids.index_select(0, row_indices),
+            self.last_hidden.index_select(0, token_indices),
+            seed_context,
+            tuple(int(aux.seq_ids[row]) for row in host_rows),
+            len(host_rows),
+        )
+
     def generate_prefill_and_store(
         self,
         target_input_ids: torch.Tensor,
@@ -719,32 +843,38 @@ class MTPRunner:
             self.reset_lazy_verify_state()
             return
 
-        context = get_batch_context()
+        target_context = get_batch_context()
         saved_token_ids = get_batch_out_context().token_ids
         saved_tile_scheduler_metadata = get_hca_context().tile_scheduler_metadata
         saved_sparse_scheduler_metadata = (
             get_mla_context().sparse_tile_scheduler_metadata
         )
 
-        # Selective/chunked prefill may omit a sampled token for some requests.
-        # Keep collective ordering stable but do not expose incomplete drafts.
-        can_seed = (
-            context.cu_seqlens_q is not None
-            and context.cu_seqlens_k is not None
-            and context.block_tables is not None
-            and context.sampling_token_indices is None
-            and sampled_ids.numel() >= num_seqs
-            and self.last_hidden is not None
+        seed_batch = self._select_prefill_seed_batch(
+            target_input_ids,
+            target_positions,
+            sampled_ids,
+            aux,
+            target_context,
+            num_seqs,
         )
-        if can_seed:
+        if seed_batch is not None:
+            (
+                target_input_ids,
+                target_positions,
+                sampled_ids,
+                seed_hidden,
+                context,
+                seed_seq_ids,
+                num_seqs,
+            ) = seed_batch
             # A full prefix-cache hit may have a zero-length fresh segment.
             # ``cu_q[1:] - 1`` would then produce -1 and crash the CUDA
             # index-select used to seed recurrent MTP. Skip drafts for this
             # round; ordinary decode will seed them on the next target token.
-            can_seed = (
-                _nonempty_ragged_bounds(context.cu_seqlens_q, num_seqs) is not None
-            )
-        if not can_seed:
+            if _nonempty_ragged_bounds(context.cu_seqlens_q, num_seqs) is None:
+                seed_batch = None
+        if seed_batch is None:
             self.reset_lazy_verify_state()
             self._run_uncached_collective_padding(
                 target_input_ids,
@@ -752,7 +882,7 @@ class MTPRunner:
                 self.last_hidden,
                 num_seqs,
             )
-            self._restore_batch_context(context)
+            self._restore_batch_context(target_context)
             get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
             get_mla_context().sparse_tile_scheduler_metadata = (
                 saved_sparse_scheduler_metadata
@@ -801,7 +931,7 @@ class MTPRunner:
         mtp_hidden = self._forward_cached_mtp(
             shifted_ids,
             shifted_positions,
-            self.last_hidden,
+            seed_hidden,
             0,
             indexer_state,
         )
@@ -838,10 +968,10 @@ class MTPRunner:
             )
         )
 
-        self._prev_seq_ids = tuple(int(seq_id) for seq_id in aux.seq_ids[:num_seqs])
+        self._prev_seq_ids = seed_seq_ids
         self._prev_drafts = torch.stack(drafts, dim=1)
         self._selected_prev_drafts = None
-        self._restore_batch_context(context)
+        self._restore_batch_context(target_context)
         get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
         get_mla_context().sparse_tile_scheduler_metadata = (
             saved_sparse_scheduler_metadata

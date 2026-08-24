@@ -194,72 +194,108 @@ impl WireBatch {
         self.seq_lens.len()
     }
 
-    /// Split a prefill batch into ordered, single-request token fragments.
+    /// Pack a prefill batch into ordered ragged microbatches.
     ///
-    /// Keeping one request per microbatch makes independent requests pipeline
-    /// naturally, while splitting a long request at `max_tokens` fills the
-    /// same forward-only pipeline. Only the last fragment of an original row
-    /// remains sampleable; earlier fragments update cache/state only.
-    pub(super) fn prefill_microbatches(&self, max_tokens: usize) -> Vec<(Self, usize, bool)> {
+    /// Requests are consumed in scheduler order. A long request is split at
+    /// the remaining token capacity, and the following request immediately
+    /// fills any unused tail space. Sequence boundaries and per-request cache
+    /// metadata remain distinct inside the packed batch. Only the final
+    /// fragment of an original row remains sampleable.
+    pub(super) fn prefill_microbatches(
+        &self,
+        max_tokens: usize,
+    ) -> Vec<(Self, Vec<(usize, bool)>)> {
         if !self.is_prefill || self.is_dummy || max_tokens == 0 || self.seq_lens.is_empty() {
-            return vec![(self.clone(), 0, true)];
+            let metadata = self
+                .seq_lens
+                .iter()
+                .enumerate()
+                .filter_map(|(seq_idx, len)| (*len > 0).then_some((seq_idx, true)))
+                .collect();
+            return vec![(self.clone(), metadata)];
         }
 
         let mut result = Vec::new();
+        let make_microbatch = || {
+            let mut batch = Self::empty(true);
+            batch.any_return_completion_logprobs = self.any_return_completion_logprobs;
+            for ratio in self.compressed_block_tables.keys() {
+                batch.compressed_block_tables.insert(*ratio, Vec::new());
+            }
+            batch
+        };
+        let mut microbatch = make_microbatch();
+        let mut metadata = Vec::new();
         let mut token_offset = 0usize;
+
         for (seq_idx, seq_len) in self.seq_lens.iter().copied().enumerate() {
             let seq_len = seq_len.max(0) as usize;
             if seq_len == 0 {
-                token_offset += seq_len;
                 continue;
             }
             let seq_end = token_offset.saturating_add(seq_len);
             let mut fragment_start = token_offset;
             while fragment_start < seq_end {
-                let fragment_end = fragment_start.saturating_add(max_tokens).min(seq_end);
-                let is_last_fragment = fragment_end == seq_end;
-                let mut compressed_block_tables = HashMap::new();
-                for (ratio, rows) in &self.compressed_block_tables {
-                    compressed_block_tables
-                        .insert(*ratio, vec![rows.get(seq_idx).cloned().unwrap_or_default()]);
+                let remaining = max_tokens.saturating_sub(microbatch.input_ids.len());
+                if remaining == 0 {
+                    result.push((microbatch, metadata));
+                    microbatch = make_microbatch();
+                    metadata = Vec::new();
+                    continue;
                 }
-                result.push((
-                    Self {
-                        is_prefill: true,
-                        input_ids: self.input_ids[fragment_start..fragment_end].to_vec(),
-                        positions: self.positions[fragment_start..fragment_end].to_vec(),
-                        seq_lens: vec![(fragment_end - fragment_start) as i32],
-                        block_tables: vec![self
-                            .block_tables
-                            .get(seq_idx)
-                            .cloned()
-                            .unwrap_or_default()],
-                        temperatures: vec![self.temperatures.get(seq_idx).copied().unwrap_or(0.0)],
-                        state_slots: vec![self.state_slots.get(seq_idx).copied().unwrap_or(-1)],
-                        compressed_block_tables,
-                        hisparse_slots: vec![self
-                            .hisparse_slots
-                            .get(seq_idx)
-                            .copied()
-                            .unwrap_or(-1)],
-                        seq_ids: vec![self.seq_ids.get(seq_idx).copied().unwrap_or(0)],
-                        sample_mask: vec![
-                            is_last_fragment
-                                && self.sample_mask.get(seq_idx).copied().unwrap_or(true),
-                        ],
-                        any_return_completion_logprobs: self
-                            .any_return_completion_logprobs,
-                        is_dummy: false,
-                    },
-                    seq_idx,
-                    is_last_fragment,
-                ));
+
+                let fragment_end = fragment_start.saturating_add(remaining).min(seq_end);
+                let is_last_fragment = fragment_end == seq_end;
+                let fragment_len = fragment_end - fragment_start;
+                microbatch
+                    .input_ids
+                    .extend_from_slice(&self.input_ids[fragment_start..fragment_end]);
+                microbatch
+                    .positions
+                    .extend_from_slice(&self.positions[fragment_start..fragment_end]);
+                microbatch.seq_lens.push(fragment_len as i32);
+                microbatch
+                    .block_tables
+                    .push(self.block_tables.get(seq_idx).cloned().unwrap_or_default());
+                microbatch
+                    .temperatures
+                    .push(self.temperatures.get(seq_idx).copied().unwrap_or(0.0));
+                microbatch
+                    .state_slots
+                    .push(self.state_slots.get(seq_idx).copied().unwrap_or(-1));
+                for (ratio, rows) in &self.compressed_block_tables {
+                    microbatch
+                        .compressed_block_tables
+                        .entry(*ratio)
+                        .or_default()
+                        .push(rows.get(seq_idx).cloned().unwrap_or_default());
+                }
+                microbatch
+                    .hisparse_slots
+                    .push(self.hisparse_slots.get(seq_idx).copied().unwrap_or(-1));
+                microbatch
+                    .seq_ids
+                    .push(self.seq_ids.get(seq_idx).copied().unwrap_or(0));
+                microbatch.sample_mask.push(
+                    is_last_fragment && self.sample_mask.get(seq_idx).copied().unwrap_or(true),
+                );
+                metadata.push((seq_idx, is_last_fragment));
                 fragment_start = fragment_end;
+
+                if microbatch.input_ids.len() == max_tokens {
+                    result.push((microbatch, metadata));
+                    microbatch = make_microbatch();
+                    metadata = Vec::new();
+                }
             }
             token_offset = seq_end;
         }
+
+        if !microbatch.input_ids.is_empty() {
+            result.push((microbatch, metadata));
+        }
         if result.is_empty() {
-            result.push((self.clone(), 0, true));
+            result.push((self.clone(), Vec::new()));
         }
         result
     }
@@ -301,8 +337,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         let block_table = item.active_block_table.clone();
         let compressed_tables = item.active_compressed_block_tables.clone();
         let temperature = item.sampling_params.temperature as f32;
-        any_return_completion_logprobs |=
-            item.sampling_params.return_completion_logprobs;
+        any_return_completion_logprobs |= item.sampling_params.return_completion_logprobs;
 
         let should_sample;
         if is_prefill {
@@ -509,7 +544,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefill_microbatches_split_long_and_independent_requests_in_order() {
+    fn prefill_microbatches_pack_fifo_requests_to_token_capacity() {
         let mut compressed = HashMap::new();
         compressed.insert(4, vec![vec![10, 11], vec![20]]);
         let batch = WireBatch {
@@ -529,25 +564,30 @@ mod tests {
         };
 
         let fragments = batch.prefill_microbatches(2);
-        assert_eq!(fragments.len(), 5);
+        assert_eq!(fragments.len(), 4);
         assert_eq!(
             fragments
                 .iter()
-                .map(|(_, seq_idx, is_last)| (*seq_idx, *is_last))
+                .map(|(_, metadata)| metadata.clone())
                 .collect::<Vec<_>>(),
-            vec![(0, false), (0, false), (0, true), (1, false), (1, true)]
+            vec![
+                vec![(0, false)],
+                vec![(0, false)],
+                vec![(0, true), (1, false)],
+                vec![(1, true)],
+            ]
         );
         assert_eq!(fragments[0].0.input_ids, vec![0, 1]);
-        assert_eq!(fragments[2].0.input_ids, vec![4]);
-        assert_eq!(fragments[3].0.input_ids, vec![5, 6]);
-        assert_eq!(fragments[4].0.positions, vec![12]);
+        assert_eq!(fragments[2].0.input_ids, vec![4, 5]);
+        assert_eq!(fragments[2].0.seq_lens, vec![1, 1]);
+        assert_eq!(fragments[3].0.positions, vec![11, 12]);
         assert_eq!(fragments[0].0.sample_mask, vec![false]);
-        assert_eq!(fragments[2].0.sample_mask, vec![true]);
-        assert_eq!(fragments[3].0.seq_ids, vec![200]);
-        assert_eq!(fragments[3].0.block_tables, vec![vec![3]]);
+        assert_eq!(fragments[2].0.sample_mask, vec![true, false]);
+        assert_eq!(fragments[2].0.seq_ids, vec![100, 200]);
+        assert_eq!(fragments[2].0.block_tables, vec![vec![1, 2], vec![3]]);
         assert_eq!(
-            fragments[3].0.compressed_block_tables.get(&4),
-            Some(&vec![vec![20]])
+            fragments[2].0.compressed_block_tables.get(&4),
+            Some(&vec![vec![10, 11], vec![20]])
         );
 
         let intermediate_payload =
@@ -557,9 +597,40 @@ mod tests {
                 .unwrap();
         assert!(intermediate_meta.sampling_token_indices.is_empty());
 
-        let final_payload = encode_binary(&fragments[2].0, "final microbatch").unwrap();
-        let final_meta =
-            crate::proto::prepare::runner_in_prefill(&final_payload, 0, 1, 64, 8, 16).unwrap();
-        assert_eq!(final_meta.sampling_token_indices, vec![0]);
+        let mixed_payload = encode_binary(&fragments[2].0, "mixed microbatch").unwrap();
+        let mixed_meta =
+            crate::proto::prepare::runner_in_prefill(&mixed_payload, 0, 1, 64, 8, 16).unwrap();
+        assert_eq!(mixed_meta.sampling_token_indices, vec![0]);
+        assert_eq!(mixed_meta.sampling_seq_indices, vec![0]);
+    }
+
+    #[test]
+    fn prefill_microbatches_leave_only_the_final_tail_underfilled() {
+        let batch = WireBatch {
+            is_prefill: true,
+            input_ids: (0..14).collect(),
+            positions: (0..14).collect(),
+            seq_lens: vec![5, 3, 6],
+            block_tables: vec![vec![1], vec![2], vec![3]],
+            temperatures: vec![0.0; 3],
+            state_slots: vec![0, 1, 2],
+            compressed_block_tables: HashMap::new(),
+            hisparse_slots: vec![0, 1, 2],
+            seq_ids: vec![10, 20, 30],
+            sample_mask: vec![true; 3],
+            any_return_completion_logprobs: false,
+            is_dummy: false,
+        };
+
+        let fragments = batch.prefill_microbatches(4);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|(batch, _)| batch.input_ids.len())
+                .collect::<Vec<_>>(),
+            vec![4, 4, 4, 2]
+        );
+        assert_eq!(fragments[1].1, vec![(0, true), (1, true)]);
+        assert_eq!(fragments[2].1, vec![(2, false)]);
     }
 }

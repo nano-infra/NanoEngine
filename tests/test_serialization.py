@@ -32,6 +32,30 @@ def test_request_to_prefill_batch_protocol():
     assert meta.positions == [0, 1, 2]
 
 
+def test_prefill_microbatch_protocol_packs_following_request_into_tail():
+    sched = _scheduler()
+    sched.add_request_bytes(
+        RequestIn(10, [0, 1, 2, 3, 4], SamplingParams(), 0, None).to_bytes()
+    )
+    sched.add_request_bytes(
+        RequestIn(20, [10, 11, 12], SamplingParams(), 0, None).to_bytes()
+    )
+
+    result = sched.schedule()
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
+    microbatches = RunnerIn.from_bytes(batch).prefill_microbatches(4)
+
+    assert len(microbatches) == 2
+    _, first_metadata = microbatches[0]
+    tail_payload, tail_metadata = microbatches[1]
+    assert first_metadata == [(0, False)]
+    assert tail_metadata == [(0, True), (1, True)]
+    tail = RunnerIn.from_bytes(tail_payload).prefill(0, 1, 4, 4, 16)
+    assert tail.input_ids == [4, 10, 11, 12]
+    assert tail.cu_seqlens_q == [0, 1, 4]
+    assert tail.sampling_seq_indices == [0, 1]
+
+
 def test_decode_batch_and_run_result_protocol():
     sched = _scheduler()
     payload = RequestIn(12345, [1, 2, 3], SamplingParams(), 0, None).to_bytes()
