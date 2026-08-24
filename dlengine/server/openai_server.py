@@ -61,6 +61,12 @@ def _is_token_id_list(value: Any) -> bool:
     return isinstance(value, list) and all(type(item) is int for item in value)
 
 
+def _stream_includes_usage(body: dict) -> bool:
+    """Whether an OpenAI stream requested a final usage-only chunk."""
+    options = body.get("stream_options")
+    return isinstance(options, dict) and options.get("include_usage") is True
+
+
 def _migration_metadata(kv_transfer: dict) -> tuple[int, int | None]:
     seq_id = int(kv_transfer.get("seq_id") or 0)
     if seq_id <= 0:
@@ -954,6 +960,7 @@ def build_app(server: OpenAIServer):
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
         model = server.served_model_name
         stream = bool(body.get("stream", False))
+        include_usage = _stream_includes_usage(body)
 
         kv_transfer = body.get("kv_transfer_params") or {}
 
@@ -1149,6 +1156,20 @@ def build_app(server: OpenAIServer):
                     }
                     finished_normally = True
                     yield f"data: {json.dumps(final)}\n\n".encode()
+                    if include_usage:
+                        usage = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": len(prompt_ids),
+                                "completion_tokens": len(gen.token_ids),
+                                "total_tokens": len(prompt_ids) + len(gen.token_ids),
+                            },
+                        }
+                        yield f"data: {json.dumps(usage)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                 except RuntimeError as e:
                     err = {"error": {"message": str(e), "type": "engine_error"}}
@@ -1364,6 +1385,7 @@ def build_app(server: OpenAIServer):
         cmpl_id = f"cmpl-{uuid.uuid4().hex}"
         model = server.served_model_name
         stream = bool(body.get("stream", False))
+        include_usage = _stream_includes_usage(body)
 
         kv_transfer = body.get("kv_transfer_params") or {}
 
@@ -1475,6 +1497,20 @@ def build_app(server: OpenAIServer):
                     }
                     finished_normally = True
                     yield f"data: {json.dumps(final)}\n\n".encode()
+                    if include_usage:
+                        usage = {
+                            "id": cmpl_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": len(prompt_ids),
+                                "completion_tokens": len(gen.token_ids),
+                                "total_tokens": len(prompt_ids) + len(gen.token_ids),
+                            },
+                        }
+                        yield f"data: {json.dumps(usage)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                 except RuntimeError as e:
                     err = {"error": {"message": str(e), "type": "engine_error"}}
