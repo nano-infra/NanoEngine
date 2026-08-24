@@ -63,3 +63,59 @@ def test_topk_transform_matches_torch(top_k):
         )
         assert (output[row, valid_k:] == -1).all()
         assert (raw_output[row, valid_k:] == -1).all()
+
+
+@torch.inference_mode()
+def test_topk_transform_ragged_handles_long_multiseq_ranges():
+    pytest.importorskip("tvm_ffi")
+
+    from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import topk_transform_ragged
+
+    torch.manual_seed(7)
+    width = 70_000
+    lengths = torch.tensor([17, 4096, 65_536], dtype=torch.int32, device="cuda")
+    row_starts = torch.tensor([9, 123, 1000], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([0, 17, 4113], dtype=torch.int32, device="cuda")
+    scores = torch.randn((3, width), dtype=torch.float32, device="cuda")
+    output = torch.empty((3, 2048), dtype=torch.int32, device="cuda")
+
+    topk_transform_ragged(scores, lengths, row_starts, offsets, output, 2048)
+    torch.cuda.synchronize()
+
+    assert torch.equal(output[0, :17].sort().values, torch.arange(17, device="cuda"))
+    assert (output[0, 17:] == -1).all()
+    for row in (1, 2):
+        length = int(lengths[row])
+        start = int(row_starts[row])
+        offset = int(offsets[row])
+        expected = torch.topk(scores[row, start : start + length], 2048).indices
+        actual = output[row] - offset
+        # The bounded threshold candidate buffer permits up to five non-tie
+        # differences; random inputs are normally exact.
+        missing = set(expected.cpu().tolist()) - set(actual.cpu().tolist())
+        extra = set(actual.cpu().tolist()) - set(expected.cpu().tolist())
+        assert len(missing) == len(extra) <= 5
+
+
+@torch.inference_mode()
+def test_topk_transform_ragged_ties_stay_unique_and_in_range():
+    pytest.importorskip("tvm_ffi")
+
+    from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import topk_transform_ragged
+
+    length = 65_536
+    row_start = 321
+    offset = 777
+    scores = torch.zeros((1, 70_000), dtype=torch.float32, device="cuda")
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    row_starts = torch.tensor([row_start], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([offset], dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 2048), dtype=torch.int32, device="cuda")
+
+    topk_transform_ragged(scores, lengths, row_starts, offsets, output, 2048)
+    torch.cuda.synchronize()
+
+    selected = output[0]
+    assert int(selected.min()) >= offset
+    assert int(selected.max()) < offset + length
+    assert torch.unique(selected).numel() == 2048

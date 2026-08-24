@@ -6,9 +6,65 @@ from dlengine.engine.scheduler import scheduler_token_budget
 
 
 def test_scheduler_budget_scales_with_pipeline_size():
-    config = SimpleNamespace(max_num_batched_tokens=16384, pp=16)
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=16384 * 16,
+        pp=16,
+        pp_prefill_scheduler_depth=0,
+    )
 
     assert scheduler_token_budget(config) == 16384 * 16
+
+
+def test_scheduler_budget_auto_covers_1m_in_62_microbatches():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=1_000_000,
+        pp=8,
+        pp_prefill_scheduler_depth=0,
+    )
+
+    budget = scheduler_token_budget(config)
+
+    assert budget == 1_000_000
+    assert (
+        config.max_num_batched_tokens * 61
+        < budget
+        <= config.max_num_batched_tokens * 62
+    )
+
+
+def test_scheduler_budget_auto_caps_window_at_64_microbatches():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=2_000_000,
+        pp=8,
+        pp_prefill_scheduler_depth=0,
+    )
+
+    assert scheduler_token_budget(config) == 16384 * 64
+
+
+def test_scheduler_budget_respects_explicit_depth_and_model_boundary():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=50_000,
+        pp=8,
+        pp_prefill_scheduler_depth=4,
+    )
+
+    assert scheduler_token_budget(config) == 50_000
+
+
+def test_scheduler_budget_pp1_behavior_is_unchanged():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=1_000_000,
+        pp=1,
+        pp_prefill_scheduler_depth=64,
+    )
+
+    assert scheduler_token_budget(config) == 16384
 
 
 class _FakeRunnerOut:

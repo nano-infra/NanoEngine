@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import DeepseekV3Config
@@ -44,8 +43,9 @@ from dlengine.runtime.layers.rotary_embedding import get_rope
 from dlengine.runtime.models.pp_utils import (
     get_pp_layer_range,
     make_pp_layers,
-    pp_recv_hidden,
-    pp_send_hidden,
+    PendingP2P,
+    pp_irecv_tensors,
+    pp_isend_tensors,
 )
 from dlengine.runtime.runner.runner_config import get_runner_config
 from dlengine.runtime.stream_pool import get_cuda_stream
@@ -217,45 +217,89 @@ class _IndexerTopKState:
         )
 
 
-def _pp_send_indexer_state(state: _IndexerTopKState, device: torch.device) -> None:
-    """Send prefill TopK state after the residual stream at a PP boundary."""
+def _pp_send_boundary(
+    hidden_states: torch.Tensor,
+    state: _IndexerTopKState,
+    *,
+    include_indexer: bool = True,
+) -> PendingP2P:
+    """Post one ordered asynchronous PP boundary transfer."""
     ctx = get_dist_context()
-    logical = state.logical_indices
+    logical = state.logical_indices if include_indexer else None
     source_layer = -1 if logical is None else state.source_layer
-    physical = state.physical_indices
+    physical = state.physical_indices if include_indexer else None
+    if logical is None and physical is not None:
+        raise RuntimeError("physical Indexer TopK state requires logical state")
     header = torch.tensor(
         [-1 if source_layer is None else source_layer, int(physical is not None)],
         dtype=torch.int64,
-        device=device,
+        device=hidden_states.device,
     )
-    dist.send(header, dst=ctx.pp_next_global_rank)
+    tensors = [hidden_states, header]
+    profiler_names = ["nano_pp/send_hidden", "nano_pp/send_indexer_header"]
     if logical is not None:
-        dist.send(logical.contiguous(), dst=ctx.pp_next_global_rank)
+        tensors.append(logical)
+        profiler_names.append("nano_pp/send_indexer_logical")
     if physical is not None:
-        dist.send(physical.contiguous(), dst=ctx.pp_next_global_rank)
+        tensors.append(physical)
+        profiler_names.append("nano_pp/send_indexer_physical")
+    with torch.autograd.profiler.record_function("nano_pp/send_boundary_async"):
+        return pp_isend_tensors(
+            tensors,
+            dst=ctx.pp_next_global_rank,
+            profiler_names=profiler_names,
+        )
 
 
-def _pp_recv_indexer_state(
-    num_tokens: int, index_topk: int, device: torch.device
-) -> _IndexerTopKState:
-    """Receive prefill TopK state sent after the residual stream."""
+def _pp_recv_boundary(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    index_topk: int,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, _IndexerTopKState]:
+    """Receive one PP boundary, grouping all currently-known buffers."""
     ctx = get_dist_context()
     state = _IndexerTopKState()
-    header = torch.empty(2, dtype=torch.int64, device=device)
-    dist.recv(header, src=ctx.pp_prev_global_rank)
-    source_layer, has_physical = (int(value) for value in header.tolist())
-    if source_layer < 0:
-        return state
-    if index_topk <= 0:
-        raise RuntimeError("Received Indexer TopK state for a model without index_topk")
-    logical = torch.empty((num_tokens, index_topk), dtype=torch.int32, device=device)
-    dist.recv(logical, src=ctx.pp_prev_global_rank)
-    physical = None
-    if has_physical:
-        physical = torch.empty_like(logical)
-        dist.recv(physical, src=ctx.pp_prev_global_rank)
+    with torch.autograd.profiler.record_function("nano_pp/recv_boundary_async"):
+        hidden_states = torch.empty(
+            (num_tokens, hidden_size), dtype=dtype, device=device
+        )
+
+        header = torch.empty(2, dtype=torch.int64, device=device)
+        pp_irecv_tensors(
+            (hidden_states, header),
+            src=ctx.pp_prev_global_rank,
+            profiler_names=(
+                "nano_pp/recv_hidden",
+                "nano_pp/recv_indexer_header",
+            ),
+        )
+        source_layer, has_physical = (int(value) for value in header.tolist())
+        if source_layer < 0:
+            return hidden_states, state
+        if index_topk <= 0:
+            raise RuntimeError(
+                "Received Indexer TopK state for a model without index_topk"
+            )
+        logical = torch.empty(
+            (num_tokens, index_topk), dtype=torch.int32, device=device
+        )
+        physical = torch.empty_like(logical) if has_physical else None
+        pp_irecv_tensors(
+            (logical,) if physical is None else (logical, physical),
+            src=ctx.pp_prev_global_rank,
+            profiler_names=(
+                ("nano_pp/recv_indexer_logical",)
+                if physical is None
+                else (
+                    "nano_pp/recv_indexer_logical",
+                    "nano_pp/recv_indexer_physical",
+                )
+            ),
+        )
     state.publish(source_layer, logical, physical)
-    return state
+    return hidden_states, state
 
 
 # Varlen attention func for non-absorbed MLA prefill, resolved once.
@@ -800,6 +844,7 @@ class DeepseekV2Model(nn.Module):
         self.is_last_pp_stage = ctx.is_last_pp_stage
         self.hidden_size = config.hidden_size
         self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+        self._pp_boundary_send_work: PendingP2P | None = None
 
         if self.is_first_pp_stage:
             self.embed_tokens = VocabParallelEmbedding(
@@ -883,13 +928,11 @@ class DeepseekV2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
             indexer_state = _IndexerTopKState()
         else:
-            hidden_states = pp_recv_hidden(
-                positions.size(0), self.hidden_size, self.hidden_dtype
-            )
-            indexer_state = _pp_recv_indexer_state(
+            hidden_states, indexer_state = _pp_recv_boundary(
                 positions.size(0),
+                self.hidden_size,
+                self.hidden_dtype,
                 int(getattr(self.config, "index_topk", 0) or 0),
-                hidden_states.device,
             )
         residual = None
 
@@ -904,8 +947,18 @@ class DeepseekV2Model(nn.Module):
         if not self.is_last_pp_stage:
             if residual is not None:
                 hidden_states = hidden_states + residual
-            pp_send_hidden(hidden_states)
-            _pp_send_indexer_state(indexer_state, hidden_states.device)
+            if self._pp_boundary_send_work is not None:
+                with torch.autograd.profiler.record_function(
+                    "nano_pp/commit_previous_send"
+                ):
+                    self._pp_boundary_send_work.wait()
+            self._pp_boundary_send_work = _pp_send_boundary(
+                hidden_states,
+                indexer_state,
+                include_indexer=(
+                    _get_indexer_mode(self.config, self.end_layer) == "shared"
+                ),
+            )
             return hidden_states
 
         hidden_states, _ = self.norm(hidden_states, residual)

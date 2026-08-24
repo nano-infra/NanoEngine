@@ -36,6 +36,46 @@ _MTP_HANDOFF_BUFFER_ID = "mtp_handoff"
 
 # Cache TTL for engine_info from NanoCtrl (seconds); inf = never expire.
 _ENGINE_INFO_CACHE_TTL = float("inf")
+_MAX_COALESCED_RDMA_BYTES = 256 * 1024 * 1024
+
+
+def _coalesce_rdma_ops(
+    ops: list[tuple], max_bytes: int = _MAX_COALESCED_RDMA_BYTES
+) -> list[tuple]:
+    """Merge adjacent reads that are contiguous in both registered regions.
+
+    RDMA reads are independent, so operations may be grouped by MR pair and
+    sorted by offsets. Fragmented block tables naturally remain split. The
+    size cap avoids backend/device limits on a single work request.
+    """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    groups: dict[tuple[object, object], list[tuple]] = {}
+    for op in ops:
+        groups.setdefault((op[0], op[1]), []).append(op)
+
+    coalesced: list[tuple] = []
+    for group_ops in groups.values():
+        group_ops.sort(key=lambda op: (op[2], op[3]))
+        for op in group_ops:
+            if coalesced:
+                previous = coalesced[-1]
+                same_handlers = previous[:2] == op[:2]
+                remote_contiguous = previous[2] + previous[4] == op[2]
+                local_contiguous = previous[3] + previous[4] == op[3]
+                fits = previous[4] + op[4] <= max_bytes
+                if same_handlers and remote_contiguous and local_contiguous and fits:
+                    coalesced[-1] = (
+                        previous[0],
+                        previous[1],
+                        previous[2],
+                        previous[3],
+                        previous[4] + op[4],
+                    )
+                    continue
+            coalesced.append(op)
+    return coalesced
 
 
 def _tensor_storage_span_num_bytes(tensor: torch.Tensor) -> int:
@@ -587,6 +627,7 @@ class P2PCacheTransfer:
             mtp_handoff_assigns or {},
         )
         engine_ids = {engine_id for mapping in assignment_maps for engine_id in mapping}
+        prepared_reads: list[dict] = []
         for engine_id in engine_ids:
             peer_aliases = {
                 peer_alias
@@ -954,25 +995,114 @@ class P2PCacheTransfer:
                 if not rdma_ops:
                     raise RuntimeError(f"No valid RDMA ops for {peer_alias}")
 
-                try:
-                    slot = endpoint.read(rdma_ops, None)
-                    if slot is None:
-                        logger.error("endpoint.read returned None")
-                        raise RuntimeError("endpoint.read returned None")
-                    slot.wait()
-                    # GPUDirect RDMA may bypass CUDA stream ordering.
-                    # Synchronize to ensure migrated KV data is visible to subsequent kernels.
-                    torch.cuda.synchronize()
+                original_op_count = len(rdma_ops)
+                coalesce_started = time.perf_counter()
+                rdma_ops = _coalesce_rdma_ops(rdma_ops)
+                coalesce_ms = (time.perf_counter() - coalesce_started) * 1000
+                transfer_gib = sum(op[4] for op in rdma_ops) / (1024**3)
 
-                    logger.info(
-                        f"Completed batch RDMA read from {peer_alias} ({len(rdma_ops)} operations)"
+                prepared_reads.append(
+                    {
+                        "peer_alias": peer_alias,
+                        "endpoint": endpoint,
+                        "rdma_ops": rdma_ops,
+                        "original_op_count": original_op_count,
+                        "coalesce_ms": coalesce_ms,
+                        "transfer_gib": transfer_gib,
+                    }
+                )
+
+        pending_reads: list[dict] = []
+        primary_error: BaseException | None = None
+        submit_phase_started = time.perf_counter()
+        for prepared in prepared_reads:
+            try:
+                submitted_at = time.perf_counter()
+                slot = prepared["endpoint"].read(prepared["rdma_ops"], None)
+                prepared["submit_ms"] = (time.perf_counter() - submitted_at) * 1000
+                if slot is None:
+                    raise RuntimeError("endpoint.read returned None")
+                prepared["slot"] = slot
+                prepared["submitted_at"] = submitted_at
+                pending_reads.append(prepared)
+            except BaseException as exc:
+                primary_error = exc
+                logger.error(
+                    "RDMA submit FAILED for %s after %d/%d peers: %s",
+                    prepared["peer_alias"],
+                    len(pending_reads),
+                    len(prepared_reads),
+                    exc,
+                    exc_info=True,
+                )
+                break
+        submit_phase_ms = (time.perf_counter() - submit_phase_started) * 1000
+
+        drain_phase_started = time.perf_counter()
+        for pending in pending_reads:
+            wait_started = time.perf_counter()
+            try:
+                pending["slot"].wait()
+                pending["wait_block_ms"] = (time.perf_counter() - wait_started) * 1000
+                pending["completion_ms"] = (
+                    time.perf_counter() - pending["submitted_at"]
+                ) * 1000
+                logger.info(
+                    "Completed batch RDMA read from %s: ops=%d->%d "
+                    "size=%.2fGiB coalesce=%.2fms submit=%.2fms "
+                    "wait_block=%.2fms completion=%.2fms",
+                    pending["peer_alias"],
+                    pending["original_op_count"],
+                    len(pending["rdma_ops"]),
+                    pending["transfer_gib"],
+                    pending["coalesce_ms"],
+                    pending["submit_ms"],
+                    pending["wait_block_ms"],
+                    pending["completion_ms"],
+                )
+            except BaseException as exc:
+                logger.error(
+                    "RDMA completion FAILED for %s: %s",
+                    pending["peer_alias"],
+                    exc,
+                    exc_info=True,
+                )
+                if primary_error is None:
+                    primary_error = exc
+                else:
+                    primary_error.add_note(
+                        f"RDMA completion also failed for "
+                        f"{pending['peer_alias']}: {exc!r}"
                     )
-                except Exception as e:
-                    logger.error(
-                        f"Batch RDMA read FAILED from {peer_alias}: {len(rdma_ops)} ops, error={e}",
-                        exc_info=True,
+        drain_phase_ms = (time.perf_counter() - drain_phase_started) * 1000
+
+        sync_ms = 0.0
+        if pending_reads:
+            try:
+                sync_started = time.perf_counter()
+                # GPUDirect RDMA may bypass CUDA stream ordering.
+                torch.cuda.synchronize()
+                sync_ms = (time.perf_counter() - sync_started) * 1000
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
+                else:
+                    primary_error.add_note(
+                        f"post-migration CUDA synchronize also failed: {exc!r}"
                     )
-                    raise
+
+        logger.info(
+            "RDMA migration aggregate: prepared=%d submitted=%d "
+            "size=%.2fGiB submit_phase=%.2fms drain_phase=%.2fms sync=%.2fms",
+            len(prepared_reads),
+            len(pending_reads),
+            sum(item["transfer_gib"] for item in pending_reads),
+            submit_phase_ms,
+            drain_phase_ms,
+            sync_ms,
+        )
+        if primary_error is not None:
+            raise primary_error
 
     def migrate_from_bytes(self, data: bytes):
         """Migrate KV cache using lean MigrateBatchInput protocol (no Sequence objects)."""

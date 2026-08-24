@@ -11,7 +11,8 @@ in which layers outside this stage's range are :class:`PPMissingLayer`
 placeholders that never execute.
 """
 
-from typing import Callable, Tuple
+from contextlib import nullcontext
+from typing import Callable, Iterable, Tuple
 
 import torch
 import torch.distributed as dist
@@ -233,10 +234,106 @@ def make_pp_layers(
     return start, end, nn.ModuleList(modules)
 
 
+class PendingP2P:
+    """Own asynchronous P2P work and its tensor storage until completion."""
+
+    def __init__(self, works: Iterable[object], tensors: Iterable[torch.Tensor]):
+        self._works = list(works)
+        self._tensors = tuple(tensors)
+        self._error: Exception | None = None
+        self._complete = False
+
+    def wait(self) -> None:
+        """Drain every operation, preserving the first communication error."""
+        if self._complete:
+            if self._error is not None:
+                raise self._error
+            return
+
+        first_error = None
+        for work in self._works:
+            try:
+                work.wait()
+            except Exception as error:  # drain peers before surfacing failure
+                if first_error is None:
+                    first_error = error
+        self._works.clear()
+        self._tensors = ()
+        self._error = first_error
+        self._complete = True
+        if first_error is not None:
+            raise first_error
+
+
+def pp_isend_tensors(
+    tensors: Iterable[torch.Tensor],
+    *,
+    dst: int,
+    profiler_names: Iterable[str] | None = None,
+) -> PendingP2P:
+    """Post ordered asynchronous sends and retain their tensor storage."""
+    send_tensors = tuple(tensor.contiguous() for tensor in tensors)
+    if not send_tensors:
+        raise ValueError("pp_isend_tensors requires at least one tensor")
+    names = tuple(profiler_names or (None,) * len(send_tensors))
+    if len(names) != len(send_tensors):
+        raise ValueError("profiler_names must match the number of tensors")
+
+    works = []
+    try:
+        for tensor, name in zip(send_tensors, names, strict=True):
+            with (
+                torch.autograd.profiler.record_function(name)
+                if name is not None
+                else nullcontext()
+            ):
+                works.append(dist.isend(tensor, dst=dst))
+    except Exception:
+        try:
+            PendingP2P(works, send_tensors).wait()
+        except Exception:
+            pass
+        raise
+    return PendingP2P(works, send_tensors)
+
+
+def pp_irecv_tensors(
+    tensors: Iterable[torch.Tensor],
+    *,
+    src: int,
+    profiler_names: Iterable[str] | None = None,
+) -> None:
+    """Post ordered asynchronous receives before waiting for the group."""
+    recv_tensors = tuple(tensors)
+    if not recv_tensors:
+        raise ValueError("pp_irecv_tensors requires at least one tensor")
+    names = tuple(profiler_names or (None,) * len(recv_tensors))
+    if len(names) != len(recv_tensors):
+        raise ValueError("profiler_names must match the number of tensors")
+
+    works = []
+    try:
+        for tensor, name in zip(recv_tensors, names, strict=True):
+            with (
+                torch.autograd.profiler.record_function(name)
+                if name is not None
+                else nullcontext()
+            ):
+                works.append(dist.irecv(tensor, src=src))
+    except Exception:
+        try:
+            PendingP2P(works, recv_tensors).wait()
+        except Exception:
+            pass
+        raise
+    PendingP2P(works, recv_tensors).wait()
+
+
 def pp_send_hidden(hidden_states: torch.Tensor) -> None:
     """Send the residual stream to the next pipeline stage."""
     ctx = get_dist_context()
-    dist.send(hidden_states.contiguous(), dst=ctx.pp_next_global_rank)
+    with torch.autograd.profiler.record_function("nano_pp/send_hidden"):
+        dist.send(hidden_states.contiguous(), dst=ctx.pp_next_global_rank)
 
 
 def pp_recv_hidden(
@@ -244,8 +341,9 @@ def pp_recv_hidden(
 ) -> torch.Tensor:
     """Receive the residual stream from the previous pipeline stage."""
     ctx = get_dist_context()
-    buffer = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
-    dist.recv(buffer, src=ctx.pp_prev_global_rank)
+    with torch.autograd.profiler.record_function("nano_pp/recv_hidden"):
+        buffer = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+        dist.recv(buffer, src=ctx.pp_prev_global_rank)
     return buffer
 
 

@@ -2,10 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from dlengine.runtime.context.cache.hca import DSV4_BYTES_PER_TOKEN
 from dlengine.runtime.disagg.p2p.cache_layout import CacheTensorLayout
-from dlengine.runtime.disagg.p2p.cache_transfer import P2PCacheTransfer
+from dlengine.runtime.disagg.p2p.cache_transfer import (
+    _coalesce_rdma_ops,
+    P2PCacheTransfer,
+)
 
 
 def _layout(**overrides):
@@ -147,3 +149,108 @@ def test_recurrent_mtp_handoff_rdma_uses_remote_and_local_state_slots(monkeypatc
     assert endpoint.ops == [
         ("local:mtp_handoff", "remote:mtp_handoff", 3 * 48, 1 * 48, 48)
     ]
+
+
+def test_rdma_ops_coalesce_only_when_both_regions_are_contiguous():
+    ops = [
+        ("local", "remote", 128, 1128, 64),
+        ("local", "remote", 0, 1000, 64),
+        ("other-local", "other-remote", 0, 0, 32),
+        ("local", "remote", 64, 1064, 64),
+        ("local", "remote", 192, 2000, 64),
+    ]
+
+    assert _coalesce_rdma_ops(ops, max_bytes=128) == [
+        ("local", "remote", 0, 1000, 128),
+        ("local", "remote", 128, 1128, 64),
+        ("local", "remote", 192, 2000, 64),
+        ("other-local", "other-remote", 0, 0, 32),
+    ]
+
+
+def test_rdma_ops_coalesce_rejects_non_positive_limit():
+    with pytest.raises(ValueError, match="max_bytes must be positive"):
+        _coalesce_rdma_ops([], max_bytes=0)
+
+
+def test_rdma_reads_submit_all_before_wait_and_drain_after_failure(monkeypatch):
+    events = []
+    fail_alias = "peer-a"
+
+    class Completion:
+        def __init__(self, alias):
+            self.alias = alias
+
+        def wait(self):
+            events.append(("wait", self.alias))
+            if self.alias == fail_alias:
+                raise RuntimeError(f"wait failed for {self.alias}")
+
+    class Endpoint:
+        def __init__(self, alias):
+            self.alias = alias
+
+        def read(self, _ops, _):
+            events.append(("read", self.alias))
+            return Completion(self.alias)
+
+    endpoints = {alias: Endpoint(alias) for alias in ("peer-a", "peer-b")}
+
+    class Agent:
+        def query_connection(self, alias):
+            return SimpleNamespace(endpoint=endpoints[alias])
+
+        def get_mr_info(self, _peer_alias, name):
+            return object() if name == "mtp_handoff" else None
+
+        def get_handle(self, name, peer_alias=None):
+            return f"remote:{peer_alias}:{name}"
+
+    class PeerContext:
+        alias = "local"
+        server_url = "peer"
+        agent = Agent()
+
+        def is_connected(self, alias):
+            return alias in endpoints
+
+    class Transfer(P2PCacheTransfer):
+        def __init__(self, cache_context):
+            self._cache_context = cache_context
+            super().__init__()
+
+        @property
+        def cache_context(self):
+            return self._cache_context
+
+    handoff = torch.full((4, 6), -1, dtype=torch.int64)
+    transfer = Transfer(SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5))
+    transfer.set_peer_agent_context(PeerContext())
+    transfer._local_mtp_handoff_mr_handler = "local:mtp_handoff"
+    transfer.remote_max_num_seqs["prefill"] = 4
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append(("sync", None))
+    )
+
+    with pytest.raises(RuntimeError, match="wait failed for peer-a"):
+        transfer._execute_rdma_reads(
+            {},
+            {},
+            mtp_handoff_assigns={
+                "prefill": {
+                    "peer-a": [(0, 0)],
+                    "peer-b": [(1, 1)],
+                }
+            },
+        )
+
+    kinds = [kind for kind, _ in events]
+    assert kinds == ["read", "read", "wait", "wait", "sync"]
+    assert {alias for kind, alias in events if kind == "read"} == {
+        "peer-a",
+        "peer-b",
+    }
+    assert {alias for kind, alias in events if kind == "wait"} == {
+        "peer-a",
+        "peer-b",
+    }

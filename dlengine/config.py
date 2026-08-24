@@ -24,9 +24,15 @@ class Config(BaseModel):
 
     # scheduler config
     # Maximum tokens processed by one model forward. With pipeline parallel
-    # prefill, the scheduler admits up to ``max_num_batched_tokens * pp``
-    # tokens and splits that window into microbatches of this size.
+    # prefill, the scheduler splits a larger admission window into
+    # microbatches of this size.
     max_num_batched_tokens: int = 16384
+    # Number of prefill microbatches admitted by one PP scheduler step. Zero
+    # selects an automatic window large enough to keep the pipeline full and,
+    # for long prompts, cover up to 64 consecutive microbatches. This is
+    # independent of ``pp_prefill_pipeline_depth``, which only controls
+    # transport-side in-flight RPCs.
+    pp_prefill_scheduler_depth: int = 0
     max_num_seqs: int = 16
     max_num_recv_seqs: int = 32
     max_model_len: int = 16384
@@ -605,6 +611,8 @@ class Config(BaseModel):
         # Pipeline parallelism validation and constraints.
         if self.pp < 1:
             raise ValueError("pp must be >= 1")
+        if self.pp_prefill_scheduler_depth < 0:
+            raise ValueError("pp_prefill_scheduler_depth must be >= 0")
         if self.pp_prefill_pipeline_depth < 0:
             raise ValueError("pp_prefill_pipeline_depth must be >= 0")
         if self.pp > 1:

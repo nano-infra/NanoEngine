@@ -176,7 +176,13 @@ def _jit_topk_module(top_k: int):
         _make_name(f"topk_{top_k}"),
         *args,
         cuda_files=["deepseek_v4/topk.cuh"],
-        cuda_wrappers=[("topk_transform", f"TopKKernel<{top_k}, {args}>::transform")],
+        cuda_wrappers=[
+            ("topk_transform", f"TopKKernel<{top_k}, {args}>::transform"),
+            (
+                "topk_transform_ragged",
+                f"TopKKernel<{top_k}, {args}>::transform_ragged",
+            ),
+        ],
     )
 
 
@@ -359,6 +365,27 @@ def topk_transform(
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
     )
+
+
+def topk_transform_ragged(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+    top_k: int,
+) -> None:
+    """Approximate TopK over ragged ``[row_start, row_start + length)`` ranges.
+
+    The output is translated to the packed global logical space by adding the
+    per-row ``offset``. Top-2048 uses a 32 KiB threshold candidate buffer;
+    dense threshold collisions can therefore differ from exact ``torch.topk``
+    by a small number of entries.
+    """
+    if top_k != 2048:
+        raise ValueError(f"ragged Indexer top_k must be 2048, got {top_k}")
+    module = _jit_topk_module(top_k)
+    module.topk_transform_ragged(scores, seq_lens, row_starts, offsets, out_indices)
 
 
 def topk_transform_512(

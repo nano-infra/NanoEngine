@@ -32,7 +32,6 @@ Weight names in HF checkpoint:
   model.layers.{i}.self_attn.indexer.weights_proj.weight   (64, 7168) BF16
 """
 
-import math
 import os
 
 import deep_gemm
@@ -41,10 +40,16 @@ import torch.nn as nn
 
 from dlengine.logging import get_logger
 from dlengine.runtime.kernel.jit.sgl import fused_kernels_enabled
-from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
+from dlengine.runtime.kernel.jit.sgl.deepseek_v4 import (
+    indexer_q_rope_hadamard_quant,
+    topk_transform_ragged,
+)
 from dlengine.runtime.kernel.jit.sgl.hadamard import hadamard_transform
 from dlengine.runtime.kernel.triton.generic.fp8_ue8m0_quant import (
     store_indexer_key_fp8_fused,
+)
+from dlengine.runtime.kernel.triton.generic.indexer_cache_gather import (
+    gather_indexer_cache,
 )
 from dlengine.runtime.kernel.triton.generic.indexer_transform import (
     indexer_k_rope_inplace,
@@ -180,6 +185,33 @@ def _expand_decode_context_lens(
         device=context_lens.device,
     )
     return (context_lens - offsets).clamp_min(1).to(torch.int32)
+
+
+def _prefill_mqa_chunk_rows(
+    num_queries: int,
+    num_keys: int,
+    device: torch.device,
+    max_rows: int | None = None,
+) -> int:
+    """Choose the ragged prefill logits chunk size from available memory."""
+    if num_queries <= 0:
+        return 0
+    if num_keys <= 0:
+        raise ValueError("prefill Indexer requires at least one key")
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError(f"max_rows must be positive, got {max_rows}")
+
+    rows = num_queries
+    logits_elements = num_queries * num_keys
+    if logits_elements >= 8_000_000:
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        logits_bytes = logits_elements * 4
+        if logits_bytes * 2 > free_mem or logits_bytes > total_mem * 0.3:
+            bytes_per_row = num_keys * 4
+            rows = max(1, int((free_mem * 0.45) // bytes_per_row))
+    if max_rows is not None:
+        rows = min(rows, max_rows)
+    return min(rows, num_queries)
 
 
 class IndexerCache:
@@ -811,16 +843,18 @@ class Indexer(nn.Module):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
         block_table: torch.Tensor,
-        query_chunk: int = 64,
+        query_chunk: int | None = None,
     ) -> torch.Tensor:
-        """Compute chunked-prefill TopK against the paged FP8 cache.
+        """Compute prefill TopK with ragged FP8 MQA logits.
 
-        Fresh keys must already have been stored by store_prefill_keys. This
-        avoids gathering/dequantizing the full prefix and scores cached and
-        fresh candidates with the same production kernel used by decode.
+        The public name is retained for compatibility. Fresh keys must already
+        be stored in the paged Indexer cache. The cache is gathered once into
+        sequence-packed ragged K/scale buffers, then large query chunks are
+        scored with ``fp8_mqa_logits``. Production Top-2048 selection uses the
+        fused radix transform and directly emits packed global logical indices.
         """
         assert self.indexer_cache is not None, "IndexerCache not initialized"
-        if query_chunk <= 0:
+        if query_chunk is not None and query_chunk <= 0:
             raise ValueError(f"query_chunk must be positive, got {query_chunk}")
         if cu_seqlens_q.shape != cu_seqlens_k.shape:
             raise RuntimeError(
@@ -858,76 +892,104 @@ class Indexer(nn.Module):
                 hidden_states, q_scale.view(-1, self.n_heads, 1)
             )
 
+        num_queries = q_fp8.shape[0]
         indices = torch.full(
-            (q_fp8.shape[0], self.index_topk),
+            (num_queries, self.index_topk),
             -1,
             dtype=torch.int32,
             device=q_fp8.device,
         )
+        if num_queries == 0:
+            return indices
+
         cache = self.indexer_cache
         page_size = cache.page_size
-        kv_cache = cache.get_buffer(self.layer_id).view(
-            cache.num_pages, page_size, 1, cache.bytes_per_token
+        num_seqs = cu_seqlens_q.numel() - 1
+        if block_table.shape[0] != num_seqs:
+            raise RuntimeError(
+                "block_table/cu_seqlens batch mismatch: "
+                f"{block_table.shape[0]} vs {num_seqs}"
+            )
+        q_first = int(cu_seqlens_q[0].item())
+        k_first = int(cu_seqlens_k[0].item())
+        q_total = int(cu_seqlens_q[-1].item())
+        if q_first != 0 or k_first != 0:
+            raise RuntimeError("ragged Indexer cu_seqlens must start at zero")
+        if q_total != num_queries:
+            raise RuntimeError(
+                "cu_seqlens_q does not cover the packed queries: "
+                f"{q_total} vs {num_queries}"
+            )
+
+        q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
+        k_lens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int32)
+        if bool(torch.any(q_lens < 0).item()) or bool(
+            torch.any(k_lens < q_lens).item()
+        ):
+            raise RuntimeError(
+                "Invalid prefill ragged lengths: K length must cover every Q length"
+            )
+        used_pages = torch.div(k_lens + page_size - 1, page_size, rounding_mode="floor")
+        if int(used_pages.max().item()) > block_table.shape[1]:
+            raise RuntimeError(
+                "Indexer block table is too short for the longest sequence"
+            )
+
+        total_k = int(cu_seqlens_k[-1].item())
+        max_seqlen_k = int(k_lens.max().item())
+        key_bytes, scale_bytes = gather_indexer_cache(
+            cache.get_buffer(self.layer_id),
+            block_table,
+            cu_seqlens_k,
+            page_size=page_size,
+            head_dim=cache.head_dim,
+            total_k=total_k,
+            max_seqlen_k=max_seqlen_k,
         )
+        key_fp8 = key_bytes.view(torch.float8_e4m3fn)
+        key_scale = scale_bytes.view(torch.float32).reshape(-1)
+        kv_fp8 = (key_fp8, key_scale)
 
-        for seq_id in range(cu_seqlens_q.shape[0] - 1):
-            q_start = int(cu_seqlens_q[seq_id].item())
-            q_end = int(cu_seqlens_q[seq_id + 1].item())
-            k_start = int(cu_seqlens_k[seq_id].item())
-            context_len = int(cu_seqlens_k[seq_id + 1].item()) - k_start
-            q_len = q_end - q_start
-            cached_len = context_len - q_len
-            if q_len <= 0:
-                continue
-            if cached_len < 0:
-                raise RuntimeError(
-                    f"Invalid chunk lengths: context={context_len}, query={q_len}"
+        q_to_seq = torch.repeat_interleave(
+            torch.arange(num_seqs, dtype=torch.int64, device=q_fp8.device),
+            q_lens.to(torch.int64),
+            output_size=num_queries,
+        )
+        q_starts = cu_seqlens_q[:-1].index_select(0, q_to_seq).to(torch.int32)
+        k_starts = cu_seqlens_k[:-1].index_select(0, q_to_seq).to(torch.int32)
+        cached_lens = (k_lens - q_lens).index_select(0, q_to_seq)
+        local_q = (
+            torch.arange(num_queries, dtype=torch.int32, device=q_fp8.device) - q_starts
+        )
+        ks = k_starts.contiguous()
+        ke = (ks + cached_lens + local_q + 1).contiguous()
+
+        chunk_rows = _prefill_mqa_chunk_rows(
+            num_queries, total_k, q_fp8.device, max_rows=query_chunk
+        )
+        use_fused_topk = self.index_topk == 2048
+        valid_lens = (ke - ks).contiguous()
+        for start in range(0, num_queries, chunk_rows):
+            end = min(start + chunk_rows, num_queries)
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[start:end],
+                kv_fp8,
+                weights[start:end],
+                ks[start:end],
+                ke[start:end],
+                clean_logits=not use_fused_topk,
+            )
+            if use_fused_topk:
+                topk_transform_ragged(
+                    logits,
+                    valid_lens[start:end],
+                    ks[start:end],
+                    ks[start:end],
+                    indices[start:end],
+                    self.index_topk,
                 )
-
-            used_pages = max(1, math.ceil(context_len / page_size))
-            if used_pages > block_table.shape[1]:
-                raise RuntimeError(
-                    f"Indexer needs {used_pages} pages, got {block_table.shape[1]}"
-                )
-            seq_pages = block_table[seq_id : seq_id + 1, :used_pages]
-            max_context_len = used_pages * page_size
-
-            for a in range(0, q_len, query_chunk):
-                b = min(a + query_chunk, q_len)
-                rows = b - a
-                tiled_q = q_fp8[q_start + a : q_start + b].unsqueeze(1)
-                tiled_weights = weights[q_start + a : q_start + b]
-                context_lens = (
-                    cached_len
-                    + torch.arange(
-                        a + 1,
-                        b + 1,
-                        dtype=torch.int32,
-                        device=q_fp8.device,
-                    )
-                ).unsqueeze(1)
-                page_tables = seq_pages.repeat(rows, 1).to(torch.int32)
-                schedule_meta = self.build_schedule_metadata(context_lens)
-                logits = deep_gemm.fp8_paged_mqa_logits(
-                    tiled_q,
-                    kv_cache,
-                    tiled_weights,
-                    context_lens,
-                    page_tables,
-                    schedule_meta,
-                    max_context_len,
-                    clean_logits=False,
-                )
-
-                # The original fused radix TopK silently clips a threshold
-                # bucket to 8192 candidates. Its correctness therefore depends
-                # on the score distribution, not just sequence length. The v2
-                # cluster kernel fixes this for Top-512, but Indexer uses
-                # Top-2048. Keep production paged-FP8 scoring and select the
-                # exact TopK here until a Top-2048 cluster kernel is available.
-                actual_topk = min(self.index_topk, context_len)
-                cols = torch.arange(max_context_len, device=q_fp8.device).unsqueeze(0)
-                logits.masked_fill_(cols >= context_lens, float("-inf"))
+            else:
+                actual_topk = min(self.index_topk, total_k)
                 top_values, logical = logits.topk(actual_topk, dim=-1)
                 logical = logical.to(torch.int32).masked_fill_(
                     ~torch.isfinite(top_values), -1
@@ -938,9 +1000,9 @@ class Indexer(nn.Module):
                         (0, self.index_topk - actual_topk),
                         value=-1,
                     )
-
-                logical = torch.where(logical >= 0, logical + k_start, logical)
-                indices[q_start + a : q_start + b] = logical
+                indices[start:end] = logical
+                del top_values, logical
+            del logits
 
         return indices
 

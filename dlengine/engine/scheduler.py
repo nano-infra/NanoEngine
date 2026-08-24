@@ -24,7 +24,21 @@ def init_scheduler(config: Config) -> RustScheduler:
 
 def scheduler_token_budget(config: Config) -> int:
     """Return the scheduler window for one pipeline-parallel engine step."""
-    return config.max_num_batched_tokens * max(1, config.pp)
+    microbatch_tokens = config.max_num_batched_tokens
+    pp_size = max(1, config.pp)
+    if pp_size == 1:
+        return microbatch_tokens
+
+    configured_depth = getattr(config, "pp_prefill_scheduler_depth", 0)
+    max_model_len = getattr(config, "max_model_len", microbatch_tokens * pp_size)
+    if configured_depth > 0:
+        scheduler_depth = configured_depth
+    else:
+        prompt_microbatches, remainder = divmod(max_model_len, microbatch_tokens)
+        prompt_microbatches += int(remainder > 0)
+        scheduler_depth = min(64, max(pp_size, prompt_microbatches))
+
+    return min(max_model_len, microbatch_tokens * scheduler_depth)
 
 
 def build_scheduler_config(
@@ -32,7 +46,8 @@ def build_scheduler_config(
 ) -> SchedulerConfig:
     cache_plan = cache_plan or ensure_cache_plan(config)
     # ``max_num_batched_tokens`` is the per-forward/per-stage microbatch size.
-    # Admit one microbatch per PP stage so a scheduler step can fill the pipe.
+    # The scheduler window is independent of the transport-side in-flight RPC
+    # depth, allowing one long prompt to remain continuously admitted.
     token_budget = scheduler_token_budget(config)
     return SchedulerConfig(
         engine_id=config.engine_id or "",

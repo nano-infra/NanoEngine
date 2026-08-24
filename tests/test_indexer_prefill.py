@@ -167,7 +167,80 @@ def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
+def test_indexer_cache_gather_handles_fragmented_partial_pages():
+    from dlengine.runtime.kernel.triton.generic.indexer_cache_gather import (
+        gather_indexer_cache,
+    )
+
+    device = torch.device("cuda")
+    page_size = 64
+    head_dim = 128
+    num_pages = 6
+    page_bytes = page_size * (head_dim + 4)
+    cache = torch.empty(num_pages, page_bytes, dtype=torch.uint8, device=device)
+    for page in range(num_pages):
+        keys = (
+            (torch.arange(page_size * head_dim, device=device) + page * 17)
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        scales = (
+            torch.arange(page_size, dtype=torch.float32, device=device)
+            + page * 100
+            + 0.25
+        )
+        cache[page, : page_size * head_dim] = keys
+        cache[page, page_size * head_dim :] = scales.view(torch.uint8)
+
+    block_table = torch.tensor([[3, 1, 5], [4, 0, 2]], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 70, 135], dtype=torch.int32, device=device)
+    key_bytes, scale_bytes = gather_indexer_cache(
+        cache,
+        block_table,
+        cu_k,
+        page_size=page_size,
+        head_dim=head_dim,
+        total_k=135,
+        max_seqlen_k=70,
+    )
+
+    expected_keys = torch.cat(
+        [
+            cache[3, : page_size * head_dim].view(page_size, head_dim),
+            cache[1, : page_size * head_dim].view(page_size, head_dim)[:6],
+            cache[4, : page_size * head_dim].view(page_size, head_dim),
+            cache[0, : page_size * head_dim].view(page_size, head_dim)[:1],
+        ]
+    )
+
+    def page_scales(page):
+        return cache[page, page_size * head_dim :].view(torch.float32)
+
+    expected_scales = torch.cat(
+        [page_scales(3), page_scales(1)[:6], page_scales(4), page_scales(0)[:1]]
+    )
+    assert torch.equal(key_bytes, expected_keys)
+    torch.testing.assert_close(
+        scale_bytes.view(torch.float32).reshape(-1), expected_scales
+    )
+
+
+def test_prefill_mqa_chunk_rows_respects_available_memory(monkeypatch):
+    from dlengine.runtime.layers.indexer import _prefill_mqa_chunk_rows
+
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda _device: (1_000_000, 10_000_000)
+    )
+    assert _prefill_mqa_chunk_rows(100, 100_000, torch.device("cuda")) == 1
+    assert _prefill_mqa_chunk_rows(100, 100_000, torch.device("cuda"), max_rows=7) == 1
+    assert _prefill_mqa_chunk_rows(10, 100, torch.device("cuda")) == 10
+    assert _prefill_mqa_chunk_rows(10, 100, torch.device("cuda"), max_rows=3) == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_ragged_prefill_topk_uses_multi_seq_causal_ranges_and_large_chunks(
+    monkeypatch,
+):
     import dlengine.runtime.layers.indexer as indexer_module
     from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
@@ -195,11 +268,6 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
         ),
         indexer,
     )
-    indexer.build_schedule_metadata = types.MethodType(
-        lambda self, context_lens: torch.empty(0, device=device),
-        indexer,
-    )
-
     monkeypatch.setattr(indexer_module, "fused_kernels_enabled", lambda: False)
     monkeypatch.setattr(
         indexer_module,
@@ -209,27 +277,37 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
             torch.ones(value.shape[0], 1, device=device),
         ),
     )
-    seen_context_lens = []
+    gather_calls = []
 
-    def fake_paged_logits(
-        tiled_q,
-        kv_cache,
-        weights,
-        context_lens,
-        page_tables,
-        schedule,
-        max_context_len,
-        **kwargs,
-    ):
-        seen_context_lens.append(context_lens.flatten().tolist())
+    def fake_gather(cache, page_table, cu_k, **kwargs):
+        gather_calls.append((page_table.clone(), cu_k.clone(), kwargs))
+        total_k = kwargs["total_k"]
         return (
-            torch.arange(max_context_len, dtype=torch.float32, device=device)
-            .expand(tiled_q.shape[0], -1)
-            .clone()
+            torch.zeros(total_k, 128, dtype=torch.uint8, device=device),
+            torch.zeros(total_k, 4, dtype=torch.uint8, device=device),
         )
 
+    monkeypatch.setattr(indexer_module, "gather_indexer_cache", fake_gather)
+    seen_ranges = []
+
+    def fake_ragged_logits(q, kv, weights, ks, ke, clean_logits=False):
+        assert clean_logits is True
+        seen_ranges.append((ks.tolist(), ke.tolist()))
+        total_k = kv[0].shape[0]
+        logits = (
+            torch.arange(total_k, dtype=torch.float32, device=device)
+            .expand(q.shape[0], -1)
+            .clone()
+        )
+        cols = torch.arange(total_k, device=device).unsqueeze(0)
+        logits.masked_fill_((cols < ks[:, None]) | (cols >= ke[:, None]), -torch.inf)
+        return logits
+
+    monkeypatch.setattr(indexer_module.deep_gemm, "fp8_mqa_logits", fake_ragged_logits)
     monkeypatch.setattr(
-        indexer_module.deep_gemm, "fp8_paged_mqa_logits", fake_paged_logits
+        indexer_module.deep_gemm,
+        "fp8_paged_mqa_logits",
+        lambda *args, **kwargs: pytest.fail("prefill must not use paged MQA"),
     )
 
     cu_q = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
@@ -252,12 +330,15 @@ def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
         device=device,
     )
     assert torch.equal(actual, expected)
-    assert seen_context_lens == [[4, 5], [3, 4], [5]]
+    assert seen_ranges == [([0, 0], [4, 5]), ([5, 5], [8, 9]), ([5], [10])]
+    assert len(gather_calls) == 1
+    assert gather_calls[0][2]["total_k"] == 10
+    assert gather_calls[0][2]["max_seqlen_k"] == 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
-    """Paged scoring must preserve exact causal TopK beyond 64K."""
+def test_ragged_prefill_long_context_uses_fused_radix_topk(monkeypatch):
+    """Production Top-2048 uses the fused ragged selector beyond 64K."""
     import dlengine.runtime.layers.indexer as indexer_module
     from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
@@ -266,7 +347,7 @@ def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
     nn.Module.__init__(indexer)
     indexer.n_heads = 2
     indexer.head_dim = 128
-    indexer.index_topk = 512
+    indexer.index_topk = 2048
     indexer.layer_id = 0
     indexer.softmax_scale = 1.0
     indexer.indexer_cache = IndexerCache(
@@ -284,9 +365,6 @@ def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
         ),
         indexer,
     )
-    indexer.build_schedule_metadata = types.MethodType(
-        lambda self, context_lens: torch.empty(0, device=device), indexer
-    )
     monkeypatch.setattr(indexer_module, "fused_kernels_enabled", lambda: False)
     monkeypatch.setattr(
         indexer_module,
@@ -297,14 +375,25 @@ def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        indexer_module.deep_gemm,
-        "fp8_paged_mqa_logits",
-        lambda tiled_q, kv_cache, weights, context_lens, page_tables, schedule, max_context_len, **kwargs: torch.arange(
-            max_context_len, dtype=torch.float32, device=device
-        )
-        .expand(tiled_q.shape[0], -1)
-        .clone(),
+        indexer_module,
+        "gather_indexer_cache",
+        lambda cache, block_table, cu_k, **kwargs: (
+            torch.zeros(kwargs["total_k"], 128, dtype=torch.uint8, device=device),
+            torch.zeros(kwargs["total_k"], 4, dtype=torch.uint8, device=device),
+        ),
     )
+
+    seen_logits = []
+
+    def fake_ragged_logits(q, kv, weights, ks, ke, clean_logits=False):
+        assert clean_logits is False
+        logits = torch.randn(
+            q.shape[0], kv[0].shape[0], dtype=torch.float32, device=device
+        )
+        seen_logits.append(logits)
+        return logits
+
+    monkeypatch.setattr(indexer_module.deep_gemm, "fp8_mqa_logits", fake_ragged_logits)
 
     cu_q = torch.tensor([0, 2], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, 65538], dtype=torch.int32, device=device)
@@ -320,8 +409,9 @@ def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
         query_chunk=2,
     )
 
-    assert actual.shape == (2, 512)
-    assert actual[0].max().item() == 65536
-    assert actual[0].min().item() == 65536 - 511
-    assert actual[1].max().item() == 65537
-    assert actual[1].min().item() == 65537 - 511
+    assert actual.shape == (2, 2048)
+    for row, length in enumerate((65537, 65538)):
+        expected = torch.topk(seen_logits[0][row, :length], 2048).indices
+        expected_set = set(expected.cpu().tolist())
+        actual_set = set(actual[row].cpu().tolist())
+        assert len(expected_set - actual_set) == len(actual_set - expected_set) <= 5

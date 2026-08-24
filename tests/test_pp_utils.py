@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import dlengine.runtime.models.pp_utils as pp_utils
 import pytest
+import torch
 from torch import nn
 
 
@@ -138,3 +139,81 @@ def test_gemma_hisparse_cache_contains_only_nonshared_full_attention():
 
 def test_pp_dp_sp_tp_global_rank_is_pp_major():
     assert pp_utils.pp_global_rank(2, 1, 0, 1, dp_size=2, sp_size=2, tp_size=2) == 21
+
+
+class _FakeWork:
+    def __init__(self, events, name, error=None):
+        self.events = events
+        self.name = name
+        self.error = error
+
+    def wait(self):
+        self.events.append(f"wait:{self.name}")
+        if self.error is not None:
+            raise self.error
+
+
+def test_pp_isend_tensors_posts_in_order_and_keeps_contiguous_storage(monkeypatch):
+    events = []
+    sent = []
+
+    def isend(tensor, dst):
+        events.append(f"send:{len(sent)}:{dst}")
+        sent.append(tensor)
+        return _FakeWork(events, str(len(sent) - 1))
+
+    monkeypatch.setattr(pp_utils.dist, "isend", isend)
+    source = torch.arange(12).reshape(3, 4).t()
+    pending = pp_utils.pp_isend_tensors((source, torch.ones(2)), dst=7)
+
+    assert events == ["send:0:7", "send:1:7"]
+    assert all(tensor.is_contiguous() for tensor in sent)
+    pending.wait()
+    assert events[-2:] == ["wait:0", "wait:1"]
+
+
+def test_pp_isend_tensors_drains_posted_work_if_later_post_fails(monkeypatch):
+    events = []
+    post_error = RuntimeError("post failed")
+
+    def isend(tensor, dst):
+        events.append(f"send:{dst}")
+        if len(events) == 2:
+            raise post_error
+        return _FakeWork(events, "0")
+
+    monkeypatch.setattr(pp_utils.dist, "isend", isend)
+    with pytest.raises(RuntimeError, match="post failed"):
+        pp_utils.pp_isend_tensors((torch.ones(1), torch.ones(1)), dst=3)
+
+    assert events == ["send:3", "send:3", "wait:0"]
+
+
+def test_pending_p2p_drains_all_work_before_reraising():
+    events = []
+    error = RuntimeError("send failed")
+    pending = pp_utils.PendingP2P(
+        (_FakeWork(events, "0", error), _FakeWork(events, "1")),
+        (torch.ones(1),),
+    )
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        pending.wait()
+    assert events == ["wait:0", "wait:1"]
+    with pytest.raises(RuntimeError, match="send failed"):
+        pending.wait()
+
+
+def test_pp_irecv_tensors_posts_entire_group_before_wait(monkeypatch):
+    events = []
+
+    def irecv(tensor, src):
+        count = sum(event.startswith("recv:") for event in events)
+        name = str(count)
+        events.append(f"recv:{name}:{src}")
+        return _FakeWork(events, name)
+
+    monkeypatch.setattr(pp_utils.dist, "irecv", irecv)
+    pp_utils.pp_irecv_tensors((torch.empty(2), torch.empty(3)), src=5)
+
+    assert events == ["recv:0:5", "recv:1:5", "wait:0", "wait:1"]
