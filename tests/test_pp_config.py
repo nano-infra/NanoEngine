@@ -102,13 +102,32 @@ def test_pp_uses_max_batched_tokens_as_prefill_microbatch_size(monkeypatch):
         pp=2,
         mode="prefill",
         max_num_batched_tokens=1024,
+        pp_prefill_scheduler_depth=3,
         pp_prefill_pipeline_depth=2,
         num_speculative_tokens=0,
     )
 
     assert config.max_num_batched_tokens == 1024
-    assert scheduler_token_budget(config) == 2048
+    assert scheduler_token_budget(config) == 3072
+    assert config.pp_prefill_scheduler_depth == 3
     assert config.pp_prefill_pipeline_depth == 2
+
+
+def test_pp_rejects_negative_prefill_scheduler_depth(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _qwen35_config(),
+    )
+
+    with pytest.raises(ValueError, match="pp_prefill_scheduler_depth must be >= 0"):
+        Config(
+            model="unused",
+            pp=2,
+            mode="prefill",
+            pp_prefill_scheduler_depth=-1,
+            num_speculative_tokens=0,
+        )
 
 
 def test_pp_still_rejects_decode_pd_role(monkeypatch):
@@ -151,7 +170,7 @@ def test_pp16_allows_supported_deepseek_architectures(monkeypatch, architecture)
     )
 
     assert config.world_size == 16
-    assert scheduler_token_budget(config) == 16384 * 16
+    assert scheduler_token_budget(config) == config.max_model_len
     assert config.kvcache_block_size == 64
     assert config.enforce_eager is True
 

@@ -10,6 +10,7 @@ import zmq.asyncio
 
 from dlengine.config import Config
 from dlengine.engine.llm_component import LLMComponent
+from dlengine.engine.scheduler import scheduler_token_budget
 from dlengine.logging import get_logger
 from dlengine.server import pd
 from dlengine.server.wire import (
@@ -458,7 +459,7 @@ class EngineServer:
         logger.info(
             f"KV Cache:        {self.config.num_kvcache_blocks} blocks x {self.config.kvcache_block_size} tokens"
         )
-        scheduler_tokens = self.config.max_num_batched_tokens * max(1, self.config.pp)
+        scheduler_tokens = scheduler_token_budget(self.config)
         logger.info(
             f"Max Tokens:      {self.config.max_num_batched_tokens} per forward, "
             f"{scheduler_tokens} scheduled, {self.config.max_model_len} model length"

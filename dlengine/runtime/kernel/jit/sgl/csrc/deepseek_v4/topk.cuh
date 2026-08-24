@@ -12,6 +12,8 @@
 namespace {
 
 constexpr uint32_t kSMEM = 32 * 1024 * sizeof(uint32_t);  // 128KB: exact through 16K contexts
+// Use a bounded threshold candidate buffer to preserve kernel occupancy.
+constexpr uint32_t kRaggedSMEM = 8 * 1024 * sizeof(uint32_t);  // 32KB
 
 struct TopKParams {
     const float* __restrict__ scores;
@@ -22,6 +24,15 @@ struct TopKParams {
     const int64_t score_stride;
     const int64_t page_table_stride;
     uint32_t      page_bits;
+};
+
+struct RaggedTopKParams {
+    const float* __restrict__ scores;
+    const int32_t* __restrict__ seq_lens;
+    const int32_t* __restrict__ row_starts;
+    const int32_t* __restrict__ offsets;
+    int32_t* __restrict__ indices;
+    const int64_t score_stride;
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x)
@@ -69,13 +80,13 @@ SGL_DEVICE void naive_transform(const float* __restrict__,  // unused
     }
 }
 
-template<uint32_t kTopK, uint32_t kTopKBlockSize>
+template<uint32_t kTopK, uint32_t kTopKBlockSize, uint32_t kRadixSMEM = kSMEM>
 [[maybe_unused]]
 SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length)
 {
     constexpr uint32_t RADIX           = 256;
     constexpr uint32_t BLOCK_SIZE      = kTopKBlockSize;
-    constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
+    constexpr uint32_t SMEM_INPUT_SIZE = kRadixSMEM / (2 * sizeof(int32_t));
 
     alignas(128) __shared__ uint32_t _s_histogram_buf[2][RADIX + 32];
     alignas(128) __shared__ uint32_t s_counter;
@@ -83,7 +94,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     alignas(128) __shared__ uint32_t s_num_input[2];
     alignas(128) __shared__ int32_t  s_last_remain;
 
-    extern __shared__ uint32_t s_input_idx[][kSMEM / (2 * sizeof(int32_t))];
+    extern __shared__ uint32_t s_input_idx[];
 
     const uint32_t tx          = threadIdx.x;
     uint32_t       remain_topk = kTopK;
@@ -153,9 +164,9 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
             else if (bin == threshold_bin) {
                 const auto pos = ::atomicAdd(&s_num_input[0], 1);
                 if (pos < SMEM_INPUT_SIZE) {
-                    [[likely]] s_input_idx[0][pos] = idx;
-                    const auto bin                 = convert_to_uint32(raw_input);
-                    const auto sub_bin             = (bin >> 24) & 0xFF;
+                    [[likely]] s_input_idx[pos] = idx;
+                    const auto bin              = convert_to_uint32(raw_input);
+                    const auto sub_bin          = (bin >> 24) & 0xFF;
                     ::atomicAdd(&s_histogram[sub_bin], 1);
                 }
             }
@@ -185,7 +196,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 
         if (remain_topk == 0) {
             for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
-                const auto idx    = s_input_idx[r_idx][i];
+                const auto idx    = s_input_idx[r_idx * SMEM_INPUT_SIZE + i];
                 const auto offset = 24 - round * 8;
                 const auto bin    = (convert_to_uint32(input[idx]) >> offset) & 0xFF;
                 if (bin > threshold_bin) {
@@ -203,7 +214,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
             }
             __syncthreads();
             for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
-                const auto idx       = s_input_idx[r_idx][i];
+                const auto idx       = s_input_idx[r_idx * SMEM_INPUT_SIZE + i];
                 const auto raw_input = input[idx];
                 const auto offset    = 24 - round * 8;
                 const auto bin       = (convert_to_uint32(raw_input) >> offset) & 0xFF;
@@ -222,9 +233,9 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
                         const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
                         if (pos < SMEM_INPUT_SIZE) {
                             /// NOTE: (dark) fuse the histogram computation here
-                            [[likely]] s_input_idx[r_idx ^ 1][pos] = idx;
-                            const auto bin                         = convert_to_uint32(raw_input);
-                            const auto sub_bin                     = (bin >> (offset - 8)) & 0xFF;
+                            [[likely]] s_input_idx[(r_idx ^ 1) * SMEM_INPUT_SIZE + pos] = idx;
+                            const auto bin                                              = convert_to_uint32(raw_input);
+                            const auto sub_bin                                          = (bin >> (offset - 8)) & 0xFF;
                             ::atomicAdd(&s_histogram[sub_bin], 1);
                         }
                     }
@@ -275,6 +286,35 @@ __global__ void topk_transform(const __grid_constant__ TopKParams params)
     device::PDLTriggerSecondary<kUsePDL>();
 }
 
+template<uint32_t kTopK, uint32_t kTopKBlockSize, bool kUsePDL>
+__global__ void topk_transform_ragged(const __grid_constant__ RaggedTopKParams params)
+{
+    const auto& [scores, seq_lens, row_starts, offsets, indices, score_stride] = params;
+    const uint32_t work_id                                                     = blockIdx.x;
+    const uint32_t seq_len                                                     = seq_lens[work_id];
+    const uint32_t row_start                                                   = row_starts[work_id];
+    const int32_t  offset                                                      = offsets[work_id];
+    const auto     score_ptr                                                   = scores + work_id * score_stride;
+    const auto     indices_ptr                                                 = indices + work_id * kTopK;
+
+    device::PDLWaitPrimary<kUsePDL>();
+
+    if (seq_len <= kTopK) {
+        for (uint32_t i = threadIdx.x; i < kTopK; i += kTopKBlockSize) {
+            indices_ptr[i] = i < seq_len ? static_cast<int32_t>(i) + offset : -1;
+        }
+    }
+    else {
+        __shared__ int32_t s_topk_indices[kTopK];
+        radix_topk<kTopK, kTopKBlockSize, kRaggedSMEM>(score_ptr + row_start, s_topk_indices, seq_len);
+        for (uint32_t i = threadIdx.x; i < kTopK; i += kTopKBlockSize) {
+            indices_ptr[i] = s_topk_indices[i] + offset;
+        }
+    }
+
+    device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template<auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {})
 {
@@ -291,6 +331,7 @@ struct TopKKernel {
     static_assert(kTopK == 512 || kTopK == 2048, "supported top-k sizes are 512 and 2048");
     static constexpr uint32_t kTopKBlockSize = kTopK < 1024 ? kTopK : 1024;
     static constexpr auto     kernel         = topk_transform<kTopK, kTopKBlockSize, kUsePDL>;
+    static constexpr auto     ragged_kernel  = topk_transform_ragged<kTopK, kTopKBlockSize, kUsePDL>;
 
     static void transform(const tvm::ffi::TensorView                     scores,
                           const tvm::ffi::TensorView                     seq_lens,
@@ -350,6 +391,39 @@ struct TopKKernel {
         constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
         setup_kernel_smem_once<kernel, kSMEM_>();
         LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
+    }
+
+    static void transform_ragged(const tvm::ffi::TensorView scores,
+                                 const tvm::ffi::TensorView seq_lens,
+                                 const tvm::ffi::TensorView row_starts,
+                                 const tvm::ffi::TensorView offsets,
+                                 const tvm::ffi::TensorView indices)
+    {
+        using namespace host;
+        auto B      = SymbolicSize{"batch_size"};
+        auto S      = SymbolicSize{"score_stride"};
+        auto device = SymbolicDevice{};
+        device.set_options<kDLCUDA>();
+
+        TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(scores);
+        for (const auto& tensor : {seq_lens, row_starts, offsets}) {
+            TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(tensor);
+        }
+        TensorMatcher({B, kTopK}).with_dtype<int32_t>().with_device(device).verify(indices);
+
+        const auto batch_size = static_cast<uint32_t>(B.unwrap());
+        const auto params     = RaggedTopKParams{
+                .scores       = static_cast<float*>(scores.data_ptr()),
+                .seq_lens     = static_cast<int32_t*>(seq_lens.data_ptr()),
+                .row_starts   = static_cast<int32_t*>(row_starts.data_ptr()),
+                .offsets      = static_cast<int32_t*>(offsets.data_ptr()),
+                .indices      = static_cast<int32_t*>(indices.data_ptr()),
+                .score_stride = S.unwrap(),
+        };
+        constexpr auto kRaggedSMEM_ = kRaggedSMEM + sizeof(int32_t);
+        setup_kernel_smem_once<ragged_kernel, kRaggedSMEM_>();
+        LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kRaggedSMEM_)
+            .enable_pdl(kUsePDL)(ragged_kernel, params);
     }
 };
 
