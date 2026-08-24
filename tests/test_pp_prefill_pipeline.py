@@ -96,8 +96,9 @@ class _FakeRunnerIn:
 
 
 class _FakeExecutor:
-    def __init__(self, token_by_payload):
+    def __init__(self, token_by_payload, logprobs_by_payload=None):
         self.token_by_payload = token_by_payload
+        self.logprobs_by_payload = logprobs_by_payload or {}
         self.events = []
         self.submitted_payloads = []
 
@@ -112,10 +113,15 @@ class _FakeExecutor:
 
     def run_wait_runner_outs(self, payloads):
         self.events.append(("wait", payloads[0]))
-        return [
-            _FakeRunnerOut([[self.token_by_payload.get(payload, 0)]], None, 1)
-            for payload in payloads
-        ]
+        outputs = []
+        for payload in payloads:
+            token_ids = self.token_by_payload.get(payload, 0)
+            if not isinstance(token_ids, list):
+                token_ids = [[token_ids]]
+            outputs.append(
+                _FakeRunnerOut(token_ids, self.logprobs_by_payload.get(payload), 1)
+            )
+        return outputs
 
 
 def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
@@ -123,9 +129,9 @@ def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
     monkeypatch.setattr(proto, "RunnerOut", _FakeRunnerOut)
     _FakeRunnerIn.fragments = {
         b"batch": [
-            (b"request0_chunk0", 0, False),
-            (b"request0_chunk1", 0, True),
-            (b"request1_chunk0", 1, True),
+            (b"request0_chunk0", [(0, False)]),
+            (b"request0_tail_request1_head", [(0, True), (1, False)]),
+            (b"request1_tail", [(1, True)]),
         ]
     }
 
@@ -140,9 +146,13 @@ def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
     engine.executor = _FakeExecutor(
         {
             b"request0_chunk0": 1,
-            b"request0_chunk1": 2,
-            b"request1_chunk0": 3,
-        }
+            b"request0_tail_request1_head": [[2], [0]],
+            b"request1_tail": 3,
+        },
+        {
+            b"request0_tail_request1_head": [[0.2], [0.0]],
+            b"request1_tail": [[0.3]],
+        },
     )
     schedule_result = SimpleNamespace(dp_group_seq_ids=[[100, 200]])
 
@@ -151,13 +161,14 @@ def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
     )
 
     assert outputs[0].token_ids == [[2], [3]]
+    assert outputs[0].logprobs == [[0.2], [0.3]]
     assert engine.executor.events == [
         ("submit", b"request0_chunk0"),
-        ("submit", b"request0_chunk1"),
-        ("submit", b"request1_chunk0"),
+        ("submit", b"request0_tail_request1_head"),
+        ("submit", b"request1_tail"),
         ("wait", b"request0_chunk0"),
-        ("wait", b"request0_chunk1"),
-        ("wait", b"request1_chunk0"),
+        ("wait", b"request0_tail_request1_head"),
+        ("wait", b"request1_tail"),
     ]
 
 
@@ -165,8 +176,11 @@ def test_static_pp_prefill_pads_shorter_dp_cells_with_dummy(monkeypatch):
     monkeypatch.setattr(proto, "RunnerIn", _FakeRunnerIn)
     monkeypatch.setattr(proto, "RunnerOut", _FakeRunnerOut)
     _FakeRunnerIn.fragments = {
-        b"cell0": [(b"cell0_chunk0", 0, False), (b"cell0_chunk1", 0, True)],
-        b"cell1": [(b"cell1_chunk0", 0, True)],
+        b"cell0": [
+            (b"cell0_chunk0", [(0, False)]),
+            (b"cell0_chunk1", [(0, True)]),
+        ],
+        b"cell1": [(b"cell1_chunk0", [(0, True)])],
     }
 
     engine = LLMEngine.__new__(LLMEngine)

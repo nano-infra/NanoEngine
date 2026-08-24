@@ -286,20 +286,21 @@ impl RunnerIn {
         super::prepare::runner_in_vision_slots(&self.payload)
     }
 
-    /// Return ordered `(payload, original_seq_index, is_last_fragment)`
-    /// microbatches for static forward-only pipeline parallel prefill.
+    /// Return ordered `(payload, fragment_metadata)` microbatches for static
+    /// forward-only pipeline parallel prefill. Metadata contains one
+    /// `(original_seq_index, is_last_fragment)` entry per packed row.
     fn prefill_microbatches(
         &self,
         py: Python<'_>,
         max_tokens: usize,
-    ) -> PyResult<Vec<(Py<PyBytes>, usize, bool)>> {
+    ) -> PyResult<Vec<(Py<PyBytes>, Vec<(usize, bool)>)>> {
         let batch: WireBatch = decode_binary(&self.payload, "run batch")?;
         batch
             .prefill_microbatches(max_tokens)
             .into_iter()
-            .map(|(microbatch, seq_idx, is_last)| {
+            .map(|(microbatch, metadata)| {
                 let payload = encode_binary(&microbatch, "prefill microbatch")?;
-                Ok((PyBytes::new(py, &payload).unbind(), seq_idx, is_last))
+                Ok((PyBytes::new(py, &payload).unbind(), metadata))
             })
             .collect()
     }

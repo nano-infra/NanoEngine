@@ -233,8 +233,9 @@ class LLMEngine:
 
         Each worker receives the same per-cell microbatch order. Worker RPCs
         are serialized, so while stage N processes microbatch K, stage N-1 can
-        process K+1. The driver keeps a bounded number of RPCs in flight and
-        folds only each request's last fragment back into scheduler order.
+        process K+1. Independent request fragments share a ragged microbatch up
+        to the per-forward token cap. The driver keeps a bounded number of RPCs
+        in flight and folds each request's final row back into scheduler order.
         """
         from dlengine._rust.proto import RunnerIn, RunnerOut
 
@@ -270,9 +271,9 @@ class LLMEngine:
             inner_metadata = []
             for fragments in cell_fragments:
                 if round_idx < len(fragments):
-                    payload, seq_idx, is_last = fragments[round_idx]
+                    payload, fragment_metadata = fragments[round_idx]
                     inner_payloads.append(payload)
-                    inner_metadata.append((seq_idx, is_last))
+                    inner_metadata.append(fragment_metadata)
                 else:
                     inner_payloads.append(dummy)
                     inner_metadata.append(None)
@@ -296,17 +297,17 @@ class LLMEngine:
             last_stage_outs = all_outs[(pp_size - 1) * inner :]
             for group_idx, out in enumerate(last_stage_outs[::tp_size]):
                 cell_idx = group_idx * tp_size
-                fragment = metadata[cell_idx]
-                if fragment is None:
+                fragments = metadata[cell_idx]
+                if not fragments:
                     continue
-                seq_idx, is_last = fragment
-                if not is_last or seq_idx >= len(aggregated_tokens[group_idx]):
-                    continue
-                if out.token_ids:
-                    aggregated_tokens[group_idx][seq_idx] = out.token_ids[0]
-                if out.logprobs:
-                    aggregated_logprobs[group_idx][seq_idx] = out.logprobs[0]
-                    has_logprobs[group_idx] = True
+                for row_idx, (seq_idx, is_last) in enumerate(fragments):
+                    if not is_last or seq_idx >= len(aggregated_tokens[group_idx]):
+                        continue
+                    if row_idx < len(out.token_ids):
+                        aggregated_tokens[group_idx][seq_idx] = out.token_ids[row_idx]
+                    if out.logprobs is not None and row_idx < len(out.logprobs):
+                        aggregated_logprobs[group_idx][seq_idx] = out.logprobs[row_idx]
+                        has_logprobs[group_idx] = True
                 max_handler_ns[group_idx] = max(
                     max_handler_ns[group_idx], int(out.server_handler_ns)
                 )

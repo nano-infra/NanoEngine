@@ -1,9 +1,8 @@
 from types import SimpleNamespace
 
+import dlengine.runtime.runner.mtp_runner as mtp_module
 import torch
 import torch.nn as nn
-
-import dlengine.runtime.runner.mtp_runner as mtp_module
 from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
 from dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp import (
     DeepSeekMTP,
@@ -13,6 +12,7 @@ from dlengine.runtime.runner.mtp_runner import (
     _active_ragged_last_rows,
     _localize_packed_topk,
     _nonempty_ragged_bounds,
+    _select_ragged_rows,
     linear_greedy_verify,
     linear_rejection_sample,
     MTPRunner,
@@ -162,6 +162,59 @@ def test_mtp_prefill_last_rows_ignore_padded_cu_seqlens_suffix():
     assert _active_ragged_last_rows(padded_cu, 2).tolist() == [52, 105]
 
 
+def test_mtp_prefill_selects_completed_rows_from_ragged_batch():
+    cu_seqlens = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
+    token_indices, compact_cu = _select_ragged_rows(cu_seqlens, torch.tensor([0, 2]))
+
+    assert token_indices.tolist() == [0, 1, 5]
+    assert compact_cu.tolist() == [0, 2, 3]
+
+
+def test_mtp_prefill_compacts_completed_rows_and_cache_metadata():
+    runner = object.__new__(MTPRunner)
+    runner.last_hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    context = set_batch_context(
+        is_prefill=True,
+        max_bs=4,
+        cu_seqlens_q=torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 10, 30, 40], dtype=torch.int32),
+        slot_mapping=torch.tensor([100, 101, 200, 201, 202, 300]),
+        block_tables=torch.tensor([[[1, 2], [3, 4], [5, 6], [0, 0]]]),
+        sampling_token_indices=torch.tensor([1, 5]),
+        sampling_seq_indices=torch.tensor([0, 2]),
+    )
+
+    selected = runner._select_prefill_seed_batch(
+        torch.tensor([10, 11, 20, 21, 22, 30]),
+        torch.tensor([0, 1, 10, 11, 12, 20]),
+        torch.tensor([101, 0, 303]),
+        SimpleNamespace(seq_ids=[11, 22, 33]),
+        context,
+        3,
+    )
+
+    assert selected is not None
+    (
+        input_ids,
+        positions,
+        sampled_ids,
+        hidden,
+        seed_context,
+        seq_ids,
+        num_seqs,
+    ) = selected
+    assert input_ids.tolist() == [10, 11, 30]
+    assert positions.tolist() == [0, 1, 20]
+    assert sampled_ids.tolist() == [101, 303]
+    assert hidden.tolist() == [[0.0, 1.0], [2.0, 3.0], [10.0, 11.0]]
+    assert seed_context.cu_seqlens_q.tolist() == [0, 2, 3]
+    assert seed_context.cu_seqlens_k.tolist() == [0, 10, 20]
+    assert seed_context.slot_mapping.tolist() == [100, 101, 300]
+    assert seed_context.block_tables.tolist() == [[[1, 2], [5, 6]]]
+    assert (seq_ids, num_seqs) == ((11, 33), 2)
+    reset_batch_context()
+
+
 def test_mtp_prefill_topk_is_localized_before_page_table_gather():
     packed = torch.tensor([[0, 52, -1], [53, 105, -1]], dtype=torch.int32)
     starts = torch.tensor([0, 53], dtype=torch.int32)
@@ -288,6 +341,22 @@ def test_pd_handoff_publish_restore_merges_mixed_batch(monkeypatch):
         [6, 7, 8, 9, 10],
     ]
     assert handoff[3, 0].item() == -1
+
+
+def test_pd_handoff_publishes_only_completed_rows_from_packed_prefill(monkeypatch):
+    handoff = torch.full((4, 6), 99, dtype=torch.int64)
+    cache_context = SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5)
+    monkeypatch.setattr(mtp_module, "get_cache_context", lambda: cache_context)
+
+    runner = object.__new__(MTPRunner)
+    runner.config = SimpleNamespace(num_speculative_tokens=5)
+    runner._prev_seq_ids = (11,)
+    runner._prev_drafts = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    runner._selected_prev_drafts = None
+
+    assert runner.publish_disagg_handoff([11, 22], [1, 3], 2) == 1
+    assert handoff[1].tolist() == [11, 1, 2, 3, 4, 5]
+    assert handoff[3].tolist() == [-1, -1, -1, -1, -1, -1]
 
 
 def test_pd_handoff_rejects_stale_sequence_id(monkeypatch):
