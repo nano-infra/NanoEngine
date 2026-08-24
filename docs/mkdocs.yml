@@ -62,8 +62,10 @@ nav:
   - Reference:
       - Feature Matrix: features.md
       - Supported Models: supported-models.md
+      - GLM Recurrent MTP: glm-recurrent-mtp.md
   - Development:
       - Offline Inference: offline-inference.md
+      - Performance Profiling: performance-profiling.md
 
 extra:
   generator: false
