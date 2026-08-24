@@ -78,9 +78,9 @@ class Config:
     # Diagnostic-only positional result path. The default preserves the
     # request-id dict/set/reorder implementation for controlled A/B testing.
     hierarchical_result_fastpath: bool = False
-    # Ray remains the lifecycle/placement plane in both modes. The ZMQ option
-    # only replaces hierarchical LocalEngine<->ModelRunner quantum control and
-    # result traffic; DLSlime continues to carry Sequence payloads.
+    # Ray remains the lifecycle/placement plane. RequestRouter<->LocalEngine
+    # ingress always uses ZMQ. This option selects LocalEngine<->ModelRunner
+    # quantum control/results; DLSlime continues to carry Sequence payloads.
     hierarchical_worker_transport: Literal["ray", "zmq"] = "ray"
 
     # parallel config

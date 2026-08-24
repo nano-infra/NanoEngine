@@ -353,6 +353,8 @@ class EngineReady:
     config_fingerprint: str
     node_id: str
     worker_node_ids: tuple[str, ...]
+    frontend_address: str
+    frontend_epoch: str
 
 
 @dataclass(frozen=True, slots=True)

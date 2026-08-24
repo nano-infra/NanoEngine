@@ -1274,6 +1274,7 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     engine.engine_id = 0
     engine._failure = None
     engine.executor = SimpleNamespace(check_worker_liveness=lambda: None)
+    engine._frontend_server = SimpleNamespace(raise_if_failed=lambda: None)
     engine._loop_thread = SimpleNamespace(is_alive=lambda: True)
     engine._events_lock = threading.Lock()
     engine._load_lock = threading.Lock()

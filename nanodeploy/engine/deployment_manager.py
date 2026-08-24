@@ -8,6 +8,7 @@ from math import ceil
 from typing import Any, Iterator, Mapping
 
 import ray
+import zmq
 from ray.util.placement_group import (
     placement_group,
     remove_placement_group,
@@ -32,6 +33,7 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     LoadSnapshot,
 )
+from nanodeploy.engine.frontend_transport import ZmqFrontendClient
 from nanodeploy.engine.local_engine import LocalEngineCore
 from nanodeploy.engine.ray_executor import (
     get_available_nodes_with_master_first,
@@ -97,57 +99,51 @@ def _control_init_method(config: Config) -> str:
 
 
 @dataclass(slots=True)
-class RayEngineTransport:
+class ZmqEngineTransport:
     engine_id: int
     actor: Any
     timeout: float
+    frontend: ZmqFrontendClient
 
     def _get(self, ref):
         with _without_proxy_env():
             return ray.get(ref, timeout=self.timeout)
 
     def add(self, command: AddCommand) -> AddResult:
-        return self._get(self.actor.submit_add.remote(command))
+        return self.frontend.add(command)
 
     def enqueue_async(self, command: AddCommand):
-        with _without_proxy_env():
-            return self.actor.enqueue_add.remote(command)
+        return self.frontend.enqueue((command,))
 
     def admit_async(self, command: AddCommand):
-        with _without_proxy_env():
-            return self.actor.admit_add.remote(command)
+        return self.frontend.admit((command,), None)
 
     def admit_batch_async(
         self,
         commands: tuple[AddCommand, ...],
         reservations: tuple[AdmissionReservation, ...],
     ):
-        with _without_proxy_env():
-            return self.actor.admit_add_batch.remote(
-                commands, reservations
-            )
+        return self.frontend.admit(commands, reservations)
 
     def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
-        with _without_proxy_env():
-            return self.actor.enqueue_add_batch.remote(commands)
+        return self.frontend.enqueue(commands)
 
     def poll_enqueue(
         self, handle
     ) -> tuple[bool, IngressAck | None]:
-        with _without_proxy_env():
-            ready, _ = ray.wait([handle], num_returns=1, timeout=0)
-            if not ready:
-                return False, None
-            return True, ray.get(ready[0])
+        ready, acks = self.frontend.poll_ingress(handle)
+        if not ready:
+            return False, None
+        if acks is None or len(acks) != 1:
+            raise RuntimeError(
+                "single frontend ingress returned an invalid ACK count"
+            )
+        return True, acks[0]
 
     def poll_admission_batch(
         self, handle
     ) -> tuple[bool, tuple[IngressAck, ...] | None]:
-        with _without_proxy_env():
-            ready, _ = ray.wait([handle], num_returns=1, timeout=0)
-            if not ready:
-                return False, None
-            return True, tuple(ray.get(ready[0]))
+        return self.frontend.poll_ingress(handle)
 
     def abort(
         self,
@@ -169,6 +165,9 @@ class RayEngineTransport:
     def load(self) -> LoadSnapshot:
         return self._get(self.actor.get_cached_load.remote())
 
+    def close(self) -> None:
+        self.frontend.close()
+
 
 class DeploymentManager:
     """Owns hierarchical actors, exact DP placement groups, and cleanup."""
@@ -188,7 +187,8 @@ class DeploymentManager:
         self.workers_by_engine: dict[int, list[Any]] = {}
         self.engines: dict[int, Any] = {}
         self.coordinator: Any | None = None
-        self.engine_clients: dict[int, RayEngineTransport] = {}
+        self.engine_clients: dict[int, ZmqEngineTransport] = {}
+        self._frontend_context: zmq.Context | None = None
         self.ready: tuple[EngineReady, ...] = ()
         self._expected_node_by_engine: dict[int, str] = {}
 
@@ -387,14 +387,29 @@ class DeploymentManager:
                         "DecodeCoordinator READY barrier did not complete"
                     )
 
-            self.engine_clients = {
-                engine_id: RayEngineTransport(
+            self._frontend_context = zmq.Context(io_threads=1)
+            ready_by_engine = {
+                item.engine_id: item for item in self.ready
+            }
+            for engine_id, actor in self.engines.items():
+                engine_ready = ready_by_engine[engine_id]
+                frontend = ZmqFrontendClient(
+                    context=self._frontend_context,
+                    address=engine_ready.frontend_address,
+                    deployment_epoch=engine_ready.frontend_epoch,
+                    engine_id=engine_id,
+                    queue_capacity=(
+                        self.config.hierarchical_queue_capacity
+                    ),
+                    startup_timeout_s=self.config.startup_timeout_s,
+                    request_timeout_s=self.config.quantum_timeout_s,
+                )
+                self.engine_clients[engine_id] = ZmqEngineTransport(
                     engine_id=engine_id,
                     actor=actor,
                     timeout=self.config.quantum_timeout_s,
+                    frontend=frontend,
                 )
-                for engine_id, actor in self.engines.items()
-            }
 
     def notify_request(
         self, target_engine_id: int, observed_wave_id: int
@@ -415,34 +430,28 @@ class DeploymentManager:
     def poll_admission_batches(
         self, handles: Mapping[int, Any]
     ) -> dict[int, tuple[IngressAck, ...]]:
-        """Resolve all ready DP admission flights with one nonblocking wait."""
+        """Resolve ready DP admission flights without blocking."""
         if not handles:
             return {}
-        unknown = set(handles).difference(self.engines)
+        unknown = set(handles).difference(self.engine_clients)
         if unknown:
             raise ValueError(
                 f"admission handles contain unknown engines {sorted(unknown)}"
             )
         if len(handles) > len(self.engines):
             raise RuntimeError("more than one admission flight per engine")
-        ref_to_engine = {
-            handle: engine_id for engine_id, handle in handles.items()
-        }
-        with _without_proxy_env():
-            ready, _ = ray.wait(
-                list(ref_to_engine),
-                num_returns=len(ref_to_engine),
-                timeout=0,
-            )
-            if not ready:
-                return {}
-            results = ray.get(
-                ready, timeout=self.config.quantum_timeout_s
-            )
-        return {
-            ref_to_engine[ref]: tuple(acks)
-            for ref, acks in zip(ready, results, strict=True)
-        }
+        ready_batches: dict[int, tuple[IngressAck, ...]] = {}
+        for engine_id, handle in handles.items():
+            ready, acks = self.engine_clients[
+                engine_id
+            ].poll_admission_batch(handle)
+            if ready:
+                if acks is None:
+                    raise RuntimeError(
+                        f"engine {engine_id} returned no admission batch"
+                    )
+                ready_batches[engine_id] = acks
+        return ready_batches
 
     def poll_frontend_events(self) -> tuple[FrontendEventBatch, ...]:
         """Fetch health, load, and all lifecycle events in one RPC per DP."""
@@ -642,6 +651,12 @@ class DeploymentManager:
                         )
                     except BaseException:
                         pass
+                for client in self.engine_clients.values():
+                    client.close()
+                self.engine_clients.clear()
+                if self._frontend_context is not None:
+                    self._frontend_context.term()
+                    self._frontend_context = None
                 all_workers = [
                     worker
                     for workers in self.workers_by_engine.values()
@@ -678,6 +693,13 @@ class DeploymentManager:
                         remove_placement_group(pg)
                     except BaseException:
                         pass
+        if self.engine_clients:
+            for client in self.engine_clients.values():
+                client.close()
+            self.engine_clients.clear()
+        if self._frontend_context is not None:
+            self._frontend_context.term()
+            self._frontend_context = None
 
     def __del__(self) -> None:
         try:

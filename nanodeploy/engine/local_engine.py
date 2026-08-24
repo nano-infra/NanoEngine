@@ -29,6 +29,7 @@ from nanodeploy.engine.hierarchical_contract import (
     HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
 )
+from nanodeploy.engine.frontend_transport import ZmqFrontendServer
 from nanodeploy.engine.local_executor import LocalExecutor
 from nanodeploy.engine.local_scheduler import LocalScheduler
 from nanodeploy.engine.topology import EngineTopology
@@ -118,6 +119,7 @@ class LocalEngineCore:
         self._stop = False
         self._failure: str | None = None
         self._loop_thread: threading.Thread | None = None
+        self._frontend_server: ZmqFrontendServer | None = None
         self._worker_transport_ready = threading.Event()
         self._coordinator: Any | None = None
         self._control_group_initialized = False
@@ -235,12 +237,23 @@ class LocalEngineCore:
                 "did not become ready"
             )
         self._raise_if_failed()
+        self._frontend_server = ZmqFrontendServer(
+            engine_id=self.engine_id,
+            advertised_host=ray.util.get_node_ip_address(),
+            queue_capacity=self.config.hierarchical_queue_capacity,
+            add=self.submit_add,
+            enqueue_batch=self.enqueue_add_batch,
+            admit_batch=self.admit_add_batch,
+        )
+        self._frontend_server.start(self.config.startup_timeout_s)
         return EngineReady(
             engine_id=self.engine_id,
             global_ranks=self.topology.global_ranks,
             config_fingerprint=self.config.collective_fingerprint(),
             node_id=actor_node_id,
             worker_node_ids=worker_nodes,
+            frontend_address=self._frontend_server.address,
+            frontend_epoch=self._frontend_server.deployment_epoch,
         )
 
     def _raise_if_failed(self) -> None:
@@ -364,7 +377,7 @@ class LocalEngineCore:
         commands: tuple[AddCommand, ...],
         reservations: tuple[AdmissionReservation, ...] | None = None,
     ) -> tuple[IngressAck, ...]:
-        """Admit one frontend batch with one actor RPC and loop command."""
+        """Admit one frontend batch with one transport request."""
         self._raise_if_failed()
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
@@ -445,8 +458,8 @@ class LocalEngineCore:
     ) -> AbortResult:
         with self._ingress_lock:
             if allow_future_ingress:
-                # A concurrent Ray actor call may reach this method before the
-                # corresponding fast enqueue RPC. Keep a bounded cancellation
+                # A concurrent abort may reach this method before the
+                # corresponding fast enqueue. Keep a bounded cancellation
                 # tombstone so that enqueue and abort have an atomic outcome
                 # under the same lock regardless of actor-call ordering.
                 self._cancelled_ingress_ids.add(request_id)
@@ -567,6 +580,11 @@ class LocalEngineCore:
     def health(self) -> bool:
         self._raise_if_failed()
         self.executor.check_worker_liveness()
+        if self._frontend_server is None:
+            raise RuntimeError(
+                f"LocalEngineCore {self.engine_id} frontend is not ready"
+            )
+        self._frontend_server.raise_if_failed()
         if self._loop_thread is None or not self._loop_thread.is_alive():
             raise RuntimeError(
                 f"LocalEngineCore {self.engine_id} event loop is not alive"
@@ -1300,6 +1318,8 @@ class LocalEngineCore:
             )
 
     def shutdown(self) -> None:
+        if self._frontend_server is not None:
+            self._frontend_server.close(self.config.quantum_timeout_s)
         with self._state_cv:
             self._stop = True
             self._state_cv.notify_all()
