@@ -23,12 +23,12 @@
 
 ## Designed for large-model serving
 
-| Layer | Responsibility |
-| --- | --- |
-| Ray | Manages cluster GPU resources and places distributed workers. |
+| Layer                | Responsibility                                                                          |
+| -------------------- | --------------------------------------------------------------------------------------- |
+| Ray                  | Manages cluster GPU resources and places distributed workers.                           |
 | dlslime-ctrl + Redis | Provides node/service discovery, liveness, scope isolation, and control-plane metadata. |
-| DLEngine | Executes model prefill and decode, owns cache state, and transfers KV through DLSlime. |
-| dlengine-router | Exposes OpenAI and Anthropic APIs and orchestrates the prefill-to-decode request flow. |
+| DLEngine             | Executes model prefill and decode, owns cache state, and transfers KV through DLSlime.  |
+| dlengine-router      | Exposes OpenAI and Anthropic APIs and orchestrates the prefill-to-decode request flow.  |
 
 ## Core capabilities
 
@@ -36,6 +36,6 @@
 - Prefill/decode disaggregation with GPUDirect RDMA KV migration.
 - MLA, NSA/DSA, GDN, MTP, FP8 cache, HiSparse, chunked prefill, and prefix reuse.
 - Long-context inference for supported DeepSeek- and GLM-family checkpoints.
-- OpenAI, Anthropic, tool-calling, grammar-constrained, streaming, and Claude Code workflows.
+- OpenAI, Anthropic, tool-calling, grammar-constrained, streaming, Claude Code, and OpenCode workflows.
 
 See the [Feature Matrix](features.md) for implementation status. Pipeline parallelism is listed there as **Coming soon** until its production correctness and performance work is complete.
