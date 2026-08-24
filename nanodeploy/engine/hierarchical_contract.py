@@ -56,7 +56,7 @@ class RequestValidation:
 def validate_add_request(
     *,
     request_id: int,
-    prompt_token_ids: Iterable[int],
+    prompt_len: int,
     max_tokens: int,
     ignore_eos: bool,
     max_model_len: int,
@@ -64,36 +64,27 @@ def validate_add_request(
 ) -> RequestValidation:
     if not 0 <= request_id <= UINT64_MAX:
         raise ValueError("request_id must fit uint64")
-    prompt = tuple(prompt_token_ids)
-    if not prompt:
-        raise ValueError("prompt_token_ids must not be empty")
+    if prompt_len < 1:
+        raise ValueError("prompt_len must be positive")
     if max_tokens < 1:
         raise ValueError("max_tokens must be at least 1")
     if not ignore_eos:
         raise ValueError("hierarchical scheduler requires ignore_eos=True")
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
-    invalid_token = next(
-        (token_id for token_id in prompt if not 0 <= token_id < vocab_size),
-        None,
-    )
-    if invalid_token is not None:
-        raise ValueError(
-            f"prompt token id {invalid_token} is outside [0, {vocab_size})"
-        )
 
     padded_completion_len = round_up(max_tokens)
-    total_capacity_len = len(prompt) + 1 + padded_completion_len
+    total_capacity_len = prompt_len + 1 + padded_completion_len
     if total_capacity_len > max_model_len:
         raise ValueError(
             "request exceeds hierarchical padded model length: "
-            f"prompt={len(prompt)} + bootstrap=1 + "
+            f"prompt={prompt_len} + bootstrap=1 + "
             f"padded_completion={padded_completion_len} > "
             f"max_model_len={max_model_len}"
         )
     return RequestValidation(
-        original_prompt_len=len(prompt),
-        internal_prompt_len=len(prompt) + 1,
+        original_prompt_len=prompt_len,
+        internal_prompt_len=prompt_len + 1,
         padded_completion_len=padded_completion_len,
         total_capacity_len=total_capacity_len,
     )
@@ -102,11 +93,13 @@ def validate_add_request(
 @dataclass(frozen=True, slots=True)
 class AddCommand:
     request_id: int
-    prompt_token_ids: tuple[int, ...]
+    prompt_len: int
+    num_tokens: int
     max_tokens: int
     temperature: float
     ignore_eos: bool
     wave_id: int
+    sequence_payload: bytes = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

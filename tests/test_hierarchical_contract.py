@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-import nanodeploy.engine.local_scheduler as local_scheduler_module
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
@@ -58,6 +57,40 @@ def make_hierarchical_config(**overrides) -> Config:
     }
     values.update(overrides)
     return Config(**values)
+
+
+def make_add(
+    request_id: int,
+    prompt_token_ids,
+    *,
+    max_tokens: int = 17,
+    temperature: float = 0.1,
+    ignore_eos: bool = True,
+    wave_id: int = 1,
+) -> tuple[AddCommand, Sequence]:
+    token_ids = list(prompt_token_ids)
+    sequence = Sequence(
+        token_ids,
+        sampling_params=SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            ignore_eos=ignore_eos,
+        ),
+    )
+    sequence.seq_id = request_id
+    return (
+        AddCommand(
+            request_id=request_id,
+            prompt_len=sequence.num_prompt_tokens,
+            num_tokens=sequence.num_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            ignore_eos=ignore_eos,
+            wave_id=wave_id,
+            sequence_payload=b"unused-by-direct-scheduler-tests",
+        ),
+        sequence,
+    )
 
 
 def test_dp2_sp4_topology_has_two_disjoint_engines():
@@ -160,7 +193,7 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
 def test_add_validation_rounds_completion_and_excludes_bootstrap():
     validation = validate_add_request(
         request_id=7,
-        prompt_token_ids=[1, 2, 3],
+        prompt_len=3,
         max_tokens=17,
         ignore_eos=True,
         max_model_len=36,
@@ -174,34 +207,41 @@ def test_add_validation_rounds_completion_and_excludes_bootstrap():
     assert validation.total_capacity_len == 36
 
 
-def test_add_validation_rejects_bad_eos_token_and_padded_length():
+def test_add_validation_rejects_bad_eos_and_padded_length():
     with pytest.raises(ValueError, match="ignore_eos=True"):
         validate_add_request(
             request_id=1,
-            prompt_token_ids=[1],
+            prompt_len=1,
             max_tokens=1,
             ignore_eos=False,
-            max_model_len=64,
-            vocab_size=129280,
-        )
-    with pytest.raises(ValueError, match="outside"):
-        validate_add_request(
-            request_id=1,
-            prompt_token_ids=[129280],
-            max_tokens=1,
-            ignore_eos=True,
             max_model_len=64,
             vocab_size=129280,
         )
     with pytest.raises(ValueError, match="padded model length"):
         validate_add_request(
             request_id=1,
-            prompt_token_ids=[1, 2],
+            prompt_len=2,
             max_tokens=17,
             ignore_eos=True,
             max_model_len=34,
             vocab_size=129280,
         )
+
+
+def test_local_scheduler_validates_prompt_tokens_inside_cpp_sequence():
+    config = make_hierarchical_config()
+    local = LocalScheduler(
+        config, config.hierarchical_topology.engine(0)
+    )
+    command, sequence = make_add(
+        9, (1, config.hf_config.vocab_size)
+    )
+
+    result = local.add(command, sequence)
+
+    assert not result.accepted
+    assert "outside" in result.reason
+    assert local.cpp_scheduler.get_total_waiting_migration_size() == 0
 
 
 def test_control_dummies_are_deterministic_and_have_reserved_blocks():
@@ -273,21 +313,17 @@ def test_frontend_admission_mirror_matches_local_cpp_placements():
     )
     assert shadow is not None
 
-    commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=tuple(
-                (index % 100) + 1 for index in range(prompt_len)
-            ),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
+    command_sequences = tuple(
+        make_add(
+            request_id,
+            ((index % 100) + 1 for index in range(prompt_len)),
         )
         for request_id, prompt_len in enumerate(
             (1, 65, 129, 257), start=1
         )
     )
+    commands = tuple(item[0] for item in command_sequences)
+    sequences = tuple(item[1] for item in command_sequences)
     reservations = tuple(
         planner.plan(shadow, command) for command in commands
     )
@@ -300,6 +336,7 @@ def test_frontend_admission_mirror_matches_local_cpp_placements():
             for reservation in reservations
             if reservation is not None
         ),
+        sequences,
     )
     assert all(result.accepted for result in results)
     running_by_id = {
@@ -371,14 +408,7 @@ def test_legacy_frontend_batch_master_reservation_is_counted_once():
     assert shadow is not None
 
     commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1,),
-            max_tokens=1,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+        make_add(request_id, (1,), max_tokens=1)[0]
         for request_id in (1, 2)
     )
 
@@ -397,23 +427,18 @@ def test_planned_admission_mismatch_keeps_local_fifo_clean():
     local = LocalScheduler(
         config, config.hierarchical_topology.engine(0)
     )
-    commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1, 2),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+    command_sequences = tuple(
+        make_add(request_id, (1, 2))
         for request_id in (10, 11)
     )
+    commands = tuple(item[0] for item in command_sequences)
+    sequences = tuple(item[1] for item in command_sequences)
     reservations = (
         AdmissionReservation(10, 0, 0, (0, 0, 0, 0)),
         AdmissionReservation(11, 0, 1, (0, 2, 0, 0)),
     )
 
-    results = local.commit_planned_batch(commands, reservations)
+    results = local.commit_planned_batch(commands, reservations, sequences)
 
     assert tuple(result.reason for result in results) == (
         "admission_state_mismatch",
@@ -455,17 +480,12 @@ def test_planned_admission_scans_live_records_once_per_batch():
         local.load_snapshot(wave_id=1, quantum_id=0)
     )
     assert shadow is not None
-    seed_commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1, 2),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+    seed_command_sequences = tuple(
+        make_add(request_id, (1, 2))
         for request_id in range(100, 104)
     )
+    seed_commands = tuple(item[0] for item in seed_command_sequences)
+    seed_sequences = tuple(item[1] for item in seed_command_sequences)
     seed_reservations = tuple(
         planner.plan(shadow, command) for command in seed_commands
     )
@@ -479,20 +499,16 @@ def test_planned_admission_scans_live_records_once_per_batch():
             for reservation in seed_reservations
             if reservation is not None
         ),
+        seed_sequences,
     )
     assert all(result.accepted for result in seed_results)
 
-    commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1, 2),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+    command_sequences = tuple(
+        make_add(request_id, (1, 2))
         for request_id in range(104, 112)
     )
+    commands = tuple(item[0] for item in command_sequences)
+    sequences = tuple(item[1] for item in command_sequences)
     reservations = tuple(
         planner.plan(shadow, command) for command in commands
     )
@@ -507,6 +523,7 @@ def test_planned_admission_scans_live_records_once_per_batch():
             for reservation in reservations
             if reservation is not None
         ),
+        sequences,
     )
 
     assert all(result.accepted for result in results)
@@ -595,16 +612,8 @@ def make_worker_results(
 def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(1))
-    result = local.add(
-        AddCommand(
-            request_id=42,
-            prompt_token_ids=(10, 11, 12),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    )
+    command, submitted_sequence = make_add(42, (10, 11, 12))
+    result = local.add(command, submitted_sequence)
     assert result.accepted
     assert local.admit() == (42,)
 
@@ -691,16 +700,7 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert local.is_finished()
     assert 42 not in local._records
     assert local._terminal_states[42] is RequestState.FINISHED
-    duplicate = local.add(
-        AddCommand(
-            request_id=42,
-            prompt_token_ids=(10, 11, 12),
-            max_tokens=17,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    )
+    duplicate = local.add(command, submitted_sequence)
     assert not duplicate.accepted
     assert duplicate.reason == "duplicate request in state FINISHED"
     assert local.abort(42).status == "already_terminal"
@@ -718,68 +718,35 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 17
 
 
-def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add(
-    monkeypatch,
-):
+def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
     config = make_hierarchical_config(
         num_kvcache_blocks=3,
         reserved_blocks_per_req=0,
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
-    created_sequences = []
-    sequence_type = local_scheduler_module.Sequence
-
-    def create_sequence(*args, **kwargs):
-        created_sequences.append(args[0])
-        return sequence_type(*args, **kwargs)
-
-    monkeypatch.setattr(local_scheduler_module, "Sequence", create_sequence)
-
-    rejected = local.add(
-        AddCommand(
-            request_id=43,
-            prompt_token_ids=tuple(range(120)),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+    command, sequence = make_add(
+        43, range(120), max_tokens=16
     )
+    rejected = local.add(command, sequence)
 
     assert not rejected.accepted
     assert "exclusive LocalEngine SP placement" in rejected.reason
     assert local.cpp_scheduler.get_total_waiting_migration_size() == 0
     assert local.state_manager.num_running_seqs == 0
     assert local.admit() == ()
-    assert created_sequences == []
 
 
-def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime(monkeypatch):
+def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime():
     config = make_hierarchical_config(
         num_kvcache_blocks=3,
         reserved_blocks_per_req=0,
         segment_size=64,
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
-    created_sequences = []
-    sequence_type = local_scheduler_module.Sequence
-
-    def create_sequence(*args, **kwargs):
-        created_sequences.append(args[0])
-        return sequence_type(*args, **kwargs)
-
-    monkeypatch.setattr(local_scheduler_module, "Sequence", create_sequence)
-
-    accepted = local.add(
-        AddCommand(
-            request_id=44,
-            prompt_token_ids=tuple(range(120)),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
+    command, submitted_sequence = make_add(
+        44, range(120), max_tokens=16
     )
+    accepted = local.add(command, submitted_sequence)
 
     assert accepted.accepted
     assert local.admit() == (44,)
@@ -787,7 +754,7 @@ def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime(monkeypatch):
     assert local.state_manager.can_fit_lifetime(
         sequence, 1 + round_up(sequence.max_tokens)
     )
-    assert created_sequences == [list(range(120))]
+    assert sequence is submitted_sequence
 
 
 def test_local_scheduler_defers_admission_without_bootstrap_capacity():
@@ -803,16 +770,10 @@ def test_local_scheduler_defers_admission_without_bootstrap_capacity():
         (45, tuple(range(120))),
         (46, tuple(range(1000, 1064))),
     ):
-        assert local.add(
-            AddCommand(
-                request_id=request_id,
-                prompt_token_ids=prompt_tokens,
-                max_tokens=16,
-                temperature=0.1,
-                ignore_eos=True,
-                wave_id=1,
-            )
-        ).accepted
+        command, sequence = make_add(
+            request_id, prompt_tokens, max_tokens=16
+        )
+        assert local.add(command, sequence).accepted
 
     assert local.admit() == (45,)
     assert [
@@ -831,25 +792,13 @@ def test_local_scheduler_try_admit_rolls_back_transient_infeasibility():
         reserved_blocks_per_req=0,
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
-    first = AddCommand(
-        request_id=47,
-        prompt_token_ids=tuple(range(120)),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-        wave_id=1,
-    )
-    second = AddCommand(
-        request_id=48,
-        prompt_token_ids=tuple(range(1000, 1064)),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-        wave_id=1,
+    first, first_sequence = make_add(47, range(120), max_tokens=16)
+    second, second_sequence = make_add(
+        48, range(1000, 1064), max_tokens=16
     )
 
-    assert local.try_admit(first).accepted
-    deferred = local.try_admit(second)
+    assert local.try_admit(first, first_sequence).accepted
+    deferred = local.try_admit(second, second_sequence)
 
     assert not deferred.accepted
     assert deferred.reason == "admission_deferred"
@@ -863,16 +812,8 @@ def test_local_scheduler_try_admit_rolls_back_transient_infeasibility():
 def test_local_scheduler_inflight_abort_wins_before_commit():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
-    assert local.add(
-        AddCommand(
-            request_id=77,
-            prompt_token_ids=(10, 11),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    ).accepted
+    command, sequence = make_add(77, (10, 11), max_tokens=16)
+    assert local.add(command, sequence).accepted
     local.admit()
     batch = local.plan_decode(wave_id=1, quantum_id=0)
 
@@ -890,16 +831,8 @@ def test_local_scheduler_inflight_abort_wins_before_commit():
 def test_local_scheduler_waiting_abort_emits_terminal_immediately():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
-    assert local.add(
-        AddCommand(
-            request_id=78,
-            prompt_token_ids=(10, 11),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    ).accepted
+    command, sequence = make_add(78, (10, 11), max_tokens=16)
+    assert local.add(command, sequence).accepted
 
     assert local.abort(78).status == "aborted"
     events = local.drain_terminal_events()
@@ -922,16 +855,10 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     )
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
     for request_id in (101, 102):
-        assert local.add(
-            AddCommand(
-                request_id=request_id,
-                prompt_token_ids=tuple(range(60)),
-                max_tokens=16,
-                temperature=0.1,
-                ignore_eos=True,
-                wave_id=1,
-            )
-        ).accepted
+        command, sequence = make_add(
+            request_id, range(60), max_tokens=16
+        )
+        assert local.add(command, sequence).accepted
 
     assert local.admit() == (101, 102)
     assert local.state_manager.num_running_tokens == 122
@@ -963,16 +890,10 @@ def test_real_request_id_can_match_control_dummy_internal_id():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
     colliding_id = local.state_manager.dummy_seqs[0].seq_id
-    assert local.add(
-        AddCommand(
-            request_id=colliding_id,
-            prompt_token_ids=(10, 11),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    ).accepted
+    command, sequence = make_add(
+        colliding_id, (10, 11), max_tokens=16
+    )
+    assert local.add(command, sequence).accepted
     assert local.admit() == (colliding_id,)
 
     batch = local.plan_decode(wave_id=1, quantum_id=0)
@@ -990,16 +911,10 @@ def test_control_dummy_id_collision_does_not_remove_dummy_on_abort():
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
     collision_dummy = local.state_manager.dummy_seqs[1]
     colliding_id = collision_dummy.seq_id
-    assert local.add(
-        AddCommand(
-            request_id=colliding_id,
-            prompt_token_ids=(10, 11),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=1,
-        )
-    ).accepted
+    command, sequence = make_add(
+        colliding_id, (10, 11), max_tokens=16
+    )
+    assert local.add(command, sequence).accepted
     local.admit()
     batch = local.plan_decode(wave_id=1, quantum_id=0)
     assert any(

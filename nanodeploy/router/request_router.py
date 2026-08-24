@@ -359,14 +359,14 @@ class RequestRouter:
 
     def _estimate_request_blocks(
         self,
-        prompt_token_ids: tuple[int, ...],
+        prompt_len: int,
         max_tokens: int,
     ) -> int:
         if self._kvcache_block_size is None:
             return 0
         if max_tokens < 1:
             return 0
-        total_tokens = len(prompt_token_ids) + round_up(max_tokens)
+        total_tokens = prompt_len + round_up(max_tokens)
         return (
             total_tokens + self._kvcache_block_size - 1
         ) // self._kvcache_block_size
@@ -385,7 +385,7 @@ class RequestRouter:
             raise RuntimeError(
                 "KV-credit routing requires a positive block size"
             )
-        prompt_tokens = len(command.prompt_token_ids)
+        prompt_tokens = command.num_tokens
         prompt_blocks = (prompt_tokens + block_size - 1) // block_size
         participating_ranks = min(
             self._kv_attention_sp, max(1, prompt_tokens)
@@ -501,7 +501,7 @@ class RequestRouter:
             return None
         padded_completion = round_up(command.max_tokens)
         lifetime_blocks = (
-            len(command.prompt_token_ids)
+            command.prompt_len
             + 1
             + padded_completion
             + block_size
@@ -535,7 +535,7 @@ class RequestRouter:
     def _candidate_engine_ids(
         self,
         *,
-        prompt_token_ids: tuple[int, ...],
+        prompt_len: int,
         max_tokens: int,
     ) -> tuple[int, ...]:
         if self.router_policy in _GLOBAL_QUEUE_POLICIES:
@@ -563,7 +563,7 @@ class RequestRouter:
             # Startup remains available before the first complete load report.
             return candidates
         request_blocks = self._estimate_request_blocks(
-            prompt_token_ids, max_tokens
+            prompt_len, max_tokens
         )
         return tuple(
             sorted(
@@ -580,7 +580,7 @@ class RequestRouter:
         *,
         request_id: int,
         engine_id: int,
-        prompt_token_ids: tuple[int, ...],
+        prompt_len: int,
         max_tokens: int,
     ) -> None:
         if (
@@ -591,7 +591,7 @@ class RequestRouter:
         if request_id in self._cache_charges:
             raise RuntimeError(f"duplicate cache charge for {request_id}")
         request_blocks = self._estimate_request_blocks(
-            prompt_token_ids, max_tokens
+            prompt_len, max_tokens
         )
         self._estimated_free_blocks[engine_id] -= request_blocks
         self._cache_charges[request_id] = (engine_id, request_blocks)
@@ -669,10 +669,12 @@ class RequestRouter:
         self,
         *,
         request_id: int,
-        prompt_token_ids: tuple[int, ...],
+        prompt_len: int,
+        num_tokens: int,
         max_tokens: int,
         temperature: float,
         ignore_eos: bool,
+        sequence_payload: bytes,
     ) -> AddResult:
         if (
             request_id in self._owners
@@ -689,7 +691,7 @@ class RequestRouter:
             OwnerState.PENDING_INGRESS
         )
         engine_ids = self._candidate_engine_ids(
-            prompt_token_ids=prompt_token_ids,
+            prompt_len=prompt_len,
             max_tokens=max_tokens,
         )
         last_result: AddResult | None = None
@@ -697,11 +699,13 @@ class RequestRouter:
         for engine_id in engine_ids:
             command = AddCommand(
                 request_id=request_id,
-                prompt_token_ids=prompt_token_ids,
+                prompt_len=prompt_len,
+                num_tokens=num_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 ignore_eos=ignore_eos,
                 wave_id=self._wave_id,
+                sequence_payload=sequence_payload,
             )
             result = self._engines[engine_id].add(command)
             if result.request_id != request_id:
@@ -723,7 +727,7 @@ class RequestRouter:
                 self._charge_cache(
                     request_id=request_id,
                     engine_id=engine_id,
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_len=prompt_len,
                     max_tokens=max_tokens,
                 )
                 if self._wakeup is not None:
@@ -744,10 +748,12 @@ class RequestRouter:
         self,
         *,
         request_id: int,
-        prompt_token_ids: tuple[int, ...],
+        prompt_len: int,
+        num_tokens: int,
         max_tokens: int,
         temperature: float,
         ignore_eos: bool,
+        sequence_payload: bytes,
     ) -> int:
         """Queue a request without waiting for a LocalEngine result."""
         submitted_at = perf_counter()
@@ -768,11 +774,13 @@ class RequestRouter:
 
         command = AddCommand(
             request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
+            prompt_len=prompt_len,
+            num_tokens=num_tokens,
             max_tokens=max_tokens,
             temperature=temperature,
             ignore_eos=ignore_eos,
             wave_id=self._wave_id,
+            sequence_payload=sequence_payload,
         )
         if self.router_policy == "least_batch_v2":
             if reason := self._kv_static_capacity_reason(command):
@@ -826,7 +834,7 @@ class RequestRouter:
             return request_id
 
         candidates = self._candidate_engine_ids(
-            prompt_token_ids=prompt_token_ids,
+            prompt_len=prompt_len,
             max_tokens=max_tokens,
         )
         engine_id = candidates[0]
@@ -836,7 +844,7 @@ class RequestRouter:
         self._charge_cache(
             request_id=request_id,
             engine_id=engine_id,
-            prompt_token_ids=prompt_token_ids,
+            prompt_len=prompt_len,
             max_tokens=max_tokens,
         )
         try:
@@ -1549,7 +1557,7 @@ class RequestRouter:
                 self._charge_cache(
                     request_id=request_id,
                     engine_id=fallback_engine_id,
-                    prompt_token_ids=pending.command.prompt_token_ids,
+                    prompt_len=pending.command.prompt_len,
                     max_tokens=pending.command.max_tokens,
                 )
                 try:

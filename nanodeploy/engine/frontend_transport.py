@@ -10,6 +10,7 @@ from typing import Callable, TypeAlias
 import msgspec
 import zmq
 
+from nanodeploy._cpp import Sequence, deserialize_sequence_payload
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
@@ -18,7 +19,7 @@ from nanodeploy.engine.hierarchical_contract import (
 )
 
 
-FRONTEND_PROTOCOL_VERSION = 1
+FRONTEND_PROTOCOL_VERSION = 2
 MAX_FRONTEND_REQUEST_BYTES = 1 << 30
 MAX_FRONTEND_RESPONSE_BYTES = 16 << 20
 _MAX_FAILURE_MESSAGE_CHARS = 8 << 10
@@ -43,7 +44,8 @@ class RemoteFrontendError(FrontendTransportError):
 
 class _WireAddCommand(msgspec.Struct, array_like=True, frozen=True):
     request_id: int
-    prompt_token_ids: tuple[int, ...]
+    prompt_len: int
+    num_tokens: int
     max_tokens: int
     temperature: float
     ignore_eos: bool
@@ -218,7 +220,8 @@ class FrontendFlight:
 def _wire_command(command: AddCommand) -> _WireAddCommand:
     return _WireAddCommand(
         command.request_id,
-        command.prompt_token_ids,
+        command.prompt_len,
+        command.num_tokens,
         command.max_tokens,
         command.temperature,
         command.ignore_eos,
@@ -229,11 +232,13 @@ def _wire_command(command: AddCommand) -> _WireAddCommand:
 def _command_from_wire(command: _WireAddCommand) -> AddCommand:
     return AddCommand(
         request_id=command.request_id,
-        prompt_token_ids=command.prompt_token_ids,
+        prompt_len=command.prompt_len,
+        num_tokens=command.num_tokens,
         max_tokens=command.max_tokens,
         temperature=command.temperature,
         ignore_eos=command.ignore_eos,
         wave_id=command.wave_id,
+        sequence_payload=b"",
     )
 
 
@@ -427,14 +432,16 @@ class ZmqFrontendServer:
         engine_id: int,
         advertised_host: str,
         queue_capacity: int,
-        add: Callable[[AddCommand], AddResult],
+        add: Callable[[AddCommand, Sequence], AddResult],
         enqueue_batch: Callable[
-            [tuple[AddCommand, ...]], tuple[IngressAck, ...]
+            [tuple[AddCommand, ...], tuple[Sequence, ...]],
+            tuple[IngressAck, ...],
         ],
         admit_batch: Callable[
             [
                 tuple[AddCommand, ...],
                 tuple[AdmissionReservation, ...] | None,
+                tuple[Sequence, ...],
             ],
             tuple[IngressAck, ...],
         ],
@@ -530,13 +537,17 @@ class ZmqFrontendServer:
                 events = dict(poller.poll(_IDLE_POLL_MS))
                 if not events.get(socket, 0) & zmq.POLLIN:
                     continue
-                frames = socket.recv_multipart(flags=zmq.NOBLOCK)
-                if len(frames) != 2:
+                frames = socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+                if len(frames) < 2:
                     continue
-                identity, frame = frames
+                identity = bytes(frames[0])
                 if identity != expected_identity:
                     continue
-                response = self._handle(frame)
+                response = self._handle(
+                    bytes(frames[1]), tuple(frames[2:])
+                )
                 self._send(socket, identity, response)
         except BaseException as exc:
             self._error = exc
@@ -552,7 +563,9 @@ class ZmqFrontendServer:
             if context is not None:
                 context.term()
 
-    def _handle(self, frame: bytes) -> FrontendResponse:
+    def _handle(
+        self, frame: bytes, payload_frames: tuple[zmq.Frame, ...]
+    ) -> FrontendResponse:
         transport_id = -1
         try:
             request = decode_frontend_request(frame)
@@ -567,6 +580,10 @@ class ZmqFrontendServer:
                     "frontend transport id must be non-negative"
                 )
             if isinstance(request, FrontendPing):
+                if payload_frames:
+                    raise FrontendTransportProtocolError(
+                        "frontend ping must not contain Sequence payloads"
+                    )
                 return FrontendReady(
                     FRONTEND_PROTOCOL_VERSION,
                     self.deployment_epoch,
@@ -574,7 +591,10 @@ class ZmqFrontendServer:
                     request.transport_id,
                 )
             if isinstance(request, FrontendAddRequest):
-                result = self._add(_command_from_wire(request.command))
+                sequences = self._decode_sequences(payload_frames, 1)
+                result = self._add(
+                    _command_from_wire(request.command), sequences[0]
+                )
                 return FrontendAddResponse(
                     FRONTEND_PROTOCOL_VERSION,
                     self.deployment_epoch,
@@ -586,8 +606,11 @@ class ZmqFrontendServer:
                 _command_from_wire(command)
                 for command in request.commands
             )
+            sequences = self._decode_sequences(
+                payload_frames, len(commands)
+            )
             if isinstance(request, FrontendEnqueueRequest):
-                acks = self._enqueue_batch(commands)
+                acks = self._enqueue_batch(commands, sequences)
             else:
                 reservations = (
                     tuple(
@@ -597,7 +620,9 @@ class ZmqFrontendServer:
                     if request.reservations is not None
                     else None
                 )
-                acks = self._admit_batch(commands, reservations)
+                acks = self._admit_batch(
+                    commands, reservations, sequences
+                )
             return FrontendIngressResponse(
                 FRONTEND_PROTOCOL_VERSION,
                 self.deployment_epoch,
@@ -614,6 +639,25 @@ class ZmqFrontendServer:
                 type(exc).__name__[:256],
                 str(exc)[:_MAX_FAILURE_MESSAGE_CHARS],
             )
+
+    @staticmethod
+    def _decode_sequences(
+        payload_frames: tuple[zmq.Frame, ...], expected: int
+    ) -> tuple[Sequence, ...]:
+        if len(payload_frames) != expected:
+            raise FrontendTransportProtocolError(
+                "frontend Sequence payload count mismatch: "
+                f"expected={expected}, got={len(payload_frames)}"
+            )
+        sequences = []
+        for payload in payload_frames:
+            if len(payload) > MAX_FRONTEND_REQUEST_BYTES:
+                raise FrontendTransportProtocolError(
+                    "frontend Sequence payload exceeds "
+                    f"{MAX_FRONTEND_REQUEST_BYTES} bytes: {len(payload)}"
+                )
+            sequences.append(deserialize_sequence_payload(payload))
+        return tuple(sequences)
 
     def _send(
         self,
@@ -717,6 +761,7 @@ class ZmqFrontendClient:
                 transport_id,
                 _wire_command(command),
             ),
+            payloads=self._sequence_payloads((command,)),
         )
         response = self._wait(flight)
         if not isinstance(response, FrontendAddResponse):
@@ -738,6 +783,7 @@ class ZmqFrontendClient:
                 transport_id,
                 tuple(_wire_command(command) for command in commands),
             ),
+            payloads=self._sequence_payloads(commands),
         )
 
     def admit(
@@ -762,6 +808,7 @@ class ZmqFrontendClient:
                     else None
                 ),
             ),
+            payloads=self._sequence_payloads(commands),
         )
 
     def poll_ingress(
@@ -793,6 +840,8 @@ class ZmqFrontendClient:
         self,
         response_kind: str,
         build: Callable[[int], FrontendRequest],
+        *,
+        payloads: tuple[bytes, ...] = (),
     ) -> FrontendFlight:
         self._assert_owner_thread()
         if self._closed:
@@ -805,8 +854,10 @@ class ZmqFrontendClient:
         )
         message = build(transport_id)
         deadline = time.monotonic() + self.request_timeout_s
-        self._send_frame(
-            encode_frontend_request(message), deadline, "frontend request"
+        self._send_frames(
+            (encode_frontend_request(message), *payloads),
+            deadline,
+            "frontend request",
         )
         self._next_transport_id += 1
         self._pending[transport_id] = flight
@@ -922,12 +973,33 @@ class ZmqFrontendClient:
     def _send_frame(
         self, frame: bytes, deadline: float, operation: str
     ) -> None:
+        self._send_frames((frame,), deadline, operation)
+
+    def _send_frames(
+        self,
+        frames: tuple[bytes, ...],
+        deadline: float,
+        operation: str,
+    ) -> None:
         while True:
             try:
-                self._socket.send(frame, flags=zmq.NOBLOCK)
+                self._socket.send_multipart(
+                    frames, flags=zmq.NOBLOCK, copy=False
+                )
                 return
             except zmq.Again:
                 self._wait_writable(deadline, operation)
+
+    @staticmethod
+    def _sequence_payloads(
+        commands: tuple[AddCommand, ...]
+    ) -> tuple[bytes, ...]:
+        payloads = tuple(command.sequence_payload for command in commands)
+        if any(not payload for payload in payloads):
+            raise FrontendTransportProtocolError(
+                "frontend ADD is missing a Sequence payload"
+            )
+        return payloads
 
     def _wait_writable(self, deadline: float, operation: str) -> None:
         poller = zmq.Poller()

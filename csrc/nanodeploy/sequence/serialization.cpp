@@ -106,6 +106,29 @@ void serialize_block_context(uintptr_t      base,
     }
 }
 
+size_t serialized_block_context_size(const BlockContext& ctx, int target_sp_rank = -1)
+{
+    size_t size = sizeof(size_t) + ctx.engine_id_.size() + 4 * sizeof(int);
+
+    size_t loc_count = ctx.block_location.size();
+    if (target_sp_rank >= 0) {
+        loc_count = 0;
+        for (const auto& loc : ctx.block_location) {
+            loc_count += loc.first == target_sp_rank;
+        }
+    }
+    size += sizeof(size_t) + loc_count * sizeof(std::pair<int, int>);
+    size += sizeof(size_t) + ctx.num_dispatched_tokens.size() * sizeof(int);
+    size += sizeof(size_t);
+    for (size_t sp_idx = 0; sp_idx < ctx.sp_block_table.size(); ++sp_idx) {
+        const auto& inner = ctx.sp_block_table[sp_idx];
+        const size_t inner_size =
+            target_sp_rank >= 0 && static_cast<int>(sp_idx) != target_sp_rank ? 0 : inner.size();
+        size += sizeof(size_t) + inner_size * sizeof(int);
+    }
+    return size;
+}
+
 void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockContext& ctx)
 {
     size_t s_len = read_raw<size_t>(base, off, max);
@@ -137,6 +160,33 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
 }  // namespace
 
 // ==================== Public API ====================
+
+size_t serialized_sequences_size(const std::vector<std::shared_ptr<Sequence>>& seqs,
+                                 bool                                          is_prefill,
+                                 int                                           sp_rank,
+                                 int                                           sp_size)
+{
+    size_t size = sizeof(size_t);
+    const int target_sp_rank = !is_prefill && sp_rank >= 0 && sp_size > 0 ? sp_rank : -1;
+    for (const auto& seq_ptr : seqs) {
+        if (!seq_ptr) {
+            continue;
+        }
+        const auto& seq = *seq_ptr;
+        size += sizeof(seq.seq_id) + sizeof(seq.status) + sizeof(seq.temperature)
+                + sizeof(seq.max_tokens) + sizeof(seq.ignore_eos) + sizeof(seq.last_token)
+                + sizeof(seq.num_tokens) + sizeof(seq.num_prompt_tokens)
+                + sizeof(seq.num_bootstrap_tokens) + sizeof(seq.num_checkpointed_tokens)
+                + sizeof(seq.num_cached_tokens) + sizeof(size_t);
+        if (is_prefill) {
+            size += seq.token_ids.size() * sizeof(int);
+        }
+        for (const auto& ctx : seq.slots_) {
+            size += serialized_block_context_size(ctx, target_sp_rank);
+        }
+    }
+    return size;
+}
 
 size_t serialize_sequences(uintptr_t                                     data_ptr,
                            size_t                                        buffer_size,

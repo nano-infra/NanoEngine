@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utility>
 
 #include <pybind11/pybind11.h>
@@ -48,6 +49,32 @@ void bind_sequence(py::module_& m)
           py::arg("sp_size") = -1);
 
     m.def("deserialize", &deserialize_sequences, py::arg("data_ptr"), py::arg("data_len"));
+
+    m.def("serialize_sequence_payload", [](const std::shared_ptr<Sequence>& seq) {
+        const std::vector<std::shared_ptr<Sequence>> seqs{seq};
+        const size_t payload_size = serialized_sequences_size(seqs, true);
+        py::bytes payload = py::reinterpret_steal<py::bytes>(
+            PyBytes_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(payload_size)));
+        const auto data_ptr = reinterpret_cast<uintptr_t>(PyBytes_AS_STRING(payload.ptr()));
+        const size_t written = serialize_sequences(data_ptr, payload_size, seqs, true);
+        if (written != payload_size) {
+            throw std::runtime_error("serialized Sequence payload size mismatch");
+        }
+        return payload;
+    });
+
+    m.def("deserialize_sequence_payload", [](const py::buffer& payload) {
+        const py::buffer_info view = payload.request();
+        if (view.itemsize != 1 || view.ndim != 1 || view.strides[0] != 1) {
+            throw py::value_error("Sequence payload must be a contiguous byte buffer");
+        }
+        auto sequences = deserialize_sequences(reinterpret_cast<uintptr_t>(view.ptr),
+                                               static_cast<size_t>(view.size));
+        if (sequences.size() != 1) {
+            throw py::value_error("Sequence payload must contain exactly one Sequence");
+        }
+        return sequences.front();
+    });
 
     // Wrapper class for sp_block_table to provide defaultdict(list) behavior.
     py::class_<BlockContext::SpBlockTable>(m, "DefaultListDict")
@@ -203,6 +230,20 @@ void bind_sequence(py::module_& m)
         .def_property_readonly("prompt_token_ids", &Sequence::prompt_token_ids)
         .def_property_readonly("completion_token_ids", &Sequence::completion_token_ids)
         .def_property_readonly("num_cached_blocks", &Sequence::num_cached_blocks)
+        .def_property_readonly("materialized_token_count", [](const Sequence& sequence) {
+            return sequence.token_ids.size();
+        })
+        .def("first_invalid_prompt_token", [](const Sequence& sequence, int vocab_size) -> py::object {
+            const size_t prompt_size = std::min(static_cast<size_t>(std::max(sequence.num_prompt_tokens, 0)),
+                                                sequence.token_ids.size());
+            for (size_t index = 0; index < prompt_size; ++index) {
+                const int token_id = sequence.token_ids[index];
+                if (token_id < 0 || token_id >= vocab_size) {
+                    return py::int_(token_id);
+                }
+            }
+            return py::none();
+        }, py::arg("vocab_size"))
 
         .def("__len__", [](const Sequence& s) { return s.num_tokens; })
         .def("__getitem__",

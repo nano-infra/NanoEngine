@@ -11,7 +11,11 @@ import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from nanodeploy._cpp import BlockContextSlot, SequenceStatus
+from nanodeploy._cpp import (
+    BlockContextSlot,
+    SequenceStatus,
+    serialize_sequence_payload,
+)
 from nanodeploy.config import Config
 from nanodeploy.engine.deployment_manager import DeploymentManager
 from nanodeploy.engine.hierarchical_contract import (
@@ -272,10 +276,12 @@ class LLMEngine:
             request_ids.append(
                 self.router.submit_async(
                     request_id=seq.seq_id,
-                    prompt_token_ids=tuple(seq.prompt_token_ids),
+                    prompt_len=seq.num_prompt_tokens,
+                    num_tokens=seq.num_tokens,
                     max_tokens=seq.max_tokens,
                     temperature=seq.temperature,
                     ignore_eos=seq.ignore_eos,
+                    sequence_payload=serialize_sequence_payload(seq),
                 )
             )
         return tuple(request_ids)

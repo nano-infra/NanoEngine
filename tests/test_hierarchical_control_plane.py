@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch.distributed as dist
 
+from nanodeploy._cpp import Sequence
 from nanodeploy.engine.decode_coordinator import DecodeCoordinatorState
 from nanodeploy.engine.deployment_manager import DeploymentManager
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
@@ -144,8 +145,80 @@ class FakeEngine:
         )
 
 
-def route(router: RequestRouter, request_id: int) -> AddResult:
+def add_request(
+    router: RequestRouter,
+    *,
+    request_id: int,
+    prompt_token_ids,
+    max_tokens: int,
+    temperature: float,
+    ignore_eos: bool,
+) -> AddResult:
+    prompt = tuple(prompt_token_ids)
     return router.add(
+        request_id=request_id,
+        prompt_len=len(prompt),
+        num_tokens=len(prompt),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        ignore_eos=ignore_eos,
+        sequence_payload=b"opaque-test-payload",
+    )
+
+
+def submit_request(
+    router: RequestRouter,
+    *,
+    request_id: int,
+    prompt_token_ids,
+    max_tokens: int,
+    temperature: float,
+    ignore_eos: bool,
+    sequence_payload: bytes = b"opaque-test-payload",
+) -> int:
+    prompt = tuple(prompt_token_ids)
+    return router.submit_async(
+        request_id=request_id,
+        prompt_len=len(prompt),
+        num_tokens=len(prompt),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        ignore_eos=ignore_eos,
+        sequence_payload=sequence_payload,
+    )
+
+
+def local_add_pair(
+    request_id: int,
+    prompt_token_ids,
+    *,
+    max_tokens: int = 16,
+    temperature: float = 0.1,
+    ignore_eos: bool = True,
+    wave_id: int = 0,
+) -> tuple[AddCommand, Sequence]:
+    prompt = list(prompt_token_ids)
+    sequence = Sequence(
+        prompt, temperature, max_tokens, ignore_eos
+    )
+    sequence.seq_id = request_id
+    return (
+        AddCommand(
+            request_id=request_id,
+            prompt_len=len(prompt),
+            num_tokens=len(prompt),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            ignore_eos=ignore_eos,
+            wave_id=wave_id,
+            sequence_payload=b"opaque-test-payload",
+        ),
+        sequence,
+    )
+
+
+def route(router: RequestRouter, request_id: int) -> AddResult:
+    return add_request(router,
         request_id=request_id,
         prompt_token_ids=(1, 2),
         max_tokens=16,
@@ -447,7 +520,7 @@ def test_router_least_batch_drains_global_pending_with_tentative_counts():
     )
 
     for request_id in (1, 2, 3, 4):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(1, 2),
             max_tokens=16,
@@ -490,7 +563,7 @@ def test_router_least_batch_uses_live_running_plus_tentative_admissions():
     )
 
     for request_id in (1, 2, 3):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(1, 2),
             max_tokens=16,
@@ -532,7 +605,7 @@ def test_router_polls_at_most_one_admission_batch_per_dp():
         (load_snapshot(0, 100), load_snapshot(1, 100))
     )
     for request_id in range(5):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(1, 2),
             max_tokens=16,
@@ -566,14 +639,14 @@ def test_router_capacity_planner_does_not_rpc_past_unfit_fifo_head():
     router.record_loads(
         (load_snapshot(0, 4), load_snapshot(1, 4))
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=tuple(range(16)),
         max_tokens=16,
         temperature=0.1,
         ignore_eos=True,
     )
-    router.submit_async(
+    submit_request(router,
         request_id=2,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -615,7 +688,7 @@ def test_router_capacity_planner_reserves_each_planned_batch_request():
     # shadow's master count, so four free blocks fit both requests exactly.
     router.record_loads((load_snapshot(0, 4),))
     for request_id in (1, 2):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -661,7 +734,7 @@ def test_router_capacity_planner_honors_dp_aggregated_receiver_limits():
             ),
         )
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=tuple(range(65)),
         max_tokens=16,
@@ -703,7 +776,7 @@ def test_router_least_batch_v2_keeps_global_fifo_and_uses_only_kv_credit():
             ),
         )
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=tuple(range(65)),
         max_tokens=16,
@@ -744,7 +817,7 @@ def test_router_least_batch_v2_filters_by_kv_then_uses_projected_load():
             load_snapshot(2, 1),
         )
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -780,7 +853,7 @@ def test_router_least_batch_v2_precharges_projected_waiting():
         (load_snapshot(0, 100), load_snapshot(1, 10))
     )
     for request_id in range(1, 5):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -811,7 +884,7 @@ def test_router_least_batch_v2_ack_does_not_release_compute_window():
     )
     router.record_loads((load_snapshot(0, 100),))
     for request_id in (1, 2):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -857,7 +930,7 @@ def test_router_least_batch_v2_rejects_duplicate_in_global_flight_and_terminal()
     router.record_loads((load_snapshot(0, 10),))
 
     def submit() -> None:
-        router.submit_async(
+        submit_request(router,
             request_id=1,
             prompt_token_ids=(1,),
             max_tokens=16,
@@ -899,14 +972,14 @@ def test_router_least_batch_v2_does_not_bypass_unfit_fifo_head():
     router.record_loads(
         (load_snapshot(0, 4), load_snapshot(1, 4))
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=tuple(range(20)),
         max_tokens=16,
         temperature=0.1,
         ignore_eos=True,
     )
-    router.submit_async(
+    submit_request(router,
         request_id=2,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -935,7 +1008,7 @@ def test_router_least_batch_v2_refills_fast_flight_without_new_snapshot():
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
     for request_id in range(1, 6):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -975,7 +1048,7 @@ def test_router_least_batch_v2_queue_full_waits_for_fresh_load_generation():
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 10),))
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -1020,7 +1093,7 @@ def test_router_least_batch_v2_queue_full_does_not_block_healthy_dp():
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
     for request_id in (1, 2, 3):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -1059,7 +1132,7 @@ def test_router_least_batch_v2_preserves_fifo_when_dp_batches_partially_fill():
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
     for request_id in range(1, 5):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -1070,7 +1143,7 @@ def test_router_least_batch_v2_preserves_fifo_when_dp_batches_partially_fill():
     assert router.poll_ingress_acks() == ()
     assert [command.request_id for command in engines[0].commands] == [1, 3]
     assert [command.request_id for command in engines[1].commands] == [2, 4]
-    router.submit_async(
+    submit_request(router,
         request_id=5,
         prompt_token_ids=(5,),
         max_tokens=16,
@@ -1108,7 +1181,7 @@ def test_router_least_batch_v2_merges_retries_from_separate_dp_polls_in_fifo():
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
     for request_id in range(1, 5):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -1142,7 +1215,7 @@ def test_router_least_batch_v2_cached_load_does_not_restore_kv_credit():
     snapshot = load_snapshot(0, 6)
     router.record_loads((snapshot,))
     for request_id in range(1, 5):
-        router.submit_async(
+        submit_request(router,
             request_id=request_id,
             prompt_token_ids=(request_id,),
             max_tokens=16,
@@ -1205,7 +1278,7 @@ def test_router_least_batch_v2_rejects_request_larger_than_empty_kv_capacity():
     )
     router.record_loads((load_snapshot(0, 250),))
 
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1,),
         max_tokens=2_000,
@@ -1382,7 +1455,7 @@ def test_router_buffers_terminal_until_async_owner_commit():
     router.record_loads(
         (load_snapshot(0, 100), load_snapshot(1, 100))
     )
-    router.submit_async(
+    submit_request(router,
         request_id=5,
         prompt_token_ids=(1, 2),
         max_tokens=16,
@@ -1429,7 +1502,7 @@ def test_router_least_batch_v2_buffers_lifecycle_before_fast_receipt():
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 10),))
-    router.submit_async(
+    submit_request(router,
         request_id=6,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -1482,7 +1555,7 @@ def test_router_resyncs_after_unexpected_local_admission_mismatch(
     router.record_loads(
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
-    router.submit_async(
+    submit_request(router,
         request_id=9,
         prompt_token_ids=(1, 2),
         max_tokens=16,
@@ -1567,7 +1640,7 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
     # prompt=2, padded completion=32, so each request is charged
     # ceil((2 + 32) / 4) = 9 blocks. After request 1, engine 0 has an
     # optimistic 11 blocks and request 2 therefore goes to engine 1.
-    first = router.add(
+    first = add_request(router,
         request_id=1,
         prompt_token_ids=(1, 2),
         max_tokens=17,
@@ -1577,7 +1650,7 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
     router.record_loads(
         (load_snapshot(0, 20), load_snapshot(1, 12))
     )
-    second = router.add(
+    second = add_request(router,
         request_id=2,
         prompt_token_ids=(1, 2),
         max_tokens=17,
@@ -1592,7 +1665,7 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
     router.record_loads(
         (load_snapshot(0, 30), load_snapshot(1, 10))
     )
-    third = router.add(
+    third = add_request(router,
         request_id=3,
         prompt_token_ids=(1, 2),
         max_tokens=17,
@@ -1616,7 +1689,7 @@ def test_router_least_cache_refunds_queue_full_before_fallback():
         (load_snapshot(0, 20), load_snapshot(1, 12))
     )
 
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1, 2),
         max_tokens=17,
@@ -1629,7 +1702,7 @@ def test_router_least_cache_refunds_queue_full_before_fallback():
 
     # The failed engine-0 estimate was refunded while engine 1 carries the
     # fallback charge, so the next request selects engine 0.
-    router.submit_async(
+    submit_request(router,
         request_id=2,
         prompt_token_ids=(1, 2),
         max_tokens=17,
@@ -1653,12 +1726,14 @@ def test_router_async_ingress_fallback_and_add_state_transition():
         (load_snapshot(0, 100), load_snapshot(1, 100))
     )
 
-    router.submit_async(
+    payload = bytes(bytearray(b"one-serialized-Sequence"))
+    submit_request(router,
         request_id=40,
         prompt_token_ids=(1, 2),
         max_tokens=16,
         temperature=0.1,
         ignore_eos=True,
+        sequence_payload=payload,
     )
     assert router.pending_ingress_count == 1
     assert router.owner(40).state == OwnerState.PENDING_GLOBAL
@@ -1668,6 +1743,8 @@ def test_router_async_ingress_fallback_and_add_state_transition():
     engines[0].handles[0]["ready"] = True
     assert router.poll_ingress_acks() == ()
     assert router.owner(40).engine_id == 1
+    assert engines[0].commands[0].sequence_payload is payload
+    assert engines[1].commands[0].sequence_payload is payload
 
     engines[1].handles[0]["ready"] = True
     ack = router.poll_ingress_acks()
@@ -1708,7 +1785,7 @@ def test_router_buffers_add_result_observed_before_ingress_ack():
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 100),))
-    router.submit_async(
+    submit_request(router,
         request_id=41,
         prompt_token_ids=(1, 2),
         max_tokens=16,
@@ -1746,7 +1823,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
         def __init__(self):
             self.commands = []
 
-        def add(self, command):
+        def add(self, command, sequence):
             self.commands.append(command)
             return AddResult(command.request_id, True, engine_id=0)
 
@@ -1782,21 +1859,16 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._ingress_queue_delay_ms_total = 0.0
     engine._scheduler_add_ms_total = 0.0
 
-    commands = [
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1, 2),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=0,
-        )
+    command_sequences = [
+        local_add_pair(request_id, (1, 2))
         for request_id in (50, 51, 52)
     ]
-    assert engine.enqueue_add(commands[0]).enqueued
-    assert engine.enqueue_add(commands[1]).enqueued
-    assert not engine.enqueue_add(commands[0]).enqueued
-    full = engine.enqueue_add(commands[2])
+    commands = [item[0] for item in command_sequences]
+    sequences = [item[1] for item in command_sequences]
+    assert engine.enqueue_add(commands[0], sequences[0]).enqueued
+    assert engine.enqueue_add(commands[1], sequences[1]).enqueued
+    assert not engine.enqueue_add(commands[0], sequences[0]).enqueued
+    full = engine.enqueue_add(commands[2], sequences[2])
     assert not full.enqueued and full.reason == "queue_full"
     assert engine.scheduler.commands == []
 
@@ -1811,7 +1883,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._publish_events((FinishEvent(50, 16, "FINISHED", 0),))
     assert engine._reserved_slots == 1
     assert engine._capacity_epoch == 1
-    assert engine.enqueue_add(commands[2]).enqueued
+    assert engine.enqueue_add(commands[2], sequences[2]).enqueued
     assert engine.submit_abort(52).status == "abort_pending"
     engine._drain_ingress()
     assert engine.drain_add_results()[0].accepted
@@ -1848,19 +1920,14 @@ def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
     engine._wave_id = 7
     first_request = RemoteRecorder()
     engine._coordinator = SimpleNamespace(first_request=first_request)
-    commands = tuple(
-        AddCommand(
-            request_id=request_id,
-            prompt_token_ids=(1,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-            wave_id=7,
-        )
+    command_sequences = tuple(
+        local_add_pair(request_id, (1,), wave_id=7)
         for request_id in (1, 2, 3)
     )
+    commands = tuple(item[0] for item in command_sequences)
+    sequences = tuple(item[1] for item in command_sequences)
 
-    acks = engine.enqueue_add_batch(commands)
+    acks = engine.enqueue_add_batch(commands, sequences)
 
     assert [ack.request_id for ack in acks] == [1, 2, 3]
     assert all(ack.enqueued for ack in acks)
@@ -1891,17 +1958,10 @@ def test_local_engine_future_ingress_abort_tombstone_wins_enqueue_race():
     engine._submit = lambda *_args, **_kwargs: AbortResult(
         request_id=77, status="not_found"
     )
-    command = AddCommand(
-        request_id=77,
-        prompt_token_ids=(1,),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-        wave_id=0,
-    )
+    command, sequence = local_add_pair(77, (1,))
 
     abort = engine.submit_abort(77, allow_future_ingress=True)
-    ack = engine.enqueue_add_batch((command,))[0]
+    ack = engine.enqueue_add_batch((command,), (sequence,))[0]
 
     assert abort.status == "abort_pending"
     assert not ack.enqueued and ack.reason == "aborted"
@@ -1935,7 +1995,7 @@ def test_router_least_batch_v2_reconciles_abort_after_fast_receipt():
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 10),))
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -1984,7 +2044,7 @@ def test_router_least_batch_v2_does_not_retry_aborted_queue_full_receipt():
     router.record_loads(
         (load_snapshot(0, 10), load_snapshot(1, 9))
     )
-    router.submit_async(
+    submit_request(router,
         request_id=1,
         prompt_token_ids=(1,),
         max_tokens=16,
@@ -2010,7 +2070,9 @@ def test_local_engine_commits_lb_plans_and_reports_state_mismatch():
         def __init__(self):
             self.batches = []
 
-        def commit_planned_batch(self, commands, reservations):
+        def commit_planned_batch(
+            self, commands, reservations, sequences
+        ):
             self.batches.append(
                 tuple(
                     (
@@ -2061,17 +2123,12 @@ def test_local_engine_commits_lb_plans_and_reports_state_mismatch():
     engine._quantum_id = 0
 
     def loop_command(request_id):
+        command, sequence = local_add_pair(request_id, (1, 2))
         return SimpleNamespace(
             kind="admit",
             payload=_PlannedAdmission(
-                AddCommand(
-                    request_id=request_id,
-                    prompt_token_ids=(1, 2),
-                    max_tokens=16,
-                    temperature=0.1,
-                    ignore_eos=True,
-                    wave_id=0,
-                ),
+                command,
+                sequence,
                 AdmissionReservation(
                     request_id=request_id,
                     engine_id=0,

@@ -10,6 +10,11 @@
 
 namespace nanodeploy {
 
+size_t serialized_sequences_size(const std::vector<std::shared_ptr<Sequence>>& seqs,
+                                 bool                                          is_prefill,
+                                 int                                           sp_rank = -1,
+                                 int                                           sp_size = -1);
+
 /**
  * @brief 序列化一组 Sequence
  * @param data_ptr 目标缓冲区的起始物理/虚拟地址

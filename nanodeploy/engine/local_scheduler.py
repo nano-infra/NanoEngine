@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from math import ceil
 from time import perf_counter
 
-from nanodeploy._cpp import BlockContextSlot
+from nanodeploy._cpp import BlockContextSlot, Sequence
 from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
@@ -24,7 +24,6 @@ from nanodeploy.engine.hierarchical_contract import (
     validate_add_request,
 )
 from nanodeploy.engine.scheduler import Scheduler
-from nanodeploy.engine.sequence import Sequence
 from nanodeploy.engine.sequence import SequenceStatus
 from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.router.admission_planner import (
@@ -32,7 +31,6 @@ from nanodeploy.router.admission_planner import (
     AdmissionPlannerConfig,
     AdmissionShadow,
 )
-from nanodeploy.sampling_params import SamplingParams
 
 
 @dataclass(slots=True)
@@ -214,7 +212,7 @@ class LocalScheduler:
                 "LocalEngine SP placement"
             )
 
-    def add(self, command: AddCommand) -> AddResult:
+    def add(self, command: AddCommand, sequence: Sequence) -> AddResult:
         existing = self._records.get(command.request_id)
         if existing is not None:
             return AddResult(
@@ -252,12 +250,34 @@ class LocalScheduler:
         try:
             validation = validate_add_request(
                 request_id=command.request_id,
-                prompt_token_ids=command.prompt_token_ids,
+                prompt_len=command.prompt_len,
                 max_tokens=command.max_tokens,
                 ignore_eos=command.ignore_eos,
                 max_model_len=self.config.max_model_len,
                 vocab_size=self.config.hf_config.vocab_size,
             )
+            if sequence.seq_id != command.request_id:
+                raise ValueError("Sequence request_id does not match ADD metadata")
+            if sequence.num_prompt_tokens != command.prompt_len:
+                raise ValueError("Sequence prompt length does not match ADD metadata")
+            if sequence.num_tokens != command.num_tokens:
+                raise ValueError("Sequence token count does not match ADD metadata")
+            if sequence.materialized_token_count != command.num_tokens:
+                raise ValueError("Sequence payload does not contain all token ids")
+            if sequence.max_tokens != command.max_tokens:
+                raise ValueError("Sequence max_tokens does not match ADD metadata")
+            if sequence.temperature != command.temperature:
+                raise ValueError("Sequence temperature does not match ADD metadata")
+            if sequence.ignore_eos != command.ignore_eos:
+                raise ValueError("Sequence ignore_eos does not match ADD metadata")
+            invalid_token = sequence.first_invalid_prompt_token(
+                self.config.hf_config.vocab_size
+            )
+            if invalid_token is not None:
+                raise ValueError(
+                    f"prompt token id {invalid_token} is outside "
+                    f"[0, {self.config.hf_config.vocab_size})"
+                )
             self._validate_exclusive_capacity(command)
         except ValueError as exc:
             return AddResult(
@@ -267,15 +287,6 @@ class LocalScheduler:
                 reason=str(exc),
             )
 
-        sequence = Sequence(
-            list(command.prompt_token_ids),
-            sampling_params=SamplingParams(
-                temperature=command.temperature,
-                max_tokens=command.max_tokens,
-                ignore_eos=command.ignore_eos,
-            ),
-        )
-        sequence.seq_id = command.request_id
         self._scheduler.add(sequence)
         self._records[command.request_id] = LocalRequestRecord(
             sequence=sequence,
@@ -308,7 +319,9 @@ class LocalScheduler:
         self._records.pop(request_id)
 
     def try_admit_batch(
-        self, commands: tuple[AddCommand, ...]
+        self,
+        commands: tuple[AddCommand, ...],
+        sequences: tuple[Sequence, ...],
     ) -> tuple[AddResult, ...]:
         """Compatibility path that plans a candidate batch locally.
 
@@ -317,10 +330,15 @@ class LocalScheduler:
         `commit_planned_batch()` so LocalEngine does not revise the LB's
         placement decision.
         """
+        if len(commands) != len(sequences):
+            raise ValueError("admission command/Sequence count mismatch")
         if not commands:
             return ()
 
-        results = [self.add(command) for command in commands]
+        results = [
+            self.add(command, sequence)
+            for command, sequence in zip(commands, sequences, strict=True)
+        ]
         candidate_ids = {
             command.request_id
             for command, result in zip(commands, results, strict=True)
@@ -344,8 +362,10 @@ class LocalScheduler:
             )
         return tuple(results)
 
-    def try_admit(self, command: AddCommand) -> AddResult:
-        return self.try_admit_batch((command,))[0]
+    def try_admit(
+        self, command: AddCommand, sequence: Sequence
+    ) -> AddResult:
+        return self.try_admit_batch((command,), (sequence,))[0]
 
     def _planned_admission_fits(
         self,
@@ -429,14 +449,18 @@ class LocalScheduler:
         self,
         commands: tuple[AddCommand, ...],
         reservations: tuple[AdmissionReservation, ...],
+        sequences: tuple[Sequence, ...],
     ) -> tuple[AddResult, ...]:
         """Validate and commit LB-selected placements without replanning."""
-        if len(commands) != len(reservations):
+        if not len(commands) == len(reservations) == len(sequences):
             raise ValueError(
-                "planned admission command/reservation count mismatch"
+                "planned admission command/reservation/Sequence count mismatch"
             )
         active_load = self._active_load_state()
-        results = [self.add(command) for command in commands]
+        results = [
+            self.add(command, sequence)
+            for command, sequence in zip(commands, sequences, strict=True)
+        ]
         batch_master_counts = [0] * self.topology.attention_sp
         batch_receiver_counts = [0] * self.topology.attention_sp
         batch_tokens = [0] * self.topology.attention_sp

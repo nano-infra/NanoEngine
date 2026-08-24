@@ -12,6 +12,7 @@ import ray
 import torch
 import torch.distributed as dist
 
+from nanodeploy._cpp import Sequence
 from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
@@ -48,12 +49,14 @@ class _LoopCommand:
 @dataclass(frozen=True, slots=True)
 class _IngressAdd:
     command: AddCommand
+    sequence: Sequence
     enqueued_at: float = field(default_factory=perf_counter)
 
 
 @dataclass(frozen=True, slots=True)
 class _PlannedAdmission:
     command: AddCommand
+    sequence: Sequence
     reservation: AdmissionReservation | None
 
 
@@ -282,15 +285,23 @@ class LocalEngineCore:
         self._raise_if_failed()
         return command.result
 
-    def submit_add(self, command: AddCommand) -> AddResult:
-        return self._submit(_LoopCommand("add", command))
+    def submit_add(
+        self, command: AddCommand, sequence: Sequence
+    ) -> AddResult:
+        return self._submit(
+            _LoopCommand("add", _IngressAdd(command, sequence))
+        )
 
-    def enqueue_add(self, command: AddCommand) -> IngressAck:
+    def enqueue_add(
+        self, command: AddCommand, sequence: Sequence
+    ) -> IngressAck:
         """Reserve capacity and enqueue without touching LocalScheduler."""
-        return self.enqueue_add_batch((command,))[0]
+        return self.enqueue_add_batch((command,), (sequence,))[0]
 
     def enqueue_add_batch(
-        self, commands: tuple[AddCommand, ...]
+        self,
+        commands: tuple[AddCommand, ...],
+        sequences: tuple[Sequence, ...],
     ) -> tuple[IngressAck, ...]:
         """Reserve and enqueue one ingress batch with a single wakeup.
 
@@ -299,12 +310,14 @@ class LocalEngineCore:
         is left exclusively to the event-loop thread at the next drain point.
         """
         self._raise_if_failed()
+        if len(commands) != len(sequences):
+            raise ValueError("ingress command/Sequence count mismatch")
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
         acks: list[IngressAck] = []
         enqueued_any = False
         with self._ingress_lock:
-            for command in commands:
+            for command, sequence in zip(commands, sequences, strict=True):
                 if command.request_id in self._cancelled_ingress_ids:
                     self._cancelled_ingress_ids.discard(command.request_id)
                     acks.append(
@@ -342,7 +355,7 @@ class LocalEngineCore:
                 self._reserved_request_ids.add(command.request_id)
                 self._ingress_pending_ids.add(command.request_id)
                 self._reserved_slots += 1
-                self._ingress_adds.put_nowait(_IngressAdd(command))
+                self._ingress_adds.put_nowait(_IngressAdd(command, sequence))
                 enqueued_any = True
                 acks.append(
                     IngressAck(
@@ -368,17 +381,22 @@ class LocalEngineCore:
                 self._state_cv.notify_all()
         return tuple(acks)
 
-    def admit_add(self, command: AddCommand) -> IngressAck:
+    def admit_add(
+        self, command: AddCommand, sequence: Sequence
+    ) -> IngressAck:
         """Run local SP admission in the scheduler's single-writer loop."""
-        return self.admit_add_batch((command,))[0]
+        return self.admit_add_batch((command,), None, (sequence,))[0]
 
     def admit_add_batch(
         self,
         commands: tuple[AddCommand, ...],
-        reservations: tuple[AdmissionReservation, ...] | None = None,
+        reservations: tuple[AdmissionReservation, ...] | None,
+        sequences: tuple[Sequence, ...],
     ) -> tuple[IngressAck, ...]:
         """Admit one frontend batch with one transport request."""
         self._raise_if_failed()
+        if len(commands) != len(sequences):
+            raise ValueError("admission command/Sequence count mismatch")
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
         if reservations is not None and len(reservations) != len(commands):
@@ -387,10 +405,13 @@ class LocalEngineCore:
             )
         immediate: list[IngressAck | None] = [None] * len(commands)
         active_commands: list[AddCommand] = []
+        active_sequences: list[Sequence] = []
         active_reservations: list[AdmissionReservation | None] = []
         active_indexes: list[int] = []
         with self._ingress_lock:
-            for index, command in enumerate(commands):
+            for index, (command, sequence) in enumerate(
+                zip(commands, sequences, strict=True)
+            ):
                 reservation = (
                     reservations[index]
                     if reservations is not None
@@ -421,6 +442,7 @@ class LocalEngineCore:
                     continue
                 self._admission_pending_ids.add(command.request_id)
                 active_commands.append(command)
+                active_sequences.append(sequence)
                 active_reservations.append(reservation)
                 active_indexes.append(index)
 
@@ -429,9 +451,10 @@ class LocalEngineCore:
                 _LoopCommand(
                     "admit_batch",
                     tuple(
-                        _PlannedAdmission(command, reservation)
-                        for command, reservation in zip(
+                        _PlannedAdmission(command, sequence, reservation)
+                        for command, sequence, reservation in zip(
                             active_commands,
+                            active_sequences,
                             active_reservations,
                             strict=True,
                         )
@@ -644,7 +667,10 @@ class LocalEngineCore:
         ) * 1000
         try:
             if command.kind == "add":
-                command.result = self.scheduler.add(command.payload)
+                ingress = command.payload
+                command.result = self.scheduler.add(
+                    ingress.command, ingress.sequence
+                )
                 if (
                     command.result.accepted
                     and self.config.attention_dp == 1
@@ -678,14 +704,12 @@ class LocalEngineCore:
         )
         self._command_count += len(commands)
         self._command_queue_delay_ms_total += sum(command_queue_ms)
-        planned_admissions = tuple(
-            command.payload
-            if isinstance(command.payload, _PlannedAdmission)
-            else _PlannedAdmission(command.payload, None)
-            for command in commands
-        )
+        planned_admissions = tuple(command.payload for command in commands)
         add_commands = tuple(
             planned.command for planned in planned_admissions
+        )
+        sequences = tuple(
+            planned.sequence for planned in planned_admissions
         )
         reservations = tuple(
             planned.reservation for planned in planned_admissions
@@ -714,6 +738,9 @@ class LocalEngineCore:
             active_reservations = tuple(
                 reservations[index] for index in active_indexes
             )
+            active_sequences = tuple(
+                sequences[index] for index in active_indexes
+            )
             if all(
                 reservation is not None
                 for reservation in active_reservations
@@ -726,6 +753,7 @@ class LocalEngineCore:
                             for reservation in active_reservations
                             if reservation is not None
                         ),
+                        active_sequences,
                     )
                 )
             elif all(
@@ -734,7 +762,7 @@ class LocalEngineCore:
             ):
                 active_results = tuple(
                     self.scheduler.try_admit_batch(
-                        active_add_commands
+                        active_add_commands, active_sequences
                     )
                 )
             else:
@@ -941,7 +969,7 @@ class LocalEngineCore:
                 continue
             add_begin = perf_counter()
             try:
-                result = self.scheduler.add(command)
+                result = self.scheduler.add(command, ingress.sequence)
             except BaseException as exc:
                 result = AddResult(
                     request_id=command.request_id,

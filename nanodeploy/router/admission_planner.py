@@ -197,7 +197,7 @@ class AdmissionPlanner:
         shadow: AdmissionShadow,
         command: AddCommand,
     ) -> AdmissionReservation | None:
-        prompt_tokens = len(command.prompt_token_ids)
+        prompt_tokens = command.num_tokens
         master = self._select_master(shadow)
         if shadow.master_counts[master] + 1 > self.config.max_num_seqs:
             return None
