@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Profile NanoDeploy's production-shaped Ray decode control RPC fanout.
+
+NanoDeploy's DLSlime data path still uses Ray to invoke ``ModelRunner.run`` on
+every worker and to return sampled token IDs.  This CPU-only benchmark creates
+real Ray actors with the same ``run`` call signature, sends the same empty
+``dp_seqs`` argument used when ``use_dlslime_rpc=True``, and returns
+``batch_size_per_gpu * loop_count`` token IDs per logical worker.
+
+The benchmark measures Ray actor submission and result round-trip overhead.  It
+does not launch ModelRunner, execute GPU kernels, or emulate DLSlime/RDMA
+traffic.  Logical workers are colocated in one isolated local Ray instance, so
+the results characterize Ray control-plane scaling rather than multi-node
+network bandwidth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import json
+import math
+import os
+import pickle
+import platform
+import socket
+import statistics
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
+import ray
+
+
+@ray.remote(num_cpus=0)
+class RayDecodeControlWorker:
+    """Minimal actor implementing the Ray-facing portion of ModelRunner.run."""
+
+    def __init__(self, logical_rank: int, loop_count: int) -> None:
+        self.logical_rank = logical_rank
+        self.loop_count = loop_count
+        self._token_rows: list[list[int]] = []
+
+    def configure_batch(self, batch_size_per_gpu: int) -> int:
+        self._token_rows = [
+            [
+                (self.logical_rank + row_index + step_index) % 32_000
+                for step_index in range(self.loop_count)
+            ]
+            for row_index in range(batch_size_per_gpu)
+        ]
+        return len(self._token_rows)
+
+    def ready(self) -> int:
+        return self.logical_rank
+
+    def run(
+        self,
+        dp_seqs: list[object],
+        is_prefill: bool,
+        enable_rpc: bool,
+        send_timestamp: float,
+    ) -> tuple[list[list[int]], float]:
+        if dp_seqs:
+            raise ValueError("DLSlime Ray control RPC must carry empty dp_seqs")
+        if is_prefill:
+            raise ValueError("this profiler measures the decode control path")
+        if not enable_rpc:
+            raise ValueError("DLSlime-backed execution must enable endpoint RPC")
+        if send_timestamp <= 0.0:
+            raise ValueError("send_timestamp must be populated")
+        return self._token_rows, time.time()
+
+
+@dataclass(frozen=True)
+class SampleStats:
+    mean_ms: float
+    stddev_ms: float
+    min_ms: float
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    max_ms: float
+
+
+def _parse_positive_ints(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected comma-separated integers, got {value!r}"
+        ) from exc
+    if not values or any(value <= 0 for value in values):
+        raise argparse.ArgumentTypeError("all values must be positive")
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("values must not contain duplicates")
+    return values
+
+
+def _percentile(samples: Sequence[float], percentile: float) -> float:
+    if not samples:
+        raise ValueError("cannot calculate a percentile of no samples")
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError("percentile must be in [0, 100]")
+    ordered = sorted(samples)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _stats(samples_ms: Sequence[float]) -> SampleStats:
+    if not samples_ms:
+        raise ValueError("at least one timing sample is required")
+    return SampleStats(
+        mean_ms=statistics.fmean(samples_ms),
+        stddev_ms=statistics.pstdev(samples_ms),
+        min_ms=min(samples_ms),
+        p50_ms=_percentile(samples_ms, 50.0),
+        p95_ms=_percentile(samples_ms, 95.0),
+        p99_ms=_percentile(samples_ms, 99.0),
+        max_ms=max(samples_ms),
+    )
+
+
+def _sample_token_rows(
+    logical_rank: int,
+    batch_size_per_gpu: int,
+    loop_count: int,
+) -> list[list[int]]:
+    return [
+        [
+            (logical_rank + row_index + step_index) % 32_000
+            for step_index in range(loop_count)
+        ]
+        for row_index in range(batch_size_per_gpu)
+    ]
+
+
+def _estimated_pickle_bytes(batch_size_per_gpu: int, loop_count: int) -> tuple[int, int]:
+    input_args = ([], False, True, 0.0)
+    output = (_sample_token_rows(0, batch_size_per_gpu, loop_count), 0.0)
+    return (
+        len(pickle.dumps(input_args, protocol=pickle.HIGHEST_PROTOCOL)),
+        len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)),
+    )
+
+
+def _invoke_once(
+    actors: Sequence[ray.actor.ActorHandle],
+) -> tuple[float, float, float, float, list[tuple[list[list[int]], float]]]:
+    send_timestamp = time.time()
+    begin_ns = time.perf_counter_ns()
+    refs = [
+        actor.run.remote([], False, True, send_timestamp)
+        for actor in actors
+    ]
+    submit_end_ns = time.perf_counter_ns()
+    results = ray.get(refs)
+    end_ns = time.perf_counter_ns()
+    receive_timestamp = time.time()
+
+    submit_ms = (submit_end_ns - begin_ns) / 1_000_000.0
+    ray_get_ms = (end_ns - submit_end_ns) / 1_000_000.0
+    roundtrip_ms = (end_ns - begin_ns) / 1_000_000.0
+    last_worker_finish = max(finished_at for _, finished_at in results)
+    finish_to_get_ms = max(0.0, (receive_timestamp - last_worker_finish) * 1000.0)
+    return submit_ms, ray_get_ms, roundtrip_ms, finish_to_get_ms, results
+
+
+def _validate_results(
+    results: Sequence[tuple[list[list[int]], float]],
+    *,
+    logical_workers: int,
+    batch_size_per_gpu: int,
+    loop_count: int,
+) -> None:
+    if len(results) != logical_workers:
+        raise RuntimeError(
+            f"received {len(results)} worker results, expected {logical_workers}"
+        )
+    for token_rows, finished_at in results:
+        if len(token_rows) != batch_size_per_gpu:
+            raise RuntimeError("worker returned the wrong number of token rows")
+        if any(len(row) != loop_count for row in token_rows):
+            raise RuntimeError("worker returned a token row with the wrong loop count")
+        if finished_at <= 0.0:
+            raise RuntimeError("worker omitted its completion timestamp")
+
+
+def _profile_case(
+    actors: Sequence[ray.actor.ActorHandle],
+    *,
+    logical_workers: int,
+    batch_size_per_gpu: int,
+    loop_count: int,
+    warmup_iterations: int,
+    measured_iterations: int,
+) -> dict[str, object]:
+    active_actors = actors[:logical_workers]
+    configured = ray.get(
+        [
+            actor.configure_batch.remote(batch_size_per_gpu)
+            for actor in active_actors
+        ]
+    )
+    if configured != [batch_size_per_gpu] * logical_workers:
+        raise RuntimeError("one or more Ray actors rejected the configured batch size")
+
+    for _ in range(warmup_iterations):
+        *_, warmup_results = _invoke_once(active_actors)
+        _validate_results(
+            warmup_results,
+            logical_workers=logical_workers,
+            batch_size_per_gpu=batch_size_per_gpu,
+            loop_count=loop_count,
+        )
+
+    submit_samples_ms: list[float] = []
+    ray_get_samples_ms: list[float] = []
+    roundtrip_samples_ms: list[float] = []
+    finish_to_get_samples_ms: list[float] = []
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(measured_iterations):
+            (
+                submit_ms,
+                ray_get_ms,
+                roundtrip_ms,
+                finish_to_get_ms,
+                results,
+            ) = _invoke_once(active_actors)
+            submit_samples_ms.append(submit_ms)
+            ray_get_samples_ms.append(ray_get_ms)
+            roundtrip_samples_ms.append(roundtrip_ms)
+            finish_to_get_samples_ms.append(finish_to_get_ms)
+            _validate_results(
+                results,
+                logical_workers=logical_workers,
+                batch_size_per_gpu=batch_size_per_gpu,
+                loop_count=loop_count,
+            )
+            del results
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    input_bytes_per_worker, output_bytes_per_worker = _estimated_pickle_bytes(
+        batch_size_per_gpu,
+        loop_count,
+    )
+    submit = _stats(submit_samples_ms)
+    ray_get_stats = _stats(ray_get_samples_ms)
+    roundtrip = _stats(roundtrip_samples_ms)
+    finish_to_get = _stats(finish_to_get_samples_ms)
+    record: dict[str, object] = {
+        "logical_workers": logical_workers,
+        "batch_size_per_gpu": batch_size_per_gpu,
+        "loop_count": loop_count,
+        "warmup_iterations": warmup_iterations,
+        "measured_iterations": measured_iterations,
+        "logical_output_token_ids": (
+            logical_workers * batch_size_per_gpu * loop_count
+        ),
+        "estimated_pickle_input_bytes_per_worker": input_bytes_per_worker,
+        "estimated_pickle_output_bytes_per_worker": output_bytes_per_worker,
+        "estimated_pickle_output_bytes_total": (
+            logical_workers * output_bytes_per_worker
+        ),
+    }
+    for prefix, values in (
+        ("actor_submit", submit),
+        ("ray_get", ray_get_stats),
+        ("roundtrip", roundtrip),
+        ("worker_finish_to_get", finish_to_get),
+    ):
+        for key, value in values.__dict__.items():
+            record[f"{prefix}_{key}"] = value
+    record["roundtrip_mean_ms_per_decode_step"] = roundtrip.mean_ms / loop_count
+    record["roundtrip_p99_ms_per_decode_step"] = roundtrip.p99_ms / loop_count
+    return record
+
+
+def _write_results(
+    output_dir: Path,
+    metadata: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "ray_rpc_overhead.json"
+    csv_path = output_dir / "ray_rpc_overhead.csv"
+    with json_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {"metadata": metadata, "records": records},
+            file,
+            indent=2,
+            sort_keys=True,
+        )
+        file.write("\n")
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(records[0]))
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--logical-workers",
+        type=_parse_positive_ints,
+        default=_parse_positive_ints("32,64,128,256"),
+        help="Comma-separated logical Ray worker counts.",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=_parse_positive_ints,
+        default=_parse_positive_ints("32,64,128"),
+        help="Comma-separated returned sequence counts per logical worker.",
+    )
+    parser.add_argument("--loop-count", type=int, default=16)
+    parser.add_argument("--warmup-iterations", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory for JSON/CSV results and the isolated Ray runtime.",
+    )
+    return parser
+
+
+def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.loop_count <= 0:
+        parser.error("--loop-count must be positive")
+    if args.warmup_iterations < 0:
+        parser.error("--warmup-iterations must be non-negative")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _validate_args(args, parser)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Ray places Unix-domain sockets below its runtime directory. Keeping this
+    # path short avoids Linux's 107-byte AF_UNIX pathname limit even when the
+    # requested result directory is descriptive and deeply nested.
+    ray_temp_dir = Path(tempfile.mkdtemp(prefix="nd-ray-", dir="/tmp"))
+
+    if ray.is_initialized():
+        raise RuntimeError("profiler requires a fresh isolated Ray instance")
+    ray_context = ray.init(
+        address="local",
+        include_dashboard=False,
+        num_cpus=min(os.cpu_count() or 1, max(args.logical_workers)),
+        _temp_dir=str(ray_temp_dir),
+        logging_level="ERROR",
+    )
+    records: list[dict[str, object]] = []
+    actors: list[ray.actor.ActorHandle] = []
+    try:
+        max_workers = max(args.logical_workers)
+        actors = [
+            RayDecodeControlWorker.remote(rank, args.loop_count)
+            for rank in range(max_workers)
+        ]
+        ready_ranks = ray.get([actor.ready.remote() for actor in actors])
+        if ready_ranks != list(range(max_workers)):
+            raise RuntimeError("Ray actors did not preserve logical rank ordering")
+
+        total_cases = len(args.batch_sizes) * len(args.logical_workers)
+        case_index = 0
+        for batch_size_per_gpu in args.batch_sizes:
+            for logical_workers in args.logical_workers:
+                case_index += 1
+                print(
+                    f"[{case_index}/{total_cases}] workers={logical_workers} "
+                    f"bs_per_gpu={batch_size_per_gpu} loop_count={args.loop_count}",
+                    flush=True,
+                )
+                record = _profile_case(
+                    actors,
+                    logical_workers=logical_workers,
+                    batch_size_per_gpu=batch_size_per_gpu,
+                    loop_count=args.loop_count,
+                    warmup_iterations=args.warmup_iterations,
+                    measured_iterations=args.iterations,
+                )
+                records.append(record)
+                print(
+                    f"  submit mean={record['actor_submit_mean_ms']:.3f} ms | "
+                    f"ray.get mean={record['ray_get_mean_ms']:.3f} ms | "
+                    f"roundtrip mean={record['roundtrip_mean_ms']:.3f} ms "
+                    f"p99={record['roundtrip_p99_ms']:.3f} ms",
+                    flush=True,
+                )
+    finally:
+        for actor in actors:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+        ray.shutdown()
+
+    metadata = {
+        "benchmark": "nanodeploy-ray-decode-control-rpc-scalability",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "ray_version": ray.__version__,
+        "ray_address": ray_context.address_info.get("gcs_address", "local"),
+        "ray_temp_dir": str(ray_temp_dir),
+        "cpu_count": os.cpu_count(),
+        "timed_scope": (
+            "Ray actor run.remote submission plus ray.get of production-shaped "
+            "decode token results"
+        ),
+        "excluded_scope": (
+            "scheduler, Sequence DLSlime/RDMA transfer, ModelRunner, GPU kernels, "
+            "actor creation, batch payload construction, and result validation"
+        ),
+        "topology_limit": (
+            "all logical workers are colocated in one isolated Ray instance; "
+            "this is not a multi-node bandwidth simulation"
+        ),
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+    }
+    _write_results(args.output_dir, metadata, records)
+    print(f"Wrote {args.output_dir / 'ray_rpc_overhead.json'}")
+    print(f"Wrote {args.output_dir / 'ray_rpc_overhead.csv'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
