@@ -635,6 +635,81 @@ def make_worker_results(
     ]
 
 
+def make_request_specific_worker_results(
+    batch: LocalDecodeBatch,
+) -> list[WorkerDecodeResult]:
+    return [
+        WorkerDecodeResult(
+            wave_id=batch.wave_id,
+            quantum_id=batch.quantum_id,
+            global_rank=global_rank,
+            forward_count=HIERARCHICAL_LOOP_COUNT,
+            mastered_request_ids=batch.expected_request_ids(global_rank),
+            sampled_token_ids=tuple(
+                tuple(
+                    request_id * 100 + offset
+                    for offset in range(HIERARCHICAL_LOOP_COUNT)
+                )
+                for request_id in batch.expected_request_ids(global_rank)
+            ),
+        )
+        for global_rank in reversed(tuple(batch.per_rank_sequences))
+    ]
+
+
+def test_local_scheduler_postprocess_preserves_frozen_positional_results():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    request_ids = tuple(range(200, 212))
+    for request_id in request_ids:
+        command, sequence = make_add(
+            request_id,
+            (request_id, request_id + 1),
+            max_tokens=HIERARCHICAL_LOOP_COUNT,
+        )
+        assert local.add(command, sequence).accepted
+    assert set(local.admit()) == set(request_ids)
+
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+    local.mark_first_forward_started(batch)
+    crowded_rank = next(
+        global_rank
+        for global_rank in batch.per_rank_sequences
+        if len(batch.expected_request_ids(global_rank)) >= 3
+    )
+    rank_request_ids = batch.expected_request_ids(crowded_rank)
+    aborted_id = rank_request_ids[len(rank_request_ids) // 2]
+    tracked_sequences = {
+        request_id: local._records[request_id].sequence
+        for request_id in request_ids
+    }
+    assert local.abort(aborted_id).status == "abort_pending"
+
+    events = local.postprocess(
+        batch,
+        make_request_specific_worker_results(batch),
+    )
+
+    assert {
+        (event.request_id, event.status) for event in events
+    } == {
+        *(
+            (request_id, "FINISHED")
+            for request_id in request_ids
+            if request_id != aborted_id
+        ),
+        (aborted_id, "ABORTED"),
+    }
+    assert tracked_sequences[aborted_id].completion_token_ids == []
+    for request_id in request_ids:
+        if request_id == aborted_id:
+            continue
+        assert tracked_sequences[request_id].completion_token_ids == [
+            request_id * 100 + offset
+            for offset in range(HIERARCHICAL_LOOP_COUNT)
+        ]
+
+
 def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(1))

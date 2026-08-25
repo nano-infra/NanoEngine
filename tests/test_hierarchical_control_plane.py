@@ -1913,6 +1913,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
                 [
                     list(range(16)),
                     [0] * 16,
+                    list(range(100, 116)),
                 ],
                 1.0,
             )
@@ -1923,7 +1924,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
                         "quantum_id": 0,
                         "global_rank": 0,
                         "forward_count": 16,
-                        "real_batch_size": 1,
+                        "real_batch_size": 2,
                         "control_dummy_count": 1,
                         "batch_kind": "real_or_mixed",
                         "forwards": tuple(
@@ -1966,7 +1967,10 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         engine_has_real = True
         real_sequence = FakeSequence(7)
         control_dummy = FakeSequence(-1)
-        per_rank_sequences = {0: [real_sequence, control_dummy]}
+        second_real_sequence = FakeSequence(9)
+        per_rank_sequences = {
+            0: [real_sequence, control_dummy, second_real_sequence]
+        }
 
         @staticmethod
         def is_control_dummy(sequence):
@@ -1974,7 +1978,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
 
         @staticmethod
         def expected_request_ids(_global_rank):
-            return (7,)
+            return (7, 9)
 
     monkeypatch.setattr(
         "nanodeploy.engine.local_executor.RPCServerEndpoint",
@@ -2028,8 +2032,11 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         "hierarchical_quantum_diagnostics": quantum_diagnostics,
     }
     assert len(results) == 1
-    assert results[0].mastered_request_ids == (7,)
-    assert results[0].sampled_token_ids == (tuple(range(16)),)
+    assert results[0].mastered_request_ids == (7, 9)
+    assert results[0].sampled_token_ids == (
+        tuple(range(16)),
+        tuple(range(100, 116)),
+    )
     assert executor.result_rebuild_sample_count == 1
     assert executor.result_rebuild_latency_ms_total >= 0
     boundary = executor.execution_boundary_metrics()
