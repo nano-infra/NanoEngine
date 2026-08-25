@@ -84,6 +84,12 @@ Sequence transfers are not interleaved between DLSLime cases. DLSLime endpoint
 setup is outside the timed interval, and configured warmup iterations run
 before each measured batch-size case.
 
+For DLSLime cases the JSON/CSV also reports `dlslime_serialize_*`,
+`dlslime_write_with_imm_*`, `dlslime_future_wait_*`, and
+`dlslime_unattributed_*`. The per-rank wait arrays record where the production
+rank-ordered `future.wait()` loop blocked; they are not independent per-link
+completion latencies because earlier waits can overlap later completions.
+
 Run it from the Ray head/driver with the DLSLime driver environment configured:
 
 ```bash

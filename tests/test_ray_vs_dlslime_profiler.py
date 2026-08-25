@@ -27,6 +27,27 @@ def test_parse_transports_rejects_invalid_or_duplicate_values() -> None:
         profiler._parse_transports("other")
 
 
+def test_encode_transport_imm_supports_legacy_and_slotted_endpoints(
+    monkeypatch,
+) -> None:
+    monkeypatch.delattr(
+        profiler.rpc_endpoint_module,
+        "_encode_imm",
+        raising=False,
+    )
+    assert profiler._encode_transport_imm(64, 0) == 64
+    with pytest.raises(RuntimeError, match="legacy RPC endpoint"):
+        profiler._encode_transport_imm(64, 1)
+
+    monkeypatch.setattr(
+        profiler.rpc_endpoint_module,
+        "_encode_imm",
+        lambda payload_bytes, slot: payload_bytes * 10 + slot,
+        raising=False,
+    )
+    assert profiler._encode_transport_imm(64, 1) == 641
+
+
 def test_plan_actor_node_ids_places_eight_workers_per_node() -> None:
     nodes = [
         {
@@ -77,8 +98,17 @@ class _FakeEndpoint:
     def __init__(self) -> None:
         self.calls = []
 
-    def send_seqs(self, sequences, is_prefill):
-        self.calls.append((sequences, is_prefill))
+    def send_seqs(self, sequences, is_prefill, *, profile_breakdown=False):
+        self.calls.append((sequences, is_prefill, profile_breakdown))
+        return {
+            "total_ms": 10.0,
+            "serialize_ms": 1.0,
+            "write_with_imm_ms": 2.0,
+            "future_wait_ms": 6.0,
+            "unattributed_ms": 1.0,
+            "future_wait_ms_by_rank": [4.0, 2.0],
+            "total_bytes": 128,
+        }
 
 
 @pytest.mark.parametrize("transport", ["ray", "dlslime"])
@@ -92,8 +122,19 @@ def test_invoke_once_uses_expected_input_path(monkeypatch, transport) -> None:
     batches = [[object()], [object()]]
     endpoint = _FakeEndpoint()
     monkeypatch.setattr(profiler.ray, "get", lambda refs: results)
+    monkeypatch.setattr(
+        profiler,
+        "_profiled_send_seqs",
+        lambda observed_endpoint, sequences, *, is_prefill: (
+            observed_endpoint.send_seqs(
+                sequences,
+                is_prefill,
+                profile_breakdown=True,
+            )
+        ),
+    )
 
-    *_, observed_results = profiler._invoke_once(
+    *_, observed_profile, observed_results = profiler._invoke_once(
         actors,
         batches,
         transport=transport,
@@ -105,10 +146,12 @@ def test_invoke_once_uses_expected_input_path(monkeypatch, transport) -> None:
         assert [call[0] for call in calls] == batches
         assert all(call[2] is False for call in calls)
         assert endpoint.calls == []
+        assert observed_profile["total_ms"] == 0.0
     else:
         assert [call[0] for call in calls] == [[], []]
         assert all(call[2] is True for call in calls)
-        assert endpoint.calls == [(batches, False)]
+        assert endpoint.calls == [(batches, False, True)]
+        assert observed_profile["future_wait_ms_by_rank"] == [4.0, 2.0]
 
 
 def test_invoke_once_rejects_dlslime_without_endpoint() -> None:

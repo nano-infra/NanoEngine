@@ -28,13 +28,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, TypedDict
 
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 import ray
 from nanodeploy._cpp import Sequence as NanoDeploySequence
 from nanodeploy._cpp import serialize
+from nanodeploy.endpoint import rpc_endpoint as rpc_endpoint_module
 from nanodeploy.endpoint.rpc_endpoint import (
     RPCClientEndpoint,
     RPCServerEndpoint,
@@ -48,6 +49,25 @@ REQUIRED_SLIME_ENV = (
     "SLIME_GID_INDEX",
     "SLIME_QP_NUM",
 )
+
+
+class DLSLimeSendProfile(TypedDict):
+    total_ms: float
+    serialize_ms: float
+    write_with_imm_ms: float
+    future_wait_ms: float
+    unattributed_ms: float
+    future_wait_ms_by_rank: list[float]
+    total_bytes: int
+
+
+def _encode_transport_imm(payload_bytes: int, transport_slot: int) -> int:
+    encode_imm = getattr(rpc_endpoint_module, "_encode_imm", None)
+    if encode_imm is None:
+        if transport_slot != 0:
+            raise RuntimeError("legacy RPC endpoint only supports transport slot 0")
+        return payload_bytes
+    return encode_imm(payload_bytes, transport_slot)
 
 
 @ray.remote(num_cpus=0, num_gpus=1)
@@ -255,6 +275,94 @@ def _plan_actor_node_ids(
     return assignments, metadata
 
 
+def _profiled_send_seqs(
+    endpoint: RPCServerEndpoint,
+    dp_seqs: Sequence[list[NanoDeploySequence]],
+    *,
+    is_prefill: bool,
+    transport_slot: int = 0,
+) -> DLSLimeSendProfile:
+    """Run the production send loop with phase-level timing enabled."""
+    start_ns = time.perf_counter_ns()
+    if len(dp_seqs) != endpoint.world_size:
+        raise ValueError("DLSLime sequence batch count does not match world size")
+
+    num_slots = getattr(endpoint, "num_slots", 1)
+    slot_size = getattr(endpoint, "slot_size", endpoint.buffer_size)
+    if not 0 <= transport_slot < num_slots:
+        raise ValueError(f"invalid RPC transport slot {transport_slot}")
+
+    futures: list[Any] = []
+    total_bytes = 0
+    serialize_ns = 0
+    write_with_imm_ns = 0
+    slot_offset = transport_slot * slot_size
+    for rank in range(endpoint.world_size):
+        binding = endpoint.server_bindings[rank]
+        buffer = binding.buffer
+        buffer_ptr = (
+            buffer.data_ptr() + buffer.storage_offset() + slot_offset
+        )
+        if not is_prefill and endpoint.optimize_decode_block_table:
+            sp_rank = (rank // endpoint.attention_tp) % endpoint.attention_sp
+            sp_size = endpoint.attention_sp
+        else:
+            sp_rank = -1
+            sp_size = -1
+
+        phase_start_ns = time.perf_counter_ns()
+        payload_bytes = serialize(
+            buffer_ptr,
+            slot_size,
+            dp_seqs[rank],
+            is_prefill,
+            sp_rank,
+            sp_size,
+        )
+        serialize_ns += time.perf_counter_ns() - phase_start_ns
+        total_bytes += payload_bytes
+
+        phase_start_ns = time.perf_counter_ns()
+        future = binding.endpoint.write_with_imm(
+            [
+                (
+                    buffer_ptr,
+                    binding.remote_buffer_ptr + slot_offset,
+                    0,
+                    0,
+                    payload_bytes,
+                )
+            ],
+            _encode_transport_imm(payload_bytes, transport_slot),
+        )
+        write_with_imm_ns += time.perf_counter_ns() - phase_start_ns
+        futures.append(future)
+
+    future_wait_ns_by_rank: list[int] = []
+    wait_phase_start_ns = time.perf_counter_ns()
+    for future in futures:
+        phase_start_ns = time.perf_counter_ns()
+        future.wait()
+        future_wait_ns_by_rank.append(
+            time.perf_counter_ns() - phase_start_ns
+        )
+    future_wait_ns = time.perf_counter_ns() - wait_phase_start_ns
+    total_ns = time.perf_counter_ns() - start_ns
+    attributed_ns = serialize_ns + write_with_imm_ns + future_wait_ns
+    return {
+        "total_ms": total_ns / 1_000_000,
+        "serialize_ms": serialize_ns / 1_000_000,
+        "write_with_imm_ms": write_with_imm_ns / 1_000_000,
+        "future_wait_ms": future_wait_ns / 1_000_000,
+        "unattributed_ms": max(0, total_ns - attributed_ns) / 1_000_000,
+        "future_wait_ms_by_rank": [
+            duration_ns / 1_000_000
+            for duration_ns in future_wait_ns_by_rank
+        ],
+        "total_bytes": total_bytes,
+    }
+
+
 def _invoke_once(
     actors: Sequence[Any],
     sequence_batches: Sequence[list[NanoDeploySequence]],
@@ -267,6 +375,7 @@ def _invoke_once(
     float,
     float,
     float,
+    DLSLimeSendProfile,
     list[tuple[list[list[int]], float]],
 ]:
     send_timestamp = time.time()
@@ -286,14 +395,30 @@ def _invoke_once(
     submit_end_ns = time.perf_counter_ns()
 
     send_seqs_ms = 0.0
+    send_profile: DLSLimeSendProfile = {
+        "total_ms": 0.0,
+        "serialize_ms": 0.0,
+        "write_with_imm_ms": 0.0,
+        "future_wait_ms": 0.0,
+        "unattributed_ms": 0.0,
+        "future_wait_ms_by_rank": [0.0] * len(actors),
+        "total_bytes": 0,
+    }
     if transport == "dlslime":
         if dlslime_endpoint is None:
             raise RuntimeError("DLSLime transport requires a connected endpoint")
         send_begin_ns = time.perf_counter_ns()
-        dlslime_endpoint.send_seqs(list(sequence_batches), is_prefill=False)
+        observed_profile = _profiled_send_seqs(
+            dlslime_endpoint,
+            list(sequence_batches),
+            is_prefill=False,
+        )
         send_seqs_ms = (
             time.perf_counter_ns() - send_begin_ns
         ) / 1_000_000.0
+        if len(observed_profile["future_wait_ms_by_rank"]) != len(actors):
+            raise RuntimeError("DLSLime endpoint returned the wrong rank count")
+        send_profile = observed_profile
 
     ray_get_begin_ns = time.perf_counter_ns()
     results = ray.get(refs)
@@ -314,6 +439,7 @@ def _invoke_once(
         ray_get_ms,
         roundtrip_ms,
         finish_to_get_ms,
+        send_profile,
         results,
     )
 
@@ -401,10 +527,19 @@ def _profile_transport(
     samples: dict[str, list[float]] = {
         "actor_submit": [],
         "dlslime_send_seqs": [],
+        "dlslime_endpoint_total": [],
+        "dlslime_serialize": [],
+        "dlslime_write_with_imm": [],
+        "dlslime_future_wait": [],
+        "dlslime_unattributed": [],
         "ray_get": [],
         "roundtrip": [],
         "worker_finish_to_get": [],
     }
+    future_wait_samples_by_rank: list[list[float]] = [
+        [] for _ in range(logical_workers)
+    ]
+    slowest_wait_rank_counts = [0] * logical_workers
     gc_was_enabled = gc.isenabled()
     gc.disable()
     try:
@@ -415,6 +550,7 @@ def _profile_transport(
                 ray_get_ms,
                 roundtrip_ms,
                 finish_to_get_ms,
+                send_profile,
                 results,
             ) = _invoke_once(
                 actors,
@@ -424,6 +560,30 @@ def _profile_transport(
             )
             samples["actor_submit"].append(submit_ms)
             samples["dlslime_send_seqs"].append(send_seqs_ms)
+            samples["dlslime_endpoint_total"].append(
+                send_profile["total_ms"]
+            )
+            samples["dlslime_serialize"].append(
+                send_profile["serialize_ms"]
+            )
+            samples["dlslime_write_with_imm"].append(
+                send_profile["write_with_imm_ms"]
+            )
+            samples["dlslime_future_wait"].append(
+                send_profile["future_wait_ms"]
+            )
+            samples["dlslime_unattributed"].append(
+                send_profile["unattributed_ms"]
+            )
+            wait_ms_by_rank = send_profile["future_wait_ms_by_rank"]
+            for rank, wait_ms in enumerate(wait_ms_by_rank):
+                future_wait_samples_by_rank[rank].append(wait_ms)
+            if transport == "dlslime":
+                slowest_wait_rank = max(
+                    range(logical_workers),
+                    key=wait_ms_by_rank.__getitem__,
+                )
+                slowest_wait_rank_counts[slowest_wait_rank] += 1
             samples["ray_get"].append(ray_get_ms)
             samples["roundtrip"].append(roundtrip_ms)
             samples["worker_finish_to_get"].append(finish_to_get_ms)
@@ -468,6 +628,15 @@ def _profile_transport(
         stats = _stats(values)
         for key, value in stats.__dict__.items():
             record[f"{prefix}_{key}"] = value
+    record["dlslime_future_wait_mean_ms_by_rank"] = [
+        statistics.fmean(values)
+        for values in future_wait_samples_by_rank
+    ]
+    record["dlslime_future_wait_p99_ms_by_rank"] = [
+        _percentile(values, 99.0)
+        for values in future_wait_samples_by_rank
+    ]
+    record["dlslime_slowest_wait_rank_counts"] = slowest_wait_rank_counts
     record["roundtrip_mean_ms_per_decode_step"] = (
         record["roundtrip_mean_ms"] / loop_count
     )
@@ -681,6 +850,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"p99={record['roundtrip_p99_ms']:.3f} ms",
                     flush=True,
                 )
+                if transport == "dlslime":
+                    print(
+                        "  send_seqs breakdown: "
+                        f"serialize={record['dlslime_serialize_mean_ms']:.3f} ms | "
+                        "write_with_imm="
+                        f"{record['dlslime_write_with_imm_mean_ms']:.3f} ms | "
+                        f"future.wait={record['dlslime_future_wait_mean_ms']:.3f} ms | "
+                        f"unattributed={record['dlslime_unattributed_mean_ms']:.3f} ms",
+                        flush=True,
+                    )
     finally:
         for actor in actors:
             try:
@@ -708,7 +887,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "timed_scope": (
             "Ray actor submission; full Sequence input via Ray or production "
             "NanoDeploy serialize + DLSLime send_seqs/recv_seqs; token output "
-            "via Ray; ray.get fan-in"
+            "via Ray; ray.get fan-in; DLSLime serialize, write_with_imm, and "
+            "future.wait breakdown"
         ),
         "excluded_scope": (
             "Sequence/output construction, endpoint initialization, "
