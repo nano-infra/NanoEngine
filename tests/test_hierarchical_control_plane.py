@@ -34,6 +34,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     OwnerState,
     RankLoad,
+    TokenCommitEvent,
     validate_execution_trace_set,
 )
 from nanodeploy.engine.local_executor import LocalExecutor
@@ -981,6 +982,19 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     engine._first_schedule_events = deque(
         (FirstScheduleEvent(1, 0, 3.0),)
     )
+    engine._token_commit_events = deque(
+        (
+            TokenCommitEvent(
+                request_id=1,
+                engine_id=0,
+                generation_epoch=0,
+                wave_id=1,
+                quantum_id=0,
+                output_offset=1,
+                token_ids=(7,),
+            ),
+        )
+    )
     engine._first_token_events = deque((FirstTokenEvent(1, 0, 1),))
     engine._terminal_events = deque(
         (FinishEvent(1, 16, "FINISHED", 0),)
@@ -993,10 +1007,12 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     assert batch.load.free_blocks_min == 9
     assert batch.add_results[0].request_id == 1
     assert batch.first_schedule_events[0].request_id == 1
+    assert batch.token_commit_events[0].token_ids == (7,)
     assert batch.first_token_events[0].request_id == 1
     assert batch.finish_events[0].request_id == 1
     assert engine._add_result_events == deque()
     assert engine._first_schedule_events == deque()
+    assert engine._token_commit_events == deque()
     assert engine._first_token_events == deque()
     assert engine._terminal_events == deque()
 
@@ -1432,7 +1448,13 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     assert engine.drain_add_results() == ()
     assert engine.drain_events() == (
         FinishEvent(50, 16, "FINISHED", 0),
-        FinishEvent(52, 0, "ABORTED", 0),
+        FinishEvent(
+            52,
+            0,
+            "ABORTED",
+            0,
+            finish_reason="ABORTED",
+        ),
     )
     assert engine._reserved_slots == 1
 

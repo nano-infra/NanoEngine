@@ -29,6 +29,7 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
+    TokenCommitEvent,
 )
 from nanodeploy.engine.frontend_transport import ZmqFrontendServer
 from nanodeploy.engine.local_executor import LocalExecutor
@@ -114,6 +115,7 @@ class LocalEngineCore:
         self._capacity_epoch = 0
         self._add_result_events: deque[AddResultEvent] = deque()
         self._first_schedule_events: deque[FirstScheduleEvent] = deque()
+        self._token_commit_events: deque[TokenCommitEvent] = deque()
         self._first_token_events: deque[FirstTokenEvent] = deque()
         self._terminal_events: deque[FinishEvent] = deque()
         self._events_lock = threading.Lock()
@@ -613,6 +615,13 @@ class LocalEngineCore:
             self._first_token_events.clear()
         return events
 
+    def drain_token_commit_events(self) -> tuple[TokenCommitEvent, ...]:
+        self._raise_if_failed()
+        with self._events_lock:
+            events = tuple(self._token_commit_events)
+            self._token_commit_events.clear()
+        return events
+
     def drain_first_schedule_events(
         self,
     ) -> tuple[FirstScheduleEvent, ...]:
@@ -635,10 +644,12 @@ class LocalEngineCore:
         with self._events_lock:
             add_results = tuple(self._add_result_events)
             first_schedule_events = tuple(self._first_schedule_events)
+            token_commit_events = tuple(self._token_commit_events)
             first_token_events = tuple(self._first_token_events)
             finish_events = tuple(self._terminal_events)
             self._add_result_events.clear()
             self._first_schedule_events.clear()
+            self._token_commit_events.clear()
             self._first_token_events.clear()
             self._terminal_events.clear()
         with self._load_lock:
@@ -648,6 +659,7 @@ class LocalEngineCore:
             load=load,
             add_results=add_results,
             first_schedule_events=first_schedule_events,
+            token_commit_events=token_commit_events,
             first_token_events=first_token_events,
             finish_events=finish_events,
         )
@@ -1036,6 +1048,7 @@ class LocalEngineCore:
                         generated_count=0,
                         status="ABORTED",
                         engine_id=self.engine_id,
+                        finish_reason="ABORTED",
                     )
                 )
                 processed += 1
@@ -1127,6 +1140,7 @@ class LocalEngineCore:
                             generated_count=0,
                             status="ABORTED",
                             engine_id=self.engine_id,
+                            finish_reason="ABORTED",
                         )
                     )
                 continue
@@ -1294,6 +1308,14 @@ class LocalEngineCore:
         with self._events_lock:
             self._first_token_events.extend(events)
 
+    def _publish_token_commit_events(
+        self, events: tuple[TokenCommitEvent, ...]
+    ) -> None:
+        if not events:
+            return
+        with self._events_lock:
+            self._token_commit_events.extend(events)
+
     def _publish_first_schedule_events(
         self, events: tuple[FirstScheduleEvent, ...]
     ) -> None:
@@ -1410,6 +1432,9 @@ class LocalEngineCore:
                     )
                     self._decode_itl_token_count += itl_token_count
                 self._decode_quantum_count += 1
+                self._publish_token_commit_events(
+                    self.scheduler.drain_token_commit_events()
+                )
                 self._publish_first_token_events(
                     self.scheduler.drain_first_token_events()
                 )

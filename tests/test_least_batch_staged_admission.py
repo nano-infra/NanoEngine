@@ -18,6 +18,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     OwnerState,
     RankLoad,
+    TokenCommitEvent,
 )
 from nanodeploy.engine.local_engine import LocalEngineCore, _IngressAdd
 from nanodeploy.router.admission_planner import AdmissionPlannerConfig
@@ -160,6 +161,36 @@ def test_pending_add_can_finish_aborted_without_successful_add_result():
     assert router.record_finish_events((terminal,)) == (terminal,)
     assert router.owner(1) is None
     assert router.terminal_event(1) == terminal
+
+
+def test_token_commit_waits_for_authoritative_owner_commit():
+    engine = _AsyncEngine()
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch",
+        admission_planner_config=_planner_config(),
+    )
+    router.record_loads((_load(),))
+    _submit(router, 1)
+    assert router.poll_ingress_acks() == ()
+    token_event = TokenCommitEvent(
+        request_id=1,
+        engine_id=0,
+        generation_epoch=0,
+        wave_id=1,
+        quantum_id=0,
+        output_offset=1,
+        token_ids=(7,),
+    )
+
+    assert router.record_token_commit_events((token_event,)) == ()
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    assert router.record_token_commit_events(()) == ()
+    assert router.record_add_results(
+        (AddResultEvent(1, 0, True, admission_version=1),)
+    )
+    assert router.record_token_commit_events(()) == (token_event,)
 
 
 def _command_and_sequence(request_id: int) -> tuple[AddCommand, Sequence]:

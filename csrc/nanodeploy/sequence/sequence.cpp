@@ -143,6 +143,13 @@ void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<i
     ctx.num_dispatched_tokens[idx]++;
 }
 
+void Sequence::append_materialized_token(int token_id)
+{
+    token_ids.push_back(token_id);
+    last_token = token_id;
+    num_tokens++;
+}
+
 int Sequence::num_blocks(BlockContextSlot slot, int sp_idx)
 {
     int n_tokens = block_ctx(slot).num_dispatched_tokens[sp_idx];

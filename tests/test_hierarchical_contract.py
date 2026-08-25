@@ -12,6 +12,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     RankLoad,
     RequestState,
+    TokenCommitEvent,
     WorkerDecodeResult,
     round_up,
     validate_add_request,
@@ -713,6 +714,19 @@ def test_local_scheduler_loop_one_bootstrap_and_completion_accounting():
     assert sum(load.master_assignments for load in first_load.rank_loads) == 1
     assert all(load.total_blocks == 32 for load in first_load.rank_loads)
     assert local.postprocess(first, make_worker_results(first)) == ()
+    first_commits = local.drain_token_commit_events()
+    assert first_commits == (
+        TokenCommitEvent(
+            request_id=42,
+            engine_id=1,
+            generation_epoch=0,
+            wave_id=1,
+            quantum_id=0,
+            output_offset=1,
+            token_ids=(100,),
+        ),
+    )
+    assert local.drain_token_commit_events() == ()
     assert sequence.num_completed_tokens == 1
     assert local.last_itl_token_slots == 0
     first_load = local.load_snapshot(wave_id=1, quantum_id=1)
@@ -735,12 +749,25 @@ def test_local_scheduler_loop_one_bootstrap_and_completion_accounting():
     assert events[0].request_id == 42
     assert events[0].generated_count == 2
     assert events[0].status == "FINISHED"
+    assert events[0].finish_reason == "LENGTH"
     assert events[0].first_forward_to_terminal_ms is not None
     assert events[0].first_forward_to_terminal_ms >= 0
     assert events[0].final_quantum_execute_ms == 0.0
     assert events[0].final_quantum_real_tokens == 1
     assert events[0].final_quantum_unused_decode_ms == 0.0
     assert events[0].global_capacity_queue_ms == 0
+    assert local.drain_token_commit_events() == (
+        TokenCommitEvent(
+            request_id=42,
+            engine_id=1,
+            generation_epoch=0,
+            wave_id=1,
+            quantum_id=1,
+            output_offset=2,
+            token_ids=(200,),
+            finish_reason="LENGTH",
+        ),
+    )
     assert local.drain_first_token_events() == ()
     assert sequence.num_completed_tokens == 2
     assert local.last_itl_token_slots == 1
@@ -770,8 +797,8 @@ def test_local_scheduler_loop_one_bootstrap_and_completion_accounting():
 
 def test_local_scheduler_loop_one_stops_on_eos_and_releases_capacity():
     config = make_hierarchical_config()
-    config.eos = 1
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    assert config.eos == config.hf_config.eos_token_id
     command, sequence = make_add(
         49,
         (10, 11),
@@ -791,6 +818,19 @@ def test_local_scheduler_loop_one_stops_on_eos_and_releases_capacity():
     assert [(event.request_id, event.generated_count, event.status) for event in events] == [
         (49, 1, "FINISHED")
     ]
+    assert events[0].finish_reason == "EOS"
+    assert local.drain_token_commit_events() == (
+        TokenCommitEvent(
+            request_id=49,
+            engine_id=0,
+            generation_epoch=0,
+            wave_id=1,
+            quantum_id=0,
+            output_offset=1,
+            token_ids=(config.eos,),
+            finish_reason="EOS",
+        ),
+    )
     assert sequence.completion_token_ids == [config.eos]
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
@@ -901,6 +941,8 @@ def test_local_scheduler_inflight_abort_wins_before_commit():
     assert len(events) == 1
     assert events[0].status == "ABORTED"
     assert events[0].generated_count == 0
+    assert events[0].finish_reason == "ABORTED"
+    assert local.drain_token_commit_events() == ()
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.abort(77).status == "already_terminal"
@@ -948,6 +990,7 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     assert [sequence.seq_id for sequence in waiting] == [102]
     assert waiting[0].num_tokens == 63
     assert waiting[0].num_bootstrap_tokens == 0
+    assert local._records[102].generation_epoch == 1
     assert local.state_manager.num_running_tokens == 64
     assert local.load_snapshot(wave_id=1, quantum_id=0).preemption_count == 1
 

@@ -25,6 +25,7 @@ from nanodeploy.engine.hierarchical_contract import (
     FirstTokenEvent,
     FinishEvent,
     IngressAck,
+    TokenCommitEvent,
 )
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
@@ -149,6 +150,8 @@ class LLMEngine:
                 self.deployment.load_snapshots()
             )
             self._hierarchical_sequences: dict[int, Sequence] = {}
+            self._hierarchical_generation_epochs: dict[int, int] = {}
+            self._hierarchical_terminal_reasons: dict[int, str] = {}
             self._last_load_report_time = 0.0
             atexit.register(self.exit)
             return
@@ -346,7 +349,14 @@ class LLMEngine:
         if self.config.scheduler_arch == "hierarchical":
             events = self.poll()
             outputs = [
-                (event.request_id, [])
+                (
+                    event.request_id,
+                    list(
+                        self._hierarchical_sequences[
+                            event.request_id
+                        ].completion_token_ids
+                    ),
+                )
                 for event in events
             ]
             return (
@@ -590,6 +600,50 @@ class LLMEngine:
         self._poll_frontend_control_plane()
         self._frontend_cycle_active = True
 
+    def _apply_token_commit_event(self, event: TokenCommitEvent) -> None:
+        sequence = self._hierarchical_sequences[event.request_id]
+        generation_epoch = self._hierarchical_generation_epochs.get(
+            event.request_id
+        )
+        if generation_epoch is None:
+            self._hierarchical_generation_epochs[event.request_id] = (
+                event.generation_epoch
+            )
+        elif generation_epoch != event.generation_epoch:
+            raise RuntimeError(
+                "frontend token generation epoch changed after commit: "
+                f"request={event.request_id}, expected={generation_epoch}, "
+                f"got={event.generation_epoch}"
+            )
+
+        expected_offset = (
+            sequence.num_completed_tokens + len(event.token_ids)
+        )
+        if event.output_offset != expected_offset:
+            raise RuntimeError(
+                "frontend token commit offset mismatch: "
+                f"request={event.request_id}, expected={expected_offset}, "
+                f"got={event.output_offset}"
+            )
+        for token_id in event.token_ids:
+            sequence.append_materialized_token(token_id)
+        if sequence.num_completed_tokens != event.output_offset:
+            raise RuntimeError(
+                "frontend Sequence token count diverged after commit: "
+                f"request={event.request_id}"
+            )
+        if event.finish_reason is not None:
+            if event.request_id in self._hierarchical_terminal_reasons:
+                raise RuntimeError(
+                    "duplicate terminal token commit: "
+                    f"request={event.request_id}"
+                )
+            self._hierarchical_terminal_reasons[event.request_id] = (
+                event.finish_reason
+            )
+        if sequence.metric is not None:
+            sequence.metric.num_generated_tokens = event.output_offset
+
     def _poll_frontend_control_plane(self) -> None:
         batches = self.deployment.poll_ready_frontend_events()
         snapshots = tuple(batch.load for batch in batches)
@@ -626,6 +680,14 @@ class LLMEngine:
             first_schedule_events
         )
 
+        token_commit_events = self.router.record_token_commit_events(
+            event
+            for batch in batches
+            for event in batch.token_commit_events
+        )
+        for event in token_commit_events:
+            self._apply_token_commit_event(event)
+
         first_token_events = tuple(
             event
             for batch in batches
@@ -651,6 +713,33 @@ class LLMEngine:
         )
         for event in finish_events:
             sequence = self._hierarchical_sequences[event.request_id]
+            if sequence.num_completed_tokens != event.generated_count:
+                raise RuntimeError(
+                    "terminal event overtook or disagrees with token commits: "
+                    f"request={event.request_id}, "
+                    f"tokens={sequence.num_completed_tokens}, "
+                    f"terminal={event.generated_count}"
+                )
+            expected_reason = self._hierarchical_terminal_reasons.get(
+                event.request_id
+            )
+            if event.status == "FINISHED":
+                if (
+                    expected_reason is None
+                    or event.finish_reason != expected_reason
+                ):
+                    raise RuntimeError(
+                        "FINISHED event has no matching terminal token commit: "
+                        f"request={event.request_id}, "
+                        f"token_reason={expected_reason}, "
+                        f"finish_reason={event.finish_reason}"
+                    )
+            elif event.finish_reason != "ABORTED":
+                raise RuntimeError(
+                    "ABORTED event has an invalid finish reason: "
+                    f"request={event.request_id}, "
+                    f"finish_reason={event.finish_reason}"
+                )
             metric = sequence.metric
             if metric is not None:
                 metric.num_generated_tokens = event.generated_count

@@ -16,6 +16,7 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     LoadSnapshot,
     OwnerState,
+    TokenCommitEvent,
     round_up,
 )
 from nanodeploy.router.admission_planner import (
@@ -185,6 +186,9 @@ class RequestRouter:
         self._next_global_queue_seq = 0
         self._immediate_ingress_acks: deque[IngressAck] = deque()
         self._early_add_results: dict[int, AddResultEvent] = {}
+        self._early_token_commit_events: dict[
+            int, list[TokenCommitEvent]
+        ] = {}
         self._early_terminal_events: dict[int, FinishEvent] = {}
         self._global_capacity_queue_ms: dict[int, float] = {}
         self._loads: dict[int, LoadSnapshot] = {}
@@ -937,6 +941,7 @@ class RequestRouter:
                             status="ABORTED",
                             engine_id=engine_id,
                             global_capacity_queue_ms=capacity_queue_ms,
+                            finish_reason="ABORTED",
                         )
                     else:
                         self._rejected_request_ids.add(request_id)
@@ -1135,6 +1140,69 @@ class RequestRouter:
             )
         return tuple(ready_events)
 
+    def commit_token_event(
+        self, event: TokenCommitEvent
+    ) -> TokenCommitEvent:
+        if event.request_id in self._terminal:
+            raise RuntimeError(
+                "token commit arrived after terminal event: "
+                f"request={event.request_id}"
+            )
+        owner = self._owners.get(event.request_id)
+        if (
+            owner is None
+            or owner.state != OwnerState.OWNED
+            or owner.engine_id != event.engine_id
+        ):
+            raise RuntimeError(
+                "token commit owner mismatch: "
+                f"request={event.request_id}, engine={event.engine_id}, "
+                f"owner={owner}"
+            )
+        return event
+
+    def record_token_commit_events(
+        self, events: Iterable[TokenCommitEvent]
+    ) -> tuple[TokenCommitEvent, ...]:
+        ready_events: list[TokenCommitEvent] = []
+        for event in events:
+            owner = self._owners.get(event.request_id)
+            if (
+                owner is not None
+                and owner.state
+                in {OwnerState.PENDING_INGRESS, OwnerState.PENDING_ADD}
+                and owner.engine_id == event.engine_id
+            ):
+                self._early_token_commit_events.setdefault(
+                    event.request_id, []
+                ).append(event)
+                continue
+            ready_events.append(event)
+
+        for request_id, buffered in tuple(
+            self._early_token_commit_events.items()
+        ):
+            owner = self._owners.get(request_id)
+            if owner is not None and owner.state == OwnerState.OWNED:
+                ready_events.extend(buffered)
+                self._early_token_commit_events.pop(request_id)
+                continue
+            if (
+                owner is None
+                or owner.engine_id != buffered[0].engine_id
+                or owner.state
+                not in {
+                    OwnerState.PENDING_INGRESS,
+                    OwnerState.PENDING_ADD,
+                }
+            ):
+                self._early_token_commit_events.pop(request_id)
+                ready_events.extend(buffered)
+
+        return tuple(
+            self.commit_token_event(event) for event in ready_events
+        )
+
     def abort(self, request_id: int) -> AbortResult:
         if request_id in self._terminal:
             return AbortResult(
@@ -1157,6 +1225,7 @@ class RequestRouter:
                 generated_count=0,
                 status="ABORTED",
                 engine_id=-1,
+                finish_reason="ABORTED",
             )
             return AbortResult(request_id=request_id, status="aborted")
         if owner.engine_id is None:
@@ -1184,6 +1253,11 @@ class RequestRouter:
         if event.request_id in self._terminal:
             raise RuntimeError(
                 f"duplicate terminal event for request {event.request_id}"
+            )
+        if event.request_id in self._early_token_commit_events:
+            raise RuntimeError(
+                "terminal event overtook buffered token commits: "
+                f"request={event.request_id}"
             )
         owner = self._owners.get(event.request_id)
         owner_state_is_valid = owner is not None and (

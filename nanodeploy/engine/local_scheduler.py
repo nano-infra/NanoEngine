@@ -19,6 +19,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LocalDecodeBatch,
     RankLoad,
     RequestState,
+    TokenCommitEvent,
     WorkerDecodeResult,
     round_up,
     validate_add_request,
@@ -43,6 +44,9 @@ class LocalRequestRecord:
     first_forward_started_at: float | None = None
     first_token_emitted: bool = False
     terminal_emitted: bool = False
+    generation_epoch: int = 0
+    committed_output_count: int = 0
+    terminal_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +76,17 @@ class LocalScheduler:
             raise ValueError("LocalScheduler topology/config SP mismatch")
         if topology.attention_tp != config.attention_tp:
             raise ValueError("LocalScheduler topology/config TP mismatch")
+        if config.eos < 0:
+            eos_token_id = getattr(config.hf_config, "eos_token_id", None)
+            if not isinstance(eos_token_id, int) or isinstance(
+                eos_token_id, bool
+            ):
+                raise ValueError(
+                    "hierarchical scheduler requires one integer EOS token id"
+                )
+            config.eos = eos_token_id
+        if not 0 <= config.eos < config.hf_config.vocab_size:
+            raise ValueError("EOS token id is outside the model vocabulary")
         if not 0 <= bootstrap_token_id < config.hf_config.vocab_size:
             raise ValueError("bootstrap_token_id is outside the model vocabulary")
 
@@ -94,6 +109,7 @@ class LocalScheduler:
         self._records: dict[int, LocalRequestRecord] = {}
         self._terminal_states: dict[int, RequestState] = {}
         self._terminal_events: list[FinishEvent] = []
+        self._token_commit_events: list[TokenCommitEvent] = []
         self._first_token_events: list[FirstTokenEvent] = []
         self._inflight_ids: set[int] = set()
         self._all_dummy_engine_quantums = 0
@@ -615,7 +631,15 @@ class LocalScheduler:
                         "preempted request retained a bootstrap token"
                     )
                 if record.state != RequestState.WAITING_ADMISSION:
+                    if record.committed_output_count != 0:
+                        raise RuntimeError(
+                            "cannot reset a request after frontend-visible "
+                            "tokens were committed: "
+                            f"request_id={request_id}, "
+                            f"committed={record.committed_output_count}"
+                        )
                     self._preemption_count += 1
+                    record.generation_epoch += 1
                 record.state = RequestState.WAITING_ADMISSION
             elif request_id in running_ids:
                 record.state = RequestState.RUNNING_DECODE
@@ -678,6 +702,18 @@ class LocalScheduler:
             request_master_global_rank=request_master_global_rank,
             frozen_request_order=frozen_request_order,
             control_dummy_ids=control_dummy_ids,
+            per_request_epoch={
+                sequence.seq_id: self._records[
+                    sequence.seq_id
+                ].generation_epoch
+                for sequence in real_sequences
+            },
+            per_request_output_offset={
+                sequence.seq_id: self._records[
+                    sequence.seq_id
+                ].committed_output_count
+                for sequence in real_sequences
+            },
             _all_sequences=sequences,
             _control_dummy_object_ids=control_dummy_object_ids,
         )
@@ -726,6 +762,7 @@ class LocalScheduler:
             self._state_manager.running.remove(sequence)
             self._state_manager.deallocate(sequence, BlockContextSlot.ACTIVE)
         record.state = RequestState.ABORTED
+        record.terminal_reason = "ABORTED"
         self._emit_terminal(record, "ABORTED")
 
     def abort(self, request_id: int) -> AbortResult:
@@ -742,6 +779,7 @@ class LocalScheduler:
         if record.state == RequestState.WAITING_ADMISSION:
             self._scheduler.waiting_migration.remove(record.sequence)
             record.state = RequestState.ABORTED
+            record.terminal_reason = "ABORTED"
             self._emit_terminal(record, "ABORTED")
             return AbortResult(request_id=request_id, status="aborted")
 
@@ -786,6 +824,11 @@ class LocalScheduler:
                 f"timestamp: request_id={record.sequence.seq_id}"
             )
         record.terminal_emitted = True
+        if record.terminal_reason is None:
+            raise RuntimeError(
+                "terminal request has no finish reason: "
+                f"request_id={request_id}, status={status}"
+            )
         self._terminal_events.append(
             FinishEvent(
                 request_id=request_id,
@@ -796,6 +839,7 @@ class LocalScheduler:
                     first_forward_to_terminal_ms
                 ),
                 final_quantum_execute_ms=final_quantum_execute_ms,
+                finish_reason=record.terminal_reason,
             )
         )
         self._records.pop(request_id)
@@ -888,9 +932,28 @@ class LocalScheduler:
             loop_count=HIERARCHICAL_LOOP_COUNT,
         )
         for request_id, previous_tokens in completed_before.items():
-            completed_tokens = self._records[
-                request_id
-            ].sequence.num_completed_tokens
+            record = self._records[request_id]
+            if batch.per_request_epoch.get(request_id) != record.generation_epoch:
+                raise RuntimeError(
+                    "decode batch generation epoch changed before commit: "
+                    f"request_id={request_id}"
+                )
+            if (
+                batch.per_request_output_offset.get(request_id)
+                != record.committed_output_count
+            ):
+                raise RuntimeError(
+                    "decode batch output offset changed before commit: "
+                    f"request_id={request_id}"
+                )
+            if record.committed_output_count != previous_tokens:
+                raise RuntimeError(
+                    "canonical/frontend output count mismatch before commit: "
+                    f"request_id={request_id}, "
+                    f"canonical={previous_tokens}, "
+                    f"committed={record.committed_output_count}"
+                )
+            completed_tokens = record.sequence.num_completed_tokens
             generated_tokens = completed_tokens - previous_tokens
             if generated_tokens < 0:
                 raise RuntimeError(
@@ -909,6 +972,65 @@ class LocalScheduler:
                 generated_tokens
                 if previous_tokens > 0
                 else max(0, generated_tokens - 1)
+            )
+            completion_token_ids = tuple(
+                record.sequence.completion_token_ids
+            )
+            token_delta = completion_token_ids[
+                previous_tokens:completed_tokens
+            ]
+            if len(token_delta) != generated_tokens:
+                raise RuntimeError(
+                    "canonical Sequence did not materialize committed tokens: "
+                    f"request_id={request_id}"
+                )
+            if generated_tokens != HIERARCHICAL_LOOP_COUNT:
+                raise RuntimeError(
+                    "loop-one request produced an invalid token delta: "
+                    f"request_id={request_id}, tokens={generated_tokens}"
+                )
+            invalid_token = next(
+                (
+                    token_id
+                    for token_id in token_delta
+                    if not 0
+                    <= token_id
+                    < self.config.hf_config.vocab_size
+                ),
+                None,
+            )
+            if invalid_token is not None:
+                raise RuntimeError(
+                    "worker sampled token outside the model vocabulary: "
+                    f"request_id={request_id}, token_id={invalid_token}"
+                )
+            finish_reason = None
+            if record.sequence.is_finished:
+                if (
+                    not record.sequence.ignore_eos
+                    and token_delta[-1] == self.config.eos
+                ):
+                    finish_reason = "EOS"
+                elif completed_tokens >= record.sequence.max_tokens:
+                    finish_reason = "LENGTH"
+                else:
+                    raise RuntimeError(
+                        "finished request has neither EOS nor length reason: "
+                        f"request_id={request_id}"
+                    )
+                record.terminal_reason = finish_reason
+            record.committed_output_count = completed_tokens
+            self._token_commit_events.append(
+                TokenCommitEvent(
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    generation_epoch=record.generation_epoch,
+                    wave_id=batch.wave_id,
+                    quantum_id=batch.quantum_id,
+                    output_offset=completed_tokens,
+                    token_ids=token_delta,
+                    finish_reason=finish_reason,
+                )
             )
         for request_id in sorted(self._inflight_ids.difference(aborted_ids)):
             record = self._records[request_id]
@@ -941,6 +1063,11 @@ class LocalScheduler:
     def drain_terminal_events(self) -> tuple[FinishEvent, ...]:
         events = tuple(self._terminal_events)
         self._terminal_events.clear()
+        return events
+
+    def drain_token_commit_events(self) -> tuple[TokenCommitEvent, ...]:
+        events = tuple(self._token_commit_events)
+        self._token_commit_events.clear()
         return events
 
     def drain_first_token_events(self) -> tuple[FirstTokenEvent, ...]:

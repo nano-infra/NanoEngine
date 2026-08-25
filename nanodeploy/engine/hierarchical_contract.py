@@ -176,6 +176,37 @@ class FirstTokenEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenCommitEvent:
+    """One ordered delta from a LocalEngine canonical Sequence."""
+
+    request_id: int
+    engine_id: int
+    generation_epoch: int
+    wave_id: int
+    quantum_id: int
+    output_offset: int
+    token_ids: tuple[int, ...]
+    finish_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.generation_epoch < 0:
+            raise ValueError("generation_epoch must be non-negative")
+        if self.wave_id < 0 or self.quantum_id < 0:
+            raise ValueError("token commit wave/quantum must be non-negative")
+        if len(self.token_ids) != HIERARCHICAL_LOOP_COUNT:
+            raise ValueError(
+                "token commit must contain exactly "
+                f"{HIERARCHICAL_LOOP_COUNT} token ids"
+            )
+        if self.output_offset < len(self.token_ids):
+            raise ValueError("token commit output_offset is too small")
+        if self.finish_reason not in {None, "EOS", "LENGTH"}:
+            raise ValueError(
+                f"invalid token commit finish reason {self.finish_reason!r}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class FirstScheduleEvent:
     """First entry into executor.run, excluding control-plane pickup delay."""
 
@@ -207,6 +238,7 @@ class FinishEvent:
     first_forward_to_terminal_ms: float | None = None
     global_capacity_queue_ms: float = 0.0
     final_quantum_execute_ms: float | None = None
+    finish_reason: str | None = None
 
     @property
     def final_quantum_real_tokens(self) -> int:
@@ -355,6 +387,7 @@ class FrontendEventBatch:
     load: LoadSnapshot
     add_results: tuple[AddResultEvent, ...] = ()
     first_schedule_events: tuple[FirstScheduleEvent, ...] = ()
+    token_commit_events: tuple[TokenCommitEvent, ...] = ()
     first_token_events: tuple[FirstTokenEvent, ...] = ()
     finish_events: tuple[FinishEvent, ...] = ()
 
@@ -428,6 +461,8 @@ class LocalDecodeBatch:
     request_master_global_rank: dict[int, int]
     frozen_request_order: dict[int, tuple[int, ...]]
     control_dummy_ids: frozenset[int]
+    per_request_epoch: dict[int, int] = field(default_factory=dict)
+    per_request_output_offset: dict[int, int] = field(default_factory=dict)
     _all_sequences: list[Any] = field(repr=False, default_factory=list)
     _control_dummy_object_ids: frozenset[int] = field(
         repr=False, default_factory=frozenset

@@ -194,6 +194,9 @@ void bind_sequence(py::module_& m)
              py::arg("token_id"),
              py::arg("slot"),
              py::arg("sp_idx") = std::nullopt)
+        .def("append_materialized_token",
+             &Sequence::append_materialized_token,
+             py::arg("token_id"))
         .def("block_ctx",
              static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
              py::arg("slot") = BlockContextSlot::ACTIVE,

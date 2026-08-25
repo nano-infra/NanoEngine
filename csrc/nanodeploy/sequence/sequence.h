@@ -137,6 +137,8 @@ public:
     void append_token(int                token_id,
                       BlockContextSlot   slot   = BlockContextSlot::ACTIVE,
                       std::optional<int> sp_idx = std::nullopt);
+    // Frontend/P-D canonical history update without scheduler KV metadata.
+    void append_materialized_token(int token_id);
 
     // Block related methods
     int num_blocks(BlockContextSlot slot, int sp_idx);
