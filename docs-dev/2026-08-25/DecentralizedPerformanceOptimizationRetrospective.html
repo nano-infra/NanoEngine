@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>去中心化性能优化复盘：从 quantum-long stop-and-wait 到流水化 admission</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071018;
+      --panel: #0d1924;
+      --panel-2: #101f2c;
+      --line: #243746;
+      --text: #e9f1f7;
+      --muted: #99adbc;
+      --cyan: #5ee6d0;
+      --blue: #75b7ff;
+      --amber: #ffc86b;
+      --red: #ff8b86;
+      --green: #85e0a3;
+      --violet: #c5a7ff;
+      --shadow: 0 18px 60px rgba(0, 0, 0, .28);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% 0%, rgba(94, 230, 208, .12), transparent 27rem),
+        radial-gradient(circle at 93% 12%, rgba(117, 183, 255, .11), transparent 31rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.65 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    header {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 62px 28px 24px;
+    }
+
+    .eyebrow {
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 1000px;
+      margin: 12px 0 18px;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      max-width: 990px;
+      margin: 0;
+      color: #bbcad5;
+      font-size: 18px;
+    }
+
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 24px;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(13, 25, 36, .78);
+      color: #bad0dd;
+      padding: 6px 11px;
+      font-size: 12px;
+    }
+
+    main {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 0 28px 70px;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      margin: 4px 0 24px;
+      padding: 12px 0;
+      background: linear-gradient(180deg, var(--bg) 72%, transparent);
+      scrollbar-width: thin;
+    }
+
+    nav button {
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #0c1721;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 9px 15px;
+      font: inherit;
+      font-weight: 700;
+    }
+
+    nav button:hover, nav button.active {
+      border-color: rgba(94, 230, 208, .7);
+      background: rgba(94, 230, 208, .12);
+      color: var(--cyan);
+    }
+
+    section[role="tabpanel"] { display: none; }
+    section[role="tabpanel"].active { display: block; }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 27px;
+      line-height: 1.25;
+      letter-spacing: -.018em;
+    }
+
+    h3 { margin: 0 0 10px; font-size: 18px; }
+    h4 { margin: 0 0 7px; font-size: 15px; }
+    p { margin: 8px 0 12px; }
+    ul, ol { margin: 8px 0 4px; padding-left: 22px; }
+    li + li { margin-top: 6px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 14px;
+      margin: 14px 0;
+    }
+
+    .span-3 { grid-column: span 3; }
+    .span-4 { grid-column: span 4; }
+    .span-5 { grid-column: span 5; }
+    .span-6 { grid-column: span 6; }
+    .span-7 { grid-column: span 7; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgba(16, 31, 44, .96), rgba(11, 22, 32, .96));
+      box-shadow: var(--shadow);
+      padding: 20px;
+    }
+
+    .card + .card { margin-top: 14px; }
+    .grid > .card { margin-top: 0; }
+
+    .hero-card {
+      border-color: rgba(94, 230, 208, .46);
+      background:
+        linear-gradient(130deg, rgba(94, 230, 208, .10), transparent 42%),
+        var(--panel);
+    }
+
+    .metric strong {
+      display: block;
+      color: var(--cyan);
+      font-size: clamp(25px, 3.2vw, 39px);
+      line-height: 1.1;
+      letter-spacing: -.03em;
+    }
+
+    .metric span {
+      display: block;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .good { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .muted { color: var(--muted); }
+    .cyan { color: var(--cyan); }
+
+    .callout {
+      margin: 14px 0 0;
+      border-left: 3px solid var(--blue);
+      border-radius: 8px;
+      background: rgba(117, 183, 255, .08);
+      padding: 12px 14px;
+    }
+
+    .callout.good-box {
+      border-left-color: var(--green);
+      background: rgba(133, 224, 163, .08);
+    }
+
+    .callout.warn-box {
+      border-left-color: var(--amber);
+      background: rgba(255, 200, 107, .08);
+    }
+
+    .callout.bad-box {
+      border-left-color: var(--red);
+      background: rgba(255, 139, 134, .08);
+    }
+
+    .verdict {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .verdict .icon {
+      display: grid;
+      flex: 0 0 34px;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 10px;
+      background: rgba(94, 230, 208, .12);
+      color: var(--cyan);
+      font-weight: 900;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      margin: 16px 0;
+    }
+
+    .node {
+      position: relative;
+      min-height: 138px;
+      border: 1px solid #2b4353;
+      border-radius: 13px;
+      background: #0c1822;
+      padding: 15px;
+    }
+
+    .node::after {
+      content: "→";
+      position: absolute;
+      right: -17px;
+      top: 48%;
+      z-index: 2;
+      color: var(--cyan);
+      font-weight: 900;
+    }
+
+    .node:last-child::after { content: ""; }
+    .node b { display: block; margin-bottom: 7px; color: var(--blue); }
+    .node small { color: var(--muted); }
+    .node.hot { border-color: rgba(255, 139, 134, .66); }
+    .node.hot b { color: var(--red); }
+    .node.fast { border-color: rgba(133, 224, 163, .56); }
+    .node.fast b { color: var(--green); }
+
+    .timeline {
+      display: grid;
+      gap: 9px;
+      margin: 18px 0 8px;
+    }
+
+    .timeline-row {
+      display: grid;
+      grid-template-columns: 190px 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .timeline-label { color: #bdd0db; font-size: 13px; }
+    .track {
+      height: 29px;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, .04);
+      overflow: hidden;
+    }
+
+    .bar {
+      display: flex;
+      height: 100%;
+      align-items: center;
+      border-radius: 7px;
+      background: linear-gradient(90deg, rgba(255, 139, 134, .42), rgba(255, 200, 107, .42));
+      color: #fff;
+      padding: 0 10px;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .bar.fast {
+      background: linear-gradient(90deg, rgba(94, 230, 208, .40), rgba(117, 183, 255, .38));
+    }
+
+    .mono {
+      overflow-x: auto;
+      border: 1px solid #263a49;
+      border-radius: 11px;
+      background: #07121a;
+      color: #cfe2ec;
+      padding: 15px;
+      white-space: pre;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      margin: 12px 0 4px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 11px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #cae0eb;
+      background: rgba(255, 255, 255, .025);
+      font-weight: 800;
+    }
+
+    td code { color: #c7e2f0; font-size: 12px; }
+
+    .delta-good { color: var(--green); font-weight: 800; }
+    .delta-bad { color: var(--red); font-weight: 800; }
+    .delta-neutral { color: var(--amber); font-weight: 800; }
+
+    .steps {
+      position: relative;
+      display: grid;
+      gap: 13px;
+      margin-top: 16px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 46px 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .step-number {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border: 1px solid rgba(94, 230, 208, .4);
+      border-radius: 12px;
+      background: rgba(94, 230, 208, .09);
+      color: var(--cyan);
+      font-weight: 900;
+    }
+
+    .step-body {
+      border-left: 1px solid var(--line);
+      padding: 1px 0 16px 18px;
+    }
+
+    .step-body p { color: #b8c9d4; }
+
+    .tag {
+      display: inline-block;
+      margin: 3px 4px 3px 0;
+      border: 1px solid #304657;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .025);
+      color: #b9cbd7;
+      padding: 2px 7px;
+      font-size: 11px;
+    }
+
+    .formula {
+      border: 1px solid rgba(197, 167, 255, .38);
+      border-radius: 13px;
+      background: rgba(197, 167, 255, .08);
+      color: #e5dcff;
+      padding: 16px;
+      text-align: center;
+      font: 700 16px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .source-list {
+      columns: 2;
+      column-gap: 32px;
+      padding-left: 20px;
+    }
+
+    footer {
+      margin-top: 28px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      padding: 22px 2px 0;
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .span-3, .span-4, .span-5, .span-6, .span-7, .span-8 { grid-column: span 12; }
+      .flow { grid-template-columns: 1fr; }
+      .node { min-height: auto; }
+      .node::after { content: "↓"; right: 50%; top: auto; bottom: -21px; }
+      .timeline-row { grid-template-columns: 1fr; gap: 4px; }
+      .source-list { columns: 1; }
+    }
+
+    @media print {
+      body { background: #fff; color: #111; }
+      header, main { max-width: none; }
+      nav { display: none; }
+      section[role="tabpanel"] { display: block !important; break-before: page; }
+      .card, .node, .mono, .formula { box-shadow: none; background: #fff; color: #111; }
+      .muted, .step-body p, .metric span { color: #444; }
+      a { color: #0645ad; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">NanoDeploy · Engineering Retrospective · 2026-08-24 → 2026-08-25</div>
+    <h1>去中心化性能优化复盘</h1>
+    <p class="subtitle">我们没有通过删除同步或削弱 admission 正确性来换性能，而是把重 CPU 数据处理移出关键边界，并把“可靠接管”与“权威提交”拆成可流水化的两阶段协议。结果是 quantum-long stop-and-wait 被解除；剩余约 3.3% 的 corrected TPOT 差距，已经主要指向执行量子而不是请求分发。</p>
+    <div class="meta-row">
+      <span class="pill">范围：2026-08-24—25</span>
+      <span class="pill">拓扑：2 机 · DP2/SP8/EP16</span>
+      <span class="pill">负载：rate 40 · 12,000 requests</span>
+      <span class="pill">代码证据基线：e1245f2</span>
+      <span class="pill">核心改动：07cc0f2 → 0105380 → 1c7b147 → baf3fbc</span>
+    </div>
+  </header>
+
+  <main>
+    <nav aria-label="复盘章节">
+      <button class="active" data-tab="summary">结论</button>
+      <button data-tab="diagnosis">诊断转折</button>
+      <button data-tab="changes">优化策略</button>
+      <button data-tab="protocol">协议与数据流</button>
+      <button data-tab="evidence">实验数据</button>
+      <button data-tab="playbook">可泛化方法</button>
+      <button data-tab="next">不足与下一步</button>
+    </nav>
+
+    <section id="summary" role="tabpanel" class="active">
+      <div class="card hero-card">
+        <h2>一句话结论</h2>
+        <p>本轮最有效的优化不是某个 kernel 或一次更快的 RPC，而是一次<strong>协议级去串行化</strong>：将原先“Router 发批次 → 等 LocalScheduler 跨过下一个 quantum 边界并 commit → 收 ACK → 才能发下一批”的事务，改为“LocalEngine 有界接管 → 毫秒级 receipt → Router 继续发 → event-loop 在安全边界 commit → AddResult 最终确认”。</p>
+        <div class="callout good-box"><strong>已经解决：</strong>单个 admission flight 不再占住约一个量子的时间，也不再把同 engine 的后续请求锁在 Router；完整 Sequence 仍只传一次，精确 SP/KV reservation 仍持续计费，scheduler 仍由 event-loop 单写。</div>
+        <div class="callout warn-box"><strong>尚未解决：</strong>单个请求仍可能等待下一个 loop-count-16 安全边界。这个等待从同步 RPC 中被显式拆成 <code>staged_queue_ms</code>，并未凭空消失；若要继续优化 TTFT，需要改变 safe-boundary 粒度或执行量子，而不是继续压缩 3 ms 的 receipt。</div>
+      </div>
+
+      <div class="grid">
+        <div class="card metric span-3"><strong>−99.78%</strong><span>Ingress ACK mean：1,543.809 → 3.323 ms</span></div>
+        <div class="card metric span-3"><strong>−44.94%</strong><span>dispatch→corrected 控制边界：1,045.739 → 575.744 ms/request</span></div>
+        <div class="card metric span-3"><strong>100%</strong><span>新版两机 rate-40：12,000/12,000 成功，goodput 100%</span></div>
+        <div class="card metric span-3"><strong class="bad">+3.30%</strong><span>当前 paired A/B：去中心化 corrected TPOT mean 相对中心化</span></div>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <div class="verdict">
+            <div class="icon">✓</div>
+            <div>
+              <h3>性能优化的真实成功点</h3>
+              <p>消除了 Router flight 与 scheduler commit 的错误耦合，使请求分发具备吞吐流水线。旧版约 1,018.5 ms 的 Local command queue 不再藏在 RPC ACK 内；Router/global capacity queue 从 506.719 ms 降到 0.018 ms。</p>
+            </div>
+          </div>
+        </div>
+        <div class="card span-6">
+          <div class="verdict">
+            <div class="icon">!</div>
+            <div>
+              <h3>不能得出的结论</h3>
+              <p>不能说新版端到端已经优于中心化。当前同拓扑 A/B 中，去中心化 corrected TPOT 为 67.561 ms/token，中心化为 65.404 ms/token；其差距的约 96% 来自 corrected 执行边界，而不是新增的 pre-GPU 控制边界差。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>本轮优化可以概括成四层</h3>
+        <div class="grid">
+          <div class="span-3"><span class="tag">算法层</span><h4>删除伪 capacity probe</h4><p class="muted">不再在安全边界创建 prompt-sized 零 Sequence 来探测容量。</p></div>
+          <div class="span-3"><span class="tag">数据层</span><h4>Opaque Sequence 一次传递</h4><p class="muted">sidecar 用于路由，完整 C++ Sequence 作为不透明 payload 保留所有权语义。</p></div>
+          <div class="span-3"><span class="tag">传输层</span><h4>持久 ZMQ 批量通道</h4><p class="muted">一个 metadata frame + N 个 payload frame，避免 Ray payload RPC 与 Python token 展开。</p></div>
+          <div class="span-3"><span class="tag">协议层</span><h4>Receipt / commit 两阶段</h4><p class="muted">快速可靠接管与权威 scheduler 提交解耦，同时保留 boundedness 和精确 charge。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="diagnosis" role="tabpanel">
+      <div class="card hero-card">
+        <h2>诊断上的最大转折：从“同步太多”转为“工作放错了边界”</h2>
+        <p>最初容易把差距归因于 Gloo/EP 全局同步或去中心化架构本身。代码路径和 CPU profiling 纠正了这个判断：全局同步是当前执行语义所需，steady-state scheduler 本身也很轻；真正危险的是 LocalEngine 单写 event-loop 在 quantum 顶部串行执行与 prompt 长度成正比的数据转换和 admission 工作。</p>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <h3 class="bad">被证伪或降级的假设</h3>
+          <ul>
+            <li><strong>“Gloo/EP 同步就是主因”：</strong>旧 paired A/B 的 worker critical quantum 仅 811.626 vs 812.184 ms，差 0.069%。</li>
+            <li><strong>“Python load snapshot / planner 很慢”：</strong>代表性测量约 0.15/0.26 ms，不能解释约 1 秒延迟。</li>
+            <li><strong>“网络按请求逐个 RPC”：</strong>原实现已按 engine 聚合，约 19.9 requests/message；问题是每 engine 仅允许一个长生命周期 flight。</li>
+            <li><strong>“把 token ids 删除就够了”：</strong>会破坏后续 P/D、迁移与恢复所需的完整 Sequence 所有权，不是可接受的生产优化。</li>
+          </ul>
+        </div>
+        <div class="card span-6">
+          <h3 class="good">最终被证据支持的因果链</h3>
+          <ol>
+            <li>frontend 把完整请求发给 LocalEngine。</li>
+            <li>同步 handler 等待 event-loop 的 scheduler commit 才回 ACK。</li>
+            <li>event-loop 每个 quantum 顶部只 drain 一次 command；错过后要等约 812 ms。</li>
+            <li>Router 在 ACK 未完成时禁止向该 engine 发下一批。</li>
+            <li>于是单请求的相位等待升级为同 engine 后续请求的队头阻塞和约一秒的 flight。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>为什么旧指标一开始没有直接暴露问题</h3>
+        <p>历史 quantum 计时在 command drain 之后才记录 <code>quantum_begin</code>，因此 admission 在“上一量子结束 → 下一量子计时开始”之间的缝隙中执行，既不进入 execute latency，也不进入 scheduler latency。复盘中新增并拆分了 scheduled arrival、actual dispatch、receipt、commit、first forward 和 terminal 六个边界。</p>
+        <div class="mono">T0 scheduled arrival
+ └─ dispatch_lag ─► T1 actual dispatch
+      └─ router / transport ─► T2 positive receipt (bounded ownership)
+           └─ staged_queue ─► T3 AddResult (authoritative commit)
+                └─ local_scheduler_queue ─► T4 first forward
+                     └─ real-token execution ─► T5 terminal</div>
+        <div class="callout"><strong>方法论：</strong>只要计时边界没有覆盖线程切换、事件循环 drain 或批次闸门，最重的等待就可能落在“不可见区”。先补全事件时间线，再讨论优化对象。</div>
+      </div>
+
+      <div class="card">
+        <h3>CPU profiling 如何缩小范围</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>代表性工作负载</th><th>中心化 C++ admission</th><th>旧本地 planned admission</th><th>含义</th></tr></thead>
+            <tbody>
+              <tr><td>4 DP / 128 requests，含 400K prompt</td><td>5.97 ms</td><td>单 LocalEngine 37.12 ms cold / 21.20 ms warm</td><td>去中心化单写边界含额外 prompt-sized 工作。</td></tr>
+              <tr><td>32 × 约 100K prompt</td><td>47.09 ms</td><td>241.25 ms cold / 146.63 ms warm</td><td>差距随 payload 放大，而不是固定 RPC RTT。</td></tr>
+              <tr><td>3.218M prompt tokens / 32 requests</td><td colspan="2">C++→Python tuple 82.56 ms；Python validation 84.12 ms；第二次 Sequence 47.57 ms；pickle 33.39 ms</td><td>数据展开、检查、重建和序列化都落在错误位置。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">并行 LocalEngine 的端到端临界路径应看最慢 engine 的 wall time，而不是把各 engine CPU 时间相加；本轮复盘统一使用 critical-path max 解释。</p>
+      </div>
+    </section>
+
+    <section id="changes" role="tabpanel">
+      <div class="card">
+        <h2>优化策略与提交链</h2>
+        <p>优化顺序遵循“先移除确定的无效工作，再压缩表示和传输，最后解除协议闸门”。如果直接从 ZMQ 或 ACK 入手，prompt-sized 重建仍会在 safe boundary 上阻塞；如果只优化序列化，Router stop-and-wait 仍然存在。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>阶段 / commit</th><th>策略</th><th>解决的问题</th><th>可量化结果</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>07cc0f2</code></td>
+                <td><strong>删除 synthetic capacity probe</strong><br>用 O(attention_sp) 的 <code>AdmissionPlanner</code> + empty shadow 替代 prompt-sized 零 Sequence 和 exact-key probe cache。</td>
+                <td>消除 quantum 边界上与 prompt token 数成正比的无效构造。</td>
+                <td>CPU planned admission：短请求 −62.3%；400K −59.7%；32×100K −55.9%。</td>
+              </tr>
+              <tr>
+                <td><code>0105380</code></td>
+                <td><strong>Ray payload RPC → persistent ZMQ</strong><br>DEALER/ROUTER、严格 schema、相关 ID、有界 frame/timeout、multi-flight。</td>
+                <td>将高频大 payload 从 actor RPC/lifecycle 通道分离；Ray 保留部署、健康和事件职责。</td>
+                <td>32×100K：frame 6.40 → 3.20 MB；encode 23.33 → 7.05 ms；localhost 全路径 31.45 ms。</td>
+              </tr>
+              <tr>
+                <td><code>1c7b147</code></td>
+                <td><strong>Opaque Sequence + sidecar</strong><br>C++ Sequence 直接编码为 bytes；Router 只看标量 sidecar；multipart <code>copy=False</code>；LocalEngine 只反序列化一次。</td>
+                <td>删除 C++→Python token tuple、Python 全量扫描、list、第二个 Sequence 和 pickle。</td>
+                <td>3.218M tokens：serialize 2.43 ms、deserialize 2.75 ms、ZMQ/deserialize/ACK 7.91 ms；planned commit 6.78 ms。</td>
+              </tr>
+              <tr>
+                <td><code>baf3fbc</code></td>
+                <td><strong>两阶段 planned staged admission</strong><br>positive receipt 表示有界 ownership；safe-boundary commit 通过 AddResult 最终确认；反向 Ray events 改为 per-engine 非阻塞 flight。</td>
+                <td>解除 receipt 与 scheduler commit 的同步绑定，删除 quantum-long stop-and-wait 和 all-engine frontend barrier。</td>
+                <td>两机 GPU ACK mean 1,543.809 → 3.323 ms；控制边界 1,045.739 → 575.744 ms/request。</td>
+              </tr>
+              <tr>
+                <td><code>675c86b</code> 等</td>
+                <td><strong>CPU/Ray 分布式验证与 observability</strong><br>增加本地 Router、真实 ZMQ、Ray 两节点 CPU benchmark，以及 receipt/commit/staged 指标。</td>
+                <td>在占用 GPU 前验证跨节点控制面、payload-once、boundedness 和 actor placement。</td>
+                <td>单机 15,818 / 48,676 req/s；Ray 两节点 13,455 req/s，均远高于 rate 40/50。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <h3>不是“少传字段”，而是重新定义数据所有权</h3>
+          <p>路由只需要 prompt length、max tokens、request id 和 placement reservation 等 sidecar；执行和未来 P/D 则需要完整 Sequence。最佳边界是：<strong>控制面读取小型 sidecar，数据面搬运 opaque payload</strong>，中间组件不展开自己不理解的对象。</p>
+          <div class="mono">sidecar: request_id / lengths / reservation
+payload:  opaque C++ Sequence bytes
+
+serialize once → send once → deserialize once</div>
+        </div>
+        <div class="card span-6">
+          <h3>不是“取消 ACK”，而是缩短 ACK 的语义</h3>
+          <p>应用层 receipt 仍必须存在，否则发送方无法确定远端是否取得 payload 所有权。变化在于 receipt 只承诺“bounded staged ingress 已建立”，不再承诺“scheduler 已 commit”。未知 receipt 采用 fail-stop，防止重传导致双重所有权。</p>
+          <div class="mono">receipt  = ownership + bounded slot
+AddResult = authoritative scheduler commit
+snapshot  = watermark reconciliation</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>有意没有采用的优化</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>候选</th><th>微基准吸引力</th><th>未采用 / 未进入生产的原因</th><th>经验</th></tr></thead>
+            <tbody>
+              <tr><td>length-only dummy payload</td><td>32 请求 wire 可降至约 1,670 bytes，序列化约 0.011 ms。</td><td>丢失 token IDs 和 Sequence 运行状态，破坏未来 P/D、迁移、恢复及所有权契约。</td><td>不要用短期 benchmark 假设永久污染协议语义。</td></tr>
+              <tr><td>fused Triton metadata injection</td><td>device microbenchmark 151–160 μs → 20.5–49.3 μs，约 3.2–7.7×。</td><td>属于 benchmark prototype；host/device overlap 下不能直接相加，也没有解释 1 秒级 stop-and-wait。</td><td>微秒级热点必须先证明处于端到端串行关键路径。</td></tr>
+              <tr><td>移除全局同步</td><td>表面上可减少 coordination。</td><td>当前 Gloo/EP 同步承载必要一致性，旧 A/B 的 worker critical 已证明其不是主差距。</td><td>不要把“可见同步点”自动等同于“可删瓶颈”。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="protocol" role="tabpanel">
+      <div class="card">
+        <h2>旧数据流：一个请求的相位等待阻塞整条 engine flight</h2>
+        <div class="flow">
+          <div class="node"><b>Router plan</b>精确规划一批请求并建立 tentative charge。</div>
+          <div class="node"><b>ZMQ multipart</b>一次发送 metadata/reservation + N 个 Sequence frames。</div>
+          <div class="node hot"><b>同步 admit_add_batch</b>server 等 event-loop；如果错过 drain，等待一个完整 quantum。</div>
+          <div class="node hot"><b>LocalScheduler commit</b>单写者在下一安全边界提交，平均 command queue 1,018.5 ms。</div>
+          <div class="node hot"><b>ACK / next flight</b>约 1,543.8 ms 后 Router 才允许该 engine 发下一批。</div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-row"><span class="timeline-label">Router flight 生命周期</span><div class="track"><div class="bar" style="width: 100%">约 1,543.8 ms</div></div></div>
+          <div class="timeline-row"><span class="timeline-label">Local command queue</span><div class="track"><div class="bar" style="width: 66%">约 1,018.5 ms</div></div></div>
+          <div class="timeline-row"><span class="timeline-label">真正 local admission</span><div class="track"><div class="bar fast" style="width: 8%">4.2 ms</div></div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>新数据流：快速接管，延迟提交，连续发射</h2>
+        <div class="flow">
+          <div class="node"><b>Router plan + charge</b>基于 cached load 和 outstanding reservation 精确规划。</div>
+          <div class="node"><b>ZMQ multipart</b>payload 保持批量、opaque、一次发送。</div>
+          <div class="node fast"><b>Bounded receipt</b>LocalEngine 原子占 slot、记录 request-id、入 FIFO，返回 ingress_version。</div>
+          <div class="node"><b>Safe-boundary commit</b>event-loop 按 FIFO prefix commit；transient mismatch 原地重试。</div>
+          <div class="node fast"><b>AddResult</b>返回 admission_version；Router 在 snapshot watermark 覆盖后释放对应 charge。</div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-row"><span class="timeline-label">短 wire flight</span><div class="track"><div class="bar fast" style="width: 10%">ACK mean 3.323 ms</div></div></div>
+          <div class="timeline-row"><span class="timeline-label">显式 staged wait</span><div class="track"><div class="bar" style="width: 52%">mean 531.509 ms；不再阻塞下一 flight</div></div></div>
+          <div class="timeline-row"><span class="timeline-label">planned commit</span><div class="track"><div class="bar fast" style="width: 9%">mean 1.217 ms</div></div></div>
+        </div>
+        <div class="callout"><strong>关键差异：</strong>新协议并未承诺请求立即进入 GPU scheduler；它承诺远端已安全接管，因此发送方可以继续推进。吞吐优化来自解除后续请求的依赖，单请求 TTFT 的相位等待则仍存在。</div>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <h3>双水位保证不会重复计费</h3>
+          <ul>
+            <li><code>ingress_version</code>：positive receipt 的单调所有权水位。</li>
+            <li><code>admission_version</code>：scheduler commit 的权威水位。</li>
+            <li>snapshot 未覆盖的 receipt 继续补计 staged slot。</li>
+            <li>SP/KV reservation 持续到 admission watermark 或 terminal，receipt 不能提前释放。</li>
+          </ul>
+        </div>
+        <div class="card span-6">
+          <h3>正确性不变量</h3>
+          <ul>
+            <li>LocalScheduler 仅 event-loop 单写，ZMQ thread 不直接修改。</li>
+            <li>positive receipt 后 payload 禁止重传，transient mismatch 本地 FIFO 重试。</li>
+            <li>staged + committed lifecycle slots 有界。</li>
+            <li>FIFO head 暂时不 fit 时，不越过依赖其 shadow 的后续 reservation。</li>
+            <li>receipt outcome 未知时 fail-stop，不冒险 requeue。</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>反向控制面也从 barrier 改为 progress engine</h3>
+        <p>原 frontend cycle 通过 <code>ray.get([engine_0, engine_1, ...])</code> 同步等待所有 engine 的事件和 load，可能让一个慢 actor 阻塞另一个 engine 的 ZMQ progress。新版为每个 engine 保留一个 outstanding event ref，<code>ray.wait(timeout=0)</code> 只消费 ready ref、立即 re-arm，并为每个 flight 保留 deadline watchdog。</p>
+        <div class="mono">poll ready per-engine events (timeout = 0)
+  ├─ consume ready load / AddResult / lifecycle events
+  ├─ re-arm only the completed engine
+  └─ fail an overdue flight by deadline
+
+poll ingress receipts → reconcile watermarks → plan → flush</div>
+      </div>
+    </section>
+
+    <section id="evidence" role="tabpanel">
+      <div class="card">
+        <h2>验证阶梯：先 CPU 控制面，再两机 GPU 端到端</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>层级</th><th>真实覆盖</th><th>结果</th><th>不能证明什么</th></tr></thead>
+            <tbody>
+              <tr><td>单机 Router / planner</td><td>真实 RequestRouter、4,096 请求、2 engines、batch 64、5 repeats。</td><td>15,818 req/s；10 ms/flight gate 模型耗时为 staged 的 2.20×。</td><td>不含跨节点 TCP 和 GPU quantum。</td></tr>
+              <tr><td>localhost ZMQ / LocalEngine stage</td><td>真实 multipart、Sequence deserialize、<code>_stage_add_batch()</code>。</td><td>48,676 req/s；receipt p99 五轮中位 1.663 ms。</td><td>不含 Ray 部署和远端网络。</td></tr>
+              <tr><td>Ray 一键两机 CPU</td><td>两节点 hard affinity、0 GPU、真实 NanoDeploy ZMQ payload；Ray 只负责 actor placement/stats。</td><td>13,455 req/s；receipt p99 中位 3.028 ms；4,096 PENDING_ADD、0 scheduler commit。</td><td>不含 RDMA、GPU 执行和 NanoDeploy 完整 Ray event 热路径。</td></tr>
+              <tr><td>两机 rate-40 GPU</td><td>DP2/SP8/EP16、12000 requests、同模型/数据/token totals。</td><td>100% 成功；ACK 3.323 ms；输出吞吐与中心化相差 −0.207%。</td><td>单次顺序 A/B 仍不能排除运行间噪声。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>优化前后：控制面发生了什么变化</h2>
+        <p>下表的旧版来自 2026-08-24 frozen hierarchical run，新版来自 2026-08-25 staged run。节点和 commit 不完全相同，因此适合验证协议瓶颈是否消失，不应把 corrected TPOT 的跨日差值解释为严格 A/B。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>指标</th><th>旧 hierarchical</th><th>新 staged hierarchical</th><th>变化 / 解读</th></tr></thead>
+            <tbody>
+              <tr><td>Ingress ACK mean</td><td>1,543.809 ms</td><td>3.323 ms</td><td class="delta-good">−99.78%；receipt 不再等待 commit。</td></tr>
+              <tr><td>Router / global capacity queue mean</td><td>506.719 ms</td><td>0.018 ms</td><td class="delta-good">几乎清零；长 flight 不再制造 false capacity wait。</td></tr>
+              <tr><td>dispatch → corrected 边界</td><td>1,045.739 ms/request<br>2.011 ms/token</td><td>575.744 ms/request<br>1.110 ms/token</td><td class="delta-good">−44.94%；仍保留一个平均约半量子的 staged wait。</td></tr>
+              <tr><td>LocalEngine 边界等待</td><td>command queue 1,018.515 ms</td><td>staged queue 531.509 ms</td><td>等待变得可观测、可与传输解耦，不再锁住 Router。</td></tr>
+              <tr><td>实际提交工作</td><td>local admission 4.242 ms</td><td>planned commit 1.217 ms</td><td class="delta-good">提交本身不是主延迟。</td></tr>
+              <tr><td>Corrected TPOT mean</td><td>66.176 ms/token</td><td>67.561 ms/token</td><td class="delta-neutral">跨节点/commit 数据，不能据此归因新版回归或收益。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card hero-card">
+        <h2>当前同配置 paired A/B：新版去中心化仍落后多少</h2>
+        <p>2026-08-25 在 <code>10.102.243.60 + 10.102.98.154</code> 上，以相同模型、数据集、rate 40、300 秒、12,000 请求、58,149,428 prompt tokens 和 7,192,133 output tokens 运行。hierarchical 启动于 <code>d2363a2</code>，随后到 <code>e1245f2</code> 的改动只涉及 profiler/说明与其测试，未改变 serving/benchmark 热路径；中心化运行于 <code>e1245f2</code>。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>指标</th><th>当前中心化</th><th>新版去中心化</th><th>去中心化差值</th></tr></thead>
+            <tbody>
+              <tr><td>成功 / 失败</td><td>12,000 / 0</td><td>12,000 / 0</td><td class="delta-good">一致，goodput 均 100%</td></tr>
+              <tr><td>Benchmark runtime</td><td>404.885 s</td><td>405.727 s</td><td>+0.841 s / +0.208%</td></tr>
+              <tr><td>Output throughput</td><td>17,763.38 tok/s</td><td>17,726.54 tok/s</td><td>−36.84 / −0.207%</td></tr>
+              <tr><td><strong>Corrected TPOT mean</strong></td><td>65.404 ms/token</td><td>67.561 ms/token</td><td class="delta-bad">+2.157 / +3.298%</td></tr>
+              <tr><td>Corrected TPOT p99</td><td>71.920 ms/token</td><td>74.079 ms/token</td><td class="delta-bad">+2.159 / +3.002%</td></tr>
+              <tr><td>Raw dispatch TPOT mean</td><td>65.432 ms/token</td><td>68.670 ms/token</td><td class="delta-bad">+3.238 / +4.949%</td></tr>
+              <tr><td><strong>Scheduled-arrival TPOT mean</strong></td><td>66.424 ms/token</td><td>68.670 ms/token</td><td class="delta-bad">+2.247 / +3.382%</td></tr>
+              <tr><td>Scheduled-arrival E2E mean / p99</td><td>40.175 / 71.464 s</td><td>41.508 / 74.174 s</td><td>+3.317% / +3.792%</td></tr>
+              <tr><td>Worker observed critical mean</td><td>802.020 ms</td><td>811.457 ms</td><td class="delta-bad">+9.437 ms / +1.176%</td></tr>
+              <tr><td>Executor boundary mean</td><td>803.563 ms</td><td>812.987 ms</td><td class="delta-bad">+9.424 ms / +1.173%</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card span-7">
+          <h3>为什么 raw dispatch 看起来差得更多</h3>
+          <p>中心化 run 的 scheduled-arrival → actual-dispatch lag mean 为 515.894 ms，去中心化仅 0.120 ms。Raw dispatch TPOT 从 T1 开始计时，因此中心化在发出请求前积累的约半秒 backlog 被排除；去中心化几乎立即 dispatch，等待则在 T1 后以 staged queue 出现。</p>
+          <div class="mono">中心化：scheduled arrival ── 515.894 ms ──► dispatch ─► execute
+                                     ↑ raw dispatch TPOT 从这里才开始
+
+去中心化：scheduled arrival ── 0.120 ms ──► dispatch ── staged ─► execute</div>
+          <p>所以公平的用户到达视角应看 scheduled-arrival TPOT；执行效率视角应看 corrected TPOT。两者回答不同问题，不能只挑更好看的一个。</p>
+        </div>
+        <div class="card span-5">
+          <h3>剩余差距的拆解</h3>
+          <ul>
+            <li>Scheduled-arrival mean gap：<strong>2.247 ms/token</strong>。</li>
+            <li>Corrected mean gap：<strong>2.157 ms/token</strong>，约占公平差距的 <strong>96%</strong>。</li>
+            <li>两架构额外 arrival→corrected 边界差仅约 <strong>0.090 ms/token</strong>，约占 4%。</li>
+          </ul>
+          <div class="callout warn-box">当前继续压 admission receipt 的收益上限很小。优先级应转向为什么去中心化 worker quantum 仍慢约 1.18%，以及 batch/packing/phase 是否改变了 corrected 执行路径。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>新版 hierarchical 内部控制边界</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>阶段</th><th>mean</th><th>p99</th><th>解释</th></tr></thead>
+            <tbody>
+              <tr><td>Router pending</td><td>0.381 ms</td><td>0.668 ms</td><td>规划前后本地等待很小。</td></tr>
+              <tr><td>Admission RPC / receipt</td><td>2.869 ms</td><td>16.467 ms</td><td>已从量子级降到毫秒级。</td></tr>
+              <tr><td>Frontend ACK overhead</td><td>0.073 ms</td><td>0.454 ms</td><td>非阻塞事件与 receipt 对账不是主因。</td></tr>
+              <tr><td>Staged queue</td><td>531.509 ms</td><td>1,125.900 ms</td><td>等待 safe boundary；仍是单请求控制边界的主体。</td></tr>
+              <tr><td>Planned commit</td><td>1.217 ms</td><td>3.050 ms</td><td>权威 scheduler commit 本身很轻。</td></tr>
+              <tr><td>Local scheduler queue</td><td>22.777 ms</td><td>53.451 ms</td><td>commit 后至 first forward。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">按每请求生成 token 归一化后，staged queue 贡献约 1.023 ms/token，占 1.110 ms/token 控制边界的约 92.2%；这解释“请求为何仍等”，但不等于它造成当前相对中心化的全部 TPOT 差距，因为中心化的相位等待主要发生在 actual dispatch 之前。</p>
+      </div>
+    </section>
+
+    <section id="playbook" role="tabpanel">
+      <div class="card hero-card">
+        <h2>可泛化的优化框架</h2>
+        <div class="formula">优先级 ≈ 串行关键路径时长 × 发生频率 × 阻塞扇出<br><span class="muted">不是“函数自身耗时最大”，而是“它让多少后续工作无法推进”</span></div>
+        <p>这套方法适用于分布式调度器、actor 系统、存储 ingestion、消息队列和控制/数据面混合服务。它强调协议依赖、所有权和计时边界，而不是只优化局部函数。</p>
+      </div>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-number">1</div>
+          <div class="step-body"><h3>先定义六个端到端边界</h3><p>至少区分 scheduled arrival、actual dispatch、receipt、authoritative commit、first execution 和 terminal。任何两个边界之间都应能独立统计 mean/p99/max；否则 backlog 很容易从一个阶段“搬”到另一个阶段并被误判为消失。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <div class="step-body"><h3>画等待依赖图，寻找长 flight 和 phase lock</h3><p>查看“谁在等谁、等待期间谁不能继续发”。本例真正的放大器不是 4 ms admission，而是 ACK 等待 commit 时 Router 禁止下一批，导致一个请求的相位等待阻塞约 20 个请求的后续 flight。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <div class="step-body"><h3>按执行位置分类，而不只按总 CPU 时间分类</h3><p>把工作分为 safe-boundary 串行、可与 accelerator overlap、frontend 异步和 offline 四类。即使总工作不变，只要把 O(payload) 的 decode/validation 移出 quantum boundary，也能显著缩短临界路径。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">4</div>
+          <div class="step-body"><h3>把“接收”与“生效”拆成两阶段</h3><p>当下游只能在离散安全点修改状态时，不要让上游同步等待生效。先做有界、可确认的 ownership transfer，再由单写者在安全点 commit；最终结果走异步事件。数据库 WAL、存储 ingest 和异步编译也适用这一模式。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">5</div>
+          <div class="step-body"><h3>用 credit / watermark 保住背压</h3><p>流水化不能等同于无限排队。发送方在 receipt 后继续保留资源 charge；接收方原子预留 bounded slot；snapshot 用单调水位告诉发送方哪些 receipt 已被远端状态覆盖，避免 double count 和提前放贷。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">6</div>
+          <div class="step-body"><h3>控制面看 sidecar，数据面传 opaque object</h3><p>如果路由组件只需要少量元数据，就不要让它展开完整对象。把可解释的调度字段放 sidecar，把复杂状态保留为 opaque payload；这样既减少转换，也保持未来扩展的所有权和兼容性。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">7</div>
+          <div class="step-body"><h3>用 progress engine 替代 all-shard barrier</h3><p>每个 shard 保持独立 outstanding flight，只消费 ready completion，并为每个 flight 设置 deadline。一个慢节点不应阻塞其他节点的 ingress、load 更新或事件消费。</p></div>
+        </div>
+        <div class="step">
+          <div class="step-number">8</div>
+          <div class="step-body"><h3>建立 CPU → 跨节点 CPU → GPU 的验证阶梯</h3><p>CPU 可以直接验证协议吞吐、batching、序列化、ownership、boundedness、重试和 actor placement；GPU 只用于验证 quantum overlap、RDMA、执行效率和端到端指标。这样既节省资源，也让故障归因更清楚。</p></div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <h3>正确的性能问题问法</h3>
+          <ul>
+            <li>这段工作是否位于串行 critical path？</li>
+            <li>它的完成是否阻止下一个 batch 或其他 shard？</li>
+            <li>时间是固定成本，还是 O(requests)、O(tokens)、O(ranks)？</li>
+            <li>并行 shard 应取 max、sum 还是带 barrier 的 max + skew？</li>
+            <li>优化后等待真的消失了，还是换了计时边界？</li>
+          </ul>
+        </div>
+        <div class="card span-6">
+          <h3>协议优化必须同时回答</h3>
+          <ul>
+            <li>positive receipt 到底承诺什么？</li>
+            <li>何时可以重传，何时必须 fail-stop？</li>
+            <li>谁是状态的唯一 writer？</li>
+            <li>queue 如何有界，资源何时 charge / release？</li>
+            <li>abort、duplicate、out-of-order event 如何收敛到唯一 terminal？</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>值得保留的反例清单</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>反模式</th><th>为什么危险</th><th>替代方式</th></tr></thead>
+            <tbody>
+              <tr><td>只看 raw dispatch latency</td><td>load generator backlog 可能发生在 dispatch 前，从指标中消失。</td><td>同时报告 scheduled-arrival、dispatch 和 corrected 边界。</td></tr>
+              <tr><td>把并行 shard 时间相加</td><td>会夸大 CPU 成本并错误定位热点。</td><td>按执行关系报告 critical max、skew 和 barrier tail。</td></tr>
+              <tr><td>为了快 ACK 而取消 ownership receipt</td><td>超时后无法判断是否能重传，可能造成双重执行。</td><td>保留短语义 receipt，最终 commit 异步确认。</td></tr>
+              <tr><td>把大对象在每层转换一次</td><td>CPU、分配和复制随 payload 线性叠加。</td><td>sidecar + opaque bytes；一次 serialize/send/deserialize。</td></tr>
+              <tr><td>看到微基准加速就直接集成</td><td>优化可能被 overlap 隐藏，或根本不在串行关键路径。</td><td>先用 boundary timing 证明它对端到端有可见上限。</td></tr>
+              <tr><td>把等待改名当成消除等待</td><td>ACK 变快但单请求仍等 safe boundary，容易过度宣称。</td><td>分别报告 receipt→commit 和 commit→first execution。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="next" role="tabpanel">
+      <div class="card hero-card">
+        <h2>当前不足：控制面主瓶颈已换挡，执行差距仍在</h2>
+        <p>这轮改动达成了“解除 admission stop-and-wait”的主要目标，但没有达到原设计文档中“corrected TPOT mean 回归不超过 1%”的验收线。当前 paired A/B 为 +3.298%，worker/executor quantum 约 +1.17%；下一轮应该围绕执行相位与量子打包做对称 profiling。</p>
+      </div>
+
+      <div class="grid">
+        <div class="card span-6">
+          <h3>优先级 P0：解释 corrected TPOT 的 3.3%</h3>
+          <ol>
+            <li>在中心化和去中心化两边同时开启相同 quantum diagnostics，比较 useful real batch、dummy slots、send_seqs、worker critical 和 result tail。</li>
+            <li>对同一 token trace 做交错运行（H/C/H/C），避免单次顺序运行的温度、节点和后台负载偏差。</li>
+            <li>核对 admission phase 改变后，两 engine 的 batch packing、首批进入时机和 active sequence 分布是否偏移。</li>
+          </ol>
+        </div>
+        <div class="card span-6">
+          <h3>优先级 P1：如果目标包含 TTFT，再缩短 staged wait</h3>
+          <ol>
+            <li>A/B loop count 16 vs 8，衡量 staged p50/p99、worker critical、协调频率和吞吐。</li>
+            <li>评估是否存在 executor 内部更细但仍安全的 admission 边界；不得让 ZMQ thread 直接写 scheduler。</li>
+            <li>对短输出请求单独观察 normalized boundary；当前 staged wait 占控制边界约 92.2%，短输出对固定等待更敏感。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>下一轮实验建议</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>实验</th><th>唯一变量</th><th>主要判据</th><th>停止条件</th></tr></thead>
+            <tbody>
+              <tr><td>两机 rate-40 交错重复 A/B</td><td>scheduler_arch</td><td>corrected/scheduled TPOT、worker critical、packing、100% goodput。</td><td>至少 3 对，置信区间能区分 1% 差距。</td></tr>
+              <tr><td>Hierarchical loop 16 vs 8</td><td>loop count</td><td>staged queue 是否近似减半，以及协调开销是否吞掉收益。</td><td>吞吐或 corrected TPOT 回归超过 1% 即停止扩展。</td></tr>
+              <tr><td>Rate 40 vs 50</td><td>arrival rate</td><td>receipt p99、message rate、global pending、scheduled-arrival backlog。</td><td>出现 unfinished、queue saturation 或 payload retry。</td></tr>
+              <tr><td>对称 quantum profiler</td><td>仅开启同一诊断</td><td>定位 9.4 ms/quantum 差值到 packing、submit、worker 或 tail。</td><td>找到可复现且占差距大头的阶段。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>必须继续守住的验收线</h3>
+        <span class="tag">12,000/12,000 success</span>
+        <span class="tag">payload retry bytes = 0</span>
+        <span class="tag">bounded staged depth</span>
+        <span class="tag">exact token totals</span>
+        <span class="tag">no duplicate / rejection / unfinished</span>
+        <span class="tag">Ray actors / GPUs fully released</span>
+        <span class="tag">scheduled-arrival + corrected 同时报告</span>
+        <p>任何继续缩短 staged wait 的方案，都不能通过放松 SP/KV reservation、跨过 FIFO head、让多个线程写 scheduler，或在 unknown receipt 后重传 payload 来实现。</p>
+      </div>
+
+      <div class="card">
+        <h3>证据与可复现入口</h3>
+        <ul class="source-list">
+          <li><a href="../2026-08-24/DecentralizedSchedulerDataflowReviewV2.md">纠正后的数据流与 CPU profiling review</a></li>
+          <li><a href="../2026-08-24/OpaqueSequenceIngress.md">Opaque Sequence ingress 设计与微基准</a></li>
+          <li><a href="../2026-08-24/TwoNodeRate40FiveMinuteAB.md">旧版两机 rate-40 paired A/B</a></li>
+          <li><a href="LeastBatchOptimizationDesign.html">两阶段 least_batch 优化设计</a></li>
+          <li><a href="least_batch_cpu_benchmark.json">单机 CPU benchmark JSON</a></li>
+          <li><a href="least_batch_ray_cpu_benchmark.json">Ray 两机 CPU benchmark JSON</a></li>
+          <li><a href="../../bench_logs/two_node_r40_staged_20260825_065545/hierarchical_dp2sp8/e815299b0bcbac849fa540c768ef21845365c9eb/sharegpt4o-random_geminiissue_r0.01_n60000_60k/dp2sp8_seg64k_n12000_r40_bs192_LB_hier_rpLB_maxreq910000_hao_basic_least_batch_staged_r40_5min_hierarchical_dp2sp8/20260825_145545.summary.json">新版 hierarchical summary</a></li>
+          <li><a href="../../bench_logs/two_node_r40_current_central_20260825_072149/legacy_global_dp2sp8/e815299b0bcbac849fa540c768ef21845365c9eb/sharegpt4o-random_geminiissue_r0.01_n60000_60k/dp2sp8_seg64k_n12000_r40_bs192_LB_legacy_rpLB_maxreq910000_hao_basic_current_central_r40_5min_legacy_global_dp2sp8/20260825_152149.summary.json">当前中心化 summary</a></li>
+          <li><a href="../../nanodeploy/engine/local_engine.py">LocalEngine staged ingress / commit</a></li>
+          <li><a href="../../nanodeploy/router/request_router.py">RequestRouter charge / watermark reconciliation</a></li>
+          <li><a href="../../nanodeploy/engine/deployment_manager.py">per-engine nonblocking frontend flights</a></li>
+          <li><a href="../../tests/test_least_batch_staged_admission.py">两阶段协议回归测试</a></li>
+        </ul>
+      </div>
+    </section>
+
+    <footer>
+      <p>复盘时间：2026-08-25 UTC。实现证据基线：<code>e1245f24aa09932bea9279d2814ae235f077022b</code>。本报告只总结 2026-08-24—25 的去中心化控制面优化；raw bench logs 仍视为生成物，不纳入文档提交。</p>
+    </footer>
+  </main>
+
+  <script>
+    const buttons = [...document.querySelectorAll('nav button[data-tab]')];
+    const panels = [...document.querySelectorAll('section[role="tabpanel"]')];
+
+    function selectTab(id, updateHash = true) {
+      buttons.forEach((button) => {
+        const selected = button.dataset.tab === id;
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-selected', String(selected));
+      });
+      panels.forEach((panel) => panel.classList.toggle('active', panel.id === id));
+      if (updateHash) history.replaceState(null, '', `#${id}`);
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
+
+    buttons.forEach((button, index) => {
+      button.setAttribute('role', 'tab');
+      button.addEventListener('click', () => selectTab(button.dataset.tab));
+      button.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+        event.preventDefault();
+        const offset = event.key === 'ArrowRight' ? 1 : -1;
+        const next = buttons[(index + offset + buttons.length) % buttons.length];
+        next.focus();
+        selectTab(next.dataset.tab);
+      });
+    });
+
+    const initial = location.hash.slice(1);
+    if (panels.some((panel) => panel.id === initial)) {
+      selectTab(initial, false);
+    } else {
+      selectTab('summary', false);
+    }
+  </script>
+</body>
+</html>
