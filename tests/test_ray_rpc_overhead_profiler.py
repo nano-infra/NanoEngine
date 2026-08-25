@@ -10,6 +10,7 @@ from scripts.ray_rpc_overhead.profile_ray_rpc_scalability import (
     _parse_positive_ints,
     _percentile,
     _plan_actor_node_ids,
+    _sample_ray_sequence_batch,
     _sample_token_rows,
     _stats,
 )
@@ -39,6 +40,23 @@ def test_sample_token_rows_match_decode_shape() -> None:
     assert rows[0][0] == 3
 
 
+def test_sample_ray_sequence_batch_preserves_requested_context() -> None:
+    batch = _sample_ray_sequence_batch(
+        logical_rank=3,
+        batch_size_per_gpu=2,
+        sequence_length=20_000,
+    )
+
+    assert len(batch) == 2
+    assert all(sequence.num_tokens == 20_000 for sequence in batch)
+    restored = pickle.loads(
+        pickle.dumps(batch, protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    assert len(restored) == 2
+    assert all(sequence.num_tokens == 20_000 for sequence in restored)
+    assert all(len(sequence.token_ids) == 20_000 for sequence in restored)
+
+
 def test_estimated_pickle_bytes_match_constructed_payloads() -> None:
     input_bytes, output_bytes = _estimated_pickle_bytes(4, 16)
     expected_input = len(
@@ -46,6 +64,21 @@ def test_estimated_pickle_bytes_match_constructed_payloads() -> None:
     )
     assert input_bytes == expected_input
     assert output_bytes > input_bytes
+
+    sequence_batch = _sample_ray_sequence_batch(0, 2, 20_000)
+    sequence_input_bytes, _ = _estimated_pickle_bytes(
+        2,
+        16,
+        sequence_batch,
+    )
+    expected_sequence_input = len(
+        pickle.dumps(
+            (sequence_batch, False, False, 0.0),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )
+    assert sequence_input_bytes == expected_sequence_input
+    assert sequence_input_bytes > 100_000
 
 
 def test_profiler_disables_ray_uv_runtime_environment_detection() -> None:

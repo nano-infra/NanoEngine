@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Profile NanoDeploy's production-shaped Ray decode control RPC fanout.
+"""Profile NanoDeploy's Ray invocation and result fanout overhead.
 
 NanoDeploy's DLSlime data path still uses Ray to invoke ``ModelRunner.run`` on
 every worker and to return sampled token IDs.  This CPU-only benchmark creates
-real Ray actors with the same ``run`` call signature, sends the same empty
-``dp_seqs`` argument used when ``use_dlslime_rpc=True``, and returns
-``batch_size_per_gpu * loop_count`` token IDs per logical worker.
+real Ray actors with the same ``run`` call signature and returns
+``batch_size_per_gpu * loop_count`` token IDs per logical worker.  It can send
+the empty ``dp_seqs`` control argument used when ``use_dlslime_rpc=True`` or
+full NanoDeploy ``Sequence`` objects to characterize Ray's former input data
+path, including serialization and deserialization.
 
 The benchmark measures Ray actor submission and result round-trip overhead.  It
 does not launch ModelRunner, execute GPU kernels, or emulate DLSlime/RDMA
@@ -40,6 +42,7 @@ from typing import Sequence
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 import ray
+from nanodeploy._cpp import Sequence as NanoDeploySequence
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
@@ -47,9 +50,15 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 class RayDecodeControlWorker:
     """Minimal actor implementing the Ray-facing portion of ModelRunner.run."""
 
-    def __init__(self, logical_rank: int, loop_count: int) -> None:
+    def __init__(
+        self,
+        logical_rank: int,
+        loop_count: int,
+        ray_sequence_length: int,
+    ) -> None:
         self.logical_rank = logical_rank
         self.loop_count = loop_count
+        self.ray_sequence_length = ray_sequence_length
         self._token_rows: list[list[int]] = []
 
     def configure_batch(self, batch_size_per_gpu: int) -> int:
@@ -79,12 +88,24 @@ class RayDecodeControlWorker:
         enable_rpc: bool,
         send_timestamp: float,
     ) -> tuple[list[list[int]], float]:
-        if dp_seqs:
-            raise ValueError("DLSlime Ray control RPC must carry empty dp_seqs")
         if is_prefill:
             raise ValueError("this profiler measures the decode control path")
-        if not enable_rpc:
-            raise ValueError("DLSlime-backed execution must enable endpoint RPC")
+        if self.ray_sequence_length > 0:
+            if enable_rpc:
+                raise ValueError("Ray Sequence transport must disable endpoint RPC")
+            if len(dp_seqs) != len(self._token_rows):
+                raise ValueError("Ray carried the wrong number of Sequences")
+            if any(
+                getattr(sequence, "num_tokens", None)
+                != self.ray_sequence_length
+                for sequence in dp_seqs
+            ):
+                raise ValueError("Ray carried a Sequence with the wrong length")
+        else:
+            if dp_seqs:
+                raise ValueError("DLSlime Ray control RPC must carry empty dp_seqs")
+            if not enable_rpc:
+                raise ValueError("DLSlime-backed execution must enable endpoint RPC")
         if send_timestamp <= 0.0:
             raise ValueError("send_timestamp must be populated")
         return self._token_rows, time.time()
@@ -158,8 +179,34 @@ def _sample_token_rows(
     ]
 
 
-def _estimated_pickle_bytes(batch_size_per_gpu: int, loop_count: int) -> tuple[int, int]:
-    input_args = ([], False, True, 0.0)
+def _sample_ray_sequence_batch(
+    logical_rank: int,
+    batch_size_per_gpu: int,
+    sequence_length: int,
+) -> list[NanoDeploySequence]:
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    token_ids = [
+        (logical_rank + token_index) % 32_000
+        for token_index in range(sequence_length)
+    ]
+    return [
+        NanoDeploySequence(token_ids, 0.0, 16, True)
+        for _ in range(batch_size_per_gpu)
+    ]
+
+
+def _estimated_pickle_bytes(
+    batch_size_per_gpu: int,
+    loop_count: int,
+    ray_sequence_batch: list[NanoDeploySequence] | None = None,
+) -> tuple[int, int]:
+    input_args = (
+        ray_sequence_batch if ray_sequence_batch is not None else [],
+        False,
+        ray_sequence_batch is None,
+        0.0,
+    )
     output = (_sample_token_rows(0, batch_size_per_gpu, loop_count), 0.0)
     return (
         len(pickle.dumps(input_args, protocol=pickle.HIGHEST_PROTOCOL)),
@@ -221,13 +268,26 @@ def _plan_actor_node_ids(
 
 def _invoke_once(
     actors: Sequence[ray.actor.ActorHandle],
+    ray_sequence_batches: Sequence[list[NanoDeploySequence]] | None,
 ) -> tuple[float, float, float, float, list[tuple[list[list[int]], float]]]:
     send_timestamp = time.time()
     begin_ns = time.perf_counter_ns()
-    refs = [
-        actor.run.remote([], False, True, send_timestamp)
-        for actor in actors
-    ]
+    if ray_sequence_batches is None:
+        refs = [
+            actor.run.remote([], False, True, send_timestamp)
+            for actor in actors
+        ]
+    else:
+        if len(ray_sequence_batches) != len(actors):
+            raise ValueError("each actor requires one Ray Sequence batch")
+        refs = [
+            actor.run.remote(sequences, False, False, send_timestamp)
+            for actor, sequences in zip(
+                actors,
+                ray_sequence_batches,
+                strict=True,
+            )
+        ]
     submit_end_ns = time.perf_counter_ns()
     results = ray.get(refs)
     end_ns = time.perf_counter_ns()
@@ -267,6 +327,7 @@ def _profile_case(
     logical_workers: int,
     batch_size_per_gpu: int,
     loop_count: int,
+    ray_sequence_length: int,
     warmup_iterations: int,
     measured_iterations: int,
 ) -> dict[str, object]:
@@ -280,8 +341,22 @@ def _profile_case(
     if configured != [batch_size_per_gpu] * logical_workers:
         raise RuntimeError("one or more Ray actors rejected the configured batch size")
 
+    ray_sequence_batches = None
+    if ray_sequence_length > 0:
+        ray_sequence_batches = [
+            _sample_ray_sequence_batch(
+                logical_rank=logical_rank,
+                batch_size_per_gpu=batch_size_per_gpu,
+                sequence_length=ray_sequence_length,
+            )
+            for logical_rank in range(logical_workers)
+        ]
+
     for _ in range(warmup_iterations):
-        *_, warmup_results = _invoke_once(active_actors)
+        *_, warmup_results = _invoke_once(
+            active_actors,
+            ray_sequence_batches,
+        )
         _validate_results(
             warmup_results,
             logical_workers=logical_workers,
@@ -303,7 +378,7 @@ def _profile_case(
                 roundtrip_ms,
                 finish_to_get_ms,
                 results,
-            ) = _invoke_once(active_actors)
+            ) = _invoke_once(active_actors, ray_sequence_batches)
             submit_samples_ms.append(submit_ms)
             ray_get_samples_ms.append(ray_get_ms)
             roundtrip_samples_ms.append(roundtrip_ms)
@@ -322,6 +397,11 @@ def _profile_case(
     input_bytes_per_worker, output_bytes_per_worker = _estimated_pickle_bytes(
         batch_size_per_gpu,
         loop_count,
+        (
+            ray_sequence_batches[0]
+            if ray_sequence_batches is not None
+            else None
+        ),
     )
     submit = _stats(submit_samples_ms)
     ray_get_stats = _stats(ray_get_samples_ms)
@@ -331,12 +411,22 @@ def _profile_case(
         "logical_workers": logical_workers,
         "batch_size_per_gpu": batch_size_per_gpu,
         "loop_count": loop_count,
+        "ray_sequence_length": ray_sequence_length,
+        "input_transport": (
+            "ray_sequence" if ray_sequence_length > 0 else "dlslime_control"
+        ),
         "warmup_iterations": warmup_iterations,
         "measured_iterations": measured_iterations,
+        "logical_input_token_ids": (
+            logical_workers * batch_size_per_gpu * ray_sequence_length
+        ),
         "logical_output_token_ids": (
             logical_workers * batch_size_per_gpu * loop_count
         ),
         "estimated_pickle_input_bytes_per_worker": input_bytes_per_worker,
+        "estimated_pickle_input_bytes_total": (
+            logical_workers * input_bytes_per_worker
+        ),
         "estimated_pickle_output_bytes_per_worker": output_bytes_per_worker,
         "estimated_pickle_output_bytes_total": (
             logical_workers * output_bytes_per_worker
@@ -392,6 +482,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated returned sequence counts per logical worker.",
     )
     parser.add_argument("--loop-count", type=int, default=16)
+    parser.add_argument(
+        "--ray-sequence-length",
+        type=int,
+        default=0,
+        help=(
+            "Full Sequence length sent through Ray per request; 0 preserves "
+            "the production DLSlime control-only input path."
+        ),
+    )
     parser.add_argument("--warmup-iterations", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument(
@@ -419,6 +518,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.loop_count <= 0:
         parser.error("--loop-count must be positive")
+    if args.ray_sequence_length < 0:
+        parser.error("--ray-sequence-length must be non-negative")
     if args.warmup_iterations < 0:
         parser.error("--warmup-iterations must be non-negative")
     if args.iterations <= 0:
@@ -471,9 +572,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         node_id,
                         soft=False,
                     )
-                ).remote(rank, args.loop_count)
+                ).remote(rank, args.loop_count, args.ray_sequence_length)
                 if node_id is not None
-                else RayDecodeControlWorker.remote(rank, args.loop_count)
+                else RayDecodeControlWorker.remote(
+                    rank,
+                    args.loop_count,
+                    args.ray_sequence_length,
+                )
             )
             actors.append(actor)
         ready_ranks = ray.get([actor.ready.remote() for actor in actors])
@@ -505,6 +610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     logical_workers=logical_workers,
                     batch_size_per_gpu=batch_size_per_gpu,
                     loop_count=args.loop_count,
+                    ray_sequence_length=args.ray_sequence_length,
                     warmup_iterations=args.warmup_iterations,
                     measured_iterations=args.iterations,
                 )
@@ -525,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ray.shutdown()
 
     metadata = {
-        "benchmark": "nanodeploy-ray-decode-control-rpc-scalability",
+        "benchmark": "nanodeploy-ray-rpc-scalability",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
@@ -537,12 +643,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selected_nodes": selected_nodes,
         "actor_placements": actor_placements,
         "timed_scope": (
-            "Ray actor run.remote submission plus ray.get of production-shaped "
-            "decode token results"
+            "Ray actor run.remote submission, optional full Sequence input "
+            "transfer, and ray.get of decode token results"
         ),
         "excluded_scope": (
-            "scheduler, Sequence DLSlime/RDMA transfer, ModelRunner, GPU kernels, "
-            "actor creation, batch payload construction, and result validation"
+            "scheduler, DLSlime/RDMA, ModelRunner, GPU kernels, actor creation, "
+            "batch payload construction, and result validation"
         ),
         "topology_limit": (
             "logical workers are colocated in one isolated Ray instance"

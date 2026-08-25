@@ -1,13 +1,17 @@
-# Ray Decode Control RPC Scalability Profiler
+# Ray RPC Scalability Profiler
 
-`profile_ray_rpc_scalability.py` measures the Ray portion that remains in the
-production DLSlime decode path:
+`profile_ray_rpc_scalability.py` has two input modes:
 
-1. The driver submits `run.remote([], False, True, send_timestamp)` to every
-   logical worker.
-2. Each worker immediately returns `BS/GPU * loop_count` sampled token IDs and
-   its completion timestamp.
-3. The driver waits for and deserializes all results with `ray.get`.
+1. The default control-only mode submits the empty `dp_seqs` used by the
+   production DLSlime decode path.
+2. `--ray-sequence-length N` sends `BS/GPU` real NanoDeploy `Sequence` objects
+   containing `N` tokens through Ray to reproduce the former Ray input path.
+
+In both modes each worker returns `BS/GPU * loop_count` sampled token IDs and
+the driver waits for and deserializes every result with `ray.get`. The timed
+round trip includes input serialization and transfer, actor execution, output
+serialization and transfer, driver deserialization, and fan-in. Sequence and
+output construction happen before timing.
 
 The profiler uses real Ray actors but no ModelRunner, model weights, GPUs, or
 DLSlime endpoints. By default all logical workers are colocated in a fresh
@@ -37,6 +41,15 @@ submission and result collection. `roundtrip_mean_ms_per_decode_step` is that
 value divided by `loop_count`; the actual RPC is issued once per quantum, not
 once per decode step.
 
+To measure full 20K-token request Sequences through Ray, add:
+
+```bash
+--ray-sequence-length 20000
+```
+
+This is a Ray Sequence-transfer baseline, not the current DLSlime input path.
+The JSON reports the estimated pickle bytes per worker and across all workers.
+
 For a dedicated two-node Ray cluster with eight workers on each host, connect
 to the head GCS address and request hard placement:
 
@@ -49,6 +62,7 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
   --workers-per-node 8 \
   --batch-sizes 32,64,128 \
   --loop-count 16 \
+  --ray-sequence-length 20000 \
   --warmup-iterations 10 \
   --iterations 100 \
   --output-dir /tmp/nanodeploy-ray-rpc-two-node
