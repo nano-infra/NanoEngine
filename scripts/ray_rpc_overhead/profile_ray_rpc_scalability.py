@@ -33,6 +33,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+# This standalone profiler is deliberately launched with python3, never
+# ``uv run``. Disable Ray's import-time uv parent-process discovery because it
+# is both unnecessary here and unreliable in PID-namespaced containers where
+# an ancestor can disappear before psutil walks the chain.
+os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+
 import ray
 
 
@@ -363,6 +369,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_dashboard=False,
         num_cpus=min(os.cpu_count() or 1, max(args.logical_workers)),
         _temp_dir=str(ray_temp_dir),
+        _skip_env_hook=True,
         logging_level="ERROR",
     )
     records: list[dict[str, object]] = []

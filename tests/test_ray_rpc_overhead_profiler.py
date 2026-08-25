@@ -4,6 +4,7 @@ import pickle
 
 import pytest
 
+from scripts.ray_rpc_overhead import profile_ray_rpc_scalability as profiler
 from scripts.ray_rpc_overhead.profile_ray_rpc_scalability import (
     _estimated_pickle_bytes,
     _parse_positive_ints,
@@ -44,3 +45,46 @@ def test_estimated_pickle_bytes_match_constructed_payloads() -> None:
     )
     assert input_bytes == expected_input
     assert output_bytes > input_bytes
+
+
+def test_profiler_disables_ray_uv_runtime_environment_detection() -> None:
+    from ray._private import ray_constants
+
+    assert profiler.os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
+    assert ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV is False
+
+
+def test_main_skips_ray_runtime_environment_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class ExpectedInit(Exception):
+        pass
+
+    init_kwargs = {}
+
+    def capture_init(**kwargs):
+        init_kwargs.update(kwargs)
+        raise ExpectedInit
+
+    monkeypatch.setattr(profiler.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(profiler.ray, "init", capture_init)
+
+    with pytest.raises(ExpectedInit):
+        profiler.main(
+            [
+                "--logical-workers",
+                "2",
+                "--batch-sizes",
+                "2",
+                "--warmup-iterations",
+                "0",
+                "--iterations",
+                "1",
+                "--output-dir",
+                str(tmp_path / "results"),
+            ]
+        )
+
+    assert init_kwargs["address"] == "local"
+    assert init_kwargs["_skip_env_hook"] is True
