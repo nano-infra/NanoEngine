@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hierarchical Sync Result Path Optimization Plan</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08111f;
+      --panel: #111d30;
+      --panel-2: #17253c;
+      --line: #2c405f;
+      --text: #e7eef9;
+      --muted: #9eb0ca;
+      --cyan: #67d8f3;
+      --green: #72e0ad;
+      --amber: #ffc970;
+      --red: #ff8b91;
+      --violet: #baa7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 15% 0%, #14365a 0, transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1220px; margin: auto; padding: 34px 24px 70px; }
+    h1 { font-size: clamp(29px, 5vw, 48px); line-height: 1.08; margin: 0 0 12px; }
+    h2 { margin: 0 0 14px; font-size: 24px; }
+    h3 { margin: 22px 0 10px; font-size: 18px; }
+    p { margin: 8px 0 14px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { color: var(--cyan); }
+    pre {
+      white-space: pre-wrap;
+      background: #081321;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      overflow: auto;
+    }
+    .eyebrow { color: var(--cyan); font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+    .lede { max-width: 900px; color: #c7d5e9; font-size: 18px; }
+    .meta, .grid, .flow, .risk-grid { display: grid; gap: 14px; }
+    .meta { grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 25px 0; }
+    .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .risk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card, .metric, .step, .risk {
+      background: linear-gradient(160deg, rgba(23,37,60,.96), rgba(14,26,44,.96));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 17px;
+    }
+    .metric strong { display: block; color: var(--green); font-size: 25px; }
+    .metric span, .muted { color: var(--muted); }
+    .status { color: var(--amber); font-weight: 750; }
+    .good { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .tabs { margin-top: 28px; }
+    .tabbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .tabbar button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 9px 14px;
+      color: var(--text);
+      background: #101c2f;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    .tabbar button[aria-selected="true"] { background: #17435d; border-color: var(--cyan); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .flow { grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; }
+    .flow .node { background: #101d31; border: 1px solid var(--line); border-radius: 12px; padding: 15px; }
+    .flow .hot { border-color: var(--amber); box-shadow: inset 0 0 0 1px rgba(255,201,112,.18); }
+    .arrow { align-self: center; color: var(--cyan); font-size: 24px; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 650; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    .callout {
+      border-left: 5px solid var(--cyan);
+      background: rgba(21,54,76,.68);
+      padding: 14px 17px;
+      border-radius: 0 11px 11px 0;
+      margin: 15px 0;
+    }
+    .callout.warnbox { border-color: var(--amber); background: rgba(83,61,24,.42); }
+    .callout.redbox { border-color: var(--red); background: rgba(84,32,42,.4); }
+    .step { position: relative; padding-left: 54px; }
+    .step::before {
+      content: attr(data-step);
+      position: absolute; left: 16px; top: 16px;
+      width: 26px; height: 26px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: #1c536f; color: white; font-weight: 800;
+    }
+    .file { color: var(--violet); }
+    .checklist li::marker { color: var(--green); }
+    footer { color: var(--muted); margin-top: 30px; font-size: 13px; }
+    @media (max-width: 850px) {
+      .meta, .grid, .risk-grid { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">NanoDeploy · Pure synchronous scheduling</div>
+  <h1>Hierarchical sync result-path optimization plan</h1>
+  <p class="lede">
+    在不引入 async/depth-2、不改变 worker 协议和调度语义的前提下，消除
+    <code>LocalScheduler.postprocess()</code> 的重复 request/rank 映射与
+    <code>SP × batch</code> Python 遍历，并让 <code>LocalExecutor</code> 复用 plan
+    阶段已经冻结的顺序信息。
+  </p>
+
+  <section class="meta">
+    <div class="metric"><span>文档状态</span><strong class="good">Reviewed</strong></div>
+    <div class="metric"><span>目标路径</span><strong>sync only</strong></div>
+    <div class="metric"><span>当前 postprocess 差值</span><strong>+2.56 ms/q</strong></div>
+    <div class="metric"><span>预计文件范围</span><strong>5 code + tests</strong></div>
+  </section>
+
+  <div class="callout warnbox">
+    <strong>边界：</strong>本计划不优化 consensus，不引入 persistent worker，不改变
+    CUDA/token materialization，也不把 qdiag 中的 <code>recv_seqs</code> 平均值当成纯网络延迟。
+  </div>
+
+  <section class="tabs">
+    <div class="tabbar" role="tablist" aria-label="Plan sections">
+      <button role="tab" aria-selected="true" data-tab="scope">范围与证据</button>
+      <button role="tab" aria-selected="false" data-tab="current">当前路径</button>
+      <button role="tab" aria-selected="false" data-tab="design">设计</button>
+      <button role="tab" aria-selected="false" data-tab="safety">正确性</button>
+      <button role="tab" aria-selected="false" data-tab="tests">测试与验收</button>
+      <button role="tab" aria-selected="false" data-tab="review">Review</button>
+    </div>
+
+    <article id="scope" class="panel active" role="tabpanel">
+      <div class="card">
+        <h2>范围与现有证据</h2>
+        <div class="grid">
+          <div class="metric"><span>Central schedule</span><strong>1.24 ms</strong></div>
+          <div class="metric"><span>Hierarchical schedule</span><strong>1.47 ms</strong></div>
+          <div class="metric"><span>GPU rank time 差值</span><strong>+0.11%</strong></div>
+        </div>
+        <p>
+          DP2SP8 下 central scheduler 尚未饱和，因此本次不试图通过新抽象提升扩展性；只删除
+          hierarchical sync 路径中已能由冻结 batch 信息替代的 Python 重复工作。
+        </p>
+
+        <table>
+          <thead><tr><th>对象</th><th>本计划处理</th><th>明确不处理</th></tr></thead>
+          <tbody>
+            <tr><td>LocalDecodeBatch</td><td>冻结 mastered row/order 元数据</td><td>worker payload schema</td></tr>
+            <tr><td>LocalExecutor</td><td>复用冻结元数据；默认 positional fastpath</td><td>Ray/ZMQ transport 替换</td></tr>
+            <tr><td>LocalScheduler</td><td>按 rank 单次线性重建 postprocess 输入</td><td>C++ Scheduler 算法</td></tr>
+            <tr><td>Config/benchmark</td><td>将已验证 fastpath 作为默认</td><td>删除诊断回退开关</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout">
+          历史 A/B 已证明 positional fastpath 正确，但它只节省约
+          <strong>0.087 ms/engine-quantum</strong>。所以计划不会把 fastpath 开关包装成主要收益；主要目标是
+          plan/submit/postprocess 三处重复扫描。
+        </div>
+      </div>
+    </article>
+
+    <article id="current" class="panel" role="tabpanel">
+      <div class="card">
+        <h2>当前同步路径与重复工作</h2>
+        <div class="flow">
+          <div class="node">
+            <strong>LocalScheduler.plan_decode</strong><br>
+            多次扫描 sequences；按每个 SP rank 再过滤 real requests。
+          </div>
+          <div class="arrow">→</div>
+          <div class="node hot">
+            <strong>LocalExecutor.run</strong><br>
+            每个 rank 再扫描完整 per-rank list，构造 mastered_by_rank；结果再做 dict/set/reorder。
+          </div>
+          <div class="arrow">→</div>
+          <div class="node hot">
+            <strong>LocalScheduler.postprocess</strong><br>
+            每个 SP rank 遍历 batch._all_sequences，并再次构造 token_by_request。
+          </div>
+        </div>
+
+        <h3>当前复杂度</h3>
+        <table>
+          <thead><tr><th>位置</th><th>重复动作</th><th>近似复杂度</th></tr></thead>
+          <tbody>
+            <tr><td>plan_decode</td><td>control/real/master/order 的独立扫描</td><td><code>O(SP × real + batch)</code></td></tr>
+            <tr><td>LocalExecutor submit</td><td>每个 rank 从完整 Sequence list 过滤 mastered</td><td><code>O(SP × batch)</code></td></tr>
+            <tr><td>LocalExecutor result</td><td>request-id dict、set 校验、expected reorder</td><td><code>O(real)</code> + Python objects</td></tr>
+            <tr><td>LocalScheduler postprocess</td><td>每个 rank 全 batch 过滤 + request-token dict</td><td><code>O(SP × batch)</code></td></tr>
+          </tbody>
+        </table>
+
+        <p class="muted">
+          <code>per_rank_sequences</code> 仍需为每个 worker 提供完整 canonical Sequence skeleton；本计划不改变这一传输要求。
+        </p>
+      </div>
+    </article>
+
+    <article id="design" class="panel" role="tabpanel">
+      <div class="card">
+        <h2>最小设计</h2>
+
+        <div class="step" data-step="1">
+          <h3>plan 阶段一次冻结</h3>
+          <p>
+            在 <code>LocalScheduler.plan_decode()</code> 的单次 sequence 遍历中，同时构建：
+          </p>
+          <pre>frozen_mastered_sequences: dict[int, tuple[Sequence, ...]]
+frozen_real_row_indices: dict[int, tuple[int, ...]]
+frozen_request_order: dict[int, tuple[int, ...]]
+request_master_global_rank: dict[int, int]</pre>
+          <p>
+            <code>frozen_real_row_indices[rank]</code> 指向 worker 原始
+            <code>token_rows</code> 中的真实请求行；control dummy 行不进入
+            <code>WorkerDecodeResult.sampled_token_ids</code>。
+          </p>
+        </div>
+
+        <div class="step" data-step="2">
+          <h3>Executor 直接复用冻结映射</h3>
+          <ul>
+            <li>提交前直接读取 <code>frozen_mastered_sequences</code>，不再调用每个 Sequence 的 <code>block_ctx()</code> 做 rank 过滤。</li>
+            <li>结果路径按 <code>frozen_real_row_indices</code> 从 <code>token_rows</code> positional pack。</li>
+            <li>继续校验 result envelope、row count、wave/quantum/rank、每行 token count。</li>
+            <li>保留旧 dict/set 路径作为显式诊断回退，但 production/config/benchmark 默认启用 fastpath。</li>
+          </ul>
+        </div>
+
+        <div class="step" data-step="3">
+          <h3>Scheduler 按 rank 单次重建</h3>
+          <p>
+            <code>batch.validate_worker_results()</code> 已保证返回 token 顺序等于
+            <code>frozen_request_order</code>。postprocess 对每个 rank 只遍历其
+            <code>frozen_mastered_sequences</code>：
+          </p>
+          <pre>real_tokens = iter(result.sampled_token_ids)
+for sequence in frozen_mastered_sequences[rank]:
+    if is_control_dummy(sequence):
+        append(sequence, ZERO_DUMMY_TOKENS)
+    else:
+        tokens = next(real_tokens)  # aborted request 也必须消费
+        if sequence.seq_id not in aborted_ids:
+            append(sequence, tokens)</pre>
+          <p>
+            这样保留 C++ postprocess 期望的 mastered Sequence 顺序，同时把
+            <code>SP × batch</code> 降为所有 mastered rows 的一次总遍历。
+          </p>
+        </div>
+
+        <h3>预计修改文件</h3>
+        <ul>
+          <li><span class="file">nanodeploy/engine/hierarchical_contract.py</span>：冻结字段与只读访问器。</li>
+          <li><span class="file">nanodeploy/engine/local_scheduler.py</span>：单次构建与线性 postprocess。</li>
+          <li><span class="file">nanodeploy/engine/local_executor.py</span>：复用冻结 mapping、默认 positional path。</li>
+          <li><span class="file">nanodeploy/config.py</span>、benchmark entry：fastpath 默认值一致。</li>
+            <li><span class="file">tests/test_hierarchical_contract.py</span>、<span class="file">tests/test_hierarchical_control_plane.py</span>：characterization、结构与错误路径。</li>
+        </ul>
+
+        <div class="callout">
+          Review 决定：两个 frozen rank map 是 <strong>LocalDecodeBatch 的必填字段</strong>，不提供静默回退扫描。
+          这样任何非 LocalScheduler 构造的 batch 都必须显式证明顺序不变量；现有手工构造测试将同步更新。
+        </div>
+      </div>
+    </article>
+
+    <article id="safety" class="panel" role="tabpanel">
+      <div class="card">
+        <h2>必须保持的正确性不变量</h2>
+        <div class="risk-grid">
+          <div class="risk">
+            <h3 class="good">身份与顺序</h3>
+            <ul class="checklist">
+              <li>batch 只属于一个 engine/wave/quantum。</li>
+              <li>每个 global rank 恰好一个 WorkerDecodeResult。</li>
+              <li>result request IDs 必须严格等于冻结顺序。</li>
+              <li>每个真实请求恰好 16 个 sampled token。</li>
+            </ul>
+          </div>
+          <div class="risk">
+            <h3 class="good">dummy 与 abort</h3>
+            <ul class="checklist">
+              <li>dummy 依赖 Python 对象身份，不依赖可能碰撞的 seq_id。</li>
+              <li>inflight abort 不提交 worker 返回 token。</li>
+              <li>即使 abort，仍消费对应 positional token，防止后续请求错位。</li>
+              <li>dummy 继续向 C++ postprocess 注入 16 个零 token。</li>
+            </ul>
+          </div>
+          <div class="risk">
+            <h3 class="good">状态与资源</h3>
+            <ul class="checklist">
+              <li>num_completed_tokens、ITL slots、mastered tokens 统计不变。</li>
+              <li>FirstTokenEvent/FinishEvent 的顺序和 generated_count 不变。</li>
+              <li>preemption/readmission 和 terminal 去重不变。</li>
+            </ul>
+          </div>
+          <div class="risk">
+            <h3 class="warn">Positional 假设</h3>
+            <p>
+              Worker 的 token rows 必须保持 RDMA 反序列化 Sequence 的 mastered 顺序。当前 slow path 的
+              “request-id 校验”同样由 driver 侧 Sequence 推导，并不能检测 worker 静默重排行，因此启用
+              positional path 不会移除一项真实存在的端到端校验。
+            </p>
+          </div>
+        </div>
+
+        <div class="callout redbox">
+          若 review 发现 worker 任一路径可能重排 mastered rows，计划必须先扩展 worker result identity，不能直接默认 fastpath。
+        </div>
+      </div>
+    </article>
+
+    <article id="tests" class="panel" role="tabpanel">
+      <div class="card">
+        <h2>测试顺序与验收门槛</h2>
+        <ol>
+          <li>
+            <strong>原始代码 characterization：</strong>先增加多 rank、多真实请求、control dummy、倒序 worker results、inflight abort 的 token 对应测试，并确认原实现通过。
+          </li>
+          <li>
+            <strong>结构回归：</strong>优化后用禁止遍历的 guard list 证明 postprocess 不再迭代
+            <code>batch._all_sequences</code>；用会在 <code>block_ctx()</code> 上失败的 fake Sequence 证明 Executor 不再提交前扫描。
+          </li>
+          <li>
+            <strong>错误路径：</strong>缺 rank、重复 rank、错误 wave/quantum、错误 row count、错误 token count 均保持 fail-stop。
+          </li>
+          <li>
+            <strong>CPU 回归：</strong>运行 hierarchical contract/control-plane、Ray executor diagnostics 和 ingress 相关测试；不触发 GPU benchmark。
+          </li>
+          <li>
+            <strong>GPU 验收（后续单独授权）：</strong>同 commit、qdiag off 的 DP2SP8 交错 A/B；再用一个 qdiag probe 对比 submit/postprocess 直接计时。
+          </li>
+        </ol>
+
+        <table>
+          <thead><tr><th>门槛</th><th>要求</th></tr></thead>
+          <tbody>
+            <tr><td>行为</td><td>完成请求、逐请求 output token count、abort/terminal 事件完全一致。</td></tr>
+            <tr><td>结构</td><td>postprocess 不再执行 <code>SP × batch._all_sequences</code>；submit 不再重新计算 mastered rows。</td></tr>
+            <tr><td>直接计时</td><td>postprocess 与 actor-submit 中至少一个稳定下降；无阶段显著退化。</td></tr>
+            <tr><td>端到端</td><td>只把重复配对且超过运行方差的改善认定为收益。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </article>
+
+    <article id="review" class="panel" role="tabpanel">
+      <div class="card">
+        <h2>第二轮 Review 记录</h2>
+        <p class="good"><strong>结论：设计可进入 characterization 阶段；不需要扩大到 worker 协议或 C++。</strong></p>
+
+        <table>
+          <thead><tr><th>检查项</th><th>结论</th><th>计划修订</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Worker row 顺序</td>
+              <td>安全。server 序列化 canonical list；worker 用稳定 list comprehension 过滤 mastered Sequence；最终 token tensor 行顺序保持该 <code>sp_seqs</code> 顺序。</td>
+              <td>增加 positional mapping characterization test。</td>
+            </tr>
+            <tr>
+              <td>旧 slow-path 校验强度</td>
+              <td>旧 <code>actual_request_order</code> 也由 driver 侧 mastered Sequence 推导，无法检测 worker 静默重排；fastpath 不会删除真实 worker identity 校验。</td>
+              <td>默认启用 fastpath，保留显式回退用于 A/B。</td>
+            </tr>
+            <tr>
+              <td>Inflight abort</td>
+              <td>安全但易错。abort 后 Sequence 会被 deallocate；positional iterator 必须先消费该真实请求 token，再跳过 C++ postprocess 输入。</td>
+              <td>增加同 rank 中“aborted request 位于 surviving requests 之间”的测试。</td>
+            </tr>
+            <tr>
+              <td>Control dummy ID 碰撞</td>
+              <td>必须继续按 Python 对象身份识别，不能按 <code>seq_id</code>。</td>
+              <td>冻结 mastered rows 保存原对象；保留 object-id set。</td>
+            </tr>
+            <tr>
+              <td>现有 fastpath 收益</td>
+              <td>历史实测只节省 0.087 ms/engine-quantum，不能解释 2.56 ms postprocess 差值。</td>
+              <td>验收重点放在 Scheduler 线性重建和 Executor submit 扫描，不夸大 result pack 收益。</td>
+            </tr>
+            <tr>
+              <td><code>recv_seqs</code></td>
+              <td>平均值受 worker 启动与 RDMA 到达相位影响，不能作为本修改的直接验收指标。</td>
+              <td>只看 executor begin→result、actor submit、postprocess 以及端到端配对。</td>
+            </tr>
+            <tr>
+              <td>手工 batch / ZMQ</td>
+              <td>LocalDecodeBatch 只有 production builder 和少量测试直接构造；ZMQ 与 Ray 都进入同一 result rebuild。</td>
+              <td>frozen fields 设为必填；更新 Ray/ZMQ fake batch 测试。</td>
+            </tr>
+            <tr>
+              <td>Config 默认值</td>
+              <td>benchmark 当前用环境变量默认 <code>0</code> 覆盖 Config；只改 Config 不会生效。</td>
+              <td>Config 与 benchmark env fallback 同时改为启用。</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Review 后的额外收敛</h3>
+        <ul class="checklist">
+          <li>postprocess 复用 <code>batch.request_master_global_rank</code>，不再从 live Sequence 重建 <code>master_sp_by_request</code>。</li>
+          <li>只计算一次 surviving inflight request 顺序，复用到完成计数和 terminal 状态更新。</li>
+          <li>保留 <code>validate_worker_results()</code> 的小型 rank map，以支持倒序返回和 duplicate/missing/extra rank fail-stop；不为 8 个 rank 牺牲清晰性。</li>
+          <li><code>per_rank_sequences</code> 的完整 canonical payload 不在本计划内，避免改变 worker 输入语义。</li>
+          <li>不触碰用户已有的 <code>.gitignore</code> 与 <code>AGENTS.md</code> 修改。</li>
+        </ul>
+      </div>
+    </article>
+  </section>
+
+  <footer>
+    NanoDeploy internal engineering plan · 2026-08-25 UTC · No external assets · No GPU operation performed
+  </footer>
+</main>
+<script>
+  const buttons = [...document.querySelectorAll('[role="tab"]')];
+  const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+  for (const button of buttons) {
+    button.addEventListener('click', () => {
+      for (const candidate of buttons) {
+        candidate.setAttribute('aria-selected', String(candidate === button));
+      }
+      for (const panel of panels) {
+        panel.classList.toggle('active', panel.id === button.dataset.tab);
+      }
+    });
+  }
+</script>
+</body>
+</html>
