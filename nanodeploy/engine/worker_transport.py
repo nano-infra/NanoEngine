@@ -15,7 +15,7 @@ import msgspec
 import zmq
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 TRANSPORT_SLOTS = 2
 MAX_COMMAND_BYTES = 1 << 20
 MAX_RESPONSE_BYTES = 16 << 20
@@ -69,6 +69,7 @@ class DecodeCommand(
     wave_id: int
     quantum_id: int
     send_timestamp: float
+    sequence_epochs: tuple[tuple[int, int], ...]
     transport_slot: int = 0
     hierarchical_trace: dict[str, Any] | None = None
     hierarchical_quantum_diagnostics: bool = False
@@ -461,6 +462,17 @@ class ZmqWorkerServer:
                 raise WorkerTransportProtocolError(
                     "worker transport slot/quantum mismatch: "
                     f"expected={expected_slot}, got={command.transport_slot}"
+                )
+            sequence_ids = tuple(
+                request_id for request_id, _epoch in command.sequence_epochs
+            )
+            if len(set(sequence_ids)) != len(sequence_ids):
+                raise WorkerTransportProtocolError(
+                    "worker sequence epochs contain duplicate request IDs"
+                )
+            if any(epoch < -1 for _request_id, epoch in command.sequence_epochs):
+                raise WorkerTransportProtocolError(
+                    "worker sequence generation epoch must be at least -1"
                 )
             quantum_keys.add((command.wave_id, command.quantum_id))
             encoded[rank] = encode_command(command)
@@ -867,6 +879,17 @@ class ZmqWorkerClient:
             raise WorkerTransportProtocolError(
                 "worker transport slot/quantum mismatch: "
                 f"expected={expected_slot}, got={command.transport_slot}"
+            )
+        sequence_ids = tuple(
+            request_id for request_id, _epoch in command.sequence_epochs
+        )
+        if len(set(sequence_ids)) != len(sequence_ids):
+            raise WorkerTransportProtocolError(
+                "worker sequence epochs contain duplicate request IDs"
+            )
+        if any(epoch < -1 for _request_id, epoch in command.sequence_epochs):
+            raise WorkerTransportProtocolError(
+                "worker sequence generation epoch must be at least -1"
             )
         if command.wave_id <= 0 or command.quantum_id < 0:
             raise WorkerTransportProtocolError(

@@ -2055,6 +2055,9 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         "is_prefill": False,
         "enable_rpc": True,
         "transport_slot": 0,
+        "hierarchical_wave_id": 1,
+        "hierarchical_quantum_id": 0,
+        "hierarchical_sequence_epochs": ((7, 0), (-1, -1)),
         "hierarchical_quantum_diagnostics": quantum_diagnostics,
     }
     assert len(results) == 1
@@ -2243,6 +2246,7 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
     assert commands[0].wave_id == 1
     assert commands[0].quantum_id == 0
     assert commands[0].transport_slot == 0
+    assert commands[0].sequence_epochs == ((7, 0), (-1, -1))
     assert executor.endpoint.sent[1] is False
     assert executor.endpoint.sent[2] == 0
     boundary = executor.execution_boundary_metrics()

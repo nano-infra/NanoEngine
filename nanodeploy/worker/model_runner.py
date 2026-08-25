@@ -61,6 +61,7 @@ from nanodeploy.worker.sp_graph_policy import (
     select_decode_graph_bucket,
     select_decode_graph_master_bs,
 )
+from nanodeploy.worker.token_carry import GpuTokenCarry
 
 logger = get_logger()
 
@@ -289,6 +290,9 @@ class ModelRunner:
             self.engine_local_rank,
             num_slots=(2 if config.scheduler_arch == "hierarchical" else 1),
         )
+        self._hierarchical_token_carry = GpuTokenCarry()
+        self._gpu_carry_hits_total = 0
+        self._payload_seed_hits_total = 0
         self._zmq_worker_config: WorkerZmqConfig | None = None
 
     def _configure_decode_deepep(self, ep_size: int) -> None:
@@ -479,6 +483,9 @@ class ModelRunner:
                 enable_rpc=True,
                 send_timestamp=command.send_timestamp,
                 transport_slot=command.transport_slot,
+                hierarchical_wave_id=command.wave_id,
+                hierarchical_quantum_id=command.quantum_id,
+                hierarchical_sequence_epochs=command.sequence_epochs,
                 hierarchical_trace=command.hierarchical_trace,
                 hierarchical_quantum_diagnostics=(
                     command.hierarchical_quantum_diagnostics
@@ -1504,6 +1511,9 @@ class ModelRunner:
         hierarchical_trace: dict | None = None,
         hierarchical_quantum_diagnostics: bool = False,
         transport_slot: int = 0,
+        hierarchical_wave_id: int | None = None,
+        hierarchical_quantum_id: int | None = None,
+        hierarchical_sequence_epochs: tuple[tuple[int, int], ...] | None = None,
     ) -> (
         tuple[list[list[int]], float]
         | tuple[list[list[int]], float, dict]
@@ -1558,6 +1568,46 @@ class ModelRunner:
             for seq in dp_seqs
             if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         ]
+
+        carry_keys: tuple[tuple[int, int], ...] | None = None
+        carry_hits = 0
+        payload_seed_hits = 0
+        if not is_prefill and self.config.scheduler_arch == "hierarchical":
+            if hierarchical_wave_id is None or hierarchical_wave_id <= 0:
+                raise RuntimeError(
+                    "hierarchical decode requires a positive wave ID"
+                )
+            if (
+                hierarchical_quantum_id is None
+                or hierarchical_quantum_id < 0
+            ):
+                raise RuntimeError(
+                    "hierarchical decode requires a non-negative quantum ID"
+                )
+            if hierarchical_sequence_epochs is None:
+                raise RuntimeError(
+                    "hierarchical decode requires sequence generation epochs"
+                )
+            sequence_ids = tuple(
+                request_id
+                for request_id, _epoch in hierarchical_sequence_epochs
+            )
+            if len(set(sequence_ids)) != len(sequence_ids):
+                raise RuntimeError(
+                    "hierarchical sequence generation epochs contain "
+                    "duplicate request IDs"
+                )
+            payload_sequence_ids = tuple(seq.seq_id for seq in dp_seqs)
+            if sequence_ids != payload_sequence_ids:
+                raise RuntimeError(
+                    "hierarchical command/payload sequence identity mismatch: "
+                    f"command={sequence_ids}, payload={payload_sequence_ids}"
+                )
+            epoch_by_request = dict(hierarchical_sequence_epochs)
+            carry_keys = tuple(
+                (seq.seq_id, epoch_by_request[seq.seq_id])
+                for seq in sp_seqs
+            )
 
         loop_count = self.config.loop_count if not is_prefill else 1
         prepare_update_ms = 0.0
@@ -1620,6 +1670,18 @@ class ModelRunner:
             else:
                 if i == 0:
                     input_ids, positions = self.prepare_decode(dp_seqs, is_dummy)
+                    if carry_keys is not None:
+                        input_ids, carry_hits = (
+                            self._hierarchical_token_carry.select_inputs(
+                                input_ids,
+                                carry_keys,
+                                wave_id=hierarchical_wave_id,
+                                quantum_id=hierarchical_quantum_id,
+                            )
+                        )
+                        payload_seed_hits = len(carry_keys) - carry_hits
+                        self._gpu_carry_hits_total += carry_hits
+                        self._payload_seed_hits_total += payload_seed_hits
                 else:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
@@ -1662,6 +1724,14 @@ class ModelRunner:
             else:
                 input_ids = torch.zeros_like(input_ids)
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+
+            if carry_keys is not None:
+                self._hierarchical_token_carry.record(
+                    input_ids,
+                    carry_keys,
+                    wave_id=hierarchical_wave_id,
+                    quantum_id=hierarchical_quantum_id,
+                )
 
             update_seqs_inner_loop(sp_seqs, sp_rank)
 
@@ -1800,6 +1870,8 @@ class ModelRunner:
                 "gpu_loop_ms": gpu_loop_ms,
                 "loop_host_ms": (worker_end - loop_begin) * 1000,
                 "token_materialize_ms": token_materialize_ms,
+                "gpu_carry_hits": carry_hits,
+                "payload_seed_hits": payload_seed_hits,
                 "worker_body_ms": (worker_end - recv_end) * 1000,
                 "worker_total_ms": (worker_end - worker_begin) * 1000,
             }

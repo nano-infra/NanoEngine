@@ -98,6 +98,12 @@ def test_depth_one_submit_collect_preserves_results_and_alternates_slots(
     assert executor.endpoint.num_slots == 2
     assert executor.endpoint.sent_slots == [0]
     assert worker.run.calls[0]["transport_slot"] == 0
+    assert worker.run.calls[0]["hierarchical_wave_id"] == 1
+    assert worker.run.calls[0]["hierarchical_quantum_id"] == 0
+    assert worker.run.calls[0]["hierarchical_sequence_epochs"] == (
+        (7, 0),
+        (-1, -1),
+    )
     with pytest.raises(RuntimeError, match="already active"):
         executor.submit(_Batch(1), timeout=1.0)
 

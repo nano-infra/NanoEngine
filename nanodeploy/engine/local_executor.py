@@ -227,6 +227,24 @@ class LocalExecutor:
         for global_rank, worker in zip(
             self.topology.global_ranks, self.workers, strict=True
         ):
+            sequence_epochs: list[tuple[int, int]] = []
+            for sequence in batch.per_rank_sequences[global_rank]:
+                if batch.is_control_dummy(sequence):
+                    generation_epoch = -1
+                else:
+                    try:
+                        generation_epoch = batch.per_request_epoch[
+                            sequence.seq_id
+                        ]
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            "decode batch omitted a real request generation "
+                            f"epoch: request_id={sequence.seq_id}"
+                        ) from exc
+                sequence_epochs.append(
+                    (sequence.seq_id, generation_epoch)
+                )
+            frozen_sequence_epochs = tuple(sequence_epochs)
             mastered = [
                 sequence
                 for sequence in batch.per_rank_sequences[global_rank]
@@ -263,6 +281,11 @@ class LocalExecutor:
                         enable_rpc=True,
                         send_timestamp=send_timestamp,
                         transport_slot=transport_slot,
+                        hierarchical_wave_id=batch.wave_id,
+                        hierarchical_quantum_id=batch.quantum_id,
+                        hierarchical_sequence_epochs=(
+                            frozen_sequence_epochs
+                        ),
                         hierarchical_trace=trace_context,
                         hierarchical_quantum_diagnostics=(
                             self.quantum_diagnostics_enabled
@@ -281,6 +304,7 @@ class LocalExecutor:
                     wave_id=batch.wave_id,
                     quantum_id=batch.quantum_id,
                     send_timestamp=send_timestamp,
+                    sequence_epochs=frozen_sequence_epochs,
                     transport_slot=transport_slot,
                     hierarchical_trace=trace_context,
                     hierarchical_quantum_diagnostics=(

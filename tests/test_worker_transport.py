@@ -42,6 +42,7 @@ def command_for(
         wave_id=wave_id,
         quantum_id=quantum_id,
         send_timestamp=time.time(),
+        sequence_epochs=((7, 0),),
         transport_slot=(
             quantum_id % 2 if transport_slot is None else transport_slot
         ),
@@ -80,12 +81,14 @@ def test_worker_protocol_round_trip_and_strict_unknown_fields():
         wave_id=3,
         quantum_id=4,
         send_timestamp=5.0,
+        sequence_epochs=((7, 2), (11, -1)),
         hierarchical_trace={"forwards": (1, 2)},
         hierarchical_quantum_diagnostics=True,
     )
     decoded_command = decode_command(encode_command(command))
     assert decoded_command.global_rank == 7
     assert decoded_command.transport_slot == 0
+    assert decoded_command.sequence_epochs == ((7, 2), (11, -1))
     assert decoded_command.hierarchical_trace == {"forwards": [1, 2]}
 
     response = DecodeSuccess(
