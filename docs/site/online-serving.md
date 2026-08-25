@@ -126,14 +126,14 @@ dlengine serve "${MODEL_PATH}" \
   --attention_dp 1 \
   --ffn_ep 1 \
   --max_model_len 1048576 \
-  --max_num_batched_tokens 16384 \
+  --max_num_batched_tokens 8192 \
   --pp_prefill_scheduler_depth 0 \
   --num_speculative_tokens 5 \
-  --gpu_memory_utilization 0.75 \
+  --gpu_memory_utilization 0.77 \
   2>&1 | tee prefill_log.log
 ```
 
-Here `max_num_batched_tokens=16384` is the per-stage prefill microbatch size. Scheduler depth is independent of transport in-flight depth. The default `pp_prefill_scheduler_depth=0` keeps at least one microbatch per stage admitted and, for long prompts, expands the scheduler window to at most 64 consecutive microbatches without turning the entire prompt into one GPU forward.
+Here `max_num_batched_tokens=8192` is the per-stage prefill microbatch size. Scheduler depth is independent of transport in-flight depth. The default `pp_prefill_scheduler_depth=0` keeps at least one microbatch per stage admitted and, for long prompts, expands the scheduler window to at most 64 consecutive microbatches without turning the entire prompt into one GPU forward.
 
 On the decode coordinator:
 
@@ -150,16 +150,17 @@ dlengine serve "${MODEL_PATH}" \
   --ffn_ep 8 \
   --max_model_len 1048576 \
   --max_num_batched_tokens 2048 \
+  --max_num_seqs 8 \
   --num_speculative_tokens 5 \
   --enable_hisparse true \
   --host_utilization_per_device 64 \
   --hisparse_device_buffer_size 12288 \
-  --gpu_memory_utilization 0.7 \
+  --gpu_memory_utilization 0.95 \
   --enforce_eager false \
   2>&1 | tee decode_log.log
 ```
 
-For GLM recurrent MTP, both PD roles must use `num_speculative_tokens=5`. The decode hot buffer must hold at least `(5 + 1) × index_topk = 12288` entries per request. For an ordinary non-MTP PD deployment, omit `num_speculative_tokens` and size the HiSparse hot buffer for that model's non-speculative attention policy.
+For GLM recurrent MTP, both PD roles must use `num_speculative_tokens=5`. On an attention-DP decode engine, `max_num_seqs` is a per-DP-rank limit, so DP8 with `max_num_seqs=8` admits up to 64 active requests globally. The decode hot buffer must hold at least `(5 + 1) × index_topk = 12288` entries per request. For an ordinary non-MTP PD deployment, omit `num_speculative_tokens` and size the HiSparse hot buffer for that model's non-speculative attention policy.
 
 Check the direct engine endpoints and their service-registry entries:
 
