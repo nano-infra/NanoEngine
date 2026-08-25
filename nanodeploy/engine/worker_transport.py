@@ -15,7 +15,8 @@ import msgspec
 import zmq
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+TRANSPORT_SLOTS = 2
 MAX_COMMAND_BYTES = 1 << 20
 MAX_RESPONSE_BYTES = 16 << 20
 MAX_FAILURE_MESSAGE_CHARS = 8 << 10
@@ -68,6 +69,7 @@ class DecodeCommand(
     wave_id: int
     quantum_id: int
     send_timestamp: float
+    transport_slot: int = 0
     hierarchical_trace: dict[str, Any] | None = None
     hierarchical_quantum_diagnostics: bool = False
 
@@ -449,6 +451,16 @@ class ZmqWorkerServer:
                 raise WorkerTransportProtocolError(
                     f"invalid worker quantum ({command.wave_id}, "
                     f"{command.quantum_id})"
+                )
+            if not 0 <= command.transport_slot < TRANSPORT_SLOTS:
+                raise WorkerTransportProtocolError(
+                    f"invalid worker transport slot {command.transport_slot}"
+                )
+            expected_slot = command.quantum_id % TRANSPORT_SLOTS
+            if command.transport_slot != expected_slot:
+                raise WorkerTransportProtocolError(
+                    "worker transport slot/quantum mismatch: "
+                    f"expected={expected_slot}, got={command.transport_slot}"
                 )
             quantum_keys.add((command.wave_id, command.quantum_id))
             encoded[rank] = encode_command(command)
@@ -846,6 +858,16 @@ class ZmqWorkerClient:
         last_quantum: tuple[int, int] | None,
     ) -> None:
         current = (command.wave_id, command.quantum_id)
+        if not 0 <= command.transport_slot < TRANSPORT_SLOTS:
+            raise WorkerTransportProtocolError(
+                f"invalid worker transport slot {command.transport_slot}"
+            )
+        expected_slot = command.quantum_id % TRANSPORT_SLOTS
+        if command.transport_slot != expected_slot:
+            raise WorkerTransportProtocolError(
+                "worker transport slot/quantum mismatch: "
+                f"expected={expected_slot}, got={command.transport_slot}"
+            )
         if command.wave_id <= 0 or command.quantum_id < 0:
             raise WorkerTransportProtocolError(
                 f"invalid worker quantum {current}"

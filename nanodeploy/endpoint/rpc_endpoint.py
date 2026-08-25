@@ -8,6 +8,24 @@ from nanodeploy.logging import get_logger
 
 logger = get_logger("NANODEPLOY")
 
+_IMM_SLOT_BITS = 1
+_IMM_SLOT_MASK = (1 << _IMM_SLOT_BITS) - 1
+_IMM_MAX_PAYLOAD_BYTES = (1 << (31 - _IMM_SLOT_BITS)) - 1
+
+
+def _encode_imm(payload_size: int, transport_slot: int) -> int:
+    if not 0 <= payload_size <= _IMM_MAX_PAYLOAD_BYTES:
+        raise ValueError(f"RPC payload size cannot fit immediate data: {payload_size}")
+    if not 0 <= transport_slot <= _IMM_SLOT_MASK:
+        raise ValueError(f"RPC slot cannot fit immediate data: {transport_slot}")
+    return (payload_size << _IMM_SLOT_BITS) | transport_slot
+
+
+def _decode_imm(immediate: int) -> tuple[int, int]:
+    if immediate < 0:
+        raise RuntimeError(f"invalid RPC immediate data {immediate}")
+    return immediate >> _IMM_SLOT_BITS, immediate & _IMM_SLOT_MASK
+
 
 def _get_slime_qp_num() -> int:
     raw = os.environ.get("SLIME_QP_NUM", "1")
@@ -30,8 +48,12 @@ class EndpointBinding:
 
 
 class RPCServerEndpoint:
-    def __init__(self, buffer_size: int, world_size: int, attention_sp: int = 1, attention_tp: int = 1, optimize_decode_block_table: bool = True):
+    def __init__(self, buffer_size: int, world_size: int, attention_sp: int = 1, attention_tp: int = 1, optimize_decode_block_table: bool = True, num_slots: int = 1):
+        if num_slots <= 0 or buffer_size < num_slots:
+            raise ValueError("RPC endpoint slots must fit in the buffer")
         self.buffer_size = buffer_size
+        self.num_slots = num_slots
+        self.slot_size = buffer_size // num_slots
         self.world_size = world_size
         self.attention_sp = attention_sp
         self.attention_tp = attention_tp
@@ -63,16 +85,27 @@ class RPCServerEndpoint:
             self.server_bindings[i].endpoint.connect(info[0])
             self.server_bindings[i].remote_buffer_ptr = info[1]
 
-    def send_seqs(self, dp_seqs: list[list[Sequence]], is_prefill: bool):
+    def send_seqs(
+        self,
+        dp_seqs: list[list[Sequence]],
+        is_prefill: bool,
+        *,
+        transport_slot: int = 0,
+    ):
         import time
         start = time.perf_counter()
         assert len(dp_seqs) == self.world_size
+        if not 0 <= transport_slot < self.num_slots:
+            raise ValueError(f"invalid RPC transport slot {transport_slot}")
         futures: list[_slime_c.SlimeReadWriteFuture] = []
         total_bytes = 0
         for i in range(self.world_size):
             binding = self.server_bindings[i]
             buffer = binding.buffer
-            buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
+            slot_offset = transport_slot * self.slot_size
+            buffer_ptr = (
+                buffer.data_ptr() + buffer.storage_offset() + slot_offset
+            )
             
             # Decode optimize path still sends the full sequence skeleton.
             # The serializer only trims heavy per-target fields inside each
@@ -87,10 +120,26 @@ class RPCServerEndpoint:
                 sp_rank = -1
                 sp_size = -1
             
-            off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill, sp_rank, sp_size)
+            off = serialize(
+                buffer_ptr,
+                self.slot_size,
+                dp_seqs[i],
+                is_prefill,
+                sp_rank,
+                sp_size,
+            )
             total_bytes += off
             future = binding.endpoint.write_with_imm(
-                [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
+                [
+                    (
+                        buffer_ptr,
+                        binding.remote_buffer_ptr + slot_offset,
+                        0,
+                        0,
+                        off,
+                    )
+                ],
+                _encode_imm(off, transport_slot),
             )
             futures.append(future)
         [future.wait() for future in futures]
@@ -105,8 +154,12 @@ class RPCServerEndpoint:
 
 
 class RPCClientEndpoint:
-    def __init__(self, buffer_size: int, rank):
+    def __init__(self, buffer_size: int, rank, num_slots: int = 1):
+        if num_slots <= 0 or buffer_size < num_slots:
+            raise ValueError("RPC endpoint slots must fit in the buffer")
         self.buffer_size = buffer_size
+        self.num_slots = num_slots
+        self.slot_size = buffer_size // num_slots
         self.rank = rank
 
         self.devices = _slime_c.available_nic()
@@ -130,13 +183,30 @@ class RPCClientEndpoint:
         self.client_binding.endpoint.connect(server_info[self.rank][0])
         self.client_binding.remote_buffer_ptr = server_info[self.rank][1]
 
-    def recv_seqs(self):
+    def recv_seqs(self, transport_slot: int = 0):
+        if not 0 <= transport_slot < self.num_slots:
+            raise ValueError(f"invalid RPC transport slot {transport_slot}")
         binding = self.client_binding
         future = binding.endpoint.imm_recv()
         future.wait()
+        payload_size, received_slot = _decode_imm(future.imm_data())
+        if received_slot != transport_slot:
+            raise RuntimeError(
+                "RPC sequence payload arrived for the wrong transport slot: "
+                f"expected={transport_slot}, got={received_slot}"
+            )
+        if payload_size > self.slot_size:
+            raise RuntimeError(
+                "RPC sequence payload exceeds its transport slot: "
+                f"payload={payload_size}, slot_size={self.slot_size}"
+            )
         buffer = binding.buffer
-        buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
-        return deserialize(buffer_ptr, future.imm_data())
+        buffer_ptr = (
+            buffer.data_ptr()
+            + buffer.storage_offset()
+            + transport_slot * self.slot_size
+        )
+        return deserialize(buffer_ptr, payload_size)
 
     def send_tokens(self):
         pass

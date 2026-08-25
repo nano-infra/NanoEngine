@@ -32,6 +32,7 @@ def command_for(
     wave_id: int = 1,
     quantum_id: int = 0,
     deployment_epoch: str | None = None,
+    transport_slot: int | None = None,
 ) -> DecodeCommand:
     return DecodeCommand(
         protocol_version=PROTOCOL_VERSION,
@@ -41,6 +42,9 @@ def command_for(
         wave_id=wave_id,
         quantum_id=quantum_id,
         send_timestamp=time.time(),
+        transport_slot=(
+            quantum_id % 2 if transport_slot is None else transport_slot
+        ),
     )
 
 
@@ -81,6 +85,7 @@ def test_worker_protocol_round_trip_and_strict_unknown_fields():
     )
     decoded_command = decode_command(encode_command(command))
     assert decoded_command.global_rank == 7
+    assert decoded_command.transport_slot == 0
     assert decoded_command.hierarchical_trace == {"forwards": [1, 2]}
 
     response = DecodeSuccess(
@@ -117,6 +122,31 @@ def test_worker_protocol_round_trip_and_strict_unknown_fields():
 def test_worker_protocol_rejects_oversized_command_before_decode():
     with pytest.raises(WorkerTransportProtocolError, match="exceeds"):
         decode_command(b"x" * (MAX_COMMAND_BYTES + 1))
+
+
+def test_server_rejects_transport_slot_quantum_mismatch(monkeypatch):
+    server = ZmqWorkerServer(
+        address="inproc://unused",
+        deployment_epoch="epoch",
+        engine_id=0,
+        expected_ranks=(0,),
+    )
+    monkeypatch.setattr(server, "_require_active", lambda: None)
+
+    with pytest.raises(
+        WorkerTransportProtocolError, match="slot/quantum mismatch"
+    ):
+        server.send_decode_commands(
+            {
+                0: command_for(
+                    server,
+                    0,
+                    quantum_id=1,
+                    transport_slot=0,
+                )
+            },
+            deadline=time.monotonic() + 1.0,
+        )
 
 
 def test_router_dealer_success_is_returned_in_topology_order():

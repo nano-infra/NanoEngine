@@ -1917,8 +1917,10 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         def connect(self, client_info):
             self.connected = client_info
 
-        def send_seqs(self, sequences, *, is_prefill):
-            self.sent = (sequences, is_prefill)
+        def send_seqs(
+            self, sequences, *, is_prefill, transport_slot=0
+        ):
+            self.sent = (sequences, is_prefill, transport_slot)
 
     class RemoteMethod:
         def __init__(self, result):
@@ -1992,6 +1994,8 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         real_sequence = FakeSequence(7)
         control_dummy = FakeSequence(-1)
         per_rank_sequences = {0: [real_sequence, control_dummy]}
+        per_request_epoch = {7: 0}
+        per_request_output_offset = {7: 0}
 
         @staticmethod
         def is_control_dummy(sequence):
@@ -2050,6 +2054,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         "dp_seqs": [],
         "is_prefill": False,
         "enable_rpc": True,
+        "transport_slot": 0,
         "hierarchical_quantum_diagnostics": quantum_diagnostics,
     }
     assert len(results) == 1
@@ -2087,8 +2092,10 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
         def __init__(self, *_args, **_kwargs):
             self.sent = None
 
-        def send_seqs(self, sequences, *, is_prefill):
-            self.sent = (sequences, is_prefill)
+        def send_seqs(
+            self, sequences, *, is_prefill, transport_slot=0
+        ):
+            self.sent = (sequences, is_prefill, transport_slot)
 
     class RemoteMethod:
         def __init__(self, result):
@@ -2172,6 +2179,8 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
         real_sequence = FakeSequence(7)
         control_dummy = FakeSequence(-1)
         per_rank_sequences = {0: [real_sequence, control_dummy]}
+        per_request_epoch = {7: 0}
+        per_request_output_offset = {7: 0}
 
         @staticmethod
         def is_control_dummy(sequence):
@@ -2233,7 +2242,9 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
     assert tuple(commands) == (0,)
     assert commands[0].wave_id == 1
     assert commands[0].quantum_id == 0
+    assert commands[0].transport_slot == 0
     assert executor.endpoint.sent[1] is False
+    assert executor.endpoint.sent[2] == 0
     boundary = executor.execution_boundary_metrics()
     assert boundary["worker_result_wait_latency_ms_mean"] >= 0
     assert "ray_get_latency_ms_mean" not in boundary

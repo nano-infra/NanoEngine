@@ -9,6 +9,7 @@ import ray
 from nanodeploy.config import Config
 from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
 from nanodeploy.engine.hierarchical_contract import (
+    DecodeFlight,
     HIERARCHICAL_LOOP_COUNT,
     LocalDecodeBatch,
     WorkerDecodeResult,
@@ -49,6 +50,7 @@ class LocalExecutor:
             topology.attention_sp,
             topology.attention_tp,
             config.optimize_decode_block_table,
+            num_slots=2,
         )
         self.last_execution_traces: tuple[dict[str, Any], ...] = ()
         self._execution_trace_history: list[dict[str, Any]] = []
@@ -80,6 +82,7 @@ class LocalExecutor:
         self.result_validate_latency_ms_total = 0.0
         self.result_pack_latency_ms_total = 0.0
         self._execution_boundary = ExecutionBoundaryRecorder()
+        self._active_flight: DecodeFlight | None = None
 
     def initialize_endpoint(self, timeout: float) -> None:
         server_info = self.endpoint.init_server_endpoint()
@@ -201,13 +204,18 @@ class LocalExecutor:
                 errors += (f"{type(exc).__name__}: {exc}",)
         return errors
 
-    def run(
+    def submit(
         self, batch: LocalDecodeBatch, timeout: float
-    ) -> list[WorkerDecodeResult]:
+    ) -> DecodeFlight:
         if batch.engine_id != self.topology.engine_id:
             raise ValueError("LocalDecodeBatch belongs to another engine")
+        if timeout <= 0:
+            raise ValueError("decode flight timeout must be positive")
+        if self._active_flight is not None:
+            raise RuntimeError("a decode flight is already active")
         executor_begin = perf_counter()
         deadline = time.monotonic() + timeout
+        transport_slot = batch.quantum_id % 2
         ordered_sequences = [
             batch.per_rank_sequences[global_rank]
             for global_rank in self.topology.global_ranks
@@ -254,6 +262,7 @@ class LocalExecutor:
                         is_prefill=False,
                         enable_rpc=True,
                         send_timestamp=send_timestamp,
+                        transport_slot=transport_slot,
                         hierarchical_trace=trace_context,
                         hierarchical_quantum_diagnostics=(
                             self.quantum_diagnostics_enabled
@@ -272,6 +281,7 @@ class LocalExecutor:
                     wave_id=batch.wave_id,
                     quantum_id=batch.quantum_id,
                     send_timestamp=send_timestamp,
+                    transport_slot=transport_slot,
                     hierarchical_trace=trace_context,
                     hierarchical_quantum_diagnostics=(
                         self.quantum_diagnostics_enabled
@@ -287,16 +297,84 @@ class LocalExecutor:
         submit_latency_ms = (perf_counter() - executor_begin) * 1000
         send_begin = perf_counter()
         try:
-            self.endpoint.send_seqs(ordered_sequences, is_prefill=False)
+            self.endpoint.send_seqs(
+                ordered_sequences,
+                is_prefill=False,
+                transport_slot=transport_slot,
+            )
         except BaseException:
             if self._zmq_server is not None:
                 self._zmq_server.mark_failed()
             raise
         send_seqs_latency_ms = (perf_counter() - send_begin) * 1000
+        flight = DecodeFlight(
+            wave_id=batch.wave_id,
+            quantum_id=batch.quantum_id,
+            engine_id=batch.engine_id,
+            transport_slot=transport_slot,
+            frozen_batch=batch,
+            per_request_epoch=tuple(sorted(batch.per_request_epoch.items())),
+            per_request_output_offset=tuple(
+                sorted(batch.per_request_output_offset.items())
+            ),
+            worker_futures=tuple(futures),
+            mastered_by_rank={
+                rank: tuple(sequences)
+                for rank, sequences in mastered_by_rank.items()
+            },
+            submitted_at=perf_counter(),
+            executor_begin=executor_begin,
+            send_timestamp=send_timestamp,
+            deadline=deadline,
+            submit_latency_ms=submit_latency_ms,
+            send_seqs_latency_ms=send_seqs_latency_ms,
+            executor_id=id(self),
+        )
+        self._active_flight = flight
+        return flight
+
+    def collect(
+        self,
+        flight: DecodeFlight,
+        timeout: float | None = None,
+    ) -> list[WorkerDecodeResult]:
+        if flight.executor_id != id(self):
+            raise ValueError("DecodeFlight belongs to another executor")
+        if self._active_flight is not flight:
+            raise RuntimeError("DecodeFlight is not the active flight")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("decode collection timeout must be positive")
+        batch = flight.frozen_batch
+        if (batch.wave_id, batch.quantum_id, batch.engine_id) != (
+            flight.wave_id,
+            flight.quantum_id,
+            flight.engine_id,
+        ):
+            raise RuntimeError("DecodeFlight frozen batch identity changed")
+        if tuple(sorted(batch.per_request_epoch.items())) != (
+            flight.per_request_epoch
+        ):
+            raise RuntimeError("DecodeFlight request epochs changed")
+        if tuple(sorted(batch.per_request_output_offset.items())) != (
+            flight.per_request_output_offset
+        ):
+            raise RuntimeError("DecodeFlight output offsets changed")
+        deadline = flight.deadline
+        if timeout is not None:
+            deadline = min(deadline, time.monotonic() + timeout)
+        executor_begin = flight.executor_begin
+        send_timestamp = flight.send_timestamp
+        futures = list(flight.worker_futures)
+        mastered_by_rank = flight.mastered_by_rank
+        submit_latency_ms = flight.submit_latency_ms
+        send_seqs_latency_ms = flight.send_seqs_latency_ms
         result_wait_begin = perf_counter()
         try:
             if self.worker_transport == "ray":
-                raw_results = list(ray.get(futures, timeout=timeout))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("decode flight collection timed out")
+                raw_results = list(ray.get(futures, timeout=remaining))
             else:
                 assert self._zmq_server is not None
                 zmq_results = self._zmq_server.receive_decode_results(
@@ -612,7 +690,14 @@ class LocalExecutor:
             }
         else:
             self.last_quantum_diagnostic = None
+        self._active_flight = None
         return results
+
+    def run(
+        self, batch: LocalDecodeBatch, timeout: float
+    ) -> list[WorkerDecodeResult]:
+        """Compatibility wrapper for one synchronous decode flight."""
+        return self.collect(self.submit(batch, timeout))
 
     def execution_boundary_metrics(self) -> dict[str, float | int]:
         return self._execution_boundary.snapshot()

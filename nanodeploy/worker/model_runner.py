@@ -285,7 +285,9 @@ class ModelRunner:
         self.preallocate_kvcache()
 
         self.endpoint = RPCClientEndpoint(
-            32 * 32_000_000, self.engine_local_rank
+            32 * 32_000_000,
+            self.engine_local_rank,
+            num_slots=(2 if config.scheduler_arch == "hierarchical" else 1),
         )
         self._zmq_worker_config: WorkerZmqConfig | None = None
 
@@ -476,6 +478,7 @@ class ModelRunner:
                 is_prefill=False,
                 enable_rpc=True,
                 send_timestamp=command.send_timestamp,
+                transport_slot=command.transport_slot,
                 hierarchical_trace=command.hierarchical_trace,
                 hierarchical_quantum_diagnostics=(
                     command.hierarchical_quantum_diagnostics
@@ -1500,6 +1503,7 @@ class ModelRunner:
         send_timestamp: float = 0.0,
         hierarchical_trace: dict | None = None,
         hierarchical_quantum_diagnostics: bool = False,
+        transport_slot: int = 0,
     ) -> (
         tuple[list[list[int]], float]
         | tuple[list[list[int]], float, dict]
@@ -1509,7 +1513,7 @@ class ModelRunner:
         worker_begin = time.perf_counter() if diagnostics_enabled else 0.0
         recv_begin = time.perf_counter() if diagnostics_enabled else 0.0
         if enable_rpc:
-            dp_seqs = self.endpoint.recv_seqs()
+            dp_seqs = self.endpoint.recv_seqs(transport_slot=transport_slot)
         recv_end = time.perf_counter() if diagnostics_enabled else 0.0
 
         if hierarchical_trace is not None:

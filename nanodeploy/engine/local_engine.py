@@ -1397,9 +1397,10 @@ class LocalEngineCore:
                     self.scheduler.mark_first_forward_started(batch)
                 )
                 begin = perf_counter()
-                worker_results = self.executor.run(
+                flight = self.executor.submit(
                     batch, timeout=self.config.quantum_timeout_s
                 )
+                worker_results = self.executor.collect(flight)
                 execute_latency_ms = (perf_counter() - begin) * 1000
                 self._execute_latency_ms_total += execute_latency_ms
                 # ABORT is the only command allowed to mutate scheduler state

@@ -503,6 +503,28 @@ class LocalDecodeBatch:
         return by_rank
 
 
+@dataclass(frozen=True, slots=True)
+class DecodeFlight:
+    """One submitted decode quantum awaiting FIFO collection."""
+
+    wave_id: int
+    quantum_id: int
+    engine_id: int
+    transport_slot: int
+    frozen_batch: LocalDecodeBatch = field(repr=False)
+    per_request_epoch: tuple[tuple[int, int], ...]
+    per_request_output_offset: tuple[tuple[int, int], ...]
+    worker_futures: tuple[Any, ...] = field(repr=False)
+    mastered_by_rank: dict[int, tuple[Any, ...]] = field(repr=False)
+    submitted_at: float
+    executor_begin: float = field(repr=False)
+    send_timestamp: float = field(repr=False)
+    deadline: float = field(repr=False)
+    submit_latency_ms: float
+    send_seqs_latency_ms: float
+    executor_id: int = field(repr=False, compare=False)
+
+
 def validate_execution_trace_set(
     traces: Iterable[Mapping[str, Any]],
     expected_global_ranks: Iterable[int],
