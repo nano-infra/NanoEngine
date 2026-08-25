@@ -82,6 +82,9 @@ class Config:
     # ingress always uses ZMQ. This option selects LocalEngine<->ModelRunner
     # quantum control/results; DLSlime continues to carry Sequence payloads.
     hierarchical_worker_transport: Literal["ray", "zmq"] = "ray"
+    # Depth two is intentionally limited to the persistent worker transport;
+    # Ray actor calls retain the synchronous one-flight contract.
+    hierarchical_async_depth: Literal[1, 2] = 1
 
     # parallel config
     attention_tp: int = 1
@@ -234,6 +237,18 @@ class Config:
         if self.hierarchical_worker_transport not in {"ray", "zmq"}:
             raise ValueError(
                 "hierarchical_worker_transport must be one of: ray, zmq"
+            )
+        if self.hierarchical_async_depth not in {1, 2}:
+            raise ValueError("hierarchical_async_depth must be one of: 1, 2")
+        if (
+            self.hierarchical_async_depth == 2
+            and (
+                self.scheduler_arch != "hierarchical"
+                or self.hierarchical_worker_transport != "zmq"
+            )
+        ):
+            raise ValueError(
+                "hierarchical_async_depth=2 requires hierarchical ZMQ workers"
             )
         if (
             self.hierarchical_worker_transport == "zmq"
@@ -507,6 +522,7 @@ class Config:
             "hierarchical_worker_transport": (
                 self.hierarchical_worker_transport
             ),
+            "hierarchical_async_depth": self.hierarchical_async_depth,
             "communication_env": {
                 name: os.getenv(name) for name in communication_env_names
             },

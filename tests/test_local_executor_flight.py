@@ -85,7 +85,7 @@ def _executor(monkeypatch):
     return LocalExecutor(config, topology, [worker]), worker
 
 
-def test_depth_one_submit_collect_preserves_results_and_alternates_slots(
+def test_depth_two_submit_collect_preserves_fifo_and_alternates_slots(
     monkeypatch,
 ):
     executor, worker = _executor(monkeypatch)
@@ -104,19 +104,20 @@ def test_depth_one_submit_collect_preserves_results_and_alternates_slots(
         (7, 0),
         (-1, -1),
     )
-    with pytest.raises(RuntimeError, match="already active"):
-        executor.submit(_Batch(1), timeout=1.0)
-
-    results = executor.collect(flight)
-    assert results[0].mastered_request_ids == (7,)
-    assert results[0].sampled_token_ids == ((7,),)
-    with pytest.raises(RuntimeError, match="not the active"):
-        executor.collect(flight)
-
     second = executor.submit(_Batch(1), timeout=1.0)
     assert second.transport_slot == 1
     assert executor.endpoint.sent_slots == [0, 1]
     assert worker.run.calls[1]["transport_slot"] == 1
+    with pytest.raises(RuntimeError, match="capacity"):
+        executor.submit(_Batch(2), timeout=1.0)
+    with pytest.raises(RuntimeError, match="FIFO"):
+        executor.collect(second)
+
+    results = executor.collect(flight)
+    assert results[0].mastered_request_ids == (7,)
+    assert results[0].sampled_token_ids == ((7,),)
+    with pytest.raises(RuntimeError, match="not pending"):
+        executor.collect(flight)
     assert executor.collect(second)[0].sampled_token_ids == ((7,),)
 
 
@@ -126,4 +127,4 @@ def test_run_remains_a_synchronous_submit_collect_wrapper(monkeypatch):
     results = executor.run(_Batch(0), timeout=1.0)
 
     assert results[0].sampled_token_ids == ((7,),)
-    assert executor._active_flight is None
+    assert not executor._active_flights

@@ -16,6 +16,7 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     LoadSnapshot,
     OwnerState,
+    ResourceReleaseEvent,
     TokenCommitEvent,
     round_up,
 )
@@ -190,6 +191,10 @@ class RequestRouter:
             int, list[TokenCommitEvent]
         ] = {}
         self._early_terminal_events: dict[int, FinishEvent] = {}
+        self._early_resource_release_events: dict[
+            int, ResourceReleaseEvent
+        ] = {}
+        self._released_request_ids: set[int] = set()
         self._global_capacity_queue_ms: dict[int, float] = {}
         self._loads: dict[int, LoadSnapshot] = {}
         self._estimated_free_blocks: dict[int, int] = {}
@@ -1273,10 +1278,9 @@ class RequestRouter:
                 f"request={event.request_id}, engine={event.engine_id}, "
                 f"owner={owner}"
             )
-        self._owners.pop(event.request_id)
-        self._future_ingress_aborts.discard(event.request_id)
-        self._refund_cache(event.request_id)
-        self._refund_least_batch(event.request_id)
+        self._owners[event.request_id] = RequestOwner(
+            OwnerState.TERMINAL_DRAINING, event.engine_id
+        )
         event = replace(
             event,
             global_capacity_queue_ms=self._global_capacity_queue_ms.pop(
@@ -1284,6 +1288,32 @@ class RequestRouter:
             ),
         )
         self._terminal[event.request_id] = event
+        return event
+
+    def release(self, event: ResourceReleaseEvent) -> ResourceReleaseEvent:
+        if event.request_id in self._released_request_ids:
+            raise RuntimeError(
+                f"duplicate resource release for request {event.request_id}"
+            )
+        terminal = self._terminal.get(event.request_id)
+        owner = self._owners.get(event.request_id)
+        if (
+            terminal is None
+            or owner is None
+            or owner.state != OwnerState.TERMINAL_DRAINING
+            or owner.engine_id != event.engine_id
+            or terminal.engine_id != event.engine_id
+        ):
+            raise RuntimeError(
+                "resource release owner mismatch: "
+                f"request={event.request_id}, engine={event.engine_id}, "
+                f"owner={owner}, terminal={terminal}"
+            )
+        self._owners.pop(event.request_id)
+        self._future_ingress_aborts.discard(event.request_id)
+        self._refund_cache(event.request_id)
+        self._refund_least_batch(event.request_id)
+        self._released_request_ids.add(event.request_id)
         return event
 
     def record_finish_events(
@@ -1340,6 +1370,60 @@ class RequestRouter:
                 ready_events.append(event)
 
         return tuple(self.finish(event) for event in ready_events)
+
+    def record_resource_release_events(
+        self, events: Iterable[ResourceReleaseEvent]
+    ) -> tuple[ResourceReleaseEvent, ...]:
+        ready_events: list[ResourceReleaseEvent] = []
+        for event in events:
+            if (
+                event.request_id in self._released_request_ids
+                or event.request_id in self._early_resource_release_events
+            ):
+                raise RuntimeError(
+                    "duplicate resource release for request "
+                    f"{event.request_id}"
+                )
+            owner = self._owners.get(event.request_id)
+            if (
+                event.request_id not in self._terminal
+                and owner is not None
+                and owner.engine_id == event.engine_id
+                and owner.state
+                in {
+                    OwnerState.PENDING_INGRESS,
+                    OwnerState.PENDING_ADD,
+                }
+            ):
+                self._early_resource_release_events[event.request_id] = event
+                continue
+            ready_events.append(event)
+
+        for request_id, event in tuple(
+            self._early_resource_release_events.items()
+        ):
+            owner = self._owners.get(request_id)
+            if (
+                request_id in self._terminal
+                and owner is not None
+                and owner.state == OwnerState.TERMINAL_DRAINING
+            ):
+                ready_events.append(event)
+                self._early_resource_release_events.pop(request_id)
+                continue
+            if (
+                owner is None
+                or owner.engine_id != event.engine_id
+                or owner.state
+                not in {
+                    OwnerState.PENDING_INGRESS,
+                    OwnerState.PENDING_ADD,
+                }
+            ):
+                ready_events.append(event)
+                self._early_resource_release_events.pop(request_id)
+
+        return tuple(self.release(event) for event in ready_events)
 
     def refresh_loads(self) -> dict[int, LoadSnapshot]:
         snapshots = {

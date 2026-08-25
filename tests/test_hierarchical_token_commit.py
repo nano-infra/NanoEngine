@@ -149,6 +149,10 @@ def test_frontend_commits_terminal_token_before_finish(monkeypatch):
             return tuple(events)
 
         @staticmethod
+        def record_resource_release_events(events):
+            return tuple(events)
+
+        @staticmethod
         def last_loads():
             return {}
 

@@ -18,6 +18,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     OwnerState,
     RankLoad,
+    ResourceReleaseEvent,
     TokenCommitEvent,
 )
 from nanodeploy.engine.local_engine import LocalEngineCore, _IngressAdd
@@ -159,8 +160,13 @@ def test_pending_add_can_finish_aborted_without_successful_add_result():
     terminal = FinishEvent(1, 0, "ABORTED", 0)
 
     assert router.record_finish_events((terminal,)) == (terminal,)
-    assert router.owner(1) is None
+    assert router.owner(1) == RequestOwner(
+        OwnerState.TERMINAL_DRAINING, 0
+    )
     assert router.terminal_event(1) == terminal
+    release = ResourceReleaseEvent(1, 0, 0, 0, -1)
+    assert router.record_resource_release_events((release,)) == (release,)
+    assert router.owner(1) is None
 
 
 def test_token_commit_waits_for_authoritative_owner_commit():
@@ -233,6 +239,7 @@ def _local_engine_for_drain(scheduler, request_ids=(1, 2)):
     engine._events_lock = threading.Lock()
     engine._add_result_events = deque()
     engine._terminal_events = deque()
+    engine._resource_release_events = deque()
     engine._ingress_queue_delay_ms_total = 0.0
     engine._scheduler_add_ms_total = 0.0
     engine._local_transient_retries = 0
@@ -305,6 +312,10 @@ def test_abort_arriving_during_commit_wins_atomic_handoff():
             events = self.events
             self.events = ()
             return events
+
+        @staticmethod
+        def drain_resource_release_events():
+            return (ResourceReleaseEvent(1, 0, 0, 0, -1),)
 
     scheduler = Scheduler()
     engine = _local_engine_for_drain(scheduler, request_ids=(1,))

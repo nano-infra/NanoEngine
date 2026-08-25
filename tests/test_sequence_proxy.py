@@ -47,6 +47,20 @@ def main() -> int:
     ctx.dp_idx = 123
     assert seq.block_ctx(BlockContextSlot.ACTIVE).dp_idx == 123
 
+    # 4) optimistic decode snapshots do not mutate canonical state.
+    seq.seq_id = 17
+    ctx.master_sp_idx = 0
+    ctx.num_dispatched_tokens = [3, 0]
+    clone = seq.clone_for_decode_dispatch()
+    clone.num_tokens += 1
+    clone.block_ctx().num_dispatched_tokens = [4, 0]
+    clone.block_table(BlockContextSlot.ACTIVE, 0).append(11)
+    assert clone.seq_id == 17
+    assert clone.token_ids == [1, 2, 3]
+    assert seq.num_tokens == 3
+    assert list(seq.block_ctx().num_dispatched_tokens) == [3, 0]
+    assert list(seq.block_table(BlockContextSlot.ACTIVE, 0)) == [7, 9]
+
     print("[ok] C++ proxy containers behave as mutable views")
     return 0
 

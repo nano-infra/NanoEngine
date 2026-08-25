@@ -1692,12 +1692,19 @@ def run_benchmark(
     hierarchical_itl_summary = None
     hierarchical_rank_loads = None
     hierarchical_worker_transport = None
+    hierarchical_async_depth = None
     if engine.config.scheduler_arch == "hierarchical":
         hierarchical_worker_transport = getattr(
             engine.config, "hierarchical_worker_transport", "ray"
         )
         metrics_summary["hierarchical_worker_transport"] = (
             hierarchical_worker_transport
+        )
+        hierarchical_async_depth = getattr(
+            engine.config, "hierarchical_async_depth", 1
+        )
+        metrics_summary["hierarchical_async_depth"] = (
+            hierarchical_async_depth
         )
         hierarchical_itl_summary = build_hierarchical_itl_summary(
             engine.hierarchical_itl_samples()
@@ -1841,6 +1848,7 @@ def run_benchmark(
         "hierarchical_worker_transport": (
             hierarchical_worker_transport
         ),
+        "hierarchical_async_depth": hierarchical_async_depth,
     }
     if hierarchical_itl_summary is not None:
         result["hierarchical_decode_itl_ms"] = (
@@ -2102,6 +2110,9 @@ def main():
         ),
         hierarchical_worker_transport=os.getenv(
             "NANODEPLOY_HIER_WORKER_TRANSPORT", "ray"
+        ),
+        hierarchical_async_depth=int(
+            os.getenv("NANODEPLOY_HIER_ASYNC_DEPTH", "1")
         ),
     )
     

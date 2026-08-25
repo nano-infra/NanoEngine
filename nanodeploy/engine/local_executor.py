@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from time import perf_counter
 from typing import Any, Iterable
 
@@ -82,7 +83,7 @@ class LocalExecutor:
         self.result_validate_latency_ms_total = 0.0
         self.result_pack_latency_ms_total = 0.0
         self._execution_boundary = ExecutionBoundaryRecorder()
-        self._active_flight: DecodeFlight | None = None
+        self._active_flights: deque[DecodeFlight] = deque()
 
     def initialize_endpoint(self, timeout: float) -> None:
         server_info = self.endpoint.init_server_endpoint()
@@ -211,8 +212,8 @@ class LocalExecutor:
             raise ValueError("LocalDecodeBatch belongs to another engine")
         if timeout <= 0:
             raise ValueError("decode flight timeout must be positive")
-        if self._active_flight is not None:
-            raise RuntimeError("a decode flight is already active")
+        if len(self._active_flights) >= 2:
+            raise RuntimeError("decode flight capacity is exhausted")
         executor_begin = perf_counter()
         deadline = time.monotonic() + timeout
         transport_slot = batch.quantum_id % 2
@@ -354,7 +355,7 @@ class LocalExecutor:
             send_seqs_latency_ms=send_seqs_latency_ms,
             executor_id=id(self),
         )
-        self._active_flight = flight
+        self._active_flights.append(flight)
         return flight
 
     def collect(
@@ -364,8 +365,10 @@ class LocalExecutor:
     ) -> list[WorkerDecodeResult]:
         if flight.executor_id != id(self):
             raise ValueError("DecodeFlight belongs to another executor")
-        if self._active_flight is not flight:
-            raise RuntimeError("DecodeFlight is not the active flight")
+        if not any(pending is flight for pending in self._active_flights):
+            raise RuntimeError("DecodeFlight is not pending")
+        if self._active_flights[0] is not flight:
+            raise RuntimeError("DecodeFlight collection must remain FIFO")
         if timeout is not None and timeout <= 0:
             raise ValueError("decode collection timeout must be positive")
         batch = flight.frozen_batch
@@ -714,7 +717,9 @@ class LocalExecutor:
             }
         else:
             self.last_quantum_diagnostic = None
-        self._active_flight = None
+        popped = self._active_flights.popleft()
+        if popped is not flight:
+            raise RuntimeError("DecodeFlight FIFO changed during collection")
         return results
 
     def run(

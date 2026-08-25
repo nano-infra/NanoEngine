@@ -23,6 +23,7 @@ class RequestState(str, Enum):
     WAITING_ADMISSION = "WAITING_ADMISSION"
     RUNNING_DECODE = "RUNNING_DECODE"
     ABORT_PENDING = "ABORT_PENDING"
+    TERMINAL_PENDING_DRAIN = "TERMINAL_PENDING_DRAIN"
     FINISHED = "FINISHED"
     ABORTED = "ABORTED"
     REJECTED = "REJECTED"
@@ -41,6 +42,7 @@ class OwnerState(str, Enum):
     PENDING_INGRESS = "PENDING_INGRESS"
     PENDING_ADD = "PENDING_ADD"
     OWNED = "OWNED"
+    TERMINAL_DRAINING = "TERMINAL_DRAINING"
     # Compatibility alias for callers that only distinguished pending/owned.
     PENDING_OWNER = "PENDING_INGRESS"
 
@@ -278,6 +280,15 @@ class FinishEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceReleaseEvent:
+    request_id: int
+    engine_id: int
+    generation_epoch: int
+    wave_id: int
+    quantum_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class RankLoad:
     """Latest and cumulative load for one runtime SP rank."""
 
@@ -390,6 +401,7 @@ class FrontendEventBatch:
     token_commit_events: tuple[TokenCommitEvent, ...] = ()
     first_token_events: tuple[FirstTokenEvent, ...] = ()
     finish_events: tuple[FinishEvent, ...] = ()
+    resource_release_events: tuple[ResourceReleaseEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

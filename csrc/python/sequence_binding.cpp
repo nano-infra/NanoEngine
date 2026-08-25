@@ -197,6 +197,11 @@ void bind_sequence(py::module_& m)
         .def("append_materialized_token",
              &Sequence::append_materialized_token,
              py::arg("token_id"))
+        .def("clone_for_decode_dispatch", [](const Sequence& sequence) {
+            auto clone = std::make_shared<Sequence>(sequence);
+            clone->metric.reset();
+            return clone;
+        })
         .def("block_ctx",
              static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
              py::arg("slot") = BlockContextSlot::ACTIVE,

@@ -21,6 +21,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AdmissionReservation,
     AbortResult,
     DecodeITLSample,
+    DecodeFlight,
     EngineReady,
     FrontendEventBatch,
     FirstScheduleEvent,
@@ -29,6 +30,8 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
+    LocalDecodeBatch,
+    ResourceReleaseEvent,
     TokenCommitEvent,
 )
 from nanodeploy.engine.frontend_transport import ZmqFrontendServer
@@ -61,6 +64,18 @@ class _PlannedAdmission:
     command: AddCommand
     sequence: Sequence
     reservation: AdmissionReservation | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingDecodeFlight:
+    batch: LocalDecodeBatch
+    flight: DecodeFlight
+    quantum_begin: float
+    quantum_started_at_unix_s: float
+    admission_latency_ms: float
+    schedule_latency_ms: float
+    coordination_latency_ms: float
+    pre_execute_snapshot: LoadSnapshot | None
 
 
 def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
@@ -118,6 +133,7 @@ class LocalEngineCore:
         self._token_commit_events: deque[TokenCommitEvent] = deque()
         self._first_token_events: deque[FirstTokenEvent] = deque()
         self._terminal_events: deque[FinishEvent] = deque()
+        self._resource_release_events: deque[ResourceReleaseEvent] = deque()
         self._events_lock = threading.Lock()
         self._load_lock = threading.Lock()
         self._state_cv = threading.Condition()
@@ -647,11 +663,13 @@ class LocalEngineCore:
             token_commit_events = tuple(self._token_commit_events)
             first_token_events = tuple(self._first_token_events)
             finish_events = tuple(self._terminal_events)
+            resource_release_events = tuple(self._resource_release_events)
             self._add_result_events.clear()
             self._first_schedule_events.clear()
             self._token_commit_events.clear()
             self._first_token_events.clear()
             self._terminal_events.clear()
+            self._resource_release_events.clear()
         with self._load_lock:
             load = self._cached_load_snapshot
         return FrontendEventBatch(
@@ -662,6 +680,7 @@ class LocalEngineCore:
             token_commit_events=token_commit_events,
             first_token_events=first_token_events,
             finish_events=finish_events,
+            resource_release_events=resource_release_events,
         )
 
     def drain_execution_traces(self) -> tuple[dict[str, Any], ...]:
@@ -772,6 +791,9 @@ class LocalEngineCore:
             elif command.kind == "abort":
                 command.result = self.scheduler.abort(command.payload)
                 self._publish_events(self.scheduler.drain_terminal_events())
+                self._publish_resource_release_events(
+                    self.scheduler.drain_resource_release_events()
+                )
             elif command.kind == "load":
                 command.result = self._build_load_snapshot()
             else:
@@ -1017,6 +1039,7 @@ class LocalEngineCore:
         drain_budget_ms = self.config.max_ingress_drain_ms
         results: list[AddResultEvent] = []
         cancelled_events: list[FinishEvent] = []
+        cancelled_releases: list[ResourceReleaseEvent] = []
         processed = 0
         while processed < self.config.max_ingress_batch_requests:
             if (
@@ -1049,6 +1072,15 @@ class LocalEngineCore:
                         status="ABORTED",
                         engine_id=self.engine_id,
                         finish_reason="ABORTED",
+                    )
+                )
+                cancelled_releases.append(
+                    ResourceReleaseEvent(
+                        request_id=command.request_id,
+                        engine_id=self.engine_id,
+                        generation_epoch=0,
+                        wave_id=command.wave_id,
+                        quantum_id=-1,
                     )
                 )
                 processed += 1
@@ -1133,6 +1165,9 @@ class LocalEngineCore:
                             f"result={abort_result}, events={scheduler_events}"
                         )
                     cancelled_events.extend(scheduler_events)
+                    cancelled_releases.extend(
+                        self.scheduler.drain_resource_release_events()
+                    )
                 else:
                     cancelled_events.append(
                         FinishEvent(
@@ -1141,6 +1176,15 @@ class LocalEngineCore:
                             status="ABORTED",
                             engine_id=self.engine_id,
                             finish_reason="ABORTED",
+                        )
+                    )
+                    cancelled_releases.append(
+                        ResourceReleaseEvent(
+                            request_id=command.request_id,
+                            engine_id=self.engine_id,
+                            generation_epoch=0,
+                            wave_id=command.wave_id,
+                            quantum_id=-1,
                         )
                     )
                 continue
@@ -1164,6 +1208,7 @@ class LocalEngineCore:
             with self._events_lock:
                 self._add_result_events.extend(results)
         self._publish_events(tuple(cancelled_events))
+        self._publish_resource_release_events(tuple(cancelled_releases))
 
     def _build_load_snapshot(self) -> LoadSnapshot:
         snapshot = self.scheduler.load_snapshot(
@@ -1295,10 +1340,18 @@ class LocalEngineCore:
     def _publish_events(self, events: tuple[FinishEvent, ...]) -> None:
         if not events:
             return
+        with self._events_lock:
+            self._terminal_events.extend(events)
+
+    def _publish_resource_release_events(
+        self, events: tuple[ResourceReleaseEvent, ...]
+    ) -> None:
+        if not events:
+            return
         for event in events:
             self._release_reservation(event.request_id)
         with self._events_lock:
-            self._terminal_events.extend(events)
+            self._resource_release_events.extend(events)
 
     def _publish_first_token_events(
         self, events: tuple[FirstTokenEvent, ...]
@@ -1334,12 +1387,133 @@ class LocalEngineCore:
                 command.error = error
                 command.completed.set()
 
+    def _collect_pending_decode_flight(
+        self, pending: _PendingDecodeFlight
+    ) -> None:
+        batch = pending.batch
+        wave_id = batch.wave_id
+        quantum_id = batch.quantum_id
+        worker_results = self.executor.collect(pending.flight)
+        execute_latency_ms = (
+            perf_counter() - pending.flight.executor_begin
+        ) * 1000
+        self._execute_latency_ms_total += execute_latency_ms
+        # ABORT is the only command allowed to mutate scheduler state after
+        # batch freeze and before canonical token commit.
+        self._drain_queue(self._abort_commands)
+        pre_commit_snapshot = None
+        if self._quantum_diagnostics_enabled:
+            pre_commit_snapshot = self.scheduler.load_snapshot(
+                wave_id=wave_id,
+                quantum_id=quantum_id,
+            )
+        begin = perf_counter()
+        events = self.scheduler.postprocess(
+            batch,
+            worker_results,
+            execute_latency_ms=execute_latency_ms,
+        )
+        postprocess_latency_ms = (perf_counter() - begin) * 1000
+        self._postprocess_latency_ms_total += postprocess_latency_ms
+        itl_token_count = self.scheduler.last_itl_token_slots
+        if itl_token_count > 0:
+            itl_ms = execute_latency_ms / HIERARCHICAL_LOOP_COUNT
+            self._decode_itl_samples.append(
+                DecodeITLSample(
+                    engine_id=self.engine_id,
+                    wave_id=wave_id,
+                    quantum_id=quantum_id,
+                    itl_ms=itl_ms,
+                    token_count=itl_token_count,
+                )
+            )
+            self._decode_itl_ms_weighted_total += itl_ms * itl_token_count
+            self._decode_itl_token_count += itl_token_count
+        self._decode_quantum_count += 1
+        self._publish_token_commit_events(
+            self.scheduler.drain_token_commit_events()
+        )
+        self._publish_first_token_events(
+            self.scheduler.drain_first_token_events()
+        )
+        self._publish_events(events)
+        self._publish_resource_release_events(
+            self.scheduler.drain_resource_release_events()
+        )
+        post_execute_snapshot = self._refresh_cached_load()
+        if not self._quantum_diagnostics_enabled:
+            return
+        pre_execute_snapshot = pending.pre_execute_snapshot
+        if pre_execute_snapshot is None:
+            raise RuntimeError(
+                "missing pre-execute quantum diagnostic snapshot"
+            )
+        if pre_commit_snapshot is None:
+            raise RuntimeError(
+                "missing pre-commit quantum diagnostic snapshot"
+            )
+        executor_diagnostic = self.executor.last_quantum_diagnostic
+        if (
+            executor_diagnostic is None
+            or executor_diagnostic.get("engine_id") != self.engine_id
+            or executor_diagnostic.get("wave_id") != wave_id
+            or executor_diagnostic.get("quantum_id") != quantum_id
+        ):
+            raise RuntimeError(
+                "LocalExecutor quantum diagnostic identity mismatch"
+            )
+        sample = {
+            "schema_version": 1,
+            "engine_id": self.engine_id,
+            "wave_id": wave_id,
+            "quantum_id": quantum_id,
+            "started_at_unix_s": pending.quantum_started_at_unix_s,
+            "engine_has_real": batch.engine_has_real,
+            "waiting_before": pre_execute_snapshot.waiting,
+            "running_before": pre_execute_snapshot.running,
+            "useful_real_batch_size": (
+                pre_execute_snapshot.useful_real_batch_size
+            ),
+            "free_blocks_min_before": pre_execute_snapshot.free_blocks_min,
+            "free_blocks_min_after": post_execute_snapshot.free_blocks_min,
+            "rank_loads_before": _rank_load_payload(pre_execute_snapshot),
+            "rank_loads_after": _rank_load_payload(post_execute_snapshot),
+            "admission_ms": pending.admission_latency_ms,
+            "schedule_ms": pending.schedule_latency_ms,
+            "consensus_wait_ms": pending.coordination_latency_ms,
+            "execute_ms": execute_latency_ms,
+            "postprocess_ms": postprocess_latency_ms,
+            "quantum_total_ms": (
+                perf_counter() - pending.quantum_begin
+            )
+            * 1000,
+            "itl_ms": execute_latency_ms / HIERARCHICAL_LOOP_COUNT,
+            "itl_token_count": itl_token_count,
+            "useful_decode_tokens": (
+                post_execute_snapshot.useful_decode_tokens
+                - pre_commit_snapshot.useful_decode_tokens
+            ),
+            "raw_token_slots": (
+                post_execute_snapshot.raw_token_slots
+                - pre_commit_snapshot.raw_token_slots
+            ),
+            "control_dummy_slots": (
+                post_execute_snapshot.control_dummy_slots
+                - pre_commit_snapshot.control_dummy_slots
+            ),
+            "preemption_count": post_execute_snapshot.preemption_count,
+            "executor": dict(executor_diagnostic),
+        }
+        with self._quantum_diagnostics_lock:
+            self._quantum_diagnostics.append(sample)
+
     def _event_loop(self) -> None:
         try:
             self.executor.activate_worker_transport(
                 self.config.startup_timeout_s
             )
             self._worker_transport_ready.set()
+            active_flights: deque[_PendingDecodeFlight] = deque()
             while True:
                 self._drain_queue(self._abort_commands)
                 self._drain_ingress()
@@ -1350,174 +1524,123 @@ class LocalEngineCore:
                 self._refresh_cached_load()
                 with self._state_cv:
                     if self._stop:
-                        return
+                        if active_flights:
+                            pending = active_flights.popleft()
+                        else:
+                            return
+                    else:
+                        pending = None
                     if not self._wave_running:
+                        if active_flights:
+                            raise RuntimeError(
+                                "paused wave retained active decode flights"
+                            )
                         self._state_cv.wait(timeout=0.1)
                         continue
                     wave_id = self._wave_id
                     quantum_id = self._quantum_id
 
-                quantum_begin = perf_counter()
-                quantum_started_at_unix_s = wall_time()
-                begin = perf_counter()
-                self.scheduler.admit()
-                admission_latency_ms = (perf_counter() - begin) * 1000
-                self._admission_latency_ms_total += admission_latency_ms
-                self._refresh_cached_load()
-                begin = perf_counter()
-                batch = self.scheduler.plan_decode(
-                    wave_id=wave_id, quantum_id=quantum_id
-                )
-                schedule_latency_ms = (perf_counter() - begin) * 1000
-                self._schedule_latency_ms_total += schedule_latency_ms
-                pre_execute_snapshot = None
-                if self._quantum_diagnostics_enabled:
-                    pre_execute_snapshot = self.scheduler.load_snapshot(
-                        wave_id=wave_id,
-                        quantum_id=quantum_id,
-                    )
-                local_unfinished = not self.scheduler.is_finished()
-                begin = perf_counter()
-                global_unfinished = self._consensus(local_unfinished)
-                coordination_latency_ms = (perf_counter() - begin) * 1000
-                self._coordination_latency_ms_total += coordination_latency_ms
-                if not global_unfinished:
-                    self._pause_wave()
-                    if (
-                        self.config.attention_dp > 1
-                        and self.topology.global_dp_idx == 0
-                    ):
-                        ray.get(
-                            self._coordinator.wave_complete.remote(wave_id),
-                            timeout=self.config.quantum_timeout_s,
-                        )
+                if pending is not None:
+                    self._collect_pending_decode_flight(pending)
                     continue
 
-                self._publish_first_schedule_events(
-                    self.scheduler.mark_first_forward_started(batch)
-                )
-                begin = perf_counter()
-                flight = self.executor.submit(
-                    batch, timeout=self.config.quantum_timeout_s
-                )
-                worker_results = self.executor.collect(flight)
-                execute_latency_ms = (perf_counter() - begin) * 1000
-                self._execute_latency_ms_total += execute_latency_ms
-                # ABORT is the only command allowed to mutate scheduler state
-                # after batch freeze and before canonical token commit.
-                self._drain_queue(self._abort_commands)
-                begin = perf_counter()
-                events = self.scheduler.postprocess(
-                    batch,
-                    worker_results,
-                    execute_latency_ms=execute_latency_ms,
-                )
-                postprocess_latency_ms = (perf_counter() - begin) * 1000
-                self._postprocess_latency_ms_total += postprocess_latency_ms
-                itl_token_count = self.scheduler.last_itl_token_slots
-                if itl_token_count > 0:
-                    itl_ms = (
-                        execute_latency_ms / HIERARCHICAL_LOOP_COUNT
+                if (
+                    len(active_flights)
+                    < self.config.hierarchical_async_depth
+                ):
+                    quantum_begin = perf_counter()
+                    quantum_started_at_unix_s = wall_time()
+                    begin = perf_counter()
+                    self.scheduler.admit()
+                    admission_latency_ms = (
+                        perf_counter() - begin
+                    ) * 1000
+                    self._admission_latency_ms_total += admission_latency_ms
+                    self._refresh_cached_load()
+                    begin = perf_counter()
+                    batch = self.scheduler.plan_decode(
+                        wave_id=wave_id, quantum_id=quantum_id
                     )
-                    self._decode_itl_samples.append(
-                        DecodeITLSample(
-                            engine_id=self.engine_id,
+                    schedule_latency_ms = (
+                        perf_counter() - begin
+                    ) * 1000
+                    self._schedule_latency_ms_total += schedule_latency_ms
+                    pre_execute_snapshot = None
+                    if self._quantum_diagnostics_enabled:
+                        pre_execute_snapshot = self.scheduler.load_snapshot(
                             wave_id=wave_id,
                             quantum_id=quantum_id,
-                            itl_ms=itl_ms,
-                            token_count=itl_token_count,
+                        )
+                    begin = perf_counter()
+                    global_has_work = self._consensus(
+                        batch.engine_has_real
+                    )
+                    coordination_latency_ms = (
+                        perf_counter() - begin
+                    ) * 1000
+                    self._coordination_latency_ms_total += (
+                        coordination_latency_ms
+                    )
+                    if not global_has_work:
+                        self.scheduler.cancel_all_dummy_lookahead(batch)
+                        if active_flights:
+                            self._collect_pending_decode_flight(
+                                active_flights.popleft()
+                            )
+                            continue
+                        self._pause_wave()
+                        if (
+                            self.config.attention_dp > 1
+                            and self.topology.global_dp_idx == 0
+                        ):
+                            ray.get(
+                                self._coordinator.wave_complete.remote(
+                                    wave_id
+                                ),
+                                timeout=self.config.quantum_timeout_s,
+                            )
+                        continue
+
+                    self._publish_first_schedule_events(
+                        self.scheduler.mark_first_forward_started(batch)
+                    )
+                    flight = self.executor.submit(
+                        batch, timeout=self.config.quantum_timeout_s
+                    )
+                    active_flights.append(
+                        _PendingDecodeFlight(
+                            batch=batch,
+                            flight=flight,
+                            quantum_begin=quantum_begin,
+                            quantum_started_at_unix_s=(
+                                quantum_started_at_unix_s
+                            ),
+                            admission_latency_ms=admission_latency_ms,
+                            schedule_latency_ms=schedule_latency_ms,
+                            coordination_latency_ms=(
+                                coordination_latency_ms
+                            ),
+                            pre_execute_snapshot=pre_execute_snapshot,
                         )
                     )
-                    self._decode_itl_ms_weighted_total += (
-                        itl_ms * itl_token_count
+                    with self._state_cv:
+                        if (
+                            not self._wave_running
+                            or self._wave_id != wave_id
+                            or self._quantum_id != quantum_id
+                        ):
+                            raise RuntimeError(
+                                "wave identity changed during decode submit"
+                            )
+                        self._quantum_id += 1
+
+                if (
+                    len(active_flights)
+                    >= self.config.hierarchical_async_depth
+                ):
+                    self._collect_pending_decode_flight(
+                        active_flights.popleft()
                     )
-                    self._decode_itl_token_count += itl_token_count
-                self._decode_quantum_count += 1
-                self._publish_token_commit_events(
-                    self.scheduler.drain_token_commit_events()
-                )
-                self._publish_first_token_events(
-                    self.scheduler.drain_first_token_events()
-                )
-                self._publish_events(events)
-                post_execute_snapshot = self._refresh_cached_load()
-                if self._quantum_diagnostics_enabled:
-                    if pre_execute_snapshot is None:
-                        raise RuntimeError(
-                            "missing pre-execute quantum diagnostic snapshot"
-                        )
-                    executor_diagnostic = (
-                        self.executor.last_quantum_diagnostic
-                    )
-                    if (
-                        executor_diagnostic is None
-                        or executor_diagnostic.get("engine_id")
-                        != self.engine_id
-                        or executor_diagnostic.get("wave_id") != wave_id
-                        or executor_diagnostic.get("quantum_id") != quantum_id
-                    ):
-                        raise RuntimeError(
-                            "LocalExecutor quantum diagnostic identity mismatch"
-                        )
-                    sample = {
-                        "schema_version": 1,
-                        "engine_id": self.engine_id,
-                        "wave_id": wave_id,
-                        "quantum_id": quantum_id,
-                        "started_at_unix_s": quantum_started_at_unix_s,
-                        "engine_has_real": batch.engine_has_real,
-                        "waiting_before": pre_execute_snapshot.waiting,
-                        "running_before": pre_execute_snapshot.running,
-                        "useful_real_batch_size": (
-                            pre_execute_snapshot.useful_real_batch_size
-                        ),
-                        "free_blocks_min_before": (
-                            pre_execute_snapshot.free_blocks_min
-                        ),
-                        "free_blocks_min_after": (
-                            post_execute_snapshot.free_blocks_min
-                        ),
-                        "rank_loads_before": _rank_load_payload(
-                            pre_execute_snapshot
-                        ),
-                        "rank_loads_after": _rank_load_payload(
-                            post_execute_snapshot
-                        ),
-                        "admission_ms": admission_latency_ms,
-                        "schedule_ms": schedule_latency_ms,
-                        "consensus_wait_ms": coordination_latency_ms,
-                        "execute_ms": execute_latency_ms,
-                        "postprocess_ms": postprocess_latency_ms,
-                        "quantum_total_ms": (
-                            perf_counter() - quantum_begin
-                        )
-                        * 1000,
-                        "itl_ms": (
-                            execute_latency_ms
-                            / HIERARCHICAL_LOOP_COUNT
-                        ),
-                        "itl_token_count": itl_token_count,
-                        "useful_decode_tokens": (
-                            post_execute_snapshot.useful_decode_tokens
-                            - pre_execute_snapshot.useful_decode_tokens
-                        ),
-                        "raw_token_slots": (
-                            post_execute_snapshot.raw_token_slots
-                            - pre_execute_snapshot.raw_token_slots
-                        ),
-                        "control_dummy_slots": (
-                            post_execute_snapshot.control_dummy_slots
-                            - pre_execute_snapshot.control_dummy_slots
-                        ),
-                        "preemption_count": (
-                            post_execute_snapshot.preemption_count
-                        ),
-                        "executor": dict(executor_diagnostic),
-                    }
-                    with self._quantum_diagnostics_lock:
-                        self._quantum_diagnostics.append(sample)
-                with self._state_cv:
-                    self._quantum_id += 1
         except BaseException as exc:
             self._failure = f"{type(exc).__name__}: {exc}"
             error = RuntimeError(

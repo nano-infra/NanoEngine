@@ -34,6 +34,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     OwnerState,
     RankLoad,
+    ResourceReleaseEvent,
     TokenCommitEvent,
     validate_execution_trace_set,
 )
@@ -460,6 +461,10 @@ def test_router_round_robin_queue_full_retry_and_sticky_owner():
     assert router.abort(10).status == "aborted"
     assert engines[1].aborts == [10]
     router.finish(FinishEvent(10, 16, "ABORTED", 1))
+    assert router.owner(10) == RequestOwner(
+        OwnerState.TERMINAL_DRAINING, 1
+    )
+    router.release(ResourceReleaseEvent(10, 1, 0, 1, 0))
     assert router.is_idle
     assert router.abort(10).status == "already_terminal"
 
@@ -712,6 +717,11 @@ def test_router_pending_add_abort_terminal_releases_staged_owner():
 
     event = FinishEvent(3, 0, "ABORTED", 0)
     assert router.record_finish_events((event,)) == (event,)
+    assert router.owner(3) == RequestOwner(
+        OwnerState.TERMINAL_DRAINING, 0
+    )
+    release = ResourceReleaseEvent(3, 0, 0, 1, -1)
+    assert router.record_resource_release_events((release,)) == (release,)
     assert router.owner(3) is None
     assert router.terminal_event(3) == event
     assert router.is_idle
@@ -999,6 +1009,9 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     engine._terminal_events = deque(
         (FinishEvent(1, 16, "FINISHED", 0),)
     )
+    engine._resource_release_events = deque(
+        (ResourceReleaseEvent(1, 0, 0, 1, 0),)
+    )
     engine._cached_load_snapshot = load_snapshot(0, 9)
 
     batch = engine.drain_frontend_events()
@@ -1010,11 +1023,13 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     assert batch.token_commit_events[0].token_ids == (7,)
     assert batch.first_token_events[0].request_id == 1
     assert batch.finish_events[0].request_id == 1
+    assert batch.resource_release_events[0].request_id == 1
     assert engine._add_result_events == deque()
     assert engine._first_schedule_events == deque()
     assert engine._token_commit_events == deque()
     assert engine._first_token_events == deque()
     assert engine._terminal_events == deque()
+    assert engine._resource_release_events == deque()
 
 
 def test_local_engine_transport_startup_failure_releases_ready_barrier():
@@ -1134,6 +1149,8 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert terminal_events[0].request_id == 5
     assert terminal_events[0].first_forward_to_terminal_ms == 750.0
     assert router.terminal_event(5) == terminal_events[0]
+    release = ResourceReleaseEvent(5, 0, 0, 1, 0)
+    assert router.record_resource_release_events((release,)) == (release,)
     assert router.is_idle
 
 
@@ -1162,8 +1179,10 @@ def test_router_least_batch_buffers_lifecycle_before_staged_receipt():
         0,
         first_forward_to_terminal_ms=500.0,
     )
+    release_event = ResourceReleaseEvent(6, 0, 0, 1, 0)
     assert router.record_add_results((add_event,)) == ()
     assert router.record_finish_events((finish_event,)) == ()
+    assert router.record_resource_release_events((release_event,)) == ()
 
     engine.handles[0]["ready"] = True
     assert router.poll_ingress_acks()[0].enqueued
@@ -1171,6 +1190,7 @@ def test_router_least_batch_buffers_lifecycle_before_staged_receipt():
     assert router.owner(6) == RequestOwner(OwnerState.OWNED, 0)
     assert router.record_finish_events(()) == (finish_event,)
     assert router.terminal_event(6) == finish_event
+    assert router.record_resource_release_events(()) == (release_event,)
     assert router.is_idle
 
 
@@ -1185,13 +1205,13 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
         (load_snapshot(0, 20), load_snapshot(1, 12))
     )
 
-    # prompt=2, padded completion=32, so each request is charged
-    # ceil((2 + 32) / 4) = 9 blocks. After request 1, engine 0 has an
+    # prompt=2, loop-one completion=31, so each request is charged
+    # ceil((2 + 31) / 4) = 9 blocks. After request 1, engine 0 has an
     # optimistic 11 blocks and request 2 therefore goes to engine 1.
     first = add_request(router,
         request_id=1,
         prompt_token_ids=(1, 2),
-        max_tokens=17,
+        max_tokens=31,
         temperature=0.1,
         ignore_eos=True,
     )
@@ -1201,7 +1221,7 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
     second = add_request(router,
         request_id=2,
         prompt_token_ids=(1, 2),
-        max_tokens=17,
+        max_tokens=31,
         temperature=0.1,
         ignore_eos=True,
     )
@@ -1216,7 +1236,7 @@ def test_router_least_cache_uses_padded_request_blocks_optimistically():
     third = add_request(router,
         request_id=3,
         prompt_token_ids=(1, 2),
-        max_tokens=17,
+        max_tokens=31,
         temperature=0.1,
         ignore_eos=True,
     )
@@ -1407,6 +1427,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._add_result_events = deque()
     engine._first_token_events = deque()
     engine._terminal_events = deque()
+    engine._resource_release_events = deque()
     engine._state_cv = threading.Condition()
     engine._wave_running = False
     engine._wave_id = 0
@@ -1440,6 +1461,10 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     assert engine._reserved_slots == 2
 
     engine._publish_events((FinishEvent(50, 16, "FINISHED", 0),))
+    assert engine._reserved_slots == 2
+    engine._publish_resource_release_events(
+        (ResourceReleaseEvent(50, 0, 0, 1, 0),)
+    )
     assert engine._reserved_slots == 1
     assert engine._capacity_epoch == 1
     assert engine.enqueue_add(commands[2], sequences[2]).enqueued
@@ -1621,6 +1646,10 @@ def test_local_engine_abort_during_planned_commit_wins_ownership_handoff():
             self._events = ()
             return events
 
+        @staticmethod
+        def drain_resource_release_events():
+            return (ResourceReleaseEvent(1, 0, 0, 1, -1),)
+
     actor_class = LocalEngineCore.__ray_metadata__.modified_class
     engine = object.__new__(actor_class)
     engine.config = SimpleNamespace(
@@ -1642,6 +1671,7 @@ def test_local_engine_abort_during_planned_commit_wins_ownership_handoff():
     engine._events_lock = threading.Lock()
     engine._add_result_events = deque()
     engine._terminal_events = deque()
+    engine._resource_release_events = deque()
     engine._ingress_queue_delay_ms_total = 0.0
     engine._scheduler_add_ms_total = 0.0
     engine._local_transient_retries = 0

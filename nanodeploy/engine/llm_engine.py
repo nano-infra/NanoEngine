@@ -755,6 +755,11 @@ class LLMEngine:
                 self.metrics_manager.complete_sequence(event.request_id)
             sequence.status = SequenceStatus.FINISHED
         self._frontend_finish_events.extend(finish_events)
+        self.router.record_resource_release_events(
+            event
+            for batch in batches
+            for event in batch.resource_release_events
+        )
 
         now = time.monotonic()
         if (

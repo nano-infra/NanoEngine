@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from math import ceil
 from time import perf_counter
@@ -19,6 +20,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LocalDecodeBatch,
     RankLoad,
     RequestState,
+    ResourceReleaseEvent,
     TokenCommitEvent,
     WorkerDecodeResult,
     round_up,
@@ -41,12 +43,19 @@ class LocalRequestRecord:
     original_prompt_len: int
     padded_completion_len: int
     scheduler_enqueued_at: float
+    admission_wave_id: int
     first_forward_started_at: float | None = None
     first_token_emitted: bool = False
     terminal_emitted: bool = False
     generation_epoch: int = 0
     committed_output_count: int = 0
     terminal_reason: str | None = None
+    terminal_state: RequestState | None = None
+    outstanding_output_placeholders: int = 0
+    last_scheduled_quantum: tuple[int, int] | None = None
+    last_completed_quantum: tuple[int, int] | None = None
+    drain_fence: tuple[int, int] | None = None
+    resources_allocated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +120,9 @@ class LocalScheduler:
         self._terminal_events: list[FinishEvent] = []
         self._token_commit_events: list[TokenCommitEvent] = []
         self._first_token_events: list[FirstTokenEvent] = []
+        self._resource_release_events: list[ResourceReleaseEvent] = []
         self._inflight_ids: set[int] = set()
+        self._inflight_batches: deque[LocalDecodeBatch] = deque()
         self._all_dummy_engine_quantums = 0
         self._useful_decode_tokens = 0
         self._raw_token_slots = 0
@@ -163,6 +174,7 @@ class LocalScheduler:
             if record.state not in {
                 RequestState.RUNNING_DECODE,
                 RequestState.ABORT_PENDING,
+                RequestState.TERMINAL_PENDING_DRAIN,
             }:
                 raise RuntimeError(
                     "LocalScheduler live record has invalid state: "
@@ -311,6 +323,7 @@ class LocalScheduler:
             original_prompt_len=validation.original_prompt_len,
             padded_completion_len=validation.padded_completion_len,
             scheduler_enqueued_at=perf_counter(),
+            admission_wave_id=command.wave_id,
         )
         return AddResult(
             request_id=command.request_id,
@@ -607,6 +620,7 @@ class LocalScheduler:
                 )
             self._master_assignments[master_sp_idx] += 1
             record.state = RequestState.RUNNING_DECODE
+            record.resources_allocated = True
             admitted_ids.append(sequence.seq_id)
         return tuple(admitted_ids)
 
@@ -623,7 +637,10 @@ class LocalScheduler:
             sequence.seq_id for sequence in self._state_manager.running
         }
         for request_id, record in self._records.items():
-            if record.state.is_terminal or record.state == RequestState.ABORT_PENDING:
+            if record.state.is_terminal or record.state in {
+                RequestState.ABORT_PENDING,
+                RequestState.TERMINAL_PENDING_DRAIN,
+            }:
                 continue
             if request_id in waiting_ids:
                 if record.sequence.num_bootstrap_tokens != 0:
@@ -644,12 +661,14 @@ class LocalScheduler:
             elif request_id in running_ids:
                 record.state = RequestState.RUNNING_DECODE
 
-    def plan_decode(self, *, wave_id: int, quantum_id: int) -> LocalDecodeBatch:
-        if self._inflight_ids:
-            raise RuntimeError("cannot freeze a second batch while one is in flight")
-
-        sequences = list(self._scheduler.plan_decode()[0])
-        self._reconcile_preemptions()
+    def _freeze_batch(
+        self,
+        sequences: list[Sequence],
+        *,
+        wave_id: int,
+        quantum_id: int,
+        output_offsets: dict[int, int] | None = None,
+    ) -> LocalDecodeBatch:
         control_dummy_ids = frozenset(
             sequence.seq_id
             for sequence in sequences
@@ -665,7 +684,6 @@ class LocalScheduler:
             for sequence in sequences
             if id(sequence) not in control_dummy_object_ids
         ]
-        self._inflight_ids = {sequence.seq_id for sequence in real_sequences}
 
         request_master_global_rank = {
             sequence.seq_id: self.topology.global_rank(
@@ -693,7 +711,7 @@ class LocalScheduler:
             global_rank: list(sequences)
             for global_rank in self.topology.global_ranks
         }
-        return LocalDecodeBatch(
+        batch = LocalDecodeBatch(
             wave_id=wave_id,
             quantum_id=quantum_id,
             engine_id=self.engine_id,
@@ -709,14 +727,186 @@ class LocalScheduler:
                 for sequence in real_sequences
             },
             per_request_output_offset={
-                sequence.seq_id: self._records[
-                    sequence.seq_id
-                ].committed_output_count
+                sequence.seq_id: (
+                    self._records[sequence.seq_id].committed_output_count
+                    if output_offsets is None
+                    else output_offsets[sequence.seq_id]
+                )
                 for sequence in real_sequences
             },
             _all_sequences=sequences,
             _control_dummy_object_ids=control_dummy_object_ids,
         )
+        self._inflight_batches.append(batch)
+        for sequence in real_sequences:
+            record = self._records[sequence.seq_id]
+            record.outstanding_output_placeholders += 1
+            record.last_scheduled_quantum = (wave_id, quantum_id)
+            self._inflight_ids.add(sequence.seq_id)
+        return batch
+
+    def _reserve_snapshot_output_block(
+        self,
+        snapshot: Sequence,
+        canonical: Sequence,
+    ) -> bool:
+        before_tables = tuple(
+            tuple(
+                snapshot.block_table(BlockContextSlot.ACTIVE, sp_idx)
+            )
+            for sp_idx in range(self.topology.attention_sp)
+        )
+        if not self._state_manager.can_append(snapshot, 1):
+            return False
+        if not self._state_manager.may_append(snapshot, 1):
+            raise RuntimeError(
+                "could not reserve optimistic decode output block: "
+                f"request_id={snapshot.seq_id}"
+            )
+        canonical_ctx = canonical.block_ctx(BlockContextSlot.ACTIVE)
+        for sp_idx, before in enumerate(before_tables):
+            snapshot_table = tuple(
+                snapshot.block_table(BlockContextSlot.ACTIVE, sp_idx)
+            )
+            canonical_table = canonical.block_table(
+                BlockContextSlot.ACTIVE, sp_idx
+            )
+            if tuple(canonical_table) != before:
+                raise RuntimeError(
+                    "canonical/snapshot KV block prefix diverged before "
+                    f"reservation: request_id={snapshot.seq_id}, "
+                    f"sp_idx={sp_idx}"
+                )
+            for block_id in snapshot_table[len(before) :]:
+                canonical_table.append(block_id)
+                canonical_ctx.block_location.append((sp_idx, block_id))
+        return True
+
+    def _plan_lookahead(
+        self,
+        predecessor: LocalDecodeBatch,
+        *,
+        wave_id: int,
+        quantum_id: int,
+    ) -> LocalDecodeBatch:
+        if predecessor.wave_id != wave_id:
+            raise RuntimeError("decode lookahead cannot cross a wave boundary")
+        if predecessor.quantum_id + 1 != quantum_id:
+            raise RuntimeError(
+                "decode lookahead quantum is not consecutive: "
+                f"predecessor={predecessor.quantum_id}, next={quantum_id}"
+            )
+
+        snapshots: list[Sequence] = []
+        output_offsets: dict[int, int] = {}
+        occupied_sp: set[int] = set()
+        master_counts = [0] * self.topology.attention_sp
+        predecessor_request_ids: set[int] = set()
+        for source in predecessor._all_sequences:
+            if predecessor.is_control_dummy(source):
+                continue
+            request_id = source.seq_id
+            predecessor_request_ids.add(request_id)
+            record = self._records[request_id]
+            if record.state != RequestState.RUNNING_DECODE:
+                continue
+            predecessor_offset = predecessor.per_request_output_offset[
+                request_id
+            ]
+            next_offset = predecessor_offset + HIERARCHICAL_LOOP_COUNT
+            if (
+                next_offset
+                != record.committed_output_count
+                + record.outstanding_output_placeholders
+            ):
+                raise RuntimeError(
+                    "optimistic decode offset diverged from outstanding "
+                    f"placeholders: request_id={request_id}"
+                )
+            if next_offset >= record.sequence.max_tokens:
+                continue
+
+            snapshot = source.clone_for_decode_dispatch()
+            snapshot.num_tokens += HIERARCHICAL_LOOP_COUNT
+            snapshot_ctx = snapshot.block_ctx(BlockContextSlot.ACTIVE)
+            master_sp_idx = snapshot_ctx.master_sp_idx
+            dispatched = list(snapshot_ctx.num_dispatched_tokens)
+            dispatched[master_sp_idx] += HIERARCHICAL_LOOP_COUNT
+            snapshot_ctx.num_dispatched_tokens = dispatched
+            if not self._reserve_snapshot_output_block(
+                snapshot, record.sequence
+            ):
+                continue
+            snapshots.append(snapshot)
+            output_offsets[request_id] = next_offset
+            occupied_sp.add(master_sp_idx)
+            master_counts[master_sp_idx] += 1
+
+        # Admission remains live while an older decode is executing. A newly
+        # admitted request has no predecessor dependency, so it can join the
+        # optimistic batch directly instead of waiting for the rolling
+        # depth-two pipeline to become empty.
+        for canonical in self._state_manager.running:
+            request_id = canonical.seq_id
+            if request_id in predecessor_request_ids:
+                continue
+            record = self._records[request_id]
+            if (
+                record.state != RequestState.RUNNING_DECODE
+                or record.outstanding_output_placeholders != 0
+            ):
+                continue
+            master_sp_idx = canonical.block_ctx(
+                BlockContextSlot.ACTIVE
+            ).master_sp_idx
+            if master_counts[master_sp_idx] >= self.config.max_num_seqs:
+                continue
+            if not self._state_manager.can_append(canonical, 1):
+                continue
+            if not self._state_manager.may_append(canonical, 1):
+                raise RuntimeError(
+                    "could not reserve first decode output block during "
+                    f"lookahead: request_id={request_id}"
+                )
+            snapshots.append(canonical.clone_for_decode_dispatch())
+            output_offsets[request_id] = record.committed_output_count
+            occupied_sp.add(master_sp_idx)
+            master_counts[master_sp_idx] += 1
+
+        for sp_idx in range(self.topology.attention_sp):
+            if sp_idx not in occupied_sp:
+                snapshots.append(self._state_manager.dummy_seqs[sp_idx])
+        return self._freeze_batch(
+            snapshots,
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+            output_offsets=output_offsets,
+        )
+
+    def plan_decode(self, *, wave_id: int, quantum_id: int) -> LocalDecodeBatch:
+        if len(self._inflight_batches) >= self.config.hierarchical_async_depth:
+            raise RuntimeError("decode flight capacity is exhausted")
+        if self._inflight_batches:
+            return self._plan_lookahead(
+                self._inflight_batches[-1],
+                wave_id=wave_id,
+                quantum_id=quantum_id,
+            )
+
+        sequences = list(self._scheduler.plan_decode()[0])
+        self._reconcile_preemptions()
+        return self._freeze_batch(
+            sequences,
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+        )
+
+    def cancel_all_dummy_lookahead(self, batch: LocalDecodeBatch) -> None:
+        if batch.engine_has_real:
+            raise RuntimeError("cannot cancel a real decode lookahead batch")
+        if not self._inflight_batches or self._inflight_batches[-1] is not batch:
+            raise RuntimeError("decode lookahead cancellation is not LIFO")
+        self._inflight_batches.pop()
 
     def mark_first_forward_started(
         self, batch: LocalDecodeBatch
@@ -731,9 +921,11 @@ class LocalScheduler:
             for request_ids in batch.frozen_request_order.values()
             for request_id in request_ids
         }
-        if batch_request_ids != self._inflight_ids:
+        if not any(pending is batch for pending in self._inflight_batches):
+            raise RuntimeError("first-forward batch is not pending")
+        if not batch_request_ids.issubset(self._inflight_ids):
             raise RuntimeError(
-                "first-forward batch does not match frozen inflight requests"
+                "first-forward batch contains a non-inflight request"
             )
 
         started_at = perf_counter()
@@ -757,13 +949,17 @@ class LocalScheduler:
 
     def _finish_aborted(self, request_id: int) -> None:
         record = self._records[request_id]
-        sequence = record.sequence
-        if sequence in self._state_manager.running:
-            self._state_manager.running.remove(sequence)
-            self._state_manager.deallocate(sequence, BlockContextSlot.ACTIVE)
-        record.state = RequestState.ABORTED
+        if record.terminal_emitted:
+            return
+        record.state = RequestState.ABORT_PENDING
+        record.terminal_state = RequestState.ABORTED
         record.terminal_reason = "ABORTED"
+        record.drain_fence = record.last_scheduled_quantum
+        if record.sequence in self._state_manager.running:
+            self._state_manager.running.remove(record.sequence)
         self._emit_terminal(record, "ABORTED")
+        if record.outstanding_output_placeholders == 0:
+            self._reclaim_terminal(record)
 
     def abort(self, request_id: int) -> AbortResult:
         record = self._records.get(request_id)
@@ -773,14 +969,16 @@ class LocalScheduler:
                     request_id=request_id, status="already_terminal"
                 )
             return AbortResult(request_id=request_id, status="not_found")
-        if request_id in self._inflight_ids:
-            record.state = RequestState.ABORT_PENDING
+        if record.terminal_emitted:
+            return AbortResult(
+                request_id=request_id, status="already_terminal"
+            )
+        if record.outstanding_output_placeholders > 0:
+            self._finish_aborted(request_id)
             return AbortResult(request_id=request_id, status="abort_pending")
         if record.state == RequestState.WAITING_ADMISSION:
             self._scheduler.waiting_migration.remove(record.sequence)
-            record.state = RequestState.ABORTED
-            record.terminal_reason = "ABORTED"
-            self._emit_terminal(record, "ABORTED")
+            self._finish_aborted(request_id)
             return AbortResult(request_id=request_id, status="aborted")
 
         self._finish_aborted(request_id)
@@ -797,9 +995,12 @@ class LocalScheduler:
             raise RuntimeError(
                 f"duplicate terminal event for request {record.sequence.seq_id}"
             )
-        if not record.state.is_terminal:
+        if record.terminal_state not in {
+            RequestState.FINISHED,
+            RequestState.ABORTED,
+        }:
             raise RuntimeError(
-                "cannot emit a terminal event for a live request: "
+                "cannot emit a terminal event without a final state: "
                 f"request_id={record.sequence.seq_id}, "
                 f"state={record.state.value}"
             )
@@ -842,8 +1043,40 @@ class LocalScheduler:
                 finish_reason=record.terminal_reason,
             )
         )
+
+    def _reclaim_terminal(self, record: LocalRequestRecord) -> None:
+        if not record.terminal_emitted or record.terminal_state is None:
+            raise RuntimeError("cannot reclaim a non-terminal request")
+        if record.outstanding_output_placeholders != 0:
+            raise RuntimeError(
+                "cannot reclaim request with outstanding decode placeholders"
+            )
+        request_id = record.sequence.seq_id
+        if record.resources_allocated:
+            if record.sequence in self._state_manager.running:
+                self._state_manager.running.remove(record.sequence)
+            self._state_manager.deallocate(
+                record.sequence,
+                BlockContextSlot.ACTIVE,
+            )
+            record.resources_allocated = False
+        record.state = record.terminal_state
         self._records.pop(request_id)
-        self._terminal_states[request_id] = record.state
+        self._terminal_states[request_id] = record.terminal_state
+        release_wave_id, release_quantum_id = (
+            record.last_completed_quantum
+            or record.drain_fence
+            or (record.admission_wave_id, -1)
+        )
+        self._resource_release_events.append(
+            ResourceReleaseEvent(
+                request_id=request_id,
+                engine_id=self.engine_id,
+                generation_epoch=record.generation_epoch,
+                wave_id=release_wave_id,
+                quantum_id=release_quantum_id,
+            )
+        )
 
     def postprocess(
         self,
@@ -856,6 +1089,24 @@ class LocalScheduler:
             raise ValueError("decode batch belongs to a different LocalScheduler")
         if execute_latency_ms is not None and execute_latency_ms < 0:
             raise ValueError("execute_latency_ms must be non-negative")
+        return self._commit_decode_batch(
+            batch,
+            worker_results,
+            execute_latency_ms=execute_latency_ms,
+        )
+
+    def _commit_decode_batch(
+        self,
+        batch: LocalDecodeBatch,
+        worker_results: list[WorkerDecodeResult],
+        *,
+        execute_latency_ms: float | None,
+    ) -> tuple[FinishEvent, ...]:
+        if (
+            not self._inflight_batches
+            or self._inflight_batches[0] is not batch
+        ):
+            raise RuntimeError("decode batches must commit in FIFO order")
         results_by_rank = batch.validate_worker_results(worker_results)
         self._raw_token_slots += (
             len(batch._all_sequences) * HIERARCHICAL_LOOP_COUNT
@@ -869,75 +1120,59 @@ class LocalScheduler:
             self._all_dummy_engine_quantums += 1
             self._all_dummy_rank_forwards += rank_forwards
 
-        aborted_ids = {
-            request_id
-            for request_id in self._inflight_ids
-            if self._records[request_id].state == RequestState.ABORT_PENDING
-        }
-        completed_before = {
-            request_id: self._records[request_id].sequence.num_completed_tokens
-            for request_id in self._inflight_ids.difference(aborted_ids)
-        }
-        master_sp_by_request = {
-            request_id: (
-                self._records[request_id]
-                .sequence.block_ctx(BlockContextSlot.ACTIVE)
-                .master_sp_idx
-            )
-            for request_id in completed_before
-        }
-        self._last_itl_token_slots = 0
-        for request_id in sorted(aborted_ids):
-            self._finish_aborted(request_id)
-
-        dp_sp_sequences: list[list[Sequence]] = []
-        dp_sp_token_ids: list[list[list[int]]] = []
-        for sp_idx in range(self.topology.attention_sp):
-            global_rank = self.topology.global_rank(sp_idx)
+        token_by_request: dict[int, tuple[int, ...]] = {}
+        for global_rank in self.topology.global_ranks:
             result = results_by_rank[global_rank]
-            token_by_request = dict(
-                zip(
-                    result.mastered_request_ids,
-                    result.sampled_token_ids,
-                    strict=True,
-                )
-            )
-            rank_sequences: list[Sequence] = []
-            rank_token_ids: list[list[int]] = []
-            for sequence in batch._all_sequences:
-                if (
-                    sequence.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
-                    != sp_idx
-                ):
-                    continue
-                if (
-                    sequence.seq_id in aborted_ids
-                    and not batch.is_control_dummy(sequence)
-                ):
-                    continue
-                rank_sequences.append(sequence)
-                if batch.is_control_dummy(sequence):
-                    rank_token_ids.append([0] * HIERARCHICAL_LOOP_COUNT)
-                else:
-                    rank_token_ids.append(
-                        list(token_by_request[sequence.seq_id])
+            for request_id, token_ids in zip(
+                result.mastered_request_ids,
+                result.sampled_token_ids,
+                strict=True,
+            ):
+                if request_id in token_by_request:
+                    raise RuntimeError(
+                        "worker results duplicated a mastered request: "
+                        f"request_id={request_id}"
                     )
-            dp_sp_sequences.append(rank_sequences)
-            dp_sp_token_ids.append(rank_token_ids)
+                token_by_request[request_id] = token_ids
 
-        self._scheduler.postprocess(
-            dp_sp_sequences,
-            dp_sp_token_ids,
-            metrics_manager=None,
-            loop_count=HIERARCHICAL_LOOP_COUNT,
+        self._last_itl_token_slots = 0
+        batch_request_ids = tuple(
+            sequence.seq_id
+            for sequence in batch._all_sequences
+            if not batch.is_control_dummy(sequence)
         )
-        for request_id, previous_tokens in completed_before.items():
+        for request_id in batch_request_ids:
             record = self._records[request_id]
-            if batch.per_request_epoch.get(request_id) != record.generation_epoch:
+            if (
+                batch.per_request_epoch.get(request_id)
+                != record.generation_epoch
+            ):
                 raise RuntimeError(
                     "decode batch generation epoch changed before commit: "
                     f"request_id={request_id}"
                 )
+            if record.outstanding_output_placeholders <= 0:
+                raise RuntimeError(
+                    "decode request has no outstanding output placeholder: "
+                    f"request_id={request_id}"
+                )
+
+            stale_output = record.state in {
+                RequestState.ABORT_PENDING,
+                RequestState.TERMINAL_PENDING_DRAIN,
+            }
+            if stale_output:
+                record.outstanding_output_placeholders -= 1
+                record.last_completed_quantum = (
+                    batch.wave_id,
+                    batch.quantum_id,
+                )
+                if record.outstanding_output_placeholders == 0:
+                    self._inflight_ids.discard(request_id)
+                    self._reclaim_terminal(record)
+                continue
+
+            previous_tokens = record.sequence.num_completed_tokens
             if (
                 batch.per_request_output_offset.get(request_id)
                 != record.committed_output_count
@@ -953,49 +1188,17 @@ class LocalScheduler:
                     f"canonical={previous_tokens}, "
                     f"committed={record.committed_output_count}"
                 )
-            completed_tokens = record.sequence.num_completed_tokens
-            generated_tokens = completed_tokens - previous_tokens
-            if generated_tokens < 0:
-                raise RuntimeError(
-                    "hierarchical completed-token counter moved backwards: "
-                    f"request_id={request_id}"
-                )
-            master_sp_idx = master_sp_by_request[request_id]
-            if not 0 <= master_sp_idx < self.topology.attention_sp:
-                raise RuntimeError(
-                    "decoded request has invalid master SP rank: "
-                    f"request_id={request_id}, sp_idx={master_sp_idx}"
-                )
-            self._useful_decode_tokens += generated_tokens
-            self._mastered_decode_tokens[master_sp_idx] += generated_tokens
-            self._last_itl_token_slots += (
-                generated_tokens
-                if previous_tokens > 0
-                else max(0, generated_tokens - 1)
-            )
-            completion_token_ids = tuple(
-                record.sequence.completion_token_ids
-            )
-            token_delta = completion_token_ids[
-                previous_tokens:completed_tokens
-            ]
-            if len(token_delta) != generated_tokens:
-                raise RuntimeError(
-                    "canonical Sequence did not materialize committed tokens: "
-                    f"request_id={request_id}"
-                )
-            if generated_tokens != HIERARCHICAL_LOOP_COUNT:
+            token_delta = token_by_request[request_id]
+            if len(token_delta) != HIERARCHICAL_LOOP_COUNT:
                 raise RuntimeError(
                     "loop-one request produced an invalid token delta: "
-                    f"request_id={request_id}, tokens={generated_tokens}"
+                    f"request_id={request_id}, tokens={len(token_delta)}"
                 )
             invalid_token = next(
                 (
                     token_id
                     for token_id in token_delta
-                    if not 0
-                    <= token_id
-                    < self.config.hf_config.vocab_size
+                    if not 0 <= token_id < self.config.hf_config.vocab_size
                 ),
                 None,
             )
@@ -1004,21 +1207,47 @@ class LocalScheduler:
                     "worker sampled token outside the model vocabulary: "
                     f"request_id={request_id}, token_id={invalid_token}"
                 )
+
+            master_sp_idx = record.sequence.block_ctx(
+                BlockContextSlot.ACTIVE
+            ).master_sp_idx
+            if not 0 <= master_sp_idx < self.topology.attention_sp:
+                raise RuntimeError(
+                    "decoded request has invalid master SP rank: "
+                    f"request_id={request_id}, sp_idx={master_sp_idx}"
+                )
+            for token_id in token_delta:
+                record.sequence.append_token(
+                    token_id,
+                    BlockContextSlot.ACTIVE,
+                    master_sp_idx,
+                )
+                self._state_manager.add_running_tokens(master_sp_idx, 1)
+            completed_tokens = record.sequence.num_completed_tokens
+            generated_tokens = completed_tokens - previous_tokens
+            self._useful_decode_tokens += generated_tokens
+            self._mastered_decode_tokens[master_sp_idx] += generated_tokens
+            self._last_itl_token_slots += (
+                generated_tokens
+                if previous_tokens > 0
+                else max(0, generated_tokens - 1)
+            )
+            materialized_delta = tuple(record.sequence.completion_token_ids)[
+                previous_tokens:completed_tokens
+            ]
+            if materialized_delta != token_delta:
+                raise RuntimeError(
+                    "canonical Sequence did not materialize committed tokens: "
+                    f"request_id={request_id}"
+                )
             finish_reason = None
-            if record.sequence.is_finished:
-                if (
-                    not record.sequence.ignore_eos
-                    and token_delta[-1] == self.config.eos
-                ):
-                    finish_reason = "EOS"
-                elif completed_tokens >= record.sequence.max_tokens:
-                    finish_reason = "LENGTH"
-                else:
-                    raise RuntimeError(
-                        "finished request has neither EOS nor length reason: "
-                        f"request_id={request_id}"
-                    )
-                record.terminal_reason = finish_reason
+            if (
+                not record.sequence.ignore_eos
+                and token_delta[-1] == self.config.eos
+            ):
+                finish_reason = "EOS"
+            elif completed_tokens >= record.sequence.max_tokens:
+                finish_reason = "LENGTH"
             record.committed_output_count = completed_tokens
             self._token_commit_events.append(
                 TokenCommitEvent(
@@ -1032,8 +1261,6 @@ class LocalScheduler:
                     finish_reason=finish_reason,
                 )
             )
-        for request_id in sorted(self._inflight_ids.difference(aborted_ids)):
-            record = self._records[request_id]
             if (
                 not record.first_token_emitted
                 and record.sequence.num_completed_tokens > 0
@@ -1048,8 +1275,14 @@ class LocalScheduler:
                         ),
                     )
                 )
-            if record.sequence.is_finished:
-                record.state = RequestState.FINISHED
+            if finish_reason is not None:
+                record.state = RequestState.TERMINAL_PENDING_DRAIN
+                record.terminal_state = RequestState.FINISHED
+                record.terminal_reason = finish_reason
+                record.drain_fence = record.last_scheduled_quantum
+                record.sequence.status = SequenceStatus.FINISHED
+                if record.sequence in self._state_manager.running:
+                    self._state_manager.running.remove(record.sequence)
                 self._emit_terminal(
                     record,
                     "FINISHED",
@@ -1057,7 +1290,20 @@ class LocalScheduler:
                 )
             else:
                 record.state = RequestState.RUNNING_DECODE
-        self._inflight_ids.clear()
+
+            record.outstanding_output_placeholders -= 1
+            record.last_completed_quantum = (
+                batch.wave_id,
+                batch.quantum_id,
+            )
+            if record.outstanding_output_placeholders == 0:
+                self._inflight_ids.discard(request_id)
+                if record.terminal_emitted:
+                    self._reclaim_terminal(record)
+
+        popped = self._inflight_batches.popleft()
+        if popped is not batch:
+            raise RuntimeError("decode batch FIFO changed during commit")
         return self.drain_terminal_events()
 
     def drain_terminal_events(self) -> tuple[FinishEvent, ...]:
@@ -1075,8 +1321,15 @@ class LocalScheduler:
         self._first_token_events.clear()
         return events
 
+    def drain_resource_release_events(
+        self,
+    ) -> tuple[ResourceReleaseEvent, ...]:
+        events = tuple(self._resource_release_events)
+        self._resource_release_events.clear()
+        return events
+
     def is_finished(self) -> bool:
-        return not self._records
+        return not self._records and not self._inflight_batches
 
     def load_snapshot(self, *, wave_id: int, quantum_id: int) -> LoadSnapshot:
         free_blocks = [

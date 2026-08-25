@@ -12,6 +12,7 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     RankLoad,
     RequestState,
+    ResourceReleaseEvent,
     TokenCommitEvent,
     WorkerDecodeResult,
     round_up,
@@ -186,6 +187,7 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert not config.hierarchical_execution_trace
     assert not config.hierarchical_quantum_diagnostics
     assert config.hierarchical_worker_transport == "ray"
+    assert config.hierarchical_async_depth == 1
     assert config.max_ingress_batch_requests == 256
     assert config.max_ingress_drain_ms == 0.0
     assert len(config.collective_fingerprint()) == 64
@@ -196,6 +198,22 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert zmq_config.collective_fingerprint() != (
         config.collective_fingerprint()
     )
+
+    async_config = make_hierarchical_config(
+        hierarchical_worker_transport="zmq",
+        hierarchical_async_depth=2,
+    )
+    assert async_config.hierarchical_async_depth == 2
+    assert async_config.collective_fingerprint() != (
+        zmq_config.collective_fingerprint()
+    )
+
+
+def test_depth_two_requires_persistent_zmq_workers():
+    with pytest.raises(
+        ValueError, match="requires hierarchical ZMQ workers"
+    ):
+        make_hierarchical_config(hierarchical_async_depth=2)
 
 
 def test_add_validation_uses_loop_one_lifetime_and_excludes_bootstrap():
@@ -835,6 +853,169 @@ def test_local_scheduler_loop_one_stops_on_eos_and_releases_capacity():
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.is_finished()
+
+
+def test_async_scheduler_defers_eos_reclaim_until_stale_flight_drains():
+    config = make_hierarchical_config(
+        attention_dp=8,
+        attention_sp=1,
+        hierarchical_worker_transport="zmq",
+        hierarchical_async_depth=2,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    command, sequence = make_add(
+        149,
+        tuple(range(62)),
+        max_tokens=4,
+        ignore_eos=False,
+    )
+    assert local.add(command, sequence).accepted
+    assert local.admit() == (149,)
+
+    first = local.plan_decode(wave_id=1, quantum_id=0)
+    assert len(sequence.block_table(BlockContextSlot.ACTIVE, 0)) == 1
+    second = local.plan_decode(wave_id=1, quantum_id=1)
+    # q+1 crosses a KV-block boundary. Its newly allocated block is copied
+    # into canonical ownership so EOS at q cannot free it prematurely.
+    assert len(sequence.block_table(BlockContextSlot.ACTIVE, 0)) == 2
+    canonical_num_tokens = sequence.num_tokens
+    second_snapshot = next(
+        item for item in second._all_sequences if item.seq_id == 149
+    )
+    assert second_snapshot is not sequence
+    assert second_snapshot.num_tokens == canonical_num_tokens + 1
+    assert second_snapshot.token_ids == sequence.token_ids
+    assert second.per_request_output_offset == {149: 1}
+
+    local.mark_first_forward_started(first)
+    local.mark_first_forward_started(second)
+    terminal = local.postprocess(
+        first,
+        make_worker_results(first, token_base=config.eos),
+    )
+
+    assert len(terminal) == 1
+    assert terminal[0].finish_reason == "EOS"
+    assert sequence.completion_token_ids == [config.eos]
+    assert local.state_manager.num_running_seqs == 1
+    assert len(sequence.block_table(BlockContextSlot.ACTIVE, 0)) == 2
+    assert local.drain_resource_release_events() == ()
+    assert not local.is_finished()
+
+    assert local.postprocess(
+        second,
+        make_worker_results(second, token_base=777),
+    ) == ()
+    assert local.drain_token_commit_events() == (
+        TokenCommitEvent(
+            request_id=149,
+            engine_id=0,
+            generation_epoch=0,
+            wave_id=1,
+            quantum_id=0,
+            output_offset=1,
+            token_ids=(config.eos,),
+            finish_reason="EOS",
+        ),
+    )
+    assert sequence.completion_token_ids == [config.eos]
+    assert local.state_manager.num_running_seqs == 0
+    assert local.state_manager.num_running_tokens == 0
+    assert sequence.block_table(BlockContextSlot.ACTIVE, 0) == []
+    assert local.drain_resource_release_events() == (
+        ResourceReleaseEvent(
+            request_id=149,
+            engine_id=0,
+            generation_epoch=0,
+            wave_id=1,
+            quantum_id=1,
+        ),
+    )
+    assert local.is_finished()
+
+
+def test_async_scheduler_known_length_excludes_request_from_lookahead():
+    config = make_hierarchical_config(
+        hierarchical_worker_transport="zmq",
+        hierarchical_async_depth=2,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    command, sequence = make_add(150, (10, 11), max_tokens=1)
+    assert local.add(command, sequence).accepted
+    assert local.admit() == (150,)
+
+    first = local.plan_decode(wave_id=1, quantum_id=0)
+    lookahead = local.plan_decode(wave_id=1, quantum_id=1)
+
+    assert first.engine_has_real
+    assert not lookahead.engine_has_real
+    assert all(
+        not lookahead.expected_request_ids(rank)
+        for rank in lookahead.per_rank_sequences
+    )
+    local.cancel_all_dummy_lookahead(lookahead)
+    local.mark_first_forward_started(first)
+    terminal = local.postprocess(first, make_worker_results(first))
+    assert terminal[0].finish_reason == "LENGTH"
+    assert local.is_finished()
+
+
+def test_async_scheduler_admits_new_request_into_rolling_lookahead():
+    config = make_hierarchical_config(
+        hierarchical_worker_transport="zmq",
+        hierarchical_async_depth=2,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    first_command, first_sequence = make_add(
+        152, (10, 11), max_tokens=4
+    )
+    assert local.add(first_command, first_sequence).accepted
+    assert local.admit() == (152,)
+    first = local.plan_decode(wave_id=1, quantum_id=0)
+
+    second_command, second_sequence = make_add(
+        153, (20, 21), max_tokens=4
+    )
+    assert local.add(second_command, second_sequence).accepted
+    assert local.admit() == (153,)
+    lookahead = local.plan_decode(wave_id=1, quantum_id=1)
+
+    lookahead_ids = {
+        request_id
+        for global_rank in lookahead.per_rank_sequences
+        for request_id in lookahead.expected_request_ids(global_rank)
+    }
+    assert lookahead_ids == {152, 153}
+    assert lookahead.per_request_output_offset == {152: 1, 153: 0}
+
+    local.mark_first_forward_started(first)
+    local.mark_first_forward_started(lookahead)
+    assert local.postprocess(first, make_worker_results(first)) == ()
+    assert local.postprocess(lookahead, make_worker_results(lookahead)) == ()
+    assert first_sequence.completion_token_ids == [100, 100]
+    assert second_sequence.completion_token_ids == [100]
+
+
+def test_async_scheduler_rejects_out_of_order_commit():
+    config = make_hierarchical_config(
+        hierarchical_worker_transport="zmq",
+        hierarchical_async_depth=2,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    command, sequence = make_add(151, (10, 11), max_tokens=4)
+    assert local.add(command, sequence).accepted
+    assert local.admit() == (151,)
+    first = local.plan_decode(wave_id=1, quantum_id=0)
+    second = local.plan_decode(wave_id=1, quantum_id=1)
+
+    with pytest.raises(RuntimeError, match="FIFO"):
+        local.postprocess(second, make_worker_results(second))
+
+    local.mark_first_forward_started(first)
+    local.mark_first_forward_started(second)
+    assert local.postprocess(first, make_worker_results(first)) == ()
+    assert local.postprocess(second, make_worker_results(second)) == ()
+    assert sequence.completion_token_ids == [100, 100]
 
 
 def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
