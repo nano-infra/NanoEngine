@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NanoDeploy Hierarchical Async Scheduling 实验计划</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08111f;
+      --panel: #101c2d;
+      --panel-2: #14243a;
+      --line: #29415f;
+      --text: #e8f0fa;
+      --muted: #9fb1c7;
+      --cyan: #4dd9e8;
+      --blue: #77a8ff;
+      --green: #58d68d;
+      --amber: #ffc857;
+      --red: #ff6b7a;
+      --purple: #b99cff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 12% 0%, #142d49 0, transparent 31rem),
+        radial-gradient(circle at 92% 12%, #28204b 0, transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.58;
+    }
+    code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+    code { color: #b8ecff; }
+    .shell {
+      width: min(1500px, calc(100% - 32px));
+      margin: 24px auto 64px;
+    }
+    header {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(16,28,45,.96), rgba(18,31,52,.84));
+      box-shadow: 0 24px 70px rgba(0,0,0,.26);
+    }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 48px); line-height: 1.15; }
+    h2 { margin: 0 0 16px; font-size: 25px; }
+    h3 { margin: 0 0 10px; font-size: 18px; }
+    p { margin: 8px 0 14px; }
+    .sub { color: var(--muted); max-width: 1050px; }
+    .badges { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 6px 11px; border: 1px solid var(--line); border-radius: 999px;
+      background: rgba(8,17,31,.55); font-size: 13px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .dot.warn { background: var(--amber); }
+    .dot.block { background: var(--red); }
+    nav {
+      position: sticky; top: 0; z-index: 5;
+      display: flex; gap: 8px; overflow-x: auto;
+      padding: 14px 2px; margin: 12px 0;
+      background: rgba(8,17,31,.92); backdrop-filter: blur(12px);
+    }
+    nav button {
+      white-space: nowrap; cursor: pointer; color: var(--muted);
+      background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+      padding: 9px 14px; font-weight: 700;
+    }
+    nav button.active { color: #06111e; background: var(--cyan); border-color: var(--cyan); }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .card {
+      grid-column: span 6; padding: 20px;
+      background: rgba(16,28,45,.92); border: 1px solid var(--line); border-radius: 16px;
+    }
+    .wide { grid-column: 1 / -1; }
+    .third { grid-column: span 4; }
+    .callout { border-left: 4px solid var(--cyan); }
+    .warn { border-left-color: var(--amber); }
+    .danger { border-left-color: var(--red); }
+    .ok { border-left-color: var(--green); }
+    ul, ol { margin: 8px 0 0; padding-left: 22px; }
+    li { margin: 6px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--cyan); background: rgba(8,17,31,.5); position: sticky; top: 60px; }
+    .table-wrap { overflow-x: auto; }
+    .status { font-weight: 800; }
+    .status.pass { color: var(--green); }
+    .status.need { color: var(--amber); }
+    .status.stop { color: var(--red); }
+    pre {
+      position: relative; overflow: auto; margin: 10px 0 0; padding: 16px;
+      color: #d8f6ff; background: #060d18; border: 1px solid #253850; border-radius: 12px;
+      font-size: 12.5px; line-height: 1.55;
+    }
+    .copy {
+      float: right; cursor: pointer; padding: 4px 8px; color: var(--text);
+      border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2);
+    }
+    .timeline { display: grid; gap: 9px; margin-top: 14px; }
+    .lane { display: grid; grid-template-columns: 125px 1fr; gap: 10px; align-items: center; }
+    .lane-name { color: var(--muted); font-size: 13px; }
+    .track { display: grid; grid-template-columns: repeat(8, 1fr); min-height: 38px; gap: 3px; }
+    .seg { display: flex; align-items: center; justify-content: center; padding: 4px; border-radius: 7px; font-size: 11px; text-align: center; }
+    .gpu { background: #703b65; }
+    .host { background: #22577a; }
+    .copyseg { background: #6e5b26; }
+    .commit { background: #236548; }
+    .empty { border: 1px dashed #29415f; color: #57708e; }
+    .flow { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin: 12px 0; }
+    .node { padding: 9px 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; }
+    .arrow { color: var(--cyan); font-weight: 900; }
+    .small { color: var(--muted); font-size: 13px; }
+    .kpi { font-size: 26px; font-weight: 850; color: var(--cyan); }
+    @media (max-width: 900px) {
+      .card, .third { grid-column: 1 / -1; }
+      .lane { grid-template-columns: 1fr; }
+      .track { overflow-x: auto; grid-template-columns: repeat(8, minmax(90px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>Hierarchical Async Scheduling · 下一步实验计划</h1>
+    <p class="sub">目标不是只证明 depth=2 能运行，而是分别回答三件事：token / EOS / abort 是否完全正确；哪些 CPU 工作确实落在上一 quantum 的 GPU 窗口内；最终 exposed latency 与吞吐是否改善。</p>
+    <div class="badges">
+      <span class="badge"><span class="dot"></span>代码基线 <code>a88ec6a</code></span>
+      <span class="badge"><span class="dot"></span>CPU + control-plane + ZMQ 回归已过</span>
+      <span class="badge"><span class="dot warn"></span>GPU 实测待执行</span>
+      <span class="badge"><span class="dot block"></span>2026-08-25 观测：8×H200 仅余约 13.7–14.2 GiB/卡</span>
+    </div>
+  </header>
+
+  <nav aria-label="实验计划标签页">
+    <button class="active" data-tab="overview">1. 目标与假设</button>
+    <button data-tab="gates">2. 开跑门槛</button>
+    <button data-tab="matrix">3. 实验矩阵</button>
+    <button data-tab="commands">4. 执行命令</button>
+    <button data-tab="analysis">5. 分析与验收</button>
+    <button data-tab="limits">6. 隐藏边界</button>
+    <button data-tab="record">7. 记录模板</button>
+  </nav>
+
+  <section id="overview" class="tab active">
+    <div class="grid">
+      <div class="card third"><div class="kpi">H1</div><h3>正确性不变</h3><p>depth1 与 depth2 在固定 seed 下逐请求 token IDs、offset、长度、finish reason 完全一致。</p></div>
+      <div class="card third"><div class="kpi">H2</div><h3>CPU/launch 被覆盖</h3><p>q GPU 执行期间完成 q+1 schedule、serialize/send、worker recv/prepare、metadata H2D 与 graph replay launch。</p></div>
+      <div class="card third"><div class="kpi">H3</div><h3>D2H 不再卡住 q+1</h3><p>q sampled token 通过 GPU carry 喂给 q+1；q 的 D2H 与 <code>.tolist()</code> 延迟到 FIFO collect。</p></div>
+
+      <div class="card wide">
+        <h2>期望稳态流水线</h2>
+        <div class="timeline">
+          <div class="lane"><div class="lane-name">LocalEngine host</div><div class="track"><div class="seg host">plan/submit q</div><div class="seg host">plan q+1</div><div class="seg host">submit q+1</div><div class="seg commit">collect/commit q</div><div class="seg host">plan/submit q+2</div><div class="seg commit">collect q+1</div><div class="seg empty">…</div><div class="seg empty">…</div></div></div>
+          <div class="lane"><div class="lane-name">Worker host</div><div class="track"><div class="seg host">recv/prepare q</div><div class="seg host">recv q+1</div><div class="seg host">prepare/H2D/launch q+1</div><div class="seg copyseg">materialize q</div><div class="seg host">prepare q+2</div><div class="seg copyseg">materialize q+1</div><div class="seg empty">…</div><div class="seg empty">…</div></div></div>
+          <div class="lane"><div class="lane-name">GPU compute</div><div class="track"><div class="seg gpu">forward q</div><div class="seg gpu">forward q</div><div class="seg gpu">forward q+1</div><div class="seg gpu">forward q+1</div><div class="seg gpu">forward q+2</div><div class="seg gpu">forward q+2</div><div class="seg empty">…</div><div class="seg empty">…</div></div></div>
+          <div class="lane"><div class="lane-name">Copy engine</div><div class="track"><div class="seg empty"></div><div class="seg copyseg">q D2H</div><div class="seg copyseg">q D2H</div><div class="seg empty"></div><div class="seg copyseg">q+1 D2H</div><div class="seg empty"></div><div class="seg empty">…</div><div class="seg empty">…</div></div></div>
+        </div>
+        <p class="small">关键判据是区间相交，而不是仅看到调用顺序。depth=2 的 CPU 单测已经证明 submit/collect 顺序；GPU trace 仍需证明 host q+1 工作确实发生在 q CUDA kernel 尚未结束时。</p>
+      </div>
+
+      <div class="card callout ok">
+        <h3>已具备</h3>
+        <ul>
+          <li>两 flight FIFO、两 payload slot、严格按序 commit。</li>
+          <li>request ID + generation epoch 的 GPU token carry。</li>
+          <li>独立 copy stream、pinned host buffer、deferred <code>.tolist()</code>。</li>
+          <li>EOS/abort semantic finish 与 resource release fence 分离。</li>
+          <li>quantum diagnostics 中已有 schedule、transport、worker、GPU loop、D2H 指标。</li>
+        </ul>
+      </div>
+      <div class="card callout warn">
+        <h3>最终 timeline 前仍需补的轻量观测</h3>
+        <ul>
+          <li>给 quantum diagnostic 增加 plan/submit/collect 与 worker prepare/launch/D2H 的 monotonic begin/end。</li>
+          <li>记录 flight queue depth、stale EOS/abort forward、deferred KV block hold time。</li>
+          <li>让 correctness harness 输出逐 request token manifest。</li>
+          <li>bench 暴露 <code>profiler_mode=runtime_overhead</code>，否则默认 profiler 只有 CUDA lane，无法证明 CPU overlap。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="gates" class="tab">
+    <div class="grid">
+      <div class="card wide callout danger">
+        <h2>当前不要启动模型</h2>
+        <p>2026-08-25T13:41Z 查询到 8 张 H200 每卡只剩约 13.7–14.2 GiB。计划中的 DeepSeek-V3 8 卡 dummy-weight / KV 配置需要空闲窗口。Ray 状态查询在本轮被中止，因此不能假设现存占用来自哪个 job，也不要直接 <code>ray stop</code> 或杀进程。</p>
+      </div>
+      <div class="card">
+        <h3>G0 · 工作树与构建</h3>
+        <ul>
+          <li>代码至少包含 commit <code>a88ec6a</code>。</li>
+          <li>保留用户的 <code>.gitignore</code>、<code>AGENTS.md</code> 修改，不混入实验提交。</li>
+          <li>C++ extension 已为当前 checkout editable install；若之后改 C++，重新执行 <code>python3 -m pip install -v -e .</code>。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>G1 · GPU 空闲</h3>
+        <ul>
+          <li>单节点阶段需要同一节点 8×H200。</li>
+          <li>建议每卡 free memory ≥ 125 GiB，再使用固定 <code>--gpu-mem 120</code>；若历史已验证其他值，以历史值为准，但 A/B 必须相同。</li>
+          <li>任何 ECC/Xid、残留 actor、显存持续变化都先停止。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>G2 · Ray 所有权</h3>
+        <ul>
+          <li>Ray 操作前清除 HTTP(S)/ALL proxy。</li>
+          <li>确认集群 8 GPU resource 均可调度且无他人 actor。</li>
+          <li>只有确认集群为本实验独占时才允许 stop/restart；共享集群只查询并等待。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>G3 · 固定变量</h3>
+        <ul>
+          <li>模型、seed、DP/SP/EP、CUDA graph mode、batch、请求序列、KV memory 完全一致。</li>
+          <li>depth1 也使用 ZMQ + result fastpath；A/B 唯一核心变量是 async depth。</li>
+          <li>先 DP1/SP8，再 DP8/SP1；两节点最后做 DP2/SP8。</li>
+        </ul>
+      </div>
+      <div class="card wide">
+        <h3>Preflight 判定</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>检查</th><th>继续</th><th>停止</th></tr></thead>
+          <tbody>
+            <tr><td>GPU free memory</td><td>8 卡均达到约定阈值，且 60 秒稳定</td><td>任一卡不足、存在未知 PID 或利用率持续非零</td></tr>
+            <tr><td>Ray</td><td>8 GPU 可用；节点/actor 属于本实验</td><td>资源不足、dead node、未知 owner</td></tr>
+            <tr><td>RDMA</td><td>8 NIC、GID=3、QP=4 均进入 driver runtime env</td><td>任一变量缺失或 worker identity 不一致</td></tr>
+            <tr><td>CPU regression</td><td>计划列出的 suites 全过</td><td>任何 FIFO、token、resource fence 回归失败</td></tr>
+            <tr><td>artifact 目录</td><td>新的 run ID，不覆盖旧结果</td><td>目录已存在且来源不明</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="matrix" class="tab">
+    <div class="card wide">
+      <h2>按门槛递进，不跨级</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>ID</th><th>层级 / topology</th><th>对照</th><th>目的</th><th>硬通过条件</th></tr></thead>
+        <tbody>
+          <tr><td>E0</td><td>CPU</td><td>当前 commit</td><td>flight、EOS、abort、KV boundary、router release、ZMQ</td><td>所有聚焦 suite 通过</td></tr>
+          <tr><td>E1</td><td>1 node · DP1/SP8</td><td>depth1 ZMQ</td><td>启动、warmup、8–16 个短请求</td><td>无 hang、无 protocol mismatch、输出数量闭合</td></tr>
+          <tr><td>E2</td><td>1 node · DP1/SP8</td><td>depth2 ZMQ</td><td>最小 async 冒烟</td><td>q→q+1 submit、FIFO collect；carry hits 出现</td></tr>
+          <tr><td>E3</td><td>1 node · DP1/SP8</td><td>depth1 vs depth2，5 seeds</td><td>精确 token manifest；batch membership/order 变化</td><td>token IDs/offset/length/reason 零差异</td></tr>
+          <tr><td>E4</td><td>1 node · DP1/SP8</td><td>max_tokens=1/2/64</td><td>known-length lookahead</td><td>max=1 不进 q+1；其他请求不受影响</td></tr>
+          <tr><td>E5</td><td>1 node · DP1/SP8</td><td>forced EOS</td><td>q EOS + stale q+1</td><td>只提交 EOS；最多 1 stale forward；release 在 q+1 drain 后</td></tr>
+          <tr><td>E6</td><td>1 node · DP1/SP8</td><td>timed abort</td><td>abort 位于 submit q+1 / collect q 间</td><td>q/q+1 token 均不提交；finish 先于 release</td></tr>
+          <tr><td>E7</td><td>1 node · DP1/SP8</td><td>depth1/2 × batch 1/8/32/128</td><td>稳定态 A/B 性能，交替顺序，各 5 次</td><td>正确性先过；统计 exposed gap、ITL、吞吐</td></tr>
+          <tr><td>E8</td><td>1 node · DP1/SP8</td><td>CPU+CUDA profiler</td><td>证明 worker q+1 prepare/H2D/launch 与 q CUDA kernel 区间相交</td><td>timeline 有明确交叠，不仅是日志顺序</td></tr>
+          <tr><td>E9</td><td>1 node · DP8/SP1</td><td>偏斜 routing</td><td>8 LocalEngine、Gloo consensus、空 engine dummy</td><td>quantum 对齐，无 hang/owner 分叉</td></tr>
+          <tr><td>E10</td><td>2 node · DP2/SP8 · 16 GPU</td><td>depth1/2</td><td>跨机最终验收</td><td>正确性零差异；collective/RDMA 稳定；性能结论复现</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+    <div class="grid" style="margin-top:14px">
+      <div class="card callout warn"><h3>必须先补 harness 才能跑 E3/E5/E6</h3><p>现有 serving benchmark 保存 latency，不保存逐请求 token IDs，也没有在精确 flight 窗口注入 abort 的 hook。不能用“请求完成数相同”替代 token correctness。</p></div>
+      <div class="card callout warn"><h3>必须先补 timestamp/profiler 才能跑 E8</h3><p>现有 quantum diagnostic 提供时长，但缺少所有 lane 的绝对 begin/end；默认 profiler 只有 CUDA activity。不能据此声称 CPU 已被 GPU 隐藏。</p></div>
+    </div>
+  </section>
+
+  <section id="commands" class="tab">
+    <div class="grid">
+      <div class="card wide">
+        <button class="copy" data-copy="preflight">复制</button>
+        <h3>1 · Preflight（Ray 查询前必须去代理；GPU 操作按仓库规则申请权限）</h3>
+        <pre id="preflight">cd /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July
+
+git rev-parse --short HEAD
+git status --short
+
+export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export SLIME_GID_INDEX=3
+export SLIME_QP_NUM=4
+
+nvidia-smi --query-gpu=index,name,memory.total,memory.free,utilization.gpu --format=csv
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+ray status
+# 共享集群不要擅自 ray stop；先确认 actor / GPU resource 的 owner。</pre>
+      </div>
+
+      <div class="card wide">
+        <button class="copy" data-copy="cpu">复制</button>
+        <h3>2 · CPU / control-plane / IPC gate</h3>
+        <pre id="cpu">python3 -m pytest -q \
+  tests/test_hierarchical_contract.py \
+  tests/test_hierarchical_token_commit.py \
+  tests/test_hierarchical_serving_ingress.py \
+  tests/test_least_batch_staged_admission.py \
+  tests/test_local_executor_flight.py \
+  tests/test_local_engine_async_pipeline.py \
+  tests/test_worker_token_carry.py \
+  tests/test_worker_token_materializer.py
+
+# ZMQ IPC bind 在受限 sandbox 中需在 sandbox 外运行
+python3 -m pytest -q tests/test_worker_transport.py
+
+# 这两个模块导入 CUDA/Triton model stack，应在可见 GPU driver 环境运行
+python3 -m pytest -q tests/test_hierarchical_control_plane.py
+python3 -m pytest -q tests/test_routing_config.py
+
+python3 tests/test_sequence_proxy.py</pre>
+      </div>
+
+      <div class="card wide">
+        <button class="copy" data-copy="data">复制</button>
+        <h3>3 · 建立独立 artifact 目录与短请求 CSV</h3>
+        <pre id="data">export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_a88ec6a"
+export RUN_ROOT="/mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July/bench_logs/async_sched_loop1/${RUN_ID}"
+mkdir -p "$RUN_ROOT"
+
+printf '%s\n' \
+  'prompt_len,output_len' \
+  '64,8' '64,16' '128,32' '256,64' \
+  &gt; "$RUN_ROOT/smoke.csv"
+
+git rev-parse HEAD &gt; "$RUN_ROOT/git_commit.txt"
+nvidia-smi -q &gt; "$RUN_ROOT/nvidia_smi_preflight.txt"
+env | sort | grep -E '^(SLIME_|NANODEPLOY_|CUDA_|RAY_)' \
+  &gt; "$RUN_ROOT/runtime_env.txt"</pre>
+      </div>
+
+      <div class="card wide">
+        <button class="copy" data-copy="common">复制</button>
+        <h3>4 · A/B 公共环境</h3>
+        <pre id="common">export MODEL_PATH="/mnt/shared-storage-user/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3/snapshots/e815299b0bcbac849fa540c768ef21845365c9eb"
+export RAY_ADDRESS="&lt;head-ip:port&gt;"
+export MASTER_ADDRESS="&lt;head-ip:free-port&gt;"
+export BASE_LOG_DIR="$RUN_ROOT"
+
+export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export SLIME_GID_INDEX=3
+export SLIME_QP_NUM=4
+export NANODEPLOY_HIER_WORKER_TRANSPORT=zmq
+export NANODEPLOY_HIER_RESULT_FASTPATH=1
+
+# Ray / GCS 通信不得经过 HTTP proxy
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy</pre>
+      </div>
+
+      <div class="card">
+        <button class="copy" data-copy="d1">复制</button>
+        <h3>5A · depth1 ZMQ smoke</h3>
+        <pre id="d1">export NANODEPLOY_HIER_ASYNC_DEPTH=1
+
+scripts/sp_ablation/start_bench.sh \
+  --ray-addr "$RAY_ADDRESS" \
+  --master-addr "$MASTER_ADDRESS" \
+  --dataset-path "$RUN_ROOT/smoke.csv" \
+  --model-path "$MODEL_PATH" \
+  --dp-size 1 --sp-size 8 --tp-size 1 \
+  --batch-size 8 --num-requests 16 \
+  --gpu-mem 120 --gpu-util 0.90 \
+  --max-model-len 4096 --max-request-tokens 4096 \
+  --scheduler-arch hierarchical \
+  --router-policy least_batch \
+  --routing-strategy LeastBatch \
+  --sp-master-selector LeastBatch \
+  --loop-count 1 --cuda-graph-mode full \
+  --hierarchical-quantum-diagnostics \
+  --diagnostic-log-interval 1 \
+  --run-label async_d1 \
+  1000</pre>
+      </div>
+
+      <div class="card">
+        <button class="copy" data-copy="d2">复制</button>
+        <h3>5B · depth2 ZMQ smoke</h3>
+        <pre id="d2">export NANODEPLOY_HIER_ASYNC_DEPTH=2
+
+scripts/sp_ablation/start_bench.sh \
+  --ray-addr "$RAY_ADDRESS" \
+  --master-addr "$MASTER_ADDRESS" \
+  --dataset-path "$RUN_ROOT/smoke.csv" \
+  --model-path "$MODEL_PATH" \
+  --dp-size 1 --sp-size 8 --tp-size 1 \
+  --batch-size 8 --num-requests 16 \
+  --gpu-mem 120 --gpu-util 0.90 \
+  --max-model-len 4096 --max-request-tokens 4096 \
+  --scheduler-arch hierarchical \
+  --router-policy least_batch \
+  --routing-strategy LeastBatch \
+  --sp-master-selector LeastBatch \
+  --loop-count 1 --cuda-graph-mode full \
+  --hierarchical-quantum-diagnostics \
+  --diagnostic-log-interval 1 \
+  --run-label async_d2 \
+  1000</pre>
+      </div>
+
+      <div class="card wide callout warn">
+        <h3>命令说明</h3>
+        <ul>
+          <li><code>start_bench.sh</code> 会做固定 256-request warmup；即使 measured smoke 只有 16 requests，仍需预留 warmup 时间。</li>
+          <li><code>NANODEPLOY_HIER_WORKER_TRANSPORT=zmq</code> 与 result fastpath 在 A/B 中保持一致。depth1 不应退回 Ray，否则比较混入 transport 差异。</li>
+          <li>每次 run 使用新的 master port / run label，并在退出后确认 NanoDeploy actors 已关闭。不要复用失败 run 的 artifact 目录。</li>
+          <li>以上 smoke 只验证启动和基本流水线；E3/E5/E6/E8 需先补 matrix 页列出的 harness / timestamp。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="analysis" class="tab">
+    <div class="grid">
+      <div class="card wide">
+        <h2>指标读取顺序</h2>
+        <div class="flow"><span class="node">协议正确</span><span class="arrow">→</span><span class="node">token manifest</span><span class="arrow">→</span><span class="node">资源 fence</span><span class="arrow">→</span><span class="node">timeline overlap</span><span class="arrow">→</span><span class="node">吞吐 / ITL</span></div>
+        <p class="small">前一层失败时不解释后一层性能。尤其不能在 token 不一致或 stale commit 存在时，用更高吞吐宣称成功。</p>
+      </div>
+      <div class="card">
+        <h3>Correctness hard gates</h3>
+        <ul>
+          <li>depth1/depth2 manifest：request ID、每个 token ID、offset、finish reason 全相同。</li>
+          <li>每个 quantum 的 wave/quantum/slot/epoch 校验均通过。</li>
+          <li>EOS/abort 后无 token commit；release 只发生在最后 referencing flight drain 后。</li>
+          <li>所有 owner、reservation、KV block、worker pending output 在结束时归零。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Pipeline hard gates</h3>
+        <ul>
+          <li>稳定连续 request 在 q0 后出现 <code>gpu_carry_hits</code>；carry miss 只能来自 seed/new request/epoch gap。</li>
+          <li>depth2 为 <code>submit q, submit q+1, collect q</code>，且 max_tokens=1 不制造 real q+1。</li>
+          <li><code>token_d2h_submit_host_ms</code> 是 launch cost；<code>token_d2h_lifetime_ms</code> 可跨 q+1，不应误当 exposed stall。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Overlap 计算</h3>
+        <p>补齐 begin/end timestamp 后，对每个 q 计算：</p>
+        <ul>
+          <li><code>overlap(plan q+1, gpu q)</code></li>
+          <li><code>overlap(worker prepare q+1, gpu q)</code></li>
+          <li><code>overlap(D2H q, gpu q+1)</code></li>
+          <li><code>exposed_host_gap = gpu_start(q+1) - gpu_end(q)</code></li>
+          <li><code>overlap_ratio = overlapped_host_work / candidate_host_work</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>性能统计</h3>
+        <ul>
+          <li>batch 1/8/32/128 分开；每组 5 次，执行顺序 D1,D2,D2,D1…。</li>
+          <li>报告 median 与 P95：decode ITL、throughput、schedule、submit、worker prepare、D2H exposed wait。</li>
+          <li>丢弃 warmup；同一组 request manifest 与 seed 固定。</li>
+          <li>保留 raw runs，不只保留聚合平均值。</li>
+        </ul>
+      </div>
+      <div class="card wide">
+        <h3>Go / no-go 标准</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>维度</th><th>GO</th><th>NO-GO / 需要修复</th></tr></thead>
+          <tbody>
+            <tr><td>正确性</td><td>零 token / offset / reason 差异</td><td>任何差异、重复、缺口或 stale commit</td></tr>
+            <tr><td>资源</td><td>finish 可先见；最终 flight 前不释放；结束后全部释放</td><td>早释放、泄漏、负计数、owner 分叉</td></tr>
+            <tr><td>Overlap</td><td>trace 明确显示 q+1 host work 与 q CUDA kernel 相交</td><td>只有顺序日志，无区间证据；或 q+1 仍被 q D2H 阻塞</td></tr>
+            <tr><td>性能</td><td>若 baseline candidate CPU ≥ GPU 时间 5%，exposed gap 应明显下降；总体 P95 ITL 不退化超过 3%</td><td>连续 5 次 median/P95 退化 &gt;3%，或收益只来自配置漂移</td></tr>
+            <tr><td>GPU-bound 情况</td><td>允许吞吐近似不变，但必须证明 host work 已隐藏且 overhead 不显著</td><td>因“吞吐没变”直接断言没有 overlap</td></tr>
+            <tr><td>两节点</td><td>无 Gloo mismatch、RDMA overwrite、hang；单节点结论可复现</td><td>任何 collective timeout 或 engine quantum 分叉</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="limits" class="tab">
+    <div class="card wide">
+      <h2>哪些可以隐藏，哪些原则上隐藏不住</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>工作</th><th>depth2 目标</th><th>边界 / 原因</th></tr></thead>
+        <tbody>
+          <tr><td>LocalScheduler q+1 plan、snapshot、KV reservation</td><td class="status pass">可覆盖在 q GPU 上</td><td>首个 quantum 没有前驱窗口；若耗时大于 q GPU，尾部仍暴露。</td></tr>
+          <tr><td>Sequence serialization、DLSlime send、ZMQ command</td><td class="status pass">可覆盖</td><td>RDMA/PCIe/NIC 与 GPU collectives 可能争用，需测净收益。</td></tr>
+          <tr><td>worker recv/deserialization、prepare_decode、metadata H2D、graph launch host</td><td class="status pass">可覆盖</td><td>只能隐藏 host preparation/launch；q+1 CUDA compute 在同 GPU/stream 上仍排在 q 之后。</td></tr>
+          <tr><td>q sampled token 作为 q+1 input</td><td class="status pass">GPU carry 消除 host 依赖</td><td>carry miss 的新 request/epoch gap 必须使用 payload seed，不能猜测 token。</td></tr>
+          <tr><td>q D2H copy</td><td class="status pass">可与 q+1 GPU 部分重叠</td><td>受 source event、copy engine、带宽与 stream dependency 约束。</td></tr>
+          <tr><td>q <code>.tolist()</code> / host materialization</td><td class="status pass">延迟到 collect，通常可隐藏一部分</td><td>FIFO commit 前最终仍必须完成；最后一个 flight 没有后继窗口。</td></tr>
+          <tr><td>q token validation / canonical commit / frontend delta</td><td class="status need">可与已提交的 q+1 GPU 重叠</td><td>这是计划 q+2 的前置条件，不能无限后移；长尾超过 q+1 GPU 时会暴露。</td></tr>
+          <tr><td>DP global consensus</td><td class="status need">可放在上一 GPU 窗口</td><td>仍受最慢 LocalEngine 限制；straggler 超过 GPU 窗口的部分隐藏不住。</td></tr>
+          <tr><td>首 quantum admission/plan/launch</td><td class="status stop">隐藏不住</td><td>没有可重叠的前一 quantum，直接影响 TTFT。</td></tr>
+          <tr><td>最后 quantum collect / terminal / release</td><td class="status stop">隐藏不住</td><td>没有后续 useful GPU work；EOS 还可能已有一个必须 drain 的 stale flight。</td></tr>
+          <tr><td>q 与 q+1 的 GPU compute</td><td class="status stop">不并发</td><td>同 GPU KV 状态与默认执行顺序决定它们串行；本设计目标是隐藏 CPU，不是并行两个 decode compute。</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section id="record" class="tab">
+    <div class="grid">
+      <div class="card wide">
+        <h2>每次 run 必须保存</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>类别</th><th>内容</th></tr></thead>
+          <tbody>
+            <tr><td>身份</td><td>UTC run ID、git commit、dirty files、hostname/node IDs、Ray address（敏感部分可脱敏）</td></tr>
+            <tr><td>硬件</td><td>GPU 型号/显存/free、driver/CUDA/PyTorch/Triton、NIC/GID/QP、单/双节点拓扑</td></tr>
+            <tr><td>配置</td><td>完整 Config fingerprint 与 JSON、所有 <code>NANODEPLOY_*</code>/<code>SLIME_*</code> 环境变量</td></tr>
+            <tr><td>输入</td><td>CSV hash、seed、request count/rate、prompt/output length histogram</td></tr>
+            <tr><td>输出</td><td>request metrics、summary、quantum JSONL、token manifest、stdout/stderr</td></tr>
+            <tr><td>Profiler</td><td>raw trace、选中 rank、profile window、trace 大小、是否 CPU+CUDA activity</td></tr>
+            <tr><td>结束状态</td><td>completed/rejected/failed、owner/reservation/KV/pending-flight 是否归零、Ray actor 是否清理</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <h3>Run note 模板</h3>
+        <pre>run_id:
+utc_start / utc_end:
+commit:
+topology:
+depth:
+model snapshot:
+dataset sha256:
+gpu free before / after:
+ray cluster owner:
+command:
+exit code:
+correctness verdict:
+resource-fence verdict:
+overlap verdict:
+performance summary:
+anomalies:
+artifact paths:
+next action:</pre>
+      </div>
+      <div class="card callout ok">
+        <h3>最终交付</h3>
+        <p>实验完成后新建一个自包含 HTML 结果报告，包含 depth1/depth2 配置 diff、正确性 manifest diff、timeline 截图/区间计算、每组 raw run 表格、失败样本和结论。不要只在聊天或终端里留下结果。</p>
+        <p>建议路径：<code>docs-dev/2026-08-25/HierarchicalAsyncSchedulingExperimentResults.html</code></p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+  const buttons = [...document.querySelectorAll('nav button')];
+  const tabs = [...document.querySelectorAll('.tab')];
+  buttons.forEach((button) => button.addEventListener('click', () => {
+    buttons.forEach((b) => b.classList.toggle('active', b === button));
+    tabs.forEach((tab) => tab.classList.toggle('active', tab.id === button.dataset.tab));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }));
+  document.querySelectorAll('[data-copy]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const target = document.getElementById(button.dataset.copy);
+      await navigator.clipboard.writeText(target.innerText);
+      const old = button.innerText;
+      button.innerText = '已复制';
+      setTimeout(() => button.innerText = old, 1000);
+    });
+  });
+</script>
+</body>
+</html>
