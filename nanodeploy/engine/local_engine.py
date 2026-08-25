@@ -1434,7 +1434,8 @@ class LocalEngineCore:
                             "LocalExecutor quantum diagnostic identity mismatch"
                         )
                     sample = {
-                        "schema_version": 1,
+                        "schema_version": 2,
+                        "scheduler_arch": "hierarchical",
                         "engine_id": self.engine_id,
                         "wave_id": wave_id,
                         "quantum_id": quantum_id,
@@ -1444,6 +1445,13 @@ class LocalEngineCore:
                         "running_before": pre_execute_snapshot.running,
                         "useful_real_batch_size": (
                             pre_execute_snapshot.useful_real_batch_size
+                        ),
+                        "control_dummy_count": (
+                            pre_execute_snapshot.control_dummy_count
+                        ),
+                        "attention_work_tokens": sum(
+                            rank_load.active_dispatched_tokens
+                            for rank_load in pre_execute_snapshot.rank_loads
                         ),
                         "free_blocks_min_before": (
                             pre_execute_snapshot.free_blocks_min

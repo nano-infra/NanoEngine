@@ -36,7 +36,7 @@ DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
 DEFAULT_DYNAMIC_SP_BUCKET_PRESET="none"
 DEFAULT_DIAGNOSTIC_LOG_INTERVAL=0
 DEFAULT_SLOW_ADD_THRESHOLD_MS=0
-DEFAULT_HIERARCHICAL_QUANTUM_DIAGNOSTICS=0
+DEFAULT_QUANTUM_DIAGNOSTICS=0
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
 DEFAULT_MAX_REQUEST_TOKENS=910000
@@ -75,7 +75,7 @@ DYNAMIC_SP_BUCKET_PRESET="$DEFAULT_DYNAMIC_SP_BUCKET_PRESET"
 DIAGNOSTIC_LOG_INTERVAL="${DIAGNOSTIC_LOG_INTERVAL:-$DEFAULT_DIAGNOSTIC_LOG_INTERVAL}"
 SLOW_ADD_THRESHOLD_MS="${SLOW_ADD_THRESHOLD_MS:-$DEFAULT_SLOW_ADD_THRESHOLD_MS}"
 HIERARCHICAL_EXECUTION_TRACE="${HIERARCHICAL_EXECUTION_TRACE:-0}"
-HIERARCHICAL_QUANTUM_DIAGNOSTICS="${HIERARCHICAL_QUANTUM_DIAGNOSTICS:-$DEFAULT_HIERARCHICAL_QUANTUM_DIAGNOSTICS}"
+QUANTUM_DIAGNOSTICS="${QUANTUM_DIAGNOSTICS:-${HIERARCHICAL_QUANTUM_DIAGNOSTICS:-$DEFAULT_QUANTUM_DIAGNOSTICS}}"
 RUN_LABEL="${RUN_LABEL:-}"
 
 # 用于存储位置参数（Rates）
@@ -114,7 +114,8 @@ usage() {
     echo "  --diagnostic-log-interval <sec>   Structured client/scheduler snapshot interval (0 = disabled)"
     echo "  --slow-add-threshold-ms <ms>      Log slow async due-batch submissions (0 = disabled)"
     echo "  --hierarchical-execution-trace    Capture high-overhead per-rank hierarchical traces"
-    echo "  --hierarchical-quantum-diagnostics Capture lightweight per-engine quantum timing/load JSONL"
+    echo "  --quantum-diagnostics     Capture lightweight decode quantum timing/load JSONL"
+    echo "  --hierarchical-quantum-diagnostics Deprecated alias for --quantum-diagnostics"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
     echo "  --disable-non-uniform-split  Disable non-uniform split (flag)"
     echo "  --help                    Show this help message"
@@ -155,7 +156,8 @@ while [[ $# -gt 0 ]]; do
         --diagnostic-log-interval) DIAGNOSTIC_LOG_INTERVAL="$2"; shift 2 ;;
         --slow-add-threshold-ms) SLOW_ADD_THRESHOLD_MS="$2"; shift 2 ;;
         --hierarchical-execution-trace) HIERARCHICAL_EXECUTION_TRACE=1; shift ;;
-        --hierarchical-quantum-diagnostics) HIERARCHICAL_QUANTUM_DIAGNOSTICS=1; shift ;;
+        --quantum-diagnostics) QUANTUM_DIAGNOSTICS=1; shift ;;
+        --hierarchical-quantum-diagnostics) QUANTUM_DIAGNOSTICS=1; shift ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
@@ -244,13 +246,8 @@ if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
     esac
 fi
 
-if ! [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" =~ ^[01]$ ]]; then
-    echo "Error: HIERARCHICAL_QUANTUM_DIAGNOSTICS must be 0 or 1."
-    exit 1
-fi
-
-if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 && "$SCHEDULER_ARCH" != "hierarchical" ]]; then
-    echo "Error: --hierarchical-quantum-diagnostics requires --scheduler-arch hierarchical."
+if ! [[ "$QUANTUM_DIAGNOSTICS" =~ ^[01]$ ]]; then
+    echo "Error: QUANTUM_DIAGNOSTICS must be 0 or 1."
     exit 1
 fi
 
@@ -306,7 +303,7 @@ echo "Dynamic SP Bucket Preset: $DYNAMIC_SP_BUCKET_PRESET"
 echo "Diagnostic Log Interval: $DIAGNOSTIC_LOG_INTERVAL"
 echo "Slow Add Threshold: ${SLOW_ADD_THRESHOLD_MS}ms"
 echo "Hierarchical Execution Trace: $HIERARCHICAL_EXECUTION_TRACE"
-echo "Hierarchical Quantum Diagnostics: $HIERARCHICAL_QUANTUM_DIAGNOSTICS"
+echo "Quantum Diagnostics: $QUANTUM_DIAGNOSTICS"
 echo "Enforce Eager: $ENFORCE_EAGER"
 echo "Model Path  : $MODEL_PATH"
 echo "Rates       : ${RATES[*]}"
@@ -323,7 +320,7 @@ log_progress "DynamicSPBucketPreset=$DYNAMIC_SP_BUCKET_PRESET"
 log_progress "DiagnosticLogInterval=$DIAGNOSTIC_LOG_INTERVAL"
 log_progress "SlowAddThresholdMs=$SLOW_ADD_THRESHOLD_MS"
 log_progress "HierarchicalExecutionTrace=$HIERARCHICAL_EXECUTION_TRACE"
-log_progress "HierarchicalQuantumDiagnostics=$HIERARCHICAL_QUANTUM_DIAGNOSTICS"
+log_progress "QuantumDiagnostics=$QUANTUM_DIAGNOSTICS"
 log_progress "EnforceEager=$ENFORCE_EAGER"
 log_progress "GPU: ${GPU_MEM}GB, Util=$GPU_UTIL | Routing=$ROUTING_STRATEGY | Loop=$LOOP_COUNT"
 log_progress "LeastBatchTokenCandidateRatio=$LEASTBATCH_TOKEN_CANDIDATE_RATIO"
@@ -391,7 +388,7 @@ for rate in "${RATES[@]}"; do
     if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
         extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_${DYNAMIC_SP_BUCKET_PRESET}"
     fi
-    if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
+    if [[ "$QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
         extra_tags="${extra_tags}_qdiag"
     fi
     if [[ -n "$RUN_LABEL" ]]; then
@@ -405,7 +402,7 @@ for rate in "${RATES[@]}"; do
     LOG_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.log"
     JSON_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.jsonl"
     TRACE_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.hier_trace.jsonl"
-    QUANTUM_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.hier_quantum.jsonl"
+    QUANTUM_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.quantum.jsonl"
 
     # 构建 Python 命令
     CMD=(
@@ -457,9 +454,9 @@ for rate in "${RATES[@]}"; do
             --hierarchical-trace-log-path "$TRACE_FILE"
         )
     fi
-    if [[ "$HIERARCHICAL_QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
+    if [[ "$QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
         CMD+=(
-            --hierarchical-quantum-log-path "$QUANTUM_FILE"
+            --quantum-log-path "$QUANTUM_FILE"
         )
     fi
 

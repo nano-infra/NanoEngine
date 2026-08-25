@@ -253,6 +253,27 @@ def _load_benchmark_module(monkeypatch, script_dir="sp_ablation"):
     return module
 
 
+def test_quantum_log_cli_accepts_both_scheduler_architectures(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    for scheduler_arch in ("legacy_global", "hierarchical"):
+        quantum_path = tmp_path / f"{scheduler_arch}.jsonl"
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "bench_serving_overhead.py",
+                "--scheduler-arch",
+                scheduler_arch,
+                "--quantum-log-path",
+                str(quantum_path),
+            ],
+        )
+        args = benchmark.parse_args()
+        assert args.quantum_log_path == str(quantum_path)
+
+
 def test_csv_dataset_skips_requests_above_total_token_limit(
     monkeypatch,
     tmp_path,
@@ -914,10 +935,24 @@ def test_benchmark_persists_compact_quantum_diagnostics(
                 }
             ]
 
-        def drain_hierarchical_quantum_diagnostics(self):
+        def drain_quantum_diagnostics(self):
             samples = tuple(self.quantum_samples)
             self.quantum_samples.clear()
             return samples
+
+        def hierarchical_metrics(self, *, refresh, include_per_engine):
+            assert refresh
+            assert include_per_engine
+            return {
+                "decode_quantum_count": 1,
+                "schedule_latency_ms_total": 2.5,
+                "per_engine": {
+                    "0": {
+                        "decode_quantum_count": 1,
+                        "rank_loads": [],
+                    }
+                },
+            }
 
     engine = DiagnosticEngine()
 
@@ -938,7 +973,7 @@ def test_benchmark_persists_compact_quantum_diagnostics(
         iter(requests()),
         np.asarray([0.001]),
         1,
-        hierarchical_quantum_log_path=str(quantum_path),
+        quantum_log_path=str(quantum_path),
         metrics_summary_path=str(summary_path),
         clock_ns=clock,
         sleep_fn=clock.sleep,
@@ -957,8 +992,18 @@ def test_benchmark_persists_compact_quantum_diagnostics(
     assert "benchmark_elapsed_s" in records[0]
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["hierarchical_quantum_diagnostic_samples"] == 1
+    assert summary["quantum_diagnostic_samples"] == 1
     assert (
-        summary["hierarchical_quantum_diagnostics_jsonl"]
+        summary["quantum_diagnostics_jsonl"]
         == str(quantum_path)
     )
+    assert summary["hierarchical_metrics"] == {
+        "decode_quantum_count": 1,
+        "schedule_latency_ms_total": 2.5,
+        "per_engine": {
+            "0": {
+                "decode_quantum_count": 1,
+                "rank_loads": [],
+            }
+        },
+    }

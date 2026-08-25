@@ -44,6 +44,77 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _legacy_quantum_load_payload(
+    scheduler,
+    config,
+    dp_seqs,
+    filtered_dp_sp_seqs,
+) -> dict:
+    """Build the decode shape shared with compact quantum diagnostics."""
+    rank_loads = []
+    useful_real_batch_size = 0
+    control_dummy_count = 0
+    attention_work_tokens = 0
+    for dp_idx, sequences in enumerate(dp_seqs):
+        worker_state = scheduler.worker_state[dp_idx]
+        real_sequences = [
+            sequence
+            for sequence in sequences
+            if not worker_state.is_control_dummy(sequence)
+        ]
+        useful_real_batch_size += len(real_sequences)
+        control_dummy_count += len(sequences) - len(real_sequences)
+        for sp_idx in range(config.attention_sp):
+            global_rank = dp_idx * config.attention_sp + sp_idx
+            mastered = filtered_dp_sp_seqs[global_rank]
+            real_mastered = [
+                sequence
+                for sequence in mastered
+                if not worker_state.is_control_dummy(sequence)
+            ]
+            active_dispatched_tokens = sum(
+                int(
+                    sequence.block_ctx(
+                        BlockContextSlot.ACTIVE
+                    ).num_dispatched_tokens[sp_idx]
+                )
+                for sequence in real_sequences
+            )
+            attention_work_tokens += active_dispatched_tokens
+            rank_loads.append(
+                {
+                    "global_rank": global_rank,
+                    "sp_idx": sp_idx,
+                    "input_batch_size": len(sequences),
+                    "master_batch_size": len(mastered),
+                    "active_master_requests": len(real_mastered),
+                    "active_dispatched_tokens": (
+                        active_dispatched_tokens
+                    ),
+                    "mastered_context_tokens": sum(
+                        len(sequence) for sequence in real_mastered
+                    ),
+                    "free_blocks": len(
+                        worker_state.block_manager[
+                            sp_idx
+                        ].free_block_ids
+                    ),
+                    "total_blocks": config.num_kvcache_blocks,
+                }
+            )
+    return {
+        "useful_real_batch_size": useful_real_batch_size,
+        "control_dummy_count": control_dummy_count,
+        "raw_token_slots": (
+            (useful_real_batch_size + control_dummy_count)
+            * config.loop_count
+        ),
+        "control_dummy_slots": control_dummy_count * config.loop_count,
+        "attention_work_tokens": attention_work_tokens,
+        "rank_loads": tuple(rank_loads),
+    }
+
+
 class LLMEngine:
     def __init__(self, model, **kwargs):
         removed_options = {
@@ -116,6 +187,8 @@ class LLMEngine:
             FirstScheduleEvent
         ] = deque()
         self._frontend_finish_events: deque[FinishEvent] = deque()
+        self._quantum_diagnostics: deque[dict] = deque()
+        self._central_quantum_id = 0
         self._frontend_cycle_active = False
         self._closed = False
         self.log_decode_step_detail = _env_flag_enabled(
@@ -354,6 +427,13 @@ class LLMEngine:
                 0.0,
                 0.0,
             )
+        diagnostics_enabled = bool(
+            self.config.hierarchical_quantum_diagnostics
+        )
+        quantum_begin = time.perf_counter() if diagnostics_enabled else 0.0
+        quantum_started_at_unix_s = (
+            time.time() if diagnostics_enabled else 0.0
+        )
         step_start = time.perf_counter()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
@@ -418,8 +498,17 @@ class LLMEngine:
         self.metrics_manager.server_metric.update_waiting_blocks(waiting_head_blocks, waiting_total_blocks)
 
         sch_end = time.perf_counter()
+        pre_execute_load = None
+        if diagnostics_enabled and not is_prefill:
+            pre_execute_load = _legacy_quantum_load_payload(
+                self.scheduler,
+                self.config,
+                dp_seqs,
+                filtered_dp_sp_seqs,
+            )
         post_sch_begin = 0
         post_sch_end = 0
+        model_runner_duration_ms = 0.0
         if is_prefill and self.config.mode == "decode":
             if not self.config.dummy_prefill:
                 logger.debug("perform migration")
@@ -523,6 +612,7 @@ class LLMEngine:
                         "free_blocks": free_blocks,
                     }
                 )
+
             else:
                 flat_sp_batch_sizes = [
                     batch_size
@@ -560,6 +650,80 @@ class LLMEngine:
                         "waiting_total_blocks_sum": sum(waiting_total_blocks),
                     }
                 )
+
+            if diagnostics_enabled:
+                if pre_execute_load is None:
+                    raise RuntimeError(
+                        "missing legacy pre-execute quantum load"
+                    )
+                executor_diagnostic = (
+                    self.executor.last_quantum_diagnostic
+                )
+                if executor_diagnostic is None:
+                    raise RuntimeError(
+                        "RayExecutor omitted its quantum diagnostic"
+                    )
+                post_execute_load = _legacy_quantum_load_payload(
+                    self.scheduler,
+                    self.config,
+                    dp_seqs,
+                    filtered_dp_sp_seqs,
+                )
+                schedule_ms = (sch_end - sch_begin) * 1000
+                postprocess_ms = (
+                    post_sch_end - post_sch_begin
+                ) * 1000
+                sample = {
+                    "schema_version": 2,
+                    "scheduler_arch": "legacy_global",
+                    "engine_id": -1,
+                    "wave_id": 0,
+                    "quantum_id": self._central_quantum_id,
+                    "started_at_unix_s": quantum_started_at_unix_s,
+                    "engine_has_real": bool(
+                        pre_execute_load["useful_real_batch_size"]
+                    ),
+                    "waiting_before": total_waiting,
+                    "running_before": pre_execute_load[
+                        "useful_real_batch_size"
+                    ],
+                    "useful_real_batch_size": pre_execute_load[
+                        "useful_real_batch_size"
+                    ],
+                    "control_dummy_count": pre_execute_load[
+                        "control_dummy_count"
+                    ],
+                    "raw_token_slots": pre_execute_load[
+                        "raw_token_slots"
+                    ],
+                    "control_dummy_slots": pre_execute_load[
+                        "control_dummy_slots"
+                    ],
+                    "attention_work_tokens": pre_execute_load[
+                        "attention_work_tokens"
+                    ],
+                    "rank_loads_before": pre_execute_load[
+                        "rank_loads"
+                    ],
+                    "rank_loads_after": post_execute_load[
+                        "rank_loads"
+                    ],
+                    "admission_ms": 0.0,
+                    "schedule_ms": schedule_ms,
+                    "consensus_wait_ms": 0.0,
+                    "execute_ms": model_runner_duration_ms,
+                    "postprocess_ms": postprocess_ms,
+                    "quantum_total_ms": (
+                        time.perf_counter() - quantum_begin
+                    )
+                    * 1000,
+                    "itl_ms": (
+                        model_runner_duration_ms / self.config.loop_count
+                    ),
+                    "executor": dict(executor_diagnostic),
+                }
+                self._quantum_diagnostics.append(sample)
+                self._central_quantum_id += 1
 
         return (
             outputs,
@@ -721,14 +885,20 @@ class LLMEngine:
             )
         return self.deployment.decode_itl_samples()
 
+    def drain_quantum_diagnostics(self) -> tuple[dict, ...]:
+        if not self.config.hierarchical_quantum_diagnostics:
+            return ()
+        if self.config.scheduler_arch == "hierarchical":
+            return self.deployment.quantum_diagnostics()
+        samples = tuple(self._quantum_diagnostics)
+        self._quantum_diagnostics.clear()
+        return samples
+
     def drain_hierarchical_quantum_diagnostics(
         self,
     ) -> tuple[dict, ...]:
-        if self.config.scheduler_arch != "hierarchical":
-            raise RuntimeError(
-                "quantum diagnostics are only available in hierarchical mode"
-            )
-        return self.deployment.quantum_diagnostics()
+        """Backward-compatible alias for compact quantum diagnostics."""
+        return self.drain_quantum_diagnostics()
 
     def execution_boundary_metrics(self) -> dict:
         if self.config.scheduler_arch == "hierarchical":

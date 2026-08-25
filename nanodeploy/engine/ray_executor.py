@@ -130,6 +130,7 @@ class RayExecutor:
         self.workers = []
         self.placement_groups = []
         self._execution_boundary = ExecutionBoundaryRecorder()
+        self.last_quantum_diagnostic: dict[str, Any] | None = None
         assert config.attn_world_size == config.ffn_world_size
         worker_env_vars = (
             build_decode_backend_worker_env(config.max_num_seqs)
@@ -280,10 +281,26 @@ class RayExecutor:
     ) -> list[list[list[int]]]:
         executor_begin = time.perf_counter()
         send_timestamp = time.time()
+        diagnostics_enabled = bool(
+            getattr(
+                self.config,
+                "hierarchical_quantum_diagnostics",
+                False,
+            )
+        )
+        self.last_quantum_diagnostic = None
         if self.config.use_dlslime_rpc:
             # When using dlslime RPC, sequences are delivered via the endpoint.
             ray_futures = [
-                getattr(worker, "run").remote([], is_prefill, True, send_timestamp)
+                getattr(worker, "run").remote(
+                    dp_seqs=[],
+                    is_prefill=is_prefill,
+                    enable_rpc=True,
+                    send_timestamp=send_timestamp,
+                    hierarchical_quantum_diagnostics=(
+                        diagnostics_enabled
+                    ),
+                )
                 for _, worker in zip(dp_seqs, self.workers)
             ]
             submit_latency_ms = (
@@ -298,7 +315,15 @@ class RayExecutor:
         else:
             # When not using dlslime RPC, pass sequences directly to workers.
             ray_futures = [
-                getattr(worker, "run").remote(seqs, is_prefill, False, send_timestamp)
+                getattr(worker, "run").remote(
+                    dp_seqs=seqs,
+                    is_prefill=is_prefill,
+                    enable_rpc=False,
+                    send_timestamp=send_timestamp,
+                    hierarchical_quantum_diagnostics=(
+                        diagnostics_enabled
+                    ),
+                )
                 for seqs, worker in zip(dp_seqs, self.workers)
             ]
             submit_latency_ms = (
@@ -318,14 +343,35 @@ class RayExecutor:
         ray_get_end = time.perf_counter()
         recv_timestamp = time.time()
 
+        unpack_begin = time.perf_counter()
         token_ids_list = []
         worker_end_times = []
-        for res in results:
-            if isinstance(res, tuple) and len(res) == 2:
+        worker_diagnostics: list[dict[str, Any]] = []
+        for global_rank, res in enumerate(results):
+            if diagnostics_enabled:
+                if not isinstance(res, tuple) or len(res) != 3:
+                    raise RuntimeError(
+                        "legacy worker returned an invalid quantum "
+                        "diagnostic envelope: expected tuple length 3"
+                    )
+                token_ids, worker_end_time, diagnostic = res
+                if (
+                    not isinstance(diagnostic, dict)
+                    or diagnostic.get("global_rank") != global_rank
+                ):
+                    raise RuntimeError(
+                        f"legacy worker {global_rank} returned an invalid "
+                        "quantum diagnostic"
+                    )
+                token_ids_list.append(token_ids)
+                worker_end_times.append(float(worker_end_time))
+                worker_diagnostics.append(dict(diagnostic))
+            elif isinstance(res, tuple) and len(res) == 2:
                 token_ids_list.append(res[0])
                 worker_end_times.append(res[1])
             else:
                 token_ids_list.append(res)
+        result_unpack_ms = (time.perf_counter() - unpack_begin) * 1000
 
         if worker_end_times:
             # Output Transfer Latency = Driver Recv Time - Max Worker Finish Time
@@ -334,29 +380,60 @@ class RayExecutor:
                 recv_timestamp - last_worker_end
             ) * 1000
             logger.info(f"[METRIC] Output Transfer Latency: {output_transfer_latency:.4f} ms")
-            self._execution_boundary.record(
-                {
-                    "actor_submit_latency_ms": submit_latency_ms,
-                    "send_seqs_latency_ms": send_seqs_latency_ms,
-                    "ray_get_latency_ms": (
-                        ray_get_end - ray_get_begin
-                    )
-                    * 1000,
-                    "executor_until_ray_get_ms": (
-                        ray_get_end - executor_begin
-                    )
-                    * 1000,
-                    "worker_observed_critical_ms": (
-                        last_worker_end - send_timestamp
-                    )
-                    * 1000,
-                    "worker_finish_to_ray_get_ms": output_transfer_latency,
-                    "worker_finish_skew_ms": (
-                        last_worker_end - min(worker_end_times)
-                    )
-                    * 1000,
+            boundary_metrics = {
+                "actor_submit_latency_ms": submit_latency_ms,
+                "send_seqs_latency_ms": send_seqs_latency_ms,
+                "ray_get_latency_ms": (
+                    ray_get_end - ray_get_begin
+                )
+                * 1000,
+                "executor_until_ray_get_ms": (
+                    ray_get_end - executor_begin
+                )
+                * 1000,
+                "worker_observed_critical_ms": (
+                    last_worker_end - send_timestamp
+                )
+                * 1000,
+                "worker_finish_to_ray_get_ms": output_transfer_latency,
+                "worker_finish_skew_ms": (
+                    last_worker_end - min(worker_end_times)
+                )
+                * 1000,
+            }
+            self._execution_boundary.record(boundary_metrics)
+            if diagnostics_enabled:
+                critical_worker = max(
+                    worker_diagnostics,
+                    key=lambda item: float(item["worker_total_ms"]),
+                )
+                gpu_loop_values = [
+                    float(item["gpu_loop_ms"])
+                    for item in worker_diagnostics
+                    if item.get("gpu_loop_ms") is not None
+                ]
+                self.last_quantum_diagnostic = {
+                    **boundary_metrics,
+                    "result_unpack_ms": result_unpack_ms,
+                    "critical_worker_global_rank": int(
+                        critical_worker["global_rank"]
+                    ),
+                    "worker_total_ms_min": min(
+                        float(item["worker_total_ms"])
+                        for item in worker_diagnostics
+                    ),
+                    "worker_total_ms_max": max(
+                        float(item["worker_total_ms"])
+                        for item in worker_diagnostics
+                    ),
+                    "gpu_loop_ms_min": (
+                        min(gpu_loop_values) if gpu_loop_values else None
+                    ),
+                    "gpu_loop_ms_max": (
+                        max(gpu_loop_values) if gpu_loop_values else None
+                    ),
+                    "worker_rank_timings": tuple(worker_diagnostics),
                 }
-            )
 
         return token_ids_list
 

@@ -71,9 +71,9 @@ class Config:
     startup_timeout_s: float = 600.0
     quantum_timeout_s: float = 120.0
     hierarchical_execution_trace: bool = False
-    # Capture one compact timing/load record per LocalEngine quantum. Unlike
-    # hierarchical_execution_trace, this does not retain per-inner-loop
-    # Python trace objects.
+    # Capture one compact timing/load record per decode quantum. The legacy
+    # field name is retained for configuration/fingerprint compatibility;
+    # both scheduler architectures may enable it.
     hierarchical_quantum_diagnostics: bool = False
     # Diagnostic-only positional result path. The default preserves the
     # request-id dict/set/reorder implementation for controlled A/B testing.
@@ -241,14 +241,6 @@ class Config:
         ):
             raise ValueError(
                 "hierarchical_worker_transport='zmq' requires "
-                "scheduler_arch='hierarchical'"
-            )
-        if (
-            self.hierarchical_quantum_diagnostics
-            and self.scheduler_arch != "hierarchical"
-        ):
-            raise ValueError(
-                "hierarchical_quantum_diagnostics requires "
                 "scheduler_arch='hierarchical'"
             )
         if self.router_policy not in {

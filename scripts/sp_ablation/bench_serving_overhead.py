@@ -190,13 +190,14 @@ def parse_args():
         help="JSONL output path for --hierarchical-execution-trace.",
     )
     parser.add_argument(
+        "--quantum-log-path",
         "--hierarchical-quantum-log-path",
+        dest="quantum_log_path",
         type=str,
         default=None,
         help=(
-            "Write one compact timing/load JSON record per hierarchical "
-            "engine quantum. This is substantially lighter than the full "
-            "execution trace."
+            "Write one compact timing/load JSON record per decode quantum "
+            "for either scheduler architecture."
         ),
     )
     
@@ -229,15 +230,6 @@ def parse_args():
                 "--hierarchical-trace-log-path is required with "
                 "--hierarchical-execution-trace"
             )
-    if (
-        args.hierarchical_quantum_log_path
-        and args.scheduler_arch != "hierarchical"
-    ):
-        parser.error(
-            "--hierarchical-quantum-log-path requires "
-            "--scheduler-arch hierarchical"
-        )
-
     return args
 
 
@@ -724,6 +716,7 @@ def run_benchmark(
     diagnostic_log_interval=0.0,
     slow_add_threshold_ms=0.0,
     hierarchical_trace_log_path=None,
+    quantum_log_path=None,
     hierarchical_quantum_log_path=None,
     request_metrics_log_path=None,
     metrics_summary_path=None,
@@ -732,6 +725,14 @@ def run_benchmark(
     show_progress=True,
 ):
     """Runs the main benchmark loop with rate-controlled request submission."""
+    if quantum_log_path and hierarchical_quantum_log_path:
+        raise ValueError(
+            "quantum_log_path and hierarchical_quantum_log_path are aliases; "
+            "provide only one"
+        )
+    quantum_log_path = (
+        quantum_log_path or hierarchical_quantum_log_path
+    )
     clock_ns = clock_ns or time.perf_counter_ns
     sleep_fn = sleep_fn or time.sleep
     seq_map = {}
@@ -806,17 +807,15 @@ def run_benchmark(
                 request_metrics_log_path
             )
 
-    if hierarchical_quantum_log_path:
-        quantum_path = Path(
-            hierarchical_quantum_log_path
-        ).expanduser()
+    if quantum_log_path:
+        quantum_path = Path(quantum_log_path).expanduser()
         quantum_path.parent.mkdir(parents=True, exist_ok=True)
         quantum_diagnostic_file = quantum_path.open(
             "w",
             encoding="utf-8",
             buffering=1,
         )
-        hierarchical_quantum_log_path = str(quantum_path)
+        quantum_log_path = str(quantum_path)
 
     def _interval_ms(timing, end_key, start_key):
         end_ns = timing.get(end_key)
@@ -1206,7 +1205,10 @@ def run_benchmark(
         nonlocal quantum_diagnostic_count
         if quantum_diagnostic_file is None:
             return 0
-        samples = engine.drain_hierarchical_quantum_diagnostics()
+        drain = getattr(engine, "drain_quantum_diagnostics", None)
+        if drain is None:
+            drain = engine.drain_hierarchical_quantum_diagnostics
+        samples = drain()
         for sample in samples:
             record = dict(sample)
             record["benchmark_elapsed_s"] = round(
@@ -1720,6 +1722,7 @@ def run_benchmark(
         metrics_summary["hierarchical_rank_loads"] = (
             hierarchical_rank_loads
         )
+        metrics_summary["hierarchical_metrics"] = final_hierarchical
     execution_boundary_metrics = engine.execution_boundary_metrics()
     metrics_summary["execution_boundary_metrics"] = (
         execution_boundary_metrics
@@ -1728,9 +1731,10 @@ def run_benchmark(
         {
             "benchmark_runtime_s": round(total_time, 6),
             "request_metrics_jsonl": request_metrics_log_path,
-            "hierarchical_quantum_diagnostics_jsonl": (
-                hierarchical_quantum_log_path
-            ),
+            "quantum_diagnostics_jsonl": quantum_log_path,
+            "quantum_diagnostic_samples": quantum_diagnostic_count,
+            # Retain the old summary keys for existing analysis tools.
+            "hierarchical_quantum_diagnostics_jsonl": quantum_log_path,
             "hierarchical_quantum_diagnostic_samples": (
                 quantum_diagnostic_count
             ),
@@ -1832,9 +1836,9 @@ def run_benchmark(
         "goodput": metrics_summary["goodput"],
         "request_metrics_jsonl": request_metrics_log_path,
         "metrics_summary_json": metrics_summary_path,
-        "hierarchical_quantum_diagnostics_jsonl": (
-            hierarchical_quantum_log_path
-        ),
+        "quantum_diagnostics_jsonl": quantum_log_path,
+        "quantum_diagnostic_samples": quantum_diagnostic_count,
+        "hierarchical_quantum_diagnostics_jsonl": quantum_log_path,
         "hierarchical_quantum_diagnostic_samples": (
             quantum_diagnostic_count
         ),
@@ -2095,7 +2099,7 @@ def main():
         dynamic_sp_bucket_preset=args.dynamic_sp_bucket_preset,
         hierarchical_execution_trace=args.hierarchical_execution_trace,
         hierarchical_quantum_diagnostics=bool(
-            args.hierarchical_quantum_log_path
+            args.quantum_log_path
         ),
         hierarchical_result_fastpath=(
             os.getenv("NANODEPLOY_HIER_RESULT_FASTPATH", "0") == "1"
@@ -2116,7 +2120,7 @@ def main():
         engine.config.hierarchical_quantum_diagnostics
     ):
         # Exclude warmup quantums from the benchmark diagnostic stream.
-        engine.drain_hierarchical_quantum_diagnostics()
+        engine.drain_quantum_diagnostics()
 
     # Prepare Data
     request_generator = get_dataset_generator(args)
@@ -2135,9 +2139,7 @@ def main():
         diagnostic_log_interval=args.diagnostic_log_interval,
         slow_add_threshold_ms=args.slow_add_threshold_ms,
         hierarchical_trace_log_path=args.hierarchical_trace_log_path,
-        hierarchical_quantum_log_path=(
-            args.hierarchical_quantum_log_path
-        ),
+        quantum_log_path=args.quantum_log_path,
         request_metrics_log_path=request_metrics_log_path,
         metrics_summary_path=args.metrics_summary_path,
     )

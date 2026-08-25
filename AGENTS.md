@@ -56,6 +56,7 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
 - After changing C++ sources, reinstall with `python3 -m pip install -v -e .` before running the full project.
 - Modify NanoDeploy code only; do not patch external dependency libraries.
 - Save useful interim reasoning or research notes under `docs-dev/` for later reference.
+- By default, do not compute SHA/hash values for files, logs, datasets, or runtime state; do not validate hash chains; and do not reconstruct historical state during startup, resume, execution, or shutdown for hash validation unless the user explicitly requests it.
 - Subagents may be used for suitable independent work.
 - Commit changes promptly with clear, accurate messages so work remains traceable.
 - Request elevated permissions before every GPU operation.
