@@ -4,6 +4,8 @@ import os
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import ray
@@ -62,8 +64,32 @@ from nanodeploy.worker.sp_graph_policy import (
     select_decode_graph_master_bs,
 )
 from nanodeploy.worker.token_carry import GpuTokenCarry
+from nanodeploy.worker.token_materializer import (
+    AsyncTokenMaterializer,
+    PendingTokenMaterialization,
+)
 
 logger = get_logger()
+
+
+@dataclass(slots=True)
+class PendingModelRunnerOutput:
+    token_materialization: PendingTokenMaterialization
+    loop_count: int
+    diagnostics_enabled: bool
+    recv_begin: float
+    recv_end: float
+    worker_begin: float
+    loop_begin: float
+    prepare_update_ms: float
+    forward_host_ms: float
+    d2h_submit_host_ms: float
+    gpu_loop_begin: Any
+    gpu_loop_end: Any
+    carry_hits: int
+    payload_seed_hits: int
+    hierarchical_trace: dict | None
+    execution_forwards: tuple[dict, ...]
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -291,6 +317,7 @@ class ModelRunner:
             num_slots=(2 if config.scheduler_arch == "hierarchical" else 1),
         )
         self._hierarchical_token_carry = GpuTokenCarry()
+        self._token_materializer = AsyncTokenMaterializer(num_slots=2)
         self._gpu_carry_hits_total = 0
         self._payload_seed_hits_total = 0
         self._zmq_worker_config: WorkerZmqConfig | None = None
@@ -463,7 +490,9 @@ class ModelRunner:
         if transport_config is None:
             raise RuntimeError("worker ZMQ transport is not configured")
 
-        def execute(command: DecodeCommand) -> WorkerExecutionOutput:
+        def execute(
+            command: DecodeCommand,
+        ) -> tuple[DecodeCommand, PendingModelRunnerOutput]:
             trace_enabled = command.hierarchical_trace is not None
             if trace_enabled != bool(
                 self.config.hierarchical_execution_trace
@@ -490,7 +519,27 @@ class ModelRunner:
                 hierarchical_quantum_diagnostics=(
                     command.hierarchical_quantum_diagnostics
                 ),
+                defer_token_materialization=True,
             )
+            if not isinstance(raw, PendingModelRunnerOutput):
+                raise RuntimeError(
+                    "worker decode did not return pending token output"
+                )
+            return command, raw
+
+        def complete(submitted: Any) -> WorkerExecutionOutput:
+            if (
+                not isinstance(submitted, tuple)
+                or len(submitted) != 2
+                or not isinstance(submitted[0], DecodeCommand)
+                or not isinstance(submitted[1], PendingModelRunnerOutput)
+            ):
+                raise RuntimeError(
+                    "worker decode pending envelope is invalid"
+                )
+            command, pending = submitted
+            raw = self.collect_pending_output(pending)
+            trace_enabled = command.hierarchical_trace is not None
             expected_len = (
                 2
                 + int(trace_enabled)
@@ -517,7 +566,7 @@ class ModelRunner:
                 diagnostic=diagnostic,
             )
 
-        ZmqWorkerClient(transport_config).run(execute)
+        ZmqWorkerClient(transport_config).run(execute, complete)
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -1514,11 +1563,22 @@ class ModelRunner:
         hierarchical_wave_id: int | None = None,
         hierarchical_quantum_id: int | None = None,
         hierarchical_sequence_epochs: tuple[tuple[int, int], ...] | None = None,
+        defer_token_materialization: bool = False,
     ) -> (
         tuple[list[list[int]], float]
         | tuple[list[list[int]], float, dict]
         | tuple[list[list[int]], float, dict, dict]
+        | PendingModelRunnerOutput
     ):
+        if defer_token_materialization and (
+            is_prefill
+            or self.config.scheduler_arch != "hierarchical"
+            or not enable_rpc
+        ):
+            raise ValueError(
+                "deferred token materialization is only supported for "
+                "hierarchical RPC decode"
+            )
         diagnostics_enabled = bool(hierarchical_quantum_diagnostics)
         worker_begin = time.perf_counter() if diagnostics_enabled else 0.0
         recv_begin = time.perf_counter() if diagnostics_enabled else 0.0
@@ -1843,7 +1903,46 @@ class ModelRunner:
         token_materialize_begin = (
             time.perf_counter() if diagnostics_enabled else 0.0
         )
-        loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
+        token_matrix = torch.cat(get_context().token_ids, dim=0).T
+        if defer_token_materialization:
+            d2h_submit_begin = time.perf_counter()
+            token_materialization = self._token_materializer.submit(
+                token_matrix,
+                slot=transport_slot,
+            )
+            d2h_submit_host_ms = (
+                time.perf_counter() - d2h_submit_begin
+            ) * 1000
+            pending_output = PendingModelRunnerOutput(
+                token_materialization=token_materialization,
+                loop_count=loop_count,
+                diagnostics_enabled=diagnostics_enabled,
+                recv_begin=recv_begin,
+                recv_end=recv_end,
+                worker_begin=worker_begin,
+                loop_begin=loop_begin,
+                prepare_update_ms=prepare_update_ms,
+                forward_host_ms=forward_host_ms,
+                d2h_submit_host_ms=d2h_submit_host_ms,
+                gpu_loop_begin=gpu_loop_begin,
+                gpu_loop_end=gpu_loop_end,
+                carry_hits=carry_hits,
+                payload_seed_hits=payload_seed_hits,
+                hierarchical_trace=(
+                    dict(hierarchical_trace)
+                    if hierarchical_trace is not None
+                    else None
+                ),
+                execution_forwards=(
+                    tuple(execution_forwards)
+                    if hierarchical_trace is not None
+                    else ()
+                ),
+            )
+            reset_context()
+            return pending_output
+
+        loop_count_token_ids = token_matrix.tolist()
         gpu_loop_ms = None
         if gpu_loop_begin is not None and gpu_loop_end is not None:
             # token materialization above already synchronizes the dependent
@@ -1880,6 +1979,84 @@ class ModelRunner:
             trace = dict(hierarchical_trace)
             trace["forward_count"] = loop_count
             trace["forwards"] = tuple(execution_forwards)
+            if diagnostic is not None:
+                return (
+                    loop_count_token_ids,
+                    worker_end_time,
+                    trace,
+                    diagnostic,
+                )
+            return loop_count_token_ids, worker_end_time, trace
+        if diagnostic is not None:
+            return loop_count_token_ids, worker_end_time, diagnostic
+        return loop_count_token_ids, worker_end_time
+
+    def collect_pending_output(
+        self,
+        pending: PendingModelRunnerOutput,
+    ) -> (
+        tuple[list[list[int]], float]
+        | tuple[list[list[int]], float, dict]
+        | tuple[list[list[int]], float, dict, dict]
+    ):
+        collect_begin = time.perf_counter()
+        loop_count_token_ids = self._token_materializer.collect(
+            pending.token_materialization
+        )
+        gpu_loop_ms = None
+        if (
+            pending.gpu_loop_begin is not None
+            and pending.gpu_loop_end is not None
+        ):
+            pending.gpu_loop_end.synchronize()
+            gpu_loop_ms = pending.gpu_loop_begin.elapsed_time(
+                pending.gpu_loop_end
+            )
+        worker_end = time.perf_counter()
+        worker_end_time = time.time()
+
+        diagnostic = None
+        if pending.diagnostics_enabled:
+            diagnostic = {
+                "global_rank": int(self.rank),
+                "recv_seqs_ms": (
+                    pending.recv_end - pending.recv_begin
+                )
+                * 1000,
+                "prepare_update_host_ms": pending.prepare_update_ms,
+                "forward_host_ms": pending.forward_host_ms,
+                "gpu_loop_ms": gpu_loop_ms,
+                "loop_host_ms": (
+                    pending.token_materialization.submitted_at
+                    - pending.loop_begin
+                )
+                * 1000,
+                "token_materialize_ms": (
+                    worker_end - collect_begin
+                )
+                * 1000,
+                "token_d2h_submit_host_ms": pending.d2h_submit_host_ms,
+                "token_d2h_lifetime_ms": (
+                    worker_end
+                    - pending.token_materialization.submitted_at
+                )
+                * 1000,
+                "gpu_carry_hits": pending.carry_hits,
+                "payload_seed_hits": pending.payload_seed_hits,
+                "worker_body_ms": (
+                    worker_end - pending.recv_end
+                )
+                * 1000,
+                "worker_total_ms": (
+                    worker_end - pending.worker_begin
+                )
+                * 1000,
+            }
+
+        if pending.hierarchical_trace is not None:
+            trace = pending.hierarchical_trace
+            trace["forward_count"] = pending.loop_count
+            trace["forwards"] = pending.execution_forwards
             if diagnostic is not None:
                 return (
                     loop_count_token_ids,

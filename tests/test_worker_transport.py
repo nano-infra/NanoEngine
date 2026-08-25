@@ -54,6 +54,7 @@ def start_client(
     rank: int,
     execute,
     errors: list[BaseException],
+    complete=None,
 ) -> threading.Thread:
     config = server.worker_config(
         rank,
@@ -63,7 +64,7 @@ def start_client(
 
     def run() -> None:
         try:
-            ZmqWorkerClient(config).run(execute)
+            ZmqWorkerClient(config).run(execute, complete)
         except BaseException as exc:
             errors.append(exc)
 
@@ -219,6 +220,66 @@ def test_router_dealer_success_is_returned_in_topology_order():
     assert errors == []
 
 
+def test_worker_launches_second_quantum_before_collecting_oldest():
+    server = ZmqWorkerServer.create_ipc(
+        engine_id=0, expected_ranks=(0,)
+    )
+    client_errors: list[BaseException] = []
+    events: list[tuple[str, int]] = []
+
+    def execute(command):
+        events.append(("submit", command.quantum_id))
+        return command.quantum_id
+
+    def complete(quantum_id):
+        events.append(("collect", quantum_id))
+        return WorkerExecutionOutput(
+            token_rows=[[quantum_id]],
+            worker_end_time=time.time(),
+        )
+
+    thread = start_client(
+        server,
+        0,
+        execute,
+        client_errors,
+        complete,
+    )
+    try:
+        server.activate(timeout_s=2.0)
+        server.send_decode_commands(
+            {0: command_for(server, 0, quantum_id=0)},
+            deadline=time.monotonic() + 2.0,
+        )
+        server.send_decode_commands(
+            {0: command_for(server, 0, quantum_id=1)},
+            deadline=time.monotonic() + 2.0,
+        )
+
+        first = server.receive_decode_results(
+            deadline=time.monotonic() + 2.0
+        )
+        second = server.receive_decode_results(
+            deadline=time.monotonic() + 2.0
+        )
+
+        assert first[0].token_rows == [[0]]
+        assert second[0].token_rows == [[1]]
+        assert events == [
+            ("submit", 0),
+            ("submit", 1),
+            ("collect", 0),
+            ("collect", 1),
+        ]
+        assert server.close(graceful=True, timeout_s=2.0) == ()
+    finally:
+        if server.cleanup_dir is not None:
+            server.close(graceful=False, timeout_s=0.0)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert client_errors == []
+
+
 def test_worker_execution_failure_is_fail_stop_and_not_retried():
     server = ZmqWorkerServer.create_ipc(
         engine_id=0, expected_ranks=(0,)
@@ -236,6 +297,10 @@ def test_worker_execution_failure_is_fail_stop_and_not_retried():
         server.activate(timeout_s=2.0)
         server.send_decode_commands(
             {0: command_for(server, 0)},
+            deadline=time.monotonic() + 2.0,
+        )
+        server.send_decode_commands(
+            {0: command_for(server, 0, quantum_id=1)},
             deadline=time.monotonic() + 2.0,
         )
         with pytest.raises(RemoteWorkerError, match="decode exploded"):

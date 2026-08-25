@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -15,7 +16,7 @@ import msgspec
 import zmq
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 TRANSPORT_SLOTS = 2
 MAX_COMMAND_BYTES = 1 << 20
 MAX_RESPONSE_BYTES = 16 << 20
@@ -73,6 +74,21 @@ class DecodeCommand(
     transport_slot: int = 0
     hierarchical_trace: dict[str, Any] | None = None
     hierarchical_quantum_diagnostics: bool = False
+
+
+class CollectCommand(
+    msgspec.Struct,
+    tag="collect",
+    tag_field="kind",
+    forbid_unknown_fields=True,
+    frozen=True,
+):
+    protocol_version: int
+    deployment_epoch: str
+    engine_id: int
+    global_rank: int
+    wave_id: int
+    quantum_id: int
 
 
 class StopCommand(
@@ -139,7 +155,7 @@ class WorkerStopped(
     global_rank: int
 
 
-WorkerCommand: TypeAlias = DecodeCommand | StopCommand
+WorkerCommand: TypeAlias = DecodeCommand | CollectCommand | StopCommand
 WorkerResponse: TypeAlias = (
     WorkerReady | DecodeSuccess | DecodeFailure | WorkerStopped
 )
@@ -324,7 +340,7 @@ class ZmqWorkerServer:
         self._poller: zmq.Poller | None = None
         self._owner_thread_id: int | None = None
         self._ready_ranks: set[int] = set()
-        self._inflight: tuple[int, int] | None = None
+        self._inflight: deque[tuple[int, int]] = deque()
         self._failed = False
 
     @classmethod
@@ -429,9 +445,9 @@ class ZmqWorkerServer:
         self._require_active()
         if self._failed:
             raise WorkerTransportError("worker ZMQ server is failed")
-        if self._inflight is not None:
+        if len(self._inflight) >= TRANSPORT_SLOTS:
             raise WorkerTransportProtocolError(
-                f"worker quantum {self._inflight} is already in flight"
+                "worker decode flight capacity is exhausted"
             )
         if set(commands) != set(self.expected_ranks):
             raise WorkerTransportProtocolError(
@@ -481,7 +497,16 @@ class ZmqWorkerServer:
                 "workers received inconsistent wave/quantum commands"
             )
 
-        self._inflight = next(iter(quantum_keys))
+        quantum_key = next(iter(quantum_keys))
+        if self._inflight:
+            last_wave_id, last_quantum_id = self._inflight[-1]
+            expected_key = (last_wave_id, last_quantum_id + 1)
+            if quantum_key != expected_key:
+                raise WorkerTransportProtocolError(
+                    f"out-of-order worker quantum {quantum_key}; "
+                    f"expected {expected_key}"
+                )
+        self._inflight.append(quantum_key)
         sent: list[int] = []
         try:
             for rank in self.expected_ranks:
@@ -500,14 +525,30 @@ class ZmqWorkerServer:
         deadline: float,
     ) -> tuple[DecodeSuccess, ...]:
         self._require_active()
-        if self._inflight is None:
+        if not self._inflight:
             raise WorkerTransportProtocolError(
                 "no worker quantum is in flight"
             )
-        wave_id, quantum_id = self._inflight
+        wave_id, quantum_id = self._inflight[0]
         pending = set(self.expected_ranks)
         results: dict[int, DecodeSuccess] = {}
         try:
+            for rank in self.expected_ranks:
+                self._send(
+                    rank,
+                    encode_command(
+                        CollectCommand(
+                            protocol_version=PROTOCOL_VERSION,
+                            deployment_epoch=self.deployment_epoch,
+                            engine_id=self.engine_id,
+                            global_rank=rank,
+                            wave_id=wave_id,
+                            quantum_id=quantum_id,
+                        )
+                    ),
+                    deadline,
+                    "decode result collection",
+                )
             while pending:
                 identity, frame = self._receive(
                     deadline, "worker decode results"
@@ -558,7 +599,7 @@ class ZmqWorkerServer:
         except BaseException:
             self._failed = True
             raise
-        self._inflight = None
+        self._inflight.popleft()
         return tuple(results[rank] for rank in self.expected_ranks)
 
     def mark_failed(self) -> None:
@@ -571,7 +612,7 @@ class ZmqWorkerServer:
             if (
                 graceful
                 and not self._failed
-                and self._inflight is None
+                and not self._inflight
                 and self._ready_ranks == set(self.expected_ranks)
             ):
                 try:
@@ -741,7 +782,8 @@ class ZmqWorkerClient:
 
     def run(
         self,
-        execute: Callable[[DecodeCommand], WorkerExecutionOutput],
+        execute: Callable[[DecodeCommand], Any],
+        complete: Callable[[Any], WorkerExecutionOutput] | None = None,
     ) -> None:
         context = zmq.Context(io_threads=1)
         socket = context.socket(zmq.DEALER)
@@ -758,6 +800,9 @@ class ZmqWorkerClient:
         poller = zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         last_quantum: tuple[int, int] | None = None
+        pending: deque[tuple[DecodeCommand, Any, BaseException | None]] = (
+            deque()
+        )
         try:
             socket.connect(self.config.address)
             startup_deadline = (
@@ -780,6 +825,7 @@ class ZmqWorkerClient:
                 if not events.get(socket, 0) & zmq.POLLIN:
                     continue
                 command: WorkerCommand | None = None
+                failure_reported = False
                 try:
                     frames = socket.recv_multipart(flags=zmq.NOBLOCK)
                     if len(frames) != 1:
@@ -795,6 +841,10 @@ class ZmqWorkerClient:
                         global_rank=self.config.global_rank,
                     )
                     if isinstance(command, StopCommand):
+                        if pending:
+                            raise WorkerTransportProtocolError(
+                                "worker STOP received with pending decode flights"
+                            )
                         self._send(
                             socket,
                             WorkerStopped(
@@ -810,11 +860,76 @@ class ZmqWorkerClient:
                             "worker STOP ACK",
                         )
                         return
-                    self._validate_quantum(command, last_quantum)
-                    output = execute(command)
+                    if isinstance(command, DecodeCommand):
+                        if len(pending) >= TRANSPORT_SLOTS:
+                            raise WorkerTransportProtocolError(
+                                "worker pending decode capacity is exhausted"
+                            )
+                        prior_error = next(
+                            (
+                                error
+                                for _prior, _output, error in pending
+                                if error is not None
+                            ),
+                            None,
+                        )
+                        try:
+                            self._validate_quantum(command, last_quantum)
+                            last_quantum = (
+                                command.wave_id,
+                                command.quantum_id,
+                            )
+                            if prior_error is not None:
+                                raise WorkerTransportError(
+                                    "prior decode flight failed before this "
+                                    "quantum could execute"
+                                ) from prior_error
+                            submitted = execute(command)
+                            execution_error = None
+                        except BaseException as exc:
+                            submitted = None
+                            execution_error = exc
+                        pending.append(
+                            (command, submitted, execution_error)
+                        )
+                        continue
+
+                    if not isinstance(command, CollectCommand):
+                        raise WorkerTransportProtocolError(
+                            "worker received an unsupported command"
+                        )
+                    if not pending:
+                        raise WorkerTransportProtocolError(
+                            "worker collect received without a pending decode"
+                        )
+                    pending_command, submitted, execution_error = pending[0]
+                    expected = (
+                        pending_command.wave_id,
+                        pending_command.quantum_id,
+                    )
+                    actual = (command.wave_id, command.quantum_id)
+                    if actual != expected:
+                        raise WorkerTransportProtocolError(
+                            f"out-of-order worker collect {actual}; "
+                            f"expected {expected}"
+                        )
+                    if execution_error is not None:
+                        self._try_send_failure(
+                            socket,
+                            execution_error,
+                            wave_id=pending_command.wave_id,
+                            quantum_id=pending_command.quantum_id,
+                        )
+                        failure_reported = True
+                        raise execution_error
+                    output = (
+                        complete(submitted)
+                        if complete is not None
+                        else submitted
+                    )
                     if not isinstance(output, WorkerExecutionOutput):
                         raise TypeError(
-                            "worker execution callback must return "
+                            "worker completion callback must return "
                             "WorkerExecutionOutput"
                         )
                     self._send(
@@ -824,8 +939,8 @@ class ZmqWorkerClient:
                             deployment_epoch=self.config.deployment_epoch,
                             engine_id=self.config.engine_id,
                             global_rank=self.config.global_rank,
-                            wave_id=command.wave_id,
-                            quantum_id=command.quantum_id,
+                            wave_id=pending_command.wave_id,
+                            quantum_id=pending_command.quantum_id,
                             token_rows=output.token_rows,
                             worker_end_time=output.worker_end_time,
                             hierarchical_trace=(
@@ -837,24 +952,25 @@ class ZmqWorkerClient:
                         + self.config.quantum_timeout_s,
                         "worker decode result",
                     )
-                    last_quantum = (command.wave_id, command.quantum_id)
+                    pending.popleft()
                 except BaseException as exc:
                     wave_id = (
                         command.wave_id
-                        if isinstance(command, DecodeCommand)
+                        if isinstance(command, (DecodeCommand, CollectCommand))
                         else -1
                     )
                     quantum_id = (
                         command.quantum_id
-                        if isinstance(command, DecodeCommand)
+                        if isinstance(command, (DecodeCommand, CollectCommand))
                         else -1
                     )
-                    self._try_send_failure(
-                        socket,
-                        exc,
-                        wave_id=wave_id,
-                        quantum_id=quantum_id,
-                    )
+                    if not failure_reported:
+                        self._try_send_failure(
+                            socket,
+                            exc,
+                            wave_id=wave_id,
+                            quantum_id=quantum_id,
+                        )
                     raise
         finally:
             try:
