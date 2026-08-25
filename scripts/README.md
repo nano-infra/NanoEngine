@@ -50,18 +50,23 @@ scripts/run_2node_rate30_6min_matrix.sh
 
 ### Admission 延迟拆解
 
-hierarchical 请求的 `T0 -> T1 -> T3` 指标会写入 per-request JSONL 和
+hierarchical 请求的 `T0 -> T1 -> T2 -> T3` 指标会写入 per-request JSONL 和
 `summary.json`：
 
+其中 T2 是 staged-ingress receipt，T3 是 authoritative AddResult commit。
+
 - `dispatch_lag_ms`：T0 计划到达至 T1 实际投递；
-- `ingress_ack_latency_ms`：T1 投递至 T3 authoritative admission ACK；
+- `ingress_ack_latency_ms`：T1 投递至 staged-ingress receipt；
 - `router_pending_ms`：RequestRouter 中等待发起 admission RPC 的累计时间；
 - `admission_rpc_ms`：前端观察到的 LocalEngine admission RPC 累计时间；
-- `local_command_queue_ms`：最终 LocalEngine 命令进入队列至单写循环拾取；
-- `local_admission_ms`：最终本地 admission batch 的处理时间；
+- `local_command_queue_ms` / `local_admission_ms`：同步 admission 的兼容口径；
+- `staged_queue_ms`：positive receipt 后至最终 planned commit 尝试被拾取；
+- `planned_commit_ms`：最终 planned placement 校验与 commit 耗时；
+- `sequence_deserialize_ms`：服务端当前 ingress batch 的 Sequence 解码总耗时；
+- `sequence_payload_bytes`：本请求的序列化 Sequence payload 字节数；
 - `admission_rpc_residual_ms`：RPC 总时间扣除本地命令排队和 admission，
   用于定位 Ray actor mailbox、传输、轮询或前序 fallback；
-- `frontend_ack_overhead_ms`：T1-T3 扣除 router 和 RPC 后的前端观察余量。
+- `frontend_ack_overhead_ms`：T1-T2 扣除 router 和 receipt RPC 后的前端观察余量。
 
 所有跨节点字段传递的是各进程内单调时钟计算出的“时长”，不比较不同节点
 的绝对时间戳。

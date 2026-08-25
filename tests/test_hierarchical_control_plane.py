@@ -14,7 +14,10 @@ import torch.distributed as dist
 
 from nanodeploy._cpp import Sequence
 from nanodeploy.engine.decode_coordinator import DecodeCoordinatorState
-from nanodeploy.engine.deployment_manager import DeploymentManager
+from nanodeploy.engine.deployment_manager import (
+    DeploymentManager,
+    _FrontendEventFlight,
+)
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
@@ -34,8 +37,8 @@ from nanodeploy.engine.hierarchical_contract import (
 )
 from nanodeploy.engine.local_executor import LocalExecutor
 from nanodeploy.engine.local_engine import (
+    _IngressAdd,
     LocalEngineCore,
-    _PlannedAdmission,
 )
 from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.engine.worker_transport import DecodeSuccess
@@ -73,6 +76,91 @@ def test_hierarchical_runtime_env_omits_unset_dlslime_settings(monkeypatch):
     manager.config = SimpleNamespace(ffn_ep=1, max_num_seqs=8)
 
     assert manager._runtime_env() == {"env_vars": {}}
+
+
+def test_frontend_event_poll_consumes_only_ready_engine_and_rearms(
+    monkeypatch,
+):
+    refs = {0: [object(), object()], 1: [object()]}
+
+    class RemoteDrain:
+        def __init__(self, engine_id):
+            self.engine_id = engine_id
+
+        def remote(self):
+            return refs[self.engine_id].pop(0)
+
+    manager = object.__new__(DeploymentManager)
+    manager.engines = {
+        engine_id: SimpleNamespace(
+            drain_frontend_events=RemoteDrain(engine_id)
+        )
+        for engine_id in (0, 1)
+    }
+    manager.config = SimpleNamespace(quantum_timeout_s=10.0)
+    manager._frontend_event_flights = {}
+    manager.close = lambda: pytest.fail("healthy event poll closed deployment")
+    clock = {"now": 1.0}
+    monkeypatch.setattr(
+        "nanodeploy.engine.deployment_manager.monotonic",
+        lambda: clock["now"],
+    )
+
+    first_ref = refs[0][0]
+    second_ref = refs[1][0]
+    batches_by_ref = {
+        first_ref: FrontendEventBatch(
+            engine_id=0,
+            load=load_snapshot(0, 1),
+        )
+    }
+
+    def fake_wait(pending_refs, *, num_returns, timeout):
+        assert pending_refs == [first_ref, second_ref]
+        assert num_returns == 2
+        assert timeout == 0
+        return [first_ref], [second_ref]
+
+    monkeypatch.setattr(
+        "nanodeploy.engine.deployment_manager.ray.wait", fake_wait
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.deployment_manager.ray.get",
+        lambda ready_refs: [batches_by_ref[ref] for ref in ready_refs],
+    )
+
+    batches = manager.poll_ready_frontend_events()
+
+    assert [batch.engine_id for batch in batches] == [0]
+    assert manager._frontend_event_flights[1].ref is second_ref
+    assert manager._frontend_event_flights[0].ref is not first_ref
+    assert manager.frontend_event_flight_metrics() == {
+        "pending": 2,
+        "oldest_age_ms": 0.0,
+    }
+
+
+def test_frontend_event_poll_timeout_is_fail_stop(monkeypatch):
+    manager = object.__new__(DeploymentManager)
+    manager.engines = {0: object()}
+    manager.config = SimpleNamespace(quantum_timeout_s=1.0)
+    manager._frontend_event_flights = {
+        0: _FrontendEventFlight(ref=object(), started_at=1.0)
+    }
+    closed = []
+    manager.close = lambda: closed.append(True)
+    monkeypatch.setattr(
+        "nanodeploy.engine.deployment_manager.monotonic", lambda: 2.1
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.deployment_manager.ray.wait",
+        lambda *_args, **_kwargs: ([], []),
+    )
+
+    with pytest.raises(TimeoutError, match=r"engines \[0\]"):
+        manager.poll_ready_frontend_events()
+
+    assert closed == [True]
 
 
 def test_finish_event_excludes_unused_final_quantum_decode_slots():
@@ -272,7 +360,9 @@ def load_snapshot(
     pending_ingress: int = 0,
     quantum_id: int = 2,
     admission_version: int = 0,
+    ingress_version: int = 0,
     capacity_epoch: int = 0,
+    reserved_slots: int | None = None,
 ) -> LoadSnapshot:
     return LoadSnapshot(
         engine_id=engine_id,
@@ -283,9 +373,14 @@ def load_snapshot(
         wave_id=1,
         quantum_id=quantum_id,
         admission_version=admission_version,
+        ingress_version=ingress_version,
         capacity_epoch=capacity_epoch,
         pending_ingress=pending_ingress,
-        reserved_slots=running + waiting + pending_ingress,
+        reserved_slots=(
+            running + waiting + pending_ingress
+            if reserved_slots is None
+            else reserved_slots
+        ),
         rank_loads=(
             RankLoad(
                 global_rank=engine_id,
@@ -396,8 +491,6 @@ def test_router_rejects_invalid_load_policy_configuration():
         RequestRouter(engines, router_policy="random")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="positive kvcache_block_size"):
         RequestRouter(engines, router_policy="least_cache")
-    with pytest.raises(ValueError, match="max_unscheduled_requests"):
-        RequestRouter(engines, max_unscheduled_requests=0)
 
 
 @dataclass
@@ -408,6 +501,7 @@ class FakeAsyncEngine(FakeEngine):
         default_factory=list
     )
     admission_version: int = 0
+    ingress_version: int = 0
 
     def enqueue_async(self, command: AddCommand):
         reason = (
@@ -431,12 +525,12 @@ class FakeAsyncEngine(FakeEngine):
     def admit_async(self, command: AddCommand):
         handle = self.enqueue_async(command)
         if handle["ack"].enqueued:
-            self.admission_version += 1
+            self.ingress_version += 1
             handle["ack"] = IngressAck(
                 request_id=command.request_id,
                 engine_id=self.engine_id,
                 enqueued=True,
-                admission_version=self.admission_version,
+                ingress_version=self.ingress_version,
             )
         return handle
 
@@ -455,15 +549,15 @@ class FakeAsyncEngine(FakeEngine):
             )
             self.commands.append(command)
             if reason is None:
-                self.admission_version += 1
+                self.ingress_version += 1
             acks.append(
                 IngressAck(
                     request_id=command.request_id,
                     engine_id=self.engine_id,
                     enqueued=reason is None,
                     reason=reason,
-                    admission_version=(
-                        self.admission_version
+                    ingress_version=(
+                        self.ingress_version
                         if reason is None
                         else None
                     ),
@@ -543,6 +637,82 @@ def test_router_least_batch_drains_global_pending_with_tentative_counts():
         router.owner(request_id).state == OwnerState.PENDING_INGRESS
         for request_id in (1, 2, 3, 4)
     )
+
+
+def test_router_least_batch_does_not_double_count_staged_snapshot_slot():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch",
+        admission_planner_config=planner_config(queue_capacity=2),
+    )
+    router.record_loads((load_snapshot(0, 100),))
+    submit_request(
+        router,
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    engine.handles[0]["ready"] = True
+    receipt = router.poll_ingress_acks()
+    assert len(receipt) == 1
+    assert receipt[0].ingress_version == 1
+    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
+
+    router.record_loads(
+        (
+            load_snapshot(
+                0,
+                100,
+                pending_ingress=1,
+                ingress_version=1,
+                reserved_slots=1,
+            ),
+        )
+    )
+    submit_request(
+        router,
+        request_id=2,
+        prompt_token_ids=(2,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1, 2]
+
+
+def test_router_pending_add_abort_terminal_releases_staged_owner():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 100),))
+    submit_request(
+        router,
+        request_id=3,
+        prompt_token_ids=(3,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    assert router.poll_ingress_acks() == ()
+    engine.handles[0]["ready"] = True
+    assert router.poll_ingress_acks()[0].enqueued
+    assert router.owner(3) == RequestOwner(OwnerState.PENDING_ADD, 0)
+
+    event = FinishEvent(3, 0, "ABORTED", 0)
+    assert router.record_finish_events((event,)) == (event,)
+    assert router.owner(3) is None
+    assert router.terminal_event(3) == event
+    assert router.is_idle
 
 
 def test_router_least_batch_uses_live_running_plus_tentative_admissions():
@@ -748,551 +918,6 @@ def test_router_capacity_planner_honors_dp_aggregated_receiver_limits():
     assert router.admission_metrics()["global_retries"] == 0
 
 
-def test_router_least_batch_v2_keeps_global_fifo_and_uses_only_kv_credit():
-    engines = {
-        0: FakeAsyncEngine(0),
-        1: FakeAsyncEngine(1),
-    }
-    config = planner_config(attention_sp=2)
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=config,
-    )
-    router.record_loads(
-        (
-            multi_rank_load_snapshot(
-                0,
-                free_blocks=(10, 10),
-                master_counts=(200, 200),
-                receiver_counts=(32, 32),
-            ),
-            multi_rank_load_snapshot(
-                1,
-                free_blocks=(8, 8),
-                master_counts=(0, 0),
-                receiver_counts=(0, 0),
-            ),
-        )
-    )
-    submit_request(router,
-        request_id=1,
-        prompt_token_ids=tuple(range(65)),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-
-    # Submission only appends to the global queue. The prompt costs
-    # ceil(65 / 4) + one SP rounding block + one decode reserve = 19,
-    # so only DP0's aggregate 20-block credit is eligible. Master/receiver
-    # limits are intentionally ignored by the frontend v2 gate.
-    assert engines[0].commands == []
-    assert engines[1].commands == []
-    assert router.owner(1) == RequestOwner(OwnerState.PENDING_GLOBAL)
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engines[0].commands] == [1]
-    assert engines[1].commands == []
-    assert engines[0].planned_batches == []
-    assert router.owner(1) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
-
-
-def test_router_least_batch_v2_filters_by_kv_then_uses_projected_load():
-    engines = {
-        0: FakeAsyncEngine(0),
-        1: FakeAsyncEngine(1),
-        2: FakeAsyncEngine(2),
-    }
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=planner_config(queue_capacity=2),
-    )
-    router.record_loads(
-        (
-            load_snapshot(0, 100, waiting=2, running=3),
-            load_snapshot(1, 10, waiting=1, running=1),
-            load_snapshot(2, 1),
-        )
-    )
-    submit_request(router,
-        request_id=1,
-        prompt_token_ids=(1,),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-
-    # The request costs two blocks. DP2 has the lowest load but cannot fit it;
-    # among the eligible engines, DP1 wins on waiting+running even though DP0
-    # has substantially more KV credit. Both snapshots have exhausted the
-    # legacy queue-slot estimate; v2 deliberately leaves that authoritative
-    # check to LocalEngine rather than mirroring it in the Router.
-    assert router.poll_ingress_acks() == ()
-    assert engines[0].commands == []
-    assert [command.request_id for command in engines[1].commands] == [1]
-    assert engines[2].commands == []
-    metrics = router.admission_metrics()["per_engine"]
-    assert metrics["0"]["projected_batch"] == 5
-    assert metrics["1"]["projected_batch"] == 3
-    assert metrics["2"]["projected_batch"] == 0
-
-
-def test_router_least_batch_v2_precharges_projected_waiting():
-    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=4,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 100), load_snapshot(1, 10))
-    )
-    for request_id in range(1, 5):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    # Equal projected loads use KV only as a tie-break. Each assignment then
-    # immediately counts as waiting, so DP0's larger cache cannot attract the
-    # whole batch before a new load snapshot arrives.
-    assert [command.request_id for command in engines[0].commands] == [1, 3]
-    assert [command.request_id for command in engines[1].commands] == [2, 4]
-    metrics = router.admission_metrics()["per_engine"]
-    assert metrics["0"]["projected_waiting"] == 2
-    assert metrics["1"]["projected_waiting"] == 2
-
-
-def test_router_least_batch_v2_ack_does_not_release_compute_window():
-    engine = FakeAsyncEngine(0)
-    router = RequestRouter(
-        {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=4,
-        admission_planner_config=planner_config(),
-        max_unscheduled_requests=1,
-    )
-    router.record_loads((load_snapshot(0, 100),))
-    for request_id in (1, 2):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1]
-    assert router.pending_global_count == 1
-
-    engine.handles[0]["ready"] = True
-    assert [ack.request_id for ack in router.poll_ingress_acks()] == [1]
-    # A fast transport receipt frees the RPC flight, not compute credit.
-    assert [command.request_id for command in engine.commands] == [1]
-    assert router.pending_global_count == 1
-    metrics = router.admission_metrics()
-    assert metrics["per_engine"]["0"]["kv_outstanding_charges"] == 1
-    assert metrics["per_engine"]["0"][
-        "unscheduled_window_remaining"
-    ] == 0
-    assert metrics["unscheduled_gate_blocked"] >= 1
-
-    router.record_add_results((AddResultEvent(1, 0, True),))
-    router.record_first_schedule_events((FirstScheduleEvent(1, 0, 1.0),))
-    # First schedule returns the window slot and immediately dispatches the
-    # global FIFO head using the still-valid KV snapshot.
-    assert [command.request_id for command in engine.commands] == [1, 2]
-    assert router.pending_global_count == 0
-    assert router.owner(2) == RequestOwner(
-        OwnerState.PENDING_INGRESS, 0
-    )
-
-
-def test_router_least_batch_v2_rejects_duplicate_in_global_flight_and_terminal():
-    engine = FakeAsyncEngine(0)
-    router = RequestRouter(
-        {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads((load_snapshot(0, 10),))
-
-    def submit() -> None:
-        submit_request(router,
-            request_id=1,
-            prompt_token_ids=(1,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    submit()
-    submit()
-    duplicate = router.poll_ingress_acks()
-    assert len(duplicate) == 1
-    assert duplicate[0].reason == "duplicate_request_id"
-    assert [command.request_id for command in engine.commands] == [1]
-
-    submit()
-    duplicate = router.poll_ingress_acks()
-    assert len(duplicate) == 1
-    assert duplicate[0].reason == "duplicate_request_id"
-    assert [command.request_id for command in engine.commands] == [1]
-
-    engine.handles[0]["ready"] = True
-    assert router.poll_ingress_acks()[0].enqueued
-    router.record_add_results((AddResultEvent(1, 0, True),))
-    router.finish(FinishEvent(1, 16, "FINISHED", 0))
-    submit()
-    duplicate = router.poll_ingress_acks()
-    assert len(duplicate) == 1
-    assert duplicate[0].reason == "duplicate_request_id"
-
-
-def test_router_least_batch_v2_does_not_bypass_unfit_fifo_head():
-    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 4), load_snapshot(1, 4))
-    )
-    submit_request(router,
-        request_id=1,
-        prompt_token_ids=tuple(range(20)),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-    submit_request(router,
-        request_id=2,
-        prompt_token_ids=(1,),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-
-    # The head costs six blocks and blocks the one-token request behind it.
-    assert router.poll_ingress_acks() == ()
-    assert engines[0].commands == []
-    assert engines[1].commands == []
-    assert router.pending_global_count == 2
-    assert router.admission_metrics()["kv_gate_blocked"] == 1
-
-
-def test_router_least_batch_v2_refills_fast_flight_without_new_snapshot():
-    engines = {0: FakeAsyncEngine(0), 1: FakeAsyncEngine(1)}
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=2,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 10), load_snapshot(1, 10))
-    )
-    for request_id in range(1, 6):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engines[0].commands] == [1, 3]
-    assert [command.request_id for command in engines[1].commands] == [2, 4]
-    assert router.pending_global_count == 1
-
-    # Completing DP0's fast receipt opens its sole flight immediately. Request
-    # 5 is issued against the still-unused credit from the same load snapshot,
-    # rather than waiting for a decode quantum/load generation.
-    engines[0].handles[0]["ready"] = True
-    acks = router.poll_ingress_acks()
-    assert [ack.request_id for ack in acks] == [1, 3]
-    assert all(ack.enqueued and ack.admission_version is None for ack in acks)
-    assert [command.request_id for command in engines[0].commands] == [1, 3, 5]
-    assert router.pending_global_count == 0
-    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
-    assert router.owner(5) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
-    metrics = router.admission_metrics()
-    assert metrics["pending_rpc"] == 2
-    assert metrics["pending_rpc_requests"] == 3
-    assert metrics["per_engine"]["0"]["ingress_receipts"] == 2
-    assert metrics["per_engine"]["0"]["kv_credit_remaining"] == 4
-
-
-def test_router_least_batch_v2_queue_full_waits_for_fresh_load_generation():
-    engine = FakeAsyncEngine(0, enqueue_reasons=["queue_full", None])
-    router = RequestRouter(
-        {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads((load_snapshot(0, 10),))
-    submit_request(router,
-        request_id=1,
-        prompt_token_ids=(1,),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-    assert router.poll_ingress_acks() == ()
-    engine.handles[0]["ready"] = True
-    assert router.poll_ingress_acks() == ()
-    assert router.owner(1) == RequestOwner(OwnerState.PENDING_GLOBAL)
-    assert len(engine.commands) == 1
-
-    # Re-polling the same cached snapshot cannot spin or fall back.
-    assert router.poll_ingress_acks() == ()
-    assert len(engine.commands) == 1
-
-    router.record_loads((load_snapshot(0, 10, quantum_id=3),))
-    assert router.poll_ingress_acks() == ()
-    assert len(engine.commands) == 2
-    engine.handles[1]["ready"] = True
-    ack = router.poll_ingress_acks()
-    assert len(ack) == 1 and ack[0].enqueued
-    assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
-    metrics = router.admission_metrics()
-    assert metrics["global_retries"] == 1
-    assert metrics["per_engine"]["0"]["ingress_queue_full"] == 1
-
-
-def test_router_least_batch_v2_queue_full_does_not_block_healthy_dp():
-    engines = {
-        0: FakeAsyncEngine(0, enqueue_reasons=["queue_full"]),
-        1: FakeAsyncEngine(1),
-    }
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=1,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 10), load_snapshot(1, 10))
-    )
-    for request_id in (1, 2, 3):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engines[0].commands] == [1]
-    assert [command.request_id for command in engines[1].commands] == [2]
-    engines[0].handles[0]["ready"] = True
-    engines[1].handles[0]["ready"] = True
-
-    assert [ack.request_id for ack in router.poll_ingress_acks()] == [2]
-    # DP0 is generation-blocked, while DP1 immediately retries the original
-    # FIFO head before request 3.
-    assert [command.request_id for command in engines[1].commands] == [2, 1]
-    assert [
-        pending.command.request_id for pending in router._global_pending
-    ] == [3]
-
-
-def test_router_least_batch_v2_preserves_fifo_when_dp_batches_partially_fill():
-    engines = {
-        0: FakeAsyncEngine(0, enqueue_reasons=[None, "queue_full"]),
-        1: FakeAsyncEngine(1, enqueue_reasons=["queue_full", None]),
-    }
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=2,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 10), load_snapshot(1, 10))
-    )
-    for request_id in range(1, 5):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engines[0].commands] == [1, 3]
-    assert [command.request_id for command in engines[1].commands] == [2, 4]
-    submit_request(router,
-        request_id=5,
-        prompt_token_ids=(5,),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-    engines[0].handles[0]["ready"] = True
-    engines[1].handles[0]["ready"] = True
-
-    acks = router.poll_ingress_acks()
-
-    assert [ack.request_id for ack in acks] == [1, 4]
-    assert [
-        pending.command.request_id for pending in router._global_pending
-    ] == [2, 3, 5]
-
-
-def test_router_least_batch_v2_merges_retries_from_separate_dp_polls_in_fifo():
-    engines = {
-        0: FakeAsyncEngine(
-            0, enqueue_reasons=["queue_full", "queue_full"]
-        ),
-        1: FakeAsyncEngine(
-            1, enqueue_reasons=["queue_full", "queue_full"]
-        ),
-    }
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=2,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 10), load_snapshot(1, 10))
-    )
-    for request_id in range(1, 5):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-    assert router.poll_ingress_acks() == ()
-
-    engines[1].handles[0]["ready"] = True
-    assert router.poll_ingress_acks() == ()
-    assert [
-        pending.command.request_id for pending in router._global_pending
-    ] == [2, 4]
-
-    engines[0].handles[0]["ready"] = True
-    assert router.poll_ingress_acks() == ()
-    assert [
-        pending.command.request_id for pending in router._global_pending
-    ] == [1, 2, 3, 4]
-
-
-def test_router_least_batch_v2_cached_load_does_not_restore_kv_credit():
-    engine = FakeAsyncEngine(0)
-    router = RequestRouter(
-        {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_batch_size=2,
-        admission_planner_config=planner_config(),
-    )
-    snapshot = load_snapshot(0, 6)
-    router.record_loads((snapshot,))
-    for request_id in range(1, 5):
-        submit_request(router,
-            request_id=request_id,
-            prompt_token_ids=(request_id,),
-            max_tokens=16,
-            temperature=0.1,
-            ignore_eos=True,
-        )
-
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1, 2]
-    router.record_loads((snapshot,))
-    assert router.admission_metrics()["per_engine"]["0"][
-        "kv_credit_remaining"
-    ] == 2
-
-    engine.handles[0]["ready"] = True
-    assert [ack.request_id for ack in router.poll_ingress_acks()] == [1, 2]
-    assert [command.request_id for command in engine.commands] == [1, 2, 3]
-    router.record_loads((snapshot,))
-    assert router.admission_metrics()["per_engine"]["0"][
-        "kv_credit_remaining"
-    ] == 0
-    engine.handles[1]["ready"] = True
-    assert [ack.request_id for ack in router.poll_ingress_acks()] == [3]
-    assert [command.request_id for command in engine.commands] == [1, 2, 3]
-
-    router.record_loads((replace(snapshot, quantum_id=3),))
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1, 2, 3]
-
-    # Even a new quantum cannot re-grant credit while the requests have not
-    # reached first schedule. Once scheduling proves that their prompt KV is
-    # reflected in snapshots, a later capacity report may replenish credit.
-    router.record_loads((load_snapshot(0, 0, quantum_id=4),))
-    router.record_first_schedule_events(
-        tuple(
-            FirstScheduleEvent(
-                request_id,
-                0,
-                local_scheduler_queue_ms=1.0,
-            )
-            for request_id in (1, 2, 3)
-        )
-    )
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1, 2, 3]
-    router.record_loads(
-        (load_snapshot(0, 6, quantum_id=5, capacity_epoch=1),)
-    )
-    assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1, 2, 3, 4]
-
-
-def test_router_least_batch_v2_rejects_request_larger_than_empty_kv_capacity():
-    engine = FakeAsyncEngine(0)
-    router = RequestRouter(
-        {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads((load_snapshot(0, 250),))
-
-    submit_request(router,
-        request_id=1,
-        prompt_token_ids=(1,),
-        max_tokens=2_000,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-
-    ack = router.poll_ingress_acks()
-    assert len(ack) == 1
-    assert not ack[0].enqueued
-    assert "exceeds every LocalEngine KV capacity" in ack[0].reason
-    assert engine.commands == []
-
-
 def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
     actor_class = LocalEngineCore.__ray_metadata__.modified_class
     engine = object.__new__(actor_class)
@@ -1484,7 +1109,9 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert router.owner(5) == RequestOwner(OwnerState.PENDING_ADD, 0)
     assert router.record_finish_events(()) == ()
 
-    router.record_add_results((AddResultEvent(5, 0, True),))
+    router.record_add_results(
+        (AddResultEvent(5, 0, True, admission_version=1),)
+    )
     terminal_events = router.record_finish_events(())
     assert len(terminal_events) == 1
     assert terminal_events[0].request_id == 5
@@ -1493,12 +1120,11 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert router.is_idle
 
 
-def test_router_least_batch_v2_buffers_lifecycle_before_fast_receipt():
+def test_router_least_batch_buffers_lifecycle_before_staged_receipt():
     engine = FakeAsyncEngine(0)
     router = RequestRouter(
         {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
+        router_policy="least_batch",
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 10),))
@@ -1511,7 +1137,7 @@ def test_router_least_batch_v2_buffers_lifecycle_before_fast_receipt():
     )
     assert router.poll_ingress_acks() == ()
 
-    add_event = AddResultEvent(6, 0, True)
+    add_event = AddResultEvent(6, 0, True, admission_version=1)
     finish_event = FinishEvent(
         6,
         16,
@@ -1529,101 +1155,6 @@ def test_router_least_batch_v2_buffers_lifecycle_before_fast_receipt():
     assert router.record_finish_events(()) == (finish_event,)
     assert router.terminal_event(6) == finish_event
     assert router.is_idle
-
-
-def test_router_resyncs_after_unexpected_local_admission_mismatch(
-    monkeypatch,
-):
-    clock = {"now": 0.0}
-    monkeypatch.setattr(
-        "nanodeploy.router.request_router.perf_counter",
-        lambda: clock["now"],
-    )
-    engines = {
-        0: FakeAsyncEngine(
-            0, enqueue_reasons=["admission_state_mismatch"]
-        ),
-        1: FakeAsyncEngine(
-            1, enqueue_reasons=["admission_state_mismatch"]
-        ),
-    }
-    router = RequestRouter(
-        engines,
-        router_policy="least_batch",
-        admission_planner_config=planner_config(),
-    )
-    router.record_loads(
-        (load_snapshot(0, 10), load_snapshot(1, 10))
-    )
-    submit_request(router,
-        request_id=9,
-        prompt_token_ids=(1, 2),
-        max_tokens=16,
-        temperature=0.1,
-        ignore_eos=True,
-    )
-
-    assert router.poll_ingress_acks() == ()
-    engines[0].handles[0]["ready"] = True
-    assert router.poll_ingress_acks() == ()
-    clock["now"] = 10.0
-    engines[1].handles[0]["ready"] = True
-    assert router.poll_ingress_acks() == ()
-    assert router.owner(9) == RequestOwner(OwnerState.PENDING_GLOBAL)
-    assert router.pending_global_count == 1
-
-    # The unchanged load generation cannot spin on the same infeasible head.
-    assert router.poll_ingress_acks() == ()
-    assert len(engines[0].commands) == 1
-    assert len(engines[1].commands) == 1
-
-    clock["now"] = 35.0
-    router.record_loads(
-        (
-            load_snapshot(
-                0, 11, quantum_id=3, capacity_epoch=1
-            ),
-            load_snapshot(
-                1, 11, quantum_id=3, capacity_epoch=1
-            ),
-        )
-    )
-    assert router.poll_ingress_acks() == ()
-    assert len(engines[0].commands) == 2
-    engines[0].handles[1]["ready"] = True
-    ack = router.poll_ingress_acks()[0]
-    assert ack.enqueued
-    assert ack.router_pending_ms == 25_000.0
-    assert ack.admission_rpc_ms == 10_000.0
-    schedule_events = router.record_first_schedule_events(
-        (FirstScheduleEvent(9, 0, local_scheduler_queue_ms=7.0),)
-    )
-    assert len(schedule_events) == 1
-    assert schedule_events[0].global_capacity_queue_ms == 25_000.0
-    assert schedule_events[0].local_scheduler_queue_ms == 7.0
-    assert schedule_events[0].first_schedule_latency_ms == 25_007.0
-    router.record_add_results((AddResultEvent(9, 0, True),))
-    terminal = router.finish(
-        FinishEvent(
-            9,
-            16,
-            "FINISHED",
-            0,
-            first_forward_to_terminal_ms=1_000.0,
-        )
-    )
-    assert terminal.first_forward_to_terminal_ms == 1_000.0
-    assert terminal.global_capacity_queue_ms == 25_000.0
-    admission_metrics = router.admission_metrics()
-    assert admission_metrics["global_retries"] == 2
-    assert admission_metrics["state_mismatches"] == 2
-    assert admission_metrics["fallbacks"] == 0
-    assert admission_metrics["per_engine"]["0"]["attempts"] == 2
-    assert admission_metrics["per_engine"]["0"]["deferred"] == 0
-    assert admission_metrics["per_engine"]["0"]["state_mismatches"] == 1
-    assert admission_metrics["per_engine"]["1"]["attempts"] == 1
-    assert admission_metrics["per_engine"]["1"]["deferred"] == 0
-    assert admission_metrics["per_engine"]["1"]["state_mismatches"] == 1
 
 
 def test_router_least_cache_uses_padded_request_blocks_optimistically():
@@ -1770,12 +1301,18 @@ def test_router_async_ingress_fallback_and_add_state_transition():
         router.admission_metrics()["per_engine"]["1"][
             "tentative_admissions"
         ]
-        == 0
+        == 1
     )
 
-    result = AddResultEvent(40, 1, True)
+    result = AddResultEvent(40, 1, True, admission_version=1)
     assert router.record_add_results((result,)) == (result,)
     assert router.owner(40) == RequestOwner(OwnerState.OWNED, 1)
+    assert (
+        router.admission_metrics()["per_engine"]["1"][
+            "tentative_admissions"
+        ]
+        == 0
+    )
 
 
 def test_router_buffers_add_result_observed_before_ingress_ack():
@@ -1794,7 +1331,7 @@ def test_router_buffers_add_result_observed_before_ingress_ack():
     )
     assert router.poll_ingress_acks() == ()
 
-    event = AddResultEvent(41, 0, True)
+    event = AddResultEvent(41, 0, True, admission_version=1)
     assert router.record_add_results((event,)) == ()
     engine.handles[0]["ready"] = True
     assert router.poll_ingress_acks()[0].enqueued
@@ -1839,12 +1376,14 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine.scheduler = FakeScheduler()
     engine._failure = None
     engine._ingress_adds = queue.Queue()
+    engine._ingress_head = None
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set()
     engine._ingress_pending_ids = set()
-    engine._cancelled_ingress_ids = set()
     engine._admission_pending_ids = set()
+    engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
+    engine._ingress_version = 0
     engine._admission_version = 0
     engine._capacity_epoch = 0
     engine._events_lock = threading.Lock()
@@ -1858,6 +1397,9 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._coordinator = None
     engine._ingress_queue_delay_ms_total = 0.0
     engine._scheduler_add_ms_total = 0.0
+    engine._local_transient_retries = 0
+    engine._staged_ingress_depth_max = 0
+    engine._planned_commit_attempts = 0
 
     command_sequences = [
         local_add_pair(request_id, (1, 2))
@@ -1886,7 +1428,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     assert engine.enqueue_add(commands[2], sequences[2]).enqueued
     assert engine.submit_abort(52).status == "abort_pending"
     engine._drain_ingress()
-    assert engine.drain_add_results()[0].accepted
+    assert engine.drain_add_results() == ()
     assert engine.drain_events() == (
         FinishEvent(50, 16, "FINISHED", 0),
         FinishEvent(52, 0, "ABORTED", 0),
@@ -1894,7 +1436,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     assert engine._reserved_slots == 1
 
 
-def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
+def test_local_engine_planned_stage_uses_one_lock_scope_and_one_wakeup():
     class RemoteRecorder:
         def __init__(self):
             self.calls = []
@@ -1906,6 +1448,7 @@ def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
     engine = object.__new__(actor_class)
     engine.config = SimpleNamespace(
         attention_dp=2,
+        attention_sp=1,
         hierarchical_queue_capacity=8,
     )
     engine.engine_id = 0
@@ -1914,8 +1457,11 @@ def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set()
     engine._ingress_pending_ids = set()
+    engine._admission_pending_ids = set()
     engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
+    engine._ingress_version = 0
+    engine._staged_ingress_depth_max = 0
     engine._state_cv = threading.Condition()
     engine._wave_id = 7
     first_request = RemoteRecorder()
@@ -1926,14 +1472,174 @@ def test_local_engine_enqueue_batch_uses_one_lock_scope_and_one_wakeup():
     )
     commands = tuple(item[0] for item in command_sequences)
     sequences = tuple(item[1] for item in command_sequences)
+    reservations = tuple(
+        AdmissionReservation(
+            request_id=command.request_id,
+            engine_id=0,
+            master_sp_idx=0,
+            dispatched_tokens=(command.num_tokens,),
+        )
+        for command in commands
+    )
 
-    acks = engine.enqueue_add_batch(commands, sequences)
+    acks = engine.admit_add_batch(commands, reservations, sequences)
 
     assert [ack.request_id for ack in acks] == [1, 2, 3]
     assert all(ack.enqueued for ack in acks)
+    assert [ack.ingress_version for ack in acks] == [1, 2, 3]
+    assert all(ack.admission_version is None for ack in acks)
     assert engine._reserved_slots == 3
     assert engine._ingress_adds.qsize() == 3
     assert first_request.calls == [(0, 7)]
+
+    invalid_command, invalid_sequence = local_add_pair(4, (4,), wave_id=7)
+    invalid = engine.admit_add_batch(
+        (invalid_command,),
+        (AdmissionReservation(4, 0, 1, (1,)),),
+        (invalid_sequence,),
+    )[0]
+    assert not invalid.enqueued
+    assert invalid.reason == "invalid_admission_reservation"
+    assert engine._ingress_version == 3
+    assert first_request.calls == [(0, 7)]
+
+
+def test_local_engine_transient_planned_head_retries_without_reordering():
+    class FakeScheduler:
+        def __init__(self):
+            self.calls = []
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            request_id = commands[0].request_id
+            self.calls.append(request_id)
+            if self.calls == [1]:
+                return (
+                    AddResult(
+                        request_id,
+                        False,
+                        engine_id=0,
+                        reason="admission_state_mismatch",
+                    ),
+                )
+            return (AddResult(request_id, True, engine_id=0),)
+
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(
+        max_ingress_batch_requests=8,
+        max_ingress_drain_ms=0.0,
+    )
+    engine.engine_id = 0
+    engine.scheduler = FakeScheduler()
+    engine._failure = None
+    engine._ingress_adds = queue.Queue()
+    engine._ingress_head = None
+    engine._ingress_lock = threading.Lock()
+    engine._reserved_request_ids = {1, 2}
+    engine._ingress_pending_ids = {1, 2}
+    engine._cancelled_ingress_ids = set()
+    engine._reserved_slots = 2
+    engine._admission_version = 0
+    engine._capacity_epoch = 0
+    engine._events_lock = threading.Lock()
+    engine._add_result_events = deque()
+    engine._terminal_events = deque()
+    engine._ingress_queue_delay_ms_total = 0.0
+    engine._scheduler_add_ms_total = 0.0
+    engine._local_transient_retries = 0
+    engine._planned_commit_attempts = 0
+    for request_id in (1, 2):
+        command, sequence = local_add_pair(request_id, (request_id,))
+        engine._ingress_adds.put_nowait(
+            _IngressAdd(
+                command,
+                sequence,
+                reservation=AdmissionReservation(
+                    request_id=request_id,
+                    engine_id=0,
+                    master_sp_idx=0,
+                    dispatched_tokens=(1,),
+                ),
+                ingress_version=request_id,
+            )
+        )
+
+    engine._drain_ingress()
+    assert engine.scheduler.calls == [1]
+    assert engine._ingress_head.command.request_id == 1
+    assert engine._ingress_adds.qsize() == 1
+    assert engine.drain_add_results() == ()
+
+    engine._drain_ingress()
+    assert engine.scheduler.calls == [1, 1, 2]
+    assert engine._ingress_head is None
+    assert [event.request_id for event in engine.drain_add_results()] == [1, 2]
+    assert engine._local_transient_retries == 1
+    assert engine._planned_commit_attempts == 3
+
+
+def test_local_engine_abort_during_planned_commit_wins_ownership_handoff():
+    class FakeScheduler:
+        def __init__(self):
+            self._events = ()
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            request_id = commands[0].request_id
+            with engine._ingress_lock:
+                engine._cancelled_ingress_ids.add(request_id)
+            return (AddResult(request_id, True, engine_id=0),)
+
+        def abort(self, request_id):
+            self._events = (FinishEvent(request_id, 0, "ABORTED", 0),)
+            return AbortResult(request_id, "aborted")
+
+        def drain_terminal_events(self):
+            events = self._events
+            self._events = ()
+            return events
+
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.config = SimpleNamespace(
+        max_ingress_batch_requests=8,
+        max_ingress_drain_ms=0.0,
+    )
+    engine.engine_id = 0
+    engine.scheduler = FakeScheduler()
+    engine._failure = None
+    engine._ingress_adds = queue.Queue()
+    engine._ingress_head = None
+    engine._ingress_lock = threading.Lock()
+    engine._reserved_request_ids = {1}
+    engine._ingress_pending_ids = {1}
+    engine._cancelled_ingress_ids = set()
+    engine._reserved_slots = 1
+    engine._admission_version = 0
+    engine._capacity_epoch = 0
+    engine._events_lock = threading.Lock()
+    engine._add_result_events = deque()
+    engine._terminal_events = deque()
+    engine._ingress_queue_delay_ms_total = 0.0
+    engine._scheduler_add_ms_total = 0.0
+    engine._local_transient_retries = 0
+    engine._planned_commit_attempts = 0
+    command, sequence = local_add_pair(1, (1,))
+    engine._ingress_adds.put_nowait(
+        _IngressAdd(
+            command,
+            sequence,
+            reservation=AdmissionReservation(1, 0, 0, (1,)),
+            ingress_version=1,
+        )
+    )
+
+    engine._drain_ingress()
+
+    assert engine.drain_add_results() == ()
+    assert engine.drain_events() == (FinishEvent(1, 0, "ABORTED", 0),)
+    assert engine._reserved_slots == 0
+    assert engine._cancelled_ingress_ids == set()
+    assert engine._admission_version == 1
 
 
 def test_local_engine_future_ingress_abort_tombstone_wins_enqueue_race():
@@ -1952,6 +1658,8 @@ def test_local_engine_future_ingress_abort_tombstone_wins_enqueue_race():
     engine._admission_pending_ids = set()
     engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
+    engine._ingress_version = 0
+    engine._staged_ingress_depth_max = 0
     engine._state_cv = threading.Condition()
     engine._wave_id = 0
     engine._wave_running = False
@@ -1970,7 +1678,7 @@ def test_local_engine_future_ingress_abort_tombstone_wins_enqueue_race():
     assert engine._cancelled_ingress_ids == set()
 
 
-def test_router_least_batch_v2_reconciles_abort_after_fast_receipt():
+def test_router_least_batch_reconciles_abort_after_staged_receipt():
     @dataclass
     class AbortRaceEngine(FakeAsyncEngine):
         abort_modes: list[bool] = field(default_factory=list)
@@ -1990,8 +1698,7 @@ def test_router_least_batch_v2_reconciles_abort_after_fast_receipt():
     engine = AbortRaceEngine(0)
     router = RequestRouter(
         {0: engine},
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
+        router_policy="least_batch",
         admission_planner_config=planner_config(),
     )
     router.record_loads((load_snapshot(0, 10),))
@@ -2012,7 +1719,7 @@ def test_router_least_batch_v2_reconciles_abort_after_fast_receipt():
     assert router.owner(1) == RequestOwner(OwnerState.PENDING_ADD, 0)
 
 
-def test_router_least_batch_v2_does_not_retry_aborted_queue_full_receipt():
+def test_router_least_batch_does_not_retry_aborted_queue_full_receipt():
     @dataclass
     class AbortRaceEngine(FakeAsyncEngine):
         cleared_ingress_aborts: list[int] = field(default_factory=list)
@@ -2037,8 +1744,7 @@ def test_router_least_batch_v2_does_not_retry_aborted_queue_full_receipt():
     }
     router = RequestRouter(
         engines,
-        router_policy="least_batch_v2",
-        kvcache_block_size=4,
+        router_policy="least_batch",
         admission_planner_config=planner_config(),
     )
     router.record_loads(
@@ -2063,113 +1769,6 @@ def test_router_least_batch_v2_does_not_retry_aborted_queue_full_receipt():
     assert router.owner(1) is None
     assert router.terminal_event(1).status == "ABORTED"
     assert router.abort(1).status == "already_terminal"
-
-
-def test_local_engine_commits_lb_plans_and_reports_state_mismatch():
-    class FakeScheduler:
-        def __init__(self):
-            self.batches = []
-
-        def commit_planned_batch(
-            self, commands, reservations, sequences
-        ):
-            self.batches.append(
-                tuple(
-                    (
-                        command.request_id,
-                        reservation.master_sp_idx,
-                    )
-                    for command, reservation in zip(
-                        commands, reservations, strict=True
-                    )
-                )
-            )
-            return tuple(
-                {
-                    60: AddResult(60, True, engine_id=0),
-                    61: AddResult(
-                        61,
-                        False,
-                        engine_id=0,
-                        reason="admission_state_mismatch",
-                    ),
-                }[command.request_id]
-                for command in commands
-            )
-
-    actor_class = LocalEngineCore.__ray_metadata__.modified_class
-    engine = object.__new__(actor_class)
-    engine.config = SimpleNamespace(attention_dp=1)
-    engine.engine_id = 0
-    engine.scheduler = FakeScheduler()
-    engine._failure = None
-    engine._coordinator = None
-    engine._command_count = 0
-    engine._command_queue_delay_ms_total = 0.0
-    engine._ingress_lock = threading.Lock()
-    engine._reserved_request_ids = set()
-    engine._ingress_pending_ids = set()
-    engine._admission_pending_ids = {60, 61}
-    engine._cancelled_ingress_ids = set()
-    engine._reserved_slots = 0
-    engine._admission_version = 0
-    engine._capacity_epoch = 0
-    engine._events_lock = threading.Lock()
-    engine._add_result_events = deque()
-    engine._terminal_events = deque()
-    engine._state_cv = threading.Condition()
-    engine._wave_running = False
-    engine._wave_id = 0
-    engine._quantum_id = 0
-
-    def loop_command(request_id):
-        command, sequence = local_add_pair(request_id, (1, 2))
-        return SimpleNamespace(
-            kind="admit",
-            payload=_PlannedAdmission(
-                command,
-                sequence,
-                AdmissionReservation(
-                    request_id=request_id,
-                    engine_id=0,
-                    master_sp_idx=request_id - 60,
-                    dispatched_tokens=(2,),
-                ),
-            ),
-            enqueued_at=0.0,
-            completed=threading.Event(),
-            result=None,
-            error=None,
-        )
-
-    accepted = loop_command(60)
-    deferred = loop_command(61)
-    engine._complete_admission_commands((accepted, deferred))
-    assert engine.scheduler.batches == [((60, 0), (61, 1))]
-    assert accepted.error is None
-    assert accepted.result.request_id == 60
-    assert accepted.result.engine_id == 0
-    assert accepted.result.enqueued
-    assert accepted.result.admission_version == 1
-    assert accepted.result.local_command_queue_ms >= 0.0
-    assert accepted.result.local_admission_ms >= 0.0
-    assert engine._reserved_request_ids == {60}
-    assert engine._reserved_slots == 1
-    assert engine.drain_add_results() == (
-        AddResultEvent(60, 0, True),
-    )
-    assert engine._wave_running
-
-    assert deferred.error is None
-    assert deferred.result.request_id == 61
-    assert deferred.result.engine_id == 0
-    assert not deferred.result.enqueued
-    assert deferred.result.reason == "admission_state_mismatch"
-    assert deferred.result.local_command_queue_ms >= 0.0
-    assert deferred.result.local_admission_ms >= 0.0
-    assert engine._reserved_request_ids == {60}
-    assert engine._reserved_slots == 1
-    assert 61 not in engine._admission_pending_ids
 
 
 def test_decode_coordinator_ready_wave_and_racing_wakeup():

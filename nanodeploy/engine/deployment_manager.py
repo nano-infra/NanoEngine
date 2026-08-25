@@ -5,6 +5,7 @@ import os
 import threading
 from dataclasses import dataclass
 from math import ceil
+from time import monotonic
 from typing import Any, Iterator, Mapping
 
 import ray
@@ -169,6 +170,12 @@ class ZmqEngineTransport:
         self.frontend.close()
 
 
+@dataclass(slots=True)
+class _FrontendEventFlight:
+    ref: Any
+    started_at: float
+
+
 class DeploymentManager:
     """Owns hierarchical actors, exact DP placement groups, and cleanup."""
 
@@ -189,6 +196,7 @@ class DeploymentManager:
         self.coordinator: Any | None = None
         self.engine_clients: dict[int, ZmqEngineTransport] = {}
         self._frontend_context: zmq.Context | None = None
+        self._frontend_event_flights: dict[int, _FrontendEventFlight] = {}
         self.ready: tuple[EngineReady, ...] = ()
         self._expected_node_by_engine: dict[int, str] = {}
 
@@ -410,6 +418,7 @@ class DeploymentManager:
                     timeout=self.config.quantum_timeout_s,
                     frontend=frontend,
                 )
+                self._arm_frontend_event_flight(engine_id)
 
     def notify_request(
         self, target_engine_id: int, observed_wave_id: int
@@ -453,30 +462,92 @@ class DeploymentManager:
                 ready_batches[engine_id] = acks
         return ready_batches
 
+    def _arm_frontend_event_flight(self, engine_id: int) -> None:
+        if engine_id in self._frontend_event_flights:
+            raise RuntimeError(
+                f"engine {engine_id} already has a frontend event flight"
+            )
+        actor = self.engines[engine_id]
+        self._frontend_event_flights[engine_id] = _FrontendEventFlight(
+            ref=actor.drain_frontend_events.remote(),
+            started_at=monotonic(),
+        )
+
+    def poll_ready_frontend_events(self) -> tuple[FrontendEventBatch, ...]:
+        """Consume ready per-DP event refs without waiting for slow engines."""
+        try:
+            with _without_proxy_env():
+                if not self._frontend_event_flights:
+                    for engine_id in sorted(self.engines):
+                        self._arm_frontend_event_flight(engine_id)
+                flights = dict(self._frontend_event_flights)
+                refs = [flight.ref for flight in flights.values()]
+                ready_refs, _ = ray.wait(
+                    refs,
+                    num_returns=len(refs),
+                    timeout=0,
+                )
+                ready_ref_set = set(ready_refs)
+                ready_engine_ids = [
+                    engine_id
+                    for engine_id, flight in sorted(flights.items())
+                    if flight.ref in ready_ref_set
+                ]
+                batches = (
+                    ray.get(
+                        [
+                            flights[engine_id].ref
+                            for engine_id in ready_engine_ids
+                        ]
+                    )
+                    if ready_engine_ids
+                    else []
+                )
+                now = monotonic()
+                overdue = [
+                    engine_id
+                    for engine_id, flight in flights.items()
+                    if (
+                        engine_id not in ready_engine_ids
+                        and now - flight.started_at
+                        > self.config.quantum_timeout_s
+                    )
+                ]
+                if overdue:
+                    raise TimeoutError(
+                        "frontend event flight timed out for engines "
+                        f"{sorted(overdue)}"
+                    )
+                for engine_id, batch in zip(
+                    ready_engine_ids, batches, strict=True
+                ):
+                    if batch.engine_id != engine_id:
+                        raise RuntimeError(
+                            "LocalEngine frontend event batch owner mismatch: "
+                            f"expected={engine_id}, got={batch.engine_id}"
+                        )
+                    self._frontend_event_flights.pop(engine_id)
+                    self._arm_frontend_event_flight(engine_id)
+            return tuple(batches)
+        except BaseException:
+            self.close()
+            raise
+
+    def frontend_event_flight_metrics(self) -> dict[str, float | int]:
+        """Return nonblocking frontend event-flight health counters."""
+        now = monotonic()
+        ages = tuple(
+            max(0.0, now - flight.started_at)
+            for flight in self._frontend_event_flights.values()
+        )
+        return {
+            "pending": len(ages),
+            "oldest_age_ms": max(ages, default=0.0) * 1000,
+        }
+
     def poll_frontend_events(self) -> tuple[FrontendEventBatch, ...]:
-        """Fetch health, load, and all lifecycle events in one RPC per DP."""
-        engine_items = sorted(self.engines.items())
-        with _without_proxy_env():
-            try:
-                batches = ray.get(
-                    [
-                        actor.drain_frontend_events.remote()
-                        for _, actor in engine_items
-                    ],
-                    timeout=self.config.quantum_timeout_s,
-                )
-            except BaseException:
-                self.close()
-                raise
-        for (engine_id, _), batch in zip(
-            engine_items, batches, strict=True
-        ):
-            if batch.engine_id != engine_id:
-                raise RuntimeError(
-                    "LocalEngine frontend event batch owner mismatch: "
-                    f"expected={engine_id}, got={batch.engine_id}"
-                )
-        return tuple(batches)
+        """Compatibility alias for the nonblocking consolidated event poll."""
+        return self.poll_ready_frontend_events()
 
     def poll_events(self) -> tuple[FinishEvent, ...]:
         with _without_proxy_env():
@@ -654,6 +725,7 @@ class DeploymentManager:
                 for client in self.engine_clients.values():
                     client.close()
                 self.engine_clients.clear()
+                self._frontend_event_flights.clear()
                 if self._frontend_context is not None:
                     self._frontend_context.term()
                     self._frontend_context = None

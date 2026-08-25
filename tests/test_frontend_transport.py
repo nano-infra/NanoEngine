@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -14,6 +17,7 @@ from nanodeploy._cpp import (
 )
 from nanodeploy.engine.frontend_transport import (
     FRONTEND_PROTOCOL_VERSION,
+    FrontendFlight,
     FrontendPing,
     FrontendTransportProtocolError,
     FrontendTransportTimeout,
@@ -81,7 +85,7 @@ def _start_pair(
                 command.request_id,
                 2,
                 True,
-                admission_version=9,
+                ingress_version=9,
             )
             for command in commands
         )
@@ -116,6 +120,17 @@ def _wait_ingress(client, flight):
             return acks
         time.sleep(0.001)
     raise AssertionError("frontend ingress response did not arrive")
+
+
+def _strip_server_metrics(acks):
+    return tuple(
+        replace(
+            ack,
+            sequence_deserialize_ms=None,
+            sequence_payload_bytes=None,
+        )
+        for ack in acks
+    )
 
 
 def test_frontend_protocol_round_trip_and_strict_unknown_fields():
@@ -163,10 +178,14 @@ def test_frontend_zmq_routes_add_enqueue_and_planned_admission():
 
         admission_acks = _wait_ingress(client, admission_flight)
         enqueue_acks = _wait_ingress(client, enqueue_flight)
-        assert admission_acks == (
-            IngressAck(2, 2, True, admission_version=9),
+        assert _strip_server_metrics(admission_acks) == (
+            IngressAck(2, 2, True, ingress_version=9),
         )
-        assert enqueue_acks == (IngressAck(1, 2, True),)
+        assert _strip_server_metrics(enqueue_acks) == (
+            IngressAck(1, 2, True),
+        )
+        assert admission_acks[0].sequence_deserialize_ms >= 0.0
+        assert admission_acks[0].sequence_payload_bytes > 0
         assert [entry[0] for entry in observed] == [
             "add",
             "enqueue",
@@ -238,9 +257,9 @@ def test_frontend_zmq_preserves_migrating_sequence_state():
 
     server, context, client, _ = _start_pair(enqueue=enqueue)
     try:
-        assert _wait_ingress(client, client.enqueue((command,))) == (
-            IngressAck(99, 2, True),
-        )
+        acks = _wait_ingress(client, client.enqueue((command,)))
+        assert _strip_server_metrics(acks) == (IngressAck(99, 2, True),)
+        assert acks[0].sequence_payload_bytes > 0
         assert len(received) == 1
         restored = received[0]
         assert restored.seq_id == 99
@@ -288,3 +307,23 @@ def test_frontend_zmq_connect_is_bounded_and_server_close_is_idempotent():
     context.term()
     server.close(2.0)
     server.close(2.0)
+
+
+def test_frontend_async_receipt_poll_has_fail_stop_deadline():
+    client = object.__new__(ZmqFrontendClient)
+    client.engine_id = 2
+    client._owner_thread_id = threading.get_ident()
+    client._closed = False
+    client._completed = {}
+    client._socket = object()
+    client._poller = SimpleNamespace(poll=lambda _timeout: [])
+    flight = FrontendFlight(
+        engine_id=2,
+        transport_id=7,
+        response_kind="ingress",
+        deadline=time.monotonic() - 1.0,
+    )
+    client._pending = {7: flight}
+
+    with pytest.raises(FrontendTransportTimeout, match="outcome is unknown"):
+        client.poll_ingress(flight)

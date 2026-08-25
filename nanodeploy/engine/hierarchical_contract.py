@@ -126,17 +126,21 @@ class IngressAck:
     engine_id: int
     enqueued: bool
     reason: str | None = None
-    # Monotonic LocalEngine admission commit version. A successful
-    # centralized-admission ACK carries the version that will be visible in
-    # subsequent cached load snapshots.
+    # Compatibility field for synchronous local admission. Planned staged
+    # receipts leave this unset; their authoritative commit version arrives on
+    # AddResultEvent and is later reflected in LoadSnapshot.
     admission_version: int | None = None
+    # Monotonic LocalEngine staged-ingress ownership version. A positive
+    # planned-admission receipt carries this version while admission_version
+    # remains None until the scheduler commit is authoritative.
+    ingress_version: int | None = None
     # Capacity epoch observed by the LocalEngine planner. Transient admission
     # failures remain blocked until a later snapshot advances past this epoch.
     capacity_epoch: int | None = None
     # Frontend monotonic-clock intervals. router_pending_ms covers time in
     # RequestRouter before control RPC attempts. admission_rpc_ms retains its
-    # historical name: for centralized least_batch it ends at authoritative
-    # admission, while least_batch_v2 ends at the fast ingress receipt.
+    # historical name but now ends at the staged-ingress receipt; scheduler
+    # commit latency is reported by AddResultEvent.
     router_pending_ms: float | None = None
     admission_rpc_ms: float | None = None
     # LocalEngine monotonic-clock intervals for the final admission attempt.
@@ -144,6 +148,10 @@ class IngressAck:
     # inside the destination actor.
     local_command_queue_ms: float | None = None
     local_admission_ms: float | None = None
+    # Server-side Sequence decode time is the enclosing batch total; payload
+    # bytes are for this request's multipart frame.
+    sequence_deserialize_ms: float | None = None
+    sequence_payload_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +160,9 @@ class AddResultEvent:
     engine_id: int
     accepted: bool
     reason: str | None = None
+    admission_version: int | None = None
+    local_planned_queue_ms: float | None = None
+    local_admission_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +283,8 @@ class LoadSnapshot:
     wave_id: int
     quantum_id: int
     admission_version: int = 0
+    # Highest positive staged-ingress receipt reflected by reserved_slots.
+    ingress_version: int = 0
     # Monotonic LocalEngine capacity generation. Unlike admission_version,
     # this only advances when a lifecycle reservation is released, so a
     # deferred global admission batch is not retried against unchanged
@@ -309,6 +322,10 @@ class LoadSnapshot:
     reserved_slots: int = 0
     ingress_queue_delay_ms_total: float = 0.0
     scheduler_add_ms_total: float = 0.0
+    local_transient_retries: int = 0
+    staged_ingress_depth_max: int = 0
+    planned_commit_attempts: int = 0
+    payload_retry_bytes: int = 0
     decode_itl_ms_weighted_total: float = 0.0
     decode_itl_token_count: int = 0
     decode_itl_sample_count: int = 0

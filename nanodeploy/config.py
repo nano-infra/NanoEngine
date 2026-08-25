@@ -60,7 +60,7 @@ class Config:
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
     scheduler_arch: Literal["legacy_global", "hierarchical"] = "legacy_global"
     router_policy: Literal[
-        "round_robin", "least_batch", "least_batch_v2", "least_cache"
+        "round_robin", "least_batch", "least_cache"
     ] = "least_batch"
     load_report_interval_ms: int = 100
     hierarchical_queue_capacity: int = 4096
@@ -254,12 +254,11 @@ class Config:
         if self.router_policy not in {
             "round_robin",
             "least_batch",
-            "least_batch_v2",
             "least_cache",
         }:
             raise ValueError(
                 "router_policy must be one of: "
-                "round_robin, least_batch, least_batch_v2, least_cache"
+                "round_robin, least_batch, least_cache"
             )
         if self.load_report_interval_ms <= 0:
             raise ValueError("load_report_interval_ms must be positive")

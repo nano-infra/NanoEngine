@@ -4,7 +4,7 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, TypeAlias
 
 import msgspec
@@ -19,7 +19,7 @@ from nanodeploy.engine.hierarchical_contract import (
 )
 
 
-FRONTEND_PROTOCOL_VERSION = 2
+FRONTEND_PROTOCOL_VERSION = 3
 MAX_FRONTEND_REQUEST_BYTES = 1 << 30
 MAX_FRONTEND_RESPONSE_BYTES = 16 << 20
 _MAX_FAILURE_MESSAGE_CHARS = 8 << 10
@@ -74,11 +74,14 @@ class _WireIngressAck(msgspec.Struct, array_like=True, frozen=True):
     enqueued: bool
     reason: str | None
     admission_version: int | None
+    ingress_version: int | None
     capacity_epoch: int | None
     router_pending_ms: float | None
     admission_rpc_ms: float | None
     local_command_queue_ms: float | None
     local_admission_ms: float | None
+    sequence_deserialize_ms: float | None
+    sequence_payload_bytes: int | None
 
 
 class FrontendPing(
@@ -215,6 +218,7 @@ class FrontendFlight:
     engine_id: int
     transport_id: int
     response_kind: str
+    deadline: float
 
 
 def _wire_command(command: AddCommand) -> _WireAddCommand:
@@ -289,11 +293,14 @@ def _wire_ack(ack: IngressAck) -> _WireIngressAck:
         ack.enqueued,
         ack.reason,
         ack.admission_version,
+        ack.ingress_version,
         ack.capacity_epoch,
         ack.router_pending_ms,
         ack.admission_rpc_ms,
         ack.local_command_queue_ms,
         ack.local_admission_ms,
+        ack.sequence_deserialize_ms,
+        ack.sequence_payload_bytes,
     )
 
 
@@ -304,11 +311,14 @@ def _ack_from_wire(ack: _WireIngressAck) -> IngressAck:
         enqueued=ack.enqueued,
         reason=ack.reason,
         admission_version=ack.admission_version,
+        ingress_version=ack.ingress_version,
         capacity_epoch=ack.capacity_epoch,
         router_pending_ms=ack.router_pending_ms,
         admission_rpc_ms=ack.admission_rpc_ms,
         local_command_queue_ms=ack.local_command_queue_ms,
         local_admission_ms=ack.local_admission_ms,
+        sequence_deserialize_ms=ack.sequence_deserialize_ms,
+        sequence_payload_bytes=ack.sequence_payload_bytes,
     )
 
 
@@ -606,9 +616,13 @@ class ZmqFrontendServer:
                 _command_from_wire(command)
                 for command in request.commands
             )
+            deserialize_begin = time.monotonic()
             sequences = self._decode_sequences(
                 payload_frames, len(commands)
             )
+            sequence_deserialize_ms = (
+                time.monotonic() - deserialize_begin
+            ) * 1000
             if isinstance(request, FrontendEnqueueRequest):
                 acks = self._enqueue_batch(commands, sequences)
             else:
@@ -623,6 +637,14 @@ class ZmqFrontendServer:
                 acks = self._admit_batch(
                     commands, reservations, sequences
                 )
+            acks = tuple(
+                replace(
+                    ack,
+                    sequence_deserialize_ms=sequence_deserialize_ms,
+                    sequence_payload_bytes=len(payload),
+                )
+                for ack, payload in zip(acks, payload_frames, strict=True)
+            )
             return FrontendIngressResponse(
                 FRONTEND_PROTOCOL_VERSION,
                 self.deployment_epoch,
@@ -847,13 +869,14 @@ class ZmqFrontendClient:
         if self._closed:
             raise FrontendTransportError("frontend ZMQ client is closed")
         transport_id = self._next_transport_id
+        deadline = time.monotonic() + self.request_timeout_s
         flight = FrontendFlight(
             engine_id=self.engine_id,
             transport_id=transport_id,
             response_kind=response_kind,
+            deadline=deadline,
         )
         message = build(transport_id)
-        deadline = time.monotonic() + self.request_timeout_s
         self._send_frames(
             (encode_frontend_request(message), *payloads),
             deadline,
@@ -864,12 +887,11 @@ class ZmqFrontendClient:
         return flight
 
     def _wait(self, flight: FrontendFlight) -> FrontendResponse:
-        deadline = time.monotonic() + self.request_timeout_s
         while True:
             response = self._pop_completed(flight)
             if response is not None:
                 return response
-            self._receive_and_buffer(deadline, "frontend response")
+            self._receive_and_buffer(flight.deadline, "frontend response")
 
     def _poll(self, flight: FrontendFlight) -> FrontendResponse | None:
         self._assert_flight(flight)
@@ -887,6 +909,10 @@ class ZmqFrontendClient:
             if response is not None:
                 return response
             events = dict(self._poller.poll(0))
+        if time.monotonic() >= flight.deadline:
+            raise FrontendTransportTimeout(
+                "frontend receipt outcome is unknown after response timeout"
+            )
         return None
 
     def _receive_and_buffer(

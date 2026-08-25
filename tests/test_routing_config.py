@@ -71,7 +71,7 @@ def test_routing_strategy_binding_only_exports_supported_values():
 
 @pytest.mark.parametrize(
     "router_policy",
-    ["round_robin", "least_batch", "least_batch_v2", "least_cache"],
+    ["round_robin", "least_batch", "least_cache"],
 )
 def test_router_policy_config(router_policy):
     config = make_config(router_policy=router_policy)

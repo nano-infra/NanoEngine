@@ -145,7 +145,6 @@ def parse_args():
         choices=[
             "round_robin",
             "least_batch",
-            "least_batch_v2",
             "least_cache",
         ],
         help="Hierarchical load-balancer policy (default: least_batch).",
@@ -637,6 +636,16 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
         "local_admission_ms": metric_percentiles(
             records, "local_admission_ms"
         ),
+        "staged_queue_ms": metric_percentiles(records, "staged_queue_ms"),
+        "planned_commit_ms": metric_percentiles(
+            records, "planned_commit_ms"
+        ),
+        "sequence_deserialize_ms": metric_percentiles(
+            records, "sequence_deserialize_ms"
+        ),
+        "sequence_payload_bytes": metric_percentiles(
+            records, "sequence_payload_bytes"
+        ),
         "admission_rpc_residual_ms": metric_percentiles(
             records, "admission_rpc_residual_ms"
         ),
@@ -647,9 +656,8 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "T0->T1: scheduled arrival to actual benchmark dispatch"
         ),
         "ingress_ack_latency_ms_definition": (
-            "benchmark dispatch to Router-observed receipt; authoritative "
-            "admission for least_batch, fast ingress receipt for "
-            "least_batch_v2"
+            "benchmark dispatch to Router-observed bounded staged-ingress "
+            "receipt"
         ),
         "router_pending_ms_definition": (
             "RequestRouter submit to admission RPC issue, accumulated across "
@@ -658,15 +666,28 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
         ),
         "admission_rpc_ms_definition": (
             "frontend monotonic time across LocalEngine control RPC attempts "
-            "until each receipt is observed; least_batch_v2 measures ingress "
-            "rather than scheduler admission"
+            "until each staged-ingress receipt is observed; scheduler commit "
+            "is reported separately by AddResultEvent"
         ),
         "local_command_queue_ms_definition": (
-            "final LocalEngine admission command enqueue to single-writer "
-            "loop pickup"
+            "compatibility queue timing for synchronous LocalEngine admission"
         ),
         "local_admission_ms_definition": (
-            "final LocalEngine single-writer admission batch processing"
+            "compatibility timing for synchronous LocalEngine admission"
+        ),
+        "staged_queue_ms_definition": (
+            "positive staged-ingress receipt to the final planned-commit "
+            "attempt pickup inside LocalEngine"
+        ),
+        "planned_commit_ms_definition": (
+            "final LocalEngine planned-placement validation and commit attempt"
+        ),
+        "sequence_deserialize_ms_definition": (
+            "server-side total Sequence decode time for the enclosing ingress "
+            "batch"
+        ),
+        "sequence_payload_bytes_definition": (
+            "serialized Sequence payload bytes for this request"
         ),
         "admission_rpc_residual_ms_definition": (
             "admission RPC time minus final local command-queue and admission "
@@ -674,8 +695,8 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "fallback attempts"
         ),
         "frontend_ack_overhead_ms_definition": (
-            "T1->T3 minus router-pending and admission-RPC time; covers "
-            "frontend submit and ACK observation overhead"
+            "dispatch-to-receipt minus router-pending and receipt-RPC time; "
+            "covers frontend submit and receipt observation overhead"
         ),
         "add_accept_latency_ms": metric_percentiles(
             records, "add_accept_latency_ms"
@@ -847,7 +868,9 @@ def run_benchmark(
         ttft_source = None
         if bootstrap_ttft_ms is not None:
             ttft_ms = bootstrap_ttft_ms
-            ttft_source = "authoritative_admission_ack"
+            ttft_source = timing.get(
+                "bootstrap_ready_source", "authoritative_admission_ack"
+            )
         elif seq.metric is not None:
             metric_ttft = seq.metric.ttft
             if metric_ttft is not None:
@@ -911,6 +934,10 @@ def run_benchmark(
         admission_rpc_ms = timing.get("admission_rpc_ms")
         local_command_queue_ms = timing.get("local_command_queue_ms")
         local_admission_ms = timing.get("local_admission_ms")
+        staged_queue_ms = timing.get("staged_queue_ms")
+        planned_commit_ms = timing.get("planned_commit_ms")
+        sequence_deserialize_ms = timing.get("sequence_deserialize_ms")
+        sequence_payload_bytes = timing.get("sequence_payload_bytes")
         admission_rpc_residual_ms = None
         if (
             admission_rpc_ms is not None
@@ -1088,7 +1115,7 @@ def run_benchmark(
                 6,
             )
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "request_id": int(request_id),
             "engine_id": int(engine_id),
             "status": status,
@@ -1117,6 +1144,10 @@ def run_benchmark(
             "admission_rpc_ms": admission_rpc_ms,
             "local_command_queue_ms": local_command_queue_ms,
             "local_admission_ms": local_admission_ms,
+            "staged_queue_ms": staged_queue_ms,
+            "planned_commit_ms": planned_commit_ms,
+            "sequence_deserialize_ms": sequence_deserialize_ms,
+            "sequence_payload_bytes": sequence_payload_bytes,
             "admission_rpc_residual_ms": admission_rpc_residual_ms,
             "frontend_ack_overhead_ms": frontend_ack_overhead_ms,
             "add_accept_latency_ms": _interval_ms(
@@ -1395,6 +1426,8 @@ def run_benchmark(
                         "admission_rpc_ms",
                         "local_command_queue_ms",
                         "local_admission_ms",
+                        "sequence_deserialize_ms",
+                        "sequence_payload_bytes",
                     ):
                         metric_value = getattr(ack, metric_name)
                         if metric_value is not None:
@@ -1413,6 +1446,9 @@ def run_benchmark(
                         # semantics. The actual model token remains available
                         # separately as model_ttft_ms.
                         timing["bootstrap_ready_ns"] = observed_ns
+                        timing["bootstrap_ready_source"] = (
+                            "authoritative_admission_ack"
+                        )
                     ingress_ack_latency_ms.append(
                         (observed_ns - timing["dispatch_ns"]) / 1_000_000
                     )
@@ -1450,10 +1486,26 @@ def run_benchmark(
                     observed_ns = clock_ns()
                     timing = request_times[result.request_id]
                     timing["add_result_ns"] = observed_ns
+                    if result.local_planned_queue_ms is not None:
+                        timing["staged_queue_ms"] = round(
+                            float(result.local_planned_queue_ms), 6
+                        )
+                    if result.local_admission_ms is not None:
+                        timing["planned_commit_ms"] = round(
+                            float(result.local_admission_ms), 6
+                        )
                     add_accept_latency_ms.append(
                         (observed_ns - timing["dispatch_ns"]) / 1_000_000
                     )
                     if result.accepted:
+                        if (
+                            result.admission_version is not None
+                            and "bootstrap_ready_ns" not in timing
+                        ):
+                            timing["bootstrap_ready_ns"] = observed_ns
+                            timing["bootstrap_ready_source"] = (
+                                "planned_add_result"
+                            )
                         accepted += 1
                         continue
                     scheduler_rejected += 1
@@ -1737,6 +1789,14 @@ def run_benchmark(
             "local_command_queue_ms"
         ],
         "local_admission_ms": metrics_summary["local_admission_ms"],
+        "staged_queue_ms": metrics_summary["staged_queue_ms"],
+        "planned_commit_ms": metrics_summary["planned_commit_ms"],
+        "sequence_deserialize_ms": metrics_summary[
+            "sequence_deserialize_ms"
+        ],
+        "sequence_payload_bytes": metrics_summary[
+            "sequence_payload_bytes"
+        ],
         "admission_rpc_residual_ms": metrics_summary[
             "admission_rpc_residual_ms"
         ],

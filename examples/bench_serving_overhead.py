@@ -89,7 +89,6 @@ def parse_args():
         choices=[
             "round_robin",
             "least_batch",
-            "least_batch_v2",
             "least_cache",
         ],
         help="Hierarchical load-balancer policy (default: least_batch).",

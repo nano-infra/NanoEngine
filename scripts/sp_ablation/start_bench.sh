@@ -101,7 +101,7 @@ usage() {
     echo "  --gpu-util <float>        GPU Memory Utilization (default: $DEFAULT_GPU_UTIL)"
     echo "  --routing-strategy <str>  Routing Strategy (default: $DEFAULT_ROUTING)"
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
-    echo "  --router-policy <str>     round_robin | least_batch | least_batch_v2 | least_cache (default: $DEFAULT_ROUTER_POLICY)"
+    echo "  --router-policy <str>     round_robin | least_batch | least_cache (default: $DEFAULT_ROUTER_POLICY)"
     echo "  --sp-master-selector <str> RoundRobin | LeastBatch | LeastCache (default: $DEFAULT_SP_MASTER_SELECTOR)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
@@ -193,7 +193,7 @@ case "$SCHEDULER_ARCH" in
 esac
 
 case "$ROUTER_POLICY" in
-    round_robin|least_batch|least_batch_v2|least_cache) ;;
+    round_robin|least_batch|least_cache) ;;
     *) echo "Error: Invalid router policy '$ROUTER_POLICY'."; exit 1 ;;
 esac
 
@@ -362,7 +362,6 @@ for rate in "${RATES[@]}"; do
     case "$ROUTER_POLICY" in
         round_robin) rp_short="rpRR" ;;
         least_batch) rp_short="rpLB" ;;
-        least_batch_v2) rp_short="rpLBv2" ;;
         least_cache) rp_short="rpLC" ;;
         *)           rp_short="$ROUTER_POLICY" ;;
     esac

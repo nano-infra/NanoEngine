@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
-from math import ceil
 from time import perf_counter
 from typing import Any, Callable, Iterable, Literal, Mapping, Protocol
 
@@ -28,13 +27,12 @@ from nanodeploy.router.admission_planner import (
 RouterPolicy = Literal[
     "round_robin",
     "least_batch",
-    "least_batch_v2",
     "least_cache",
 ]
 _ROUTER_POLICIES = frozenset(
-    {"round_robin", "least_batch", "least_batch_v2", "least_cache"}
+    {"round_robin", "least_batch", "least_cache"}
 )
-_GLOBAL_QUEUE_POLICIES = frozenset({"least_batch", "least_batch_v2"})
+_GLOBAL_QUEUE_POLICIES = frozenset({"least_batch"})
 
 
 class EngineTransport(Protocol):
@@ -115,23 +113,10 @@ class _AdmissionBatchFlight:
 
 
 @dataclass(slots=True)
-class _IngressBatchFlight:
-    engine_id: int
-    pending: tuple[_GlobalPending, ...]
-    handle: Any
-    rpc_started_at: float
-
-
-@dataclass(frozen=True, slots=True)
-class _KvIngressCharge:
-    engine_id: int
-    blocks: int
-
-
-@dataclass(slots=True)
 class _LeastBatchCharge:
     engine_id: int
     reservation: AdmissionReservation
+    ingress_version: int | None = None
     admission_version: int | None = None
 
 
@@ -154,7 +139,6 @@ class RequestRouter:
         admission_batch_size: int = 256,
         poll_admission_batches: AdmissionBatchPoller | None = None,
         admission_planner_config: AdmissionPlannerConfig | None = None,
-        max_unscheduled_requests: int | None = None,
         initial_wave_id: int = 0,
     ) -> None:
         if not engines:
@@ -175,11 +159,6 @@ class RequestRouter:
             )
         if admission_batch_size <= 0:
             raise ValueError("admission_batch_size must be positive")
-        if (
-            max_unscheduled_requests is not None
-            and max_unscheduled_requests <= 0
-        ):
-            raise ValueError("max_unscheduled_requests must be positive")
         self._ready_engine_ids = tuple(self._engines)
         self.router_policy = router_policy
         self._kvcache_block_size = kvcache_block_size
@@ -189,7 +168,6 @@ class RequestRouter:
         self._pending_ingress: dict[int, _PendingIngress] = {}
         self._global_pending: deque[_GlobalPending] = deque()
         self._admission_flights: dict[int, _AdmissionBatchFlight] = {}
-        self._ingress_batch_flights: dict[int, _IngressBatchFlight] = {}
         self._admission_batch_size = admission_batch_size
         self._poll_admission_batches = poll_admission_batches
         self._admission_planner = (
@@ -200,54 +178,7 @@ class RequestRouter:
             )
             else None
         )
-        if router_policy == "least_batch_v2":
-            if admission_planner_config is None:
-                raise ValueError(
-                    "least_batch_v2 requires admission_planner_config"
-                )
-            if (
-                kvcache_block_size is None
-                or kvcache_block_size <= 0
-                or kvcache_block_size
-                != admission_planner_config.kvcache_block_size
-            ):
-                raise ValueError(
-                    "least_batch_v2 requires a matching positive "
-                    "kvcache_block_size"
-                )
-            if max_unscheduled_requests is None:
-                max_unscheduled_requests = (
-                    admission_planner_config.max_num_seqs
-                )
-        self._max_unscheduled_requests = max_unscheduled_requests or 0
-        self._kv_attention_sp = (
-            admission_planner_config.attention_sp
-            if admission_planner_config is not None
-            else 1
-        )
-        self._kv_reserved_blocks_per_req = (
-            admission_planner_config.reserved_blocks_per_req
-            if admission_planner_config is not None
-            else 0.0
-        )
-        self._kv_credit_generation: dict[int, tuple[Any, ...]] = {}
-        self._kv_remaining_blocks: dict[int, int] = {}
-        self._kv_ingress_charges: dict[int, _KvIngressCharge] = {}
-        self._kv_unscheduled_counts = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
-        self._kv_projected_waiting_counts = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
-        self._kv_outstanding_blocks = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
         self._future_ingress_aborts: set[int] = set()
-        self._kv_blocked_generation: dict[
-            int, tuple[Any, ...] | None
-        ] = {
-            engine_id: None for engine_id in self._ready_engine_ids
-        }
         self._engine_blocked_capacity_epoch: dict[int, int | None] = {
             engine_id: None for engine_id in self._ready_engine_ids
         }
@@ -266,32 +197,20 @@ class RequestRouter:
         self._admission_attempts = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
-        self._admission_commits = {
+        self._admission_batches = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
-        self._admission_deferred = {
+        self._admission_receipts = {
+            engine_id: 0 for engine_id in self._ready_engine_ids
+        }
+        self._admission_commits = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
         self._admission_queue_full = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
-        self._admission_local_state_mismatch = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
         self._admission_fallbacks = 0
         self._admission_global_retries = 0
-        self._admission_state_mismatches = 0
-        self._kv_ingress_attempts = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
-        self._kv_ingress_receipts = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
-        self._kv_ingress_queue_full = {
-            engine_id: 0 for engine_id in self._ready_engine_ids
-        }
-        self._kv_gate_blocked = 0
-        self._unscheduled_gate_blocked = 0
         self._rr_cursor = 0
         self._wakeup = wakeup
         self._wave_id = initial_wave_id
@@ -345,15 +264,9 @@ class RequestRouter:
             for offset in range(len(engine_ids))
         )
 
-    def _projected_waiting(self, engine_id: int) -> int:
-        """Return observed waiting plus assignments since that observation."""
-        return self._kv_projected_waiting_counts[engine_id]
-
     def _projected_batch(self, engine_id: int) -> int:
         snapshot = self._loads.get(engine_id)
         running = snapshot.running if snapshot is not None else 0
-        if self.router_policy == "least_batch_v2":
-            return running + self._projected_waiting(engine_id)
         tentative = self._least_batch_tentative_counts[engine_id]
         return running + tentative
 
@@ -370,167 +283,6 @@ class RequestRouter:
         return (
             total_tokens + self._kvcache_block_size - 1
         ) // self._kvcache_block_size
-
-    def _estimate_kv_admission_blocks(self, command: AddCommand) -> int:
-        """Conservative scalar estimate of the immediate KV footprint.
-
-        This deliberately does not mirror LocalScheduler placement. The SP
-        rounding guard is the maximum extra block rounding introduced by
-        splitting the prompt across the ranks that can receive at least one
-        token. Full padded decode lifetime remains a local static-validity
-        and scheduling concern rather than live frontend KV reservation.
-        """
-        block_size = self._kvcache_block_size
-        if block_size is None or block_size <= 0:
-            raise RuntimeError(
-                "KV-credit routing requires a positive block size"
-            )
-        prompt_tokens = command.num_tokens
-        prompt_blocks = (prompt_tokens + block_size - 1) // block_size
-        participating_ranks = min(
-            self._kv_attention_sp, max(1, prompt_tokens)
-        )
-        sp_rounding_guard = participating_ranks - 1
-        decode_reserve = ceil(self._kv_reserved_blocks_per_req)
-        return prompt_blocks + sp_rounding_guard + decode_reserve
-
-    def _kv_snapshot_state(
-        self, snapshot: LoadSnapshot
-    ) -> tuple[tuple[Any, ...], int] | None:
-        ranks = {rank.sp_idx: rank for rank in snapshot.rank_loads}
-        expected = set(range(self._kv_attention_sp))
-        if set(ranks) != expected:
-            return None
-        free_blocks = tuple(
-            ranks[sp_idx].free_blocks
-            for sp_idx in range(self._kv_attention_sp)
-        )
-        generation = (
-            snapshot.wave_id,
-            snapshot.quantum_id,
-            snapshot.capacity_epoch,
-            free_blocks,
-        )
-        total_free_blocks = sum(free_blocks)
-        return generation, total_free_blocks
-
-    def _record_kv_credit_snapshot(
-        self,
-        snapshot: LoadSnapshot,
-        *,
-        refresh_load_projection: bool = False,
-    ) -> None:
-        if self.router_policy != "least_batch_v2":
-            return
-        engine_id = snapshot.engine_id
-        if refresh_load_projection:
-            observed_waiting = snapshot.waiting + snapshot.pending_ingress
-            # Outstanding charges cover requests between frontend dispatch and
-            # first schedule. max() prevents a load snapshot captured before
-            # a fast ingress receipt from making ACK look like free compute
-            # capacity. New assignments increment this projection below.
-            self._kv_projected_waiting_counts[engine_id] = max(
-                observed_waiting,
-                self._kv_unscheduled_counts[engine_id],
-            )
-        state = self._kv_snapshot_state(snapshot)
-        if state is None:
-            self._kv_credit_generation.pop(engine_id, None)
-            self._kv_remaining_blocks.pop(engine_id, None)
-            return
-        generation, free_blocks = state
-        self._kv_credit_generation[engine_id] = generation
-        # A charge stays live until the request reaches first schedule. Before
-        # that point a newer quantum can still report KV free blocks that do
-        # not reflect an ingress command waiting inside LocalEngine. Rebuilding
-        # credit from snapshot minus this ledger prevents quantum-by-quantum
-        # re-granting. Queue and placement limits remain authoritative in the
-        # LocalEngine; the frontend v2 eligibility gate intentionally models
-        # only KV credit plus its bounded unscheduled window.
-        self._kv_remaining_blocks[engine_id] = max(
-            0,
-            free_blocks - self._kv_outstanding_blocks[engine_id],
-        )
-
-    def _charge_kv_ingress(
-        self, *, request_id: int, engine_id: int, blocks: int
-    ) -> None:
-        if request_id in self._kv_ingress_charges:
-            raise RuntimeError(
-                f"duplicate KV ingress charge for {request_id}"
-            )
-        self._kv_ingress_charges[request_id] = _KvIngressCharge(
-            engine_id=engine_id,
-            blocks=blocks,
-        )
-        self._kv_unscheduled_counts[engine_id] += 1
-        self._kv_projected_waiting_counts[engine_id] += 1
-        self._kv_outstanding_blocks[engine_id] += blocks
-
-    def _release_kv_ingress_charge(self, request_id: int) -> None:
-        charge = self._kv_ingress_charges.pop(request_id, None)
-        if charge is None:
-            return
-        engine_id = charge.engine_id
-        self._kv_unscheduled_counts[engine_id] -= 1
-        self._kv_projected_waiting_counts[engine_id] -= 1
-        self._kv_outstanding_blocks[engine_id] -= charge.blocks
-        if (
-            self._kv_unscheduled_counts[engine_id] < 0
-            or self._kv_projected_waiting_counts[engine_id] < 0
-            or self._kv_outstanding_blocks[engine_id] < 0
-        ):
-            raise RuntimeError(
-                "KV ingress charge ledger became negative: "
-                f"engine={engine_id}, request={request_id}"
-            )
-        snapshot = self._loads.get(engine_id)
-        if snapshot is not None:
-            self._record_kv_credit_snapshot(snapshot)
-
-    def _kv_static_capacity_reason(
-        self, command: AddCommand
-    ) -> str | None:
-        """Reject only requests that cannot fit an otherwise empty engine."""
-        block_size = self._kvcache_block_size
-        if (
-            block_size is None
-            or block_size <= 0
-            or command.max_tokens < 0
-        ):
-            return None
-        padded_completion = round_up(command.max_tokens)
-        lifetime_blocks = (
-            command.prompt_len
-            + 1
-            + padded_completion
-            + block_size
-            - 1
-        ) // block_size
-        master_lifetime_blocks = (
-            1 + padded_completion + block_size - 1
-        ) // block_size
-        observed_complete_engine = False
-        for snapshot in self._loads.values():
-            ranks = {rank.sp_idx: rank for rank in snapshot.rank_loads}
-            if set(ranks) != set(range(self._kv_attention_sp)):
-                continue
-            observed_complete_engine = True
-            service_blocks = [
-                ranks[sp_idx].total_blocks
-                - ranks[sp_idx].control_dummy_blocks
-                for sp_idx in range(self._kv_attention_sp)
-            ]
-            if (
-                service_blocks
-                and min(service_blocks) > 0
-                and lifetime_blocks <= sum(service_blocks)
-                and master_lifetime_blocks <= max(service_blocks)
-            ):
-                return None
-        if not observed_complete_engine:
-            return None
-        return "request padded lifetime exceeds every LocalEngine KV capacity"
 
     def _candidate_engine_ids(
         self,
@@ -651,7 +403,7 @@ class RequestRouter:
             )
         if admission_version is None:
             raise RuntimeError(
-                "successful centralized admission ACK did not carry an "
+                "successful planned admission event did not carry an "
                 f"admission version: request={request_id}"
             )
         charge.admission_version = admission_version
@@ -782,42 +534,23 @@ class RequestRouter:
             wave_id=self._wave_id,
             sequence_payload=sequence_payload,
         )
-        if self.router_policy == "least_batch_v2":
-            if reason := self._kv_static_capacity_reason(command):
-                self._rejected_request_ids.add(request_id)
-                self._immediate_ingress_acks.append(
-                    IngressAck(
-                        request_id=request_id,
-                        engine_id=-1,
-                        enqueued=False,
-                        reason=reason,
-                    )
-                )
-                return request_id
         if self.router_policy in _GLOBAL_QUEUE_POLICIES:
             self._owners[request_id] = RequestOwner(
                 OwnerState.PENDING_GLOBAL
             )
-            if self.router_policy == "least_batch":
-                queue_is_capacity_blocked = (
-                    (
-                        bool(self._global_pending)
-                        and any(
-                            pending.capacity_blocked_since is not None
-                            for pending in self._global_pending
-                        )
-                    )
-                    or not any(
-                        self._engine_has_admission_window(engine_id)
-                        for engine_id in self._ready_engine_ids
+            queue_is_capacity_blocked = (
+                (
+                    bool(self._global_pending)
+                    and any(
+                        pending.capacity_blocked_since is not None
+                        for pending in self._global_pending
                     )
                 )
-            else:
-                queue_is_capacity_blocked = bool(
-                    self._global_pending
-                    and self._global_pending[0].capacity_blocked_since
-                    is not None
+                or not any(
+                    self._engine_has_admission_window(engine_id)
+                    for engine_id in self._ready_engine_ids
                 )
+            )
             capacity_blocked_since = (
                 submitted_at if queue_is_capacity_blocked else None
             )
@@ -918,7 +651,13 @@ class RequestRouter:
             for charge in self._least_batch_charges.values():
                 if charge.engine_id == engine_id:
                     planner.apply_reservation(
-                        shadow, charge.reservation
+                        shadow,
+                        charge.reservation,
+                        count_queue_slot=(
+                            charge.ingress_version is None
+                            or charge.ingress_version
+                            > snapshot.ingress_version
+                        ),
                     )
             shadows[engine_id] = shadow
         return shadows
@@ -1052,6 +791,7 @@ class RequestRouter:
                 rpc_started_at=rpc_started_at,
                 capacity_epoch=self._capacity_epoch(engine_id),
             )
+            self._admission_batches[engine_id] += 1
             dispatched_request_ids.update(
                 pending.command.request_id for pending in batch
             )
@@ -1091,7 +831,8 @@ class RequestRouter:
         return ready_batches
 
     def _poll_centralized_admission(self) -> tuple[IngressAck, ...]:
-        self._dispatch_global_pending()
+        if not self._admission_flights:
+            self._dispatch_global_pending()
         ready_batches = self._ready_admission_batches()
         unknown = set(ready_batches).difference(self._admission_flights)
         if unknown:
@@ -1133,31 +874,24 @@ class RequestRouter:
                         f"request={request_id}, engine={engine_id}, ack={ack}"
                     )
 
-                transient = (
-                    not ack.enqueued
-                    and ack.reason
-                    in {
-                        "queue_full",
-                        "admission_deferred",
-                        "admission_state_mismatch",
-                    }
-                )
+                future_abort = request_id in self._future_ingress_aborts
+                if future_abort:
+                    self._future_ingress_aborts.discard(request_id)
+                    if ack.enqueued:
+                        self._engines[engine_id].abort(request_id)
+                    else:
+                        self._engines[engine_id].clear_ingress_abort(request_id)
+                        ack = replace(ack, reason="aborted")
+
+                transient = not ack.enqueued and ack.reason == "queue_full"
                 if transient:
-                    self._admission_state_mismatches += 1
                     capacity_blocked = True
                     if ack.capacity_epoch is not None:
                         blocked_capacity_epoch = max(
                             blocked_capacity_epoch,
                             ack.capacity_epoch,
                         )
-                    if ack.reason == "admission_state_mismatch":
-                        self._admission_local_state_mismatch[
-                            engine_id
-                        ] += 1
-                    elif ack.reason == "admission_deferred":
-                        self._admission_deferred[engine_id] += 1
-                    else:
-                        self._admission_queue_full[engine_id] += 1
+                    self._admission_queue_full[engine_id] += 1
                     self._refund_least_batch(request_id)
                     self._owners[request_id] = RequestOwner(
                         OwnerState.PENDING_GLOBAL
@@ -1169,22 +903,43 @@ class RequestRouter:
                     continue
 
                 if ack.enqueued:
-                    self._commit_least_batch(
-                        request_id, ack.admission_version
-                    )
-                    self._admission_commits[engine_id] += 1
+                    if ack.admission_version is not None:
+                        raise RuntimeError(
+                            "planned ingress receipt unexpectedly carried an "
+                            f"admission version: request={request_id}"
+                        )
+                    if ack.ingress_version is None:
+                        raise RuntimeError(
+                            "planned ingress receipt did not carry an ingress "
+                            f"version: request={request_id}"
+                        )
+                    charge = self._least_batch_charges.get(request_id)
+                    if charge is None:
+                        raise RuntimeError(
+                            "missing least-batch charge for ingress receipt: "
+                            f"request={request_id}"
+                        )
+                    charge.ingress_version = ack.ingress_version
+                    self._admission_receipts[engine_id] += 1
                     self._owners[request_id] = RequestOwner(
                         OwnerState.PENDING_ADD, engine_id
                     )
-                    if self._wakeup is not None:
-                        self._wave_id = self._wakeup(
-                            engine_id, self._wave_id
-                        )
                 else:
                     self._refund_least_batch(request_id)
-                    self._global_capacity_queue_ms.pop(request_id, None)
+                    capacity_queue_ms = self._global_capacity_queue_ms.pop(
+                        request_id, 0.0
+                    )
                     self._owners.pop(request_id, None)
-                    self._rejected_request_ids.add(request_id)
+                    if ack.reason == "aborted":
+                        self._terminal[request_id] = FinishEvent(
+                            request_id=request_id,
+                            generated_count=0,
+                            status="ABORTED",
+                            engine_id=engine_id,
+                            global_capacity_queue_ms=capacity_queue_ms,
+                        )
+                    else:
+                        self._rejected_request_ids.add(request_id)
                 acks.append(
                     replace(
                         ack,
@@ -1208,309 +963,11 @@ class RequestRouter:
         self._dispatch_global_pending()
         return tuple(acks)
 
-    def _kv_engine_has_dispatch_window(self, engine_id: int) -> bool:
-        generation = self._kv_credit_generation.get(engine_id)
-        return (
-            generation is not None
-            and engine_id not in self._ingress_batch_flights
-            and self._kv_blocked_generation[engine_id] != generation
-        )
-
-    def _dispatch_kv_global_pending(self) -> None:
-        if not self._global_pending:
-            return
-
-        available = {
-            engine_id
-            for engine_id in self._ready_engine_ids
-            if self._kv_engine_has_dispatch_window(engine_id)
-        }
-        batches: dict[int, list[tuple[_GlobalPending, int]]] = {}
-        assignment_order: list[_GlobalPending] = []
-        kv_blocked = False
-        unscheduled_blocked = False
-
-        while self._global_pending and available:
-            pending_global = self._global_pending[0]
-            request_blocks = self._estimate_kv_admission_blocks(
-                pending_global.command
-            )
-            kv_candidates = [
-                engine_id
-                for engine_id in available
-                if self._kv_remaining_blocks.get(engine_id, 0)
-                >= request_blocks
-            ]
-            if not kv_candidates:
-                kv_blocked = True
-                break
-            candidates = [
-                engine_id
-                for engine_id in kv_candidates
-                if self._projected_waiting(engine_id)
-                < self._max_unscheduled_requests
-            ]
-            if not candidates:
-                unscheduled_blocked = True
-                break
-
-            # KV is an eligibility gate, not the balancing score. Among
-            # engines that can hold the FIFO head, choose the smallest
-            # projected running+waiting load. Remaining KV is only a
-            # tie-break so a roomy engine wins equal-load choices.
-            engine_id = min(
-                candidates,
-                key=lambda candidate: (
-                    self._projected_batch(candidate),
-                    -(
-                        self._kv_remaining_blocks[candidate]
-                        - request_blocks
-                    ),
-                    candidate,
-                ),
-            )
-            self._kv_remaining_blocks[engine_id] -= request_blocks
-
-            self._global_pending.popleft()
-            batches.setdefault(engine_id, []).append(
-                (pending_global, request_blocks)
-            )
-            assignment_order.append(pending_global)
-            request_id = pending_global.command.request_id
-            owner = self._owners.get(request_id)
-            if (
-                owner is None
-                or owner.state != OwnerState.PENDING_GLOBAL
-                or owner.engine_id is not None
-            ):
-                raise RuntimeError(
-                    "KV-gated global owner mismatch: "
-                    f"request={request_id}, owner={owner}"
-                )
-            self._charge_kv_ingress(
-                request_id=request_id,
-                engine_id=engine_id,
-                blocks=request_blocks,
-            )
-            self._owners[request_id] = RequestOwner(
-                OwnerState.PENDING_INGRESS, engine_id
-            )
-            self._kv_ingress_attempts[engine_id] += 1
-            if len(batches[engine_id]) >= self._admission_batch_size:
-                available.remove(engine_id)
-
-        dispatched_request_ids: set[int] = set()
-        for engine_id, planned_batch in batches.items():
-            batch = [pending for pending, _ in planned_batch]
-            rpc_started_at = perf_counter()
-            for pending_global in batch:
-                request_id = pending_global.command.request_id
-                pending_global.router_pending_ms += (
-                    rpc_started_at - pending_global.router_queued_at
-                ) * 1000
-                if pending_global.capacity_blocked_since is not None:
-                    self._global_capacity_queue_ms[request_id] += (
-                        rpc_started_at
-                        - pending_global.capacity_blocked_since
-                    ) * 1000
-                    pending_global.capacity_blocked_since = None
-            try:
-                handle = self._engines[engine_id].enqueue_batch_async(
-                    tuple(item.command for item in batch)
-                )
-            except BaseException:
-                restore = [
-                    pending
-                    for pending in assignment_order
-                    if pending.command.request_id
-                    not in dispatched_request_ids
-                ]
-                for pending_global in restore:
-                    request_id = pending_global.command.request_id
-                    self._release_kv_ingress_charge(request_id)
-                    self._owners[request_id] = RequestOwner(
-                        OwnerState.PENDING_GLOBAL
-                    )
-                    pending_global.router_queued_at = rpc_started_at
-                self._requeue_global_pending(restore)
-                raise
-
-            self._ingress_batch_flights[engine_id] = _IngressBatchFlight(
-                engine_id=engine_id,
-                pending=tuple(batch),
-                handle=handle,
-                rpc_started_at=rpc_started_at,
-            )
-            dispatched_request_ids.update(
-                pending.command.request_id for pending in batch
-            )
-
-        if self._global_pending and (kv_blocked or unscheduled_blocked):
-            if kv_blocked:
-                self._kv_gate_blocked += 1
-            if unscheduled_blocked:
-                self._unscheduled_gate_blocked += 1
-            self._mark_global_capacity_blocked(perf_counter())
-
-    def _ready_ingress_batches(
-        self,
-    ) -> Mapping[int, tuple[IngressAck, ...]]:
-        handles = {
-            engine_id: flight.handle
-            for engine_id, flight in self._ingress_batch_flights.items()
-        }
-        if not handles:
-            return {}
-        if self._poll_admission_batches is not None:
-            return self._poll_admission_batches(handles)
-        ready_batches: dict[int, tuple[IngressAck, ...]] = {}
-        for engine_id, handle in handles.items():
-            ready, acks = self._engines[
-                engine_id
-            ].poll_admission_batch(handle)
-            if ready:
-                if acks is None:
-                    raise RuntimeError(
-                        f"engine {engine_id} returned no ingress batch"
-                    )
-                ready_batches[engine_id] = acks
-        return ready_batches
-
-    def _poll_kv_ingress_batches(self) -> tuple[IngressAck, ...]:
-        self._dispatch_kv_global_pending()
-        ready_batches = self._ready_ingress_batches()
-        unknown = set(ready_batches).difference(
-            self._ingress_batch_flights
-        )
-        if unknown:
-            raise RuntimeError(
-                f"ingress poller returned unknown engines {sorted(unknown)}"
-            )
-
-        acks: list[IngressAck] = []
-        requeued: list[_GlobalPending] = []
-        queue_full_engines: set[int] = set()
-        for engine_id in sorted(ready_batches):
-            flight = self._ingress_batch_flights.pop(engine_id)
-            engine_acks = tuple(ready_batches[engine_id])
-            if len(engine_acks) != len(flight.pending):
-                raise RuntimeError(
-                    "LocalEngine ingress batch result count mismatch: "
-                    f"engine={engine_id}, commands={len(flight.pending)}, "
-                    f"acks={len(engine_acks)}"
-                )
-            ack_observed_at = perf_counter()
-            rpc_ms = (
-                ack_observed_at - flight.rpc_started_at
-            ) * 1000
-            for pending_global, ack in zip(
-                flight.pending,
-                engine_acks,
-                strict=True,
-            ):
-                request_id = pending_global.command.request_id
-                pending_global.admission_rpc_ms += rpc_ms
-                if (
-                    ack.request_id != request_id
-                    or ack.engine_id != engine_id
-                ):
-                    self._future_ingress_aborts.discard(request_id)
-                    self._release_kv_ingress_charge(request_id)
-                    self._owners.pop(request_id, None)
-                    raise RuntimeError(
-                        "LocalEngine returned an inconsistent ingress ACK: "
-                        f"request={request_id}, engine={engine_id}, ack={ack}"
-                    )
-
-                future_abort = request_id in self._future_ingress_aborts
-                if future_abort:
-                    self._future_ingress_aborts.discard(request_id)
-                    if ack.enqueued:
-                        # The receipt establishes that enqueue is no longer a
-                        # future actor call. Reconcile the tombstone with the
-                        # concrete ingress/scheduler state and clean it up if
-                        # LocalEngine had already rejected the request.
-                        self._engines[engine_id].abort(request_id)
-                    else:
-                        self._engines[engine_id].clear_ingress_abort(
-                            request_id
-                        )
-                        ack = replace(ack, reason="aborted")
-
-                if not ack.enqueued and ack.reason == "queue_full":
-                    self._release_kv_ingress_charge(request_id)
-                    self._kv_ingress_queue_full[engine_id] += 1
-                    queue_full_engines.add(engine_id)
-                    self._admission_global_retries += 1
-                    self._owners[request_id] = RequestOwner(
-                        OwnerState.PENDING_GLOBAL
-                    )
-                    pending_global.router_queued_at = ack_observed_at
-                    pending_global.capacity_blocked_since = ack_observed_at
-                    requeued.append(pending_global)
-                    continue
-
-                if ack.enqueued:
-                    self._kv_ingress_receipts[engine_id] += 1
-                    self._owners[request_id] = RequestOwner(
-                        OwnerState.PENDING_ADD, engine_id
-                    )
-                    if self._wakeup is not None:
-                        self._wave_id = self._wakeup(
-                            engine_id, self._wave_id
-                        )
-                else:
-                    self._release_kv_ingress_charge(request_id)
-                    self._owners.pop(request_id, None)
-                    capacity_queue_ms = self._global_capacity_queue_ms.pop(
-                        request_id, 0.0
-                    )
-                    if ack.reason == "aborted":
-                        self._terminal[request_id] = FinishEvent(
-                            request_id=request_id,
-                            generated_count=0,
-                            status="ABORTED",
-                            engine_id=engine_id,
-                            global_capacity_queue_ms=capacity_queue_ms,
-                        )
-                    else:
-                        self._rejected_request_ids.add(request_id)
-                acks.append(
-                    replace(
-                        ack,
-                        router_pending_ms=pending_global.router_pending_ms,
-                        admission_rpc_ms=pending_global.admission_rpc_ms,
-                    )
-                )
-
-        if requeued:
-            # A stale queue-slot snapshot blocks only the engine that rejected
-            # the batch. Healthy engines may immediately take the requeued
-            # global FIFO head using their remaining ledger-backed credit.
-            for engine_id in queue_full_engines:
-                self._kv_blocked_generation[engine_id] = (
-                    self._kv_credit_generation.get(engine_id)
-                )
-            ordered = sorted(
-                requeued, key=lambda pending: pending.queue_seq
-            )
-            self._requeue_global_pending(ordered)
-            self._mark_global_capacity_blocked(perf_counter())
-        if ready_batches:
-            # Receipts free only the bounded transport flight. The request's
-            # KV and unscheduled-load charge remains live until first schedule,
-            # so ACK latency cannot become compute dispatch credit.
-            self._dispatch_kv_global_pending()
-        return tuple(acks)
-
     def poll_ingress_acks(self) -> tuple[IngressAck, ...]:
         acks = list(self._immediate_ingress_acks)
         self._immediate_ingress_acks.clear()
         if self.router_policy == "least_batch":
             acks.extend(self._poll_centralized_admission())
-            return tuple(acks)
-        if self.router_policy == "least_batch_v2":
-            acks.extend(self._poll_kv_ingress_batches())
             return tuple(acks)
         for request_id, pending in tuple(self._pending_ingress.items()):
             engine_id = pending.candidate_engine_ids[
@@ -1640,12 +1097,16 @@ class RequestRouter:
                     f"engine={event.engine_id}, owner={owner}"
                 )
             if event.accepted:
+                if self.router_policy == "least_batch":
+                    self._commit_least_batch(
+                        event.request_id, event.admission_version
+                    )
+                    self._admission_commits[event.engine_id] += 1
                 self._owners[event.request_id] = RequestOwner(
                     OwnerState.OWNED, event.engine_id
                 )
             else:
                 self._future_ingress_aborts.discard(event.request_id)
-                self._release_kv_ingress_charge(event.request_id)
                 self._refund_cache(event.request_id)
                 self._refund_least_batch(event.request_id)
                 self._global_capacity_queue_ms.pop(event.request_id, None)
@@ -1666,24 +1127,12 @@ class RequestRouter:
 
         ready_events = []
         for event in events:
-            charge = self._kv_ingress_charges.get(event.request_id)
-            if charge is not None and charge.engine_id != event.engine_id:
-                raise RuntimeError(
-                    "first-schedule KV charge owner mismatch: "
-                    f"request={event.request_id}, engine={event.engine_id}, "
-                    f"charge_engine={charge.engine_id}"
-                )
-            self._release_kv_ingress_charge(event.request_id)
             ready_events.append(
                 replace(
                     event,
                     global_capacity_queue_ms=capacity_queue_ms(event),
                 )
             )
-        if ready_events and self.router_policy == "least_batch_v2":
-            # First schedule is the compute-credit boundary. Refill directly
-            # instead of waiting for the next frontend poll or load snapshot.
-            self._dispatch_kv_global_pending()
         return tuple(ready_events)
 
     def abort(self, request_id: int) -> AbortResult:
@@ -1702,7 +1151,6 @@ class RequestRouter:
             )
             self._owners.pop(request_id)
             self._future_ingress_aborts.discard(request_id)
-            self._release_kv_ingress_charge(request_id)
             self._global_capacity_queue_ms.pop(request_id, None)
             self._terminal[request_id] = FinishEvent(
                 request_id=request_id,
@@ -1714,7 +1162,7 @@ class RequestRouter:
         if owner.engine_id is None:
             return AbortResult(request_id=request_id, status="abort_pending")
         allow_future_ingress = (
-            self.router_policy == "least_batch_v2"
+            self.router_policy in _GLOBAL_QUEUE_POLICIES
             and owner.state == OwnerState.PENDING_INGRESS
         )
         result = self._engines[owner.engine_id].abort(
@@ -1738,11 +1186,14 @@ class RequestRouter:
                 f"duplicate terminal event for request {event.request_id}"
             )
         owner = self._owners.get(event.request_id)
-        if (
-            owner is None
-            or owner.state != OwnerState.OWNED
-            or owner.engine_id != event.engine_id
-        ):
+        owner_state_is_valid = owner is not None and (
+            owner.state == OwnerState.OWNED
+            or (
+                event.status == "ABORTED"
+                and owner.state == OwnerState.PENDING_ADD
+            )
+        )
+        if not owner_state_is_valid or owner.engine_id != event.engine_id:
             raise RuntimeError(
                 "terminal event owner mismatch: "
                 f"request={event.request_id}, engine={event.engine_id}, "
@@ -1750,7 +1201,6 @@ class RequestRouter:
             )
         self._owners.pop(event.request_id)
         self._future_ingress_aborts.discard(event.request_id)
-        self._release_kv_ingress_charge(event.request_id)
         self._refund_cache(event.request_id)
         self._refund_least_batch(event.request_id)
         event = replace(
@@ -1791,7 +1241,13 @@ class RequestRouter:
             owner = self._owners.get(request_id)
             if (
                 owner is not None
-                and owner.state == OwnerState.OWNED
+                and (
+                    owner.state == OwnerState.OWNED
+                    or (
+                        event.status == "ABORTED"
+                        and owner.state == OwnerState.PENDING_ADD
+                    )
+                )
                 and owner.engine_id == event.engine_id
             ):
                 ready_events.append(event)
@@ -1834,9 +1290,6 @@ class RequestRouter:
         }
         self._loads.update(loads)
         for engine_id, snapshot in loads.items():
-            self._record_kv_credit_snapshot(
-                snapshot, refresh_load_projection=True
-            )
             for request_id, charge in tuple(
                 self._least_batch_charges.items()
             ):
@@ -1875,95 +1328,39 @@ class RequestRouter:
         for engine_id in self._ready_engine_ids:
             snapshot = self._loads.get(engine_id)
             running = snapshot.running if snapshot is not None else 0
-            waiting = snapshot.waiting if snapshot is not None else 0
-            pending_ingress = (
-                snapshot.pending_ingress if snapshot is not None else 0
-            )
             tentative = self._least_batch_tentative_counts[engine_id]
             engine_metrics = {
                 "running_snapshot": running,
                 "tentative_admissions": tentative,
                 "projected_batch": self._projected_batch(engine_id),
                 "attempts": self._admission_attempts[engine_id],
+                "batch_messages": self._admission_batches[engine_id],
+                "positive_receipts": self._admission_receipts[engine_id],
                 "commits": self._admission_commits[engine_id],
-                "deferred": self._admission_deferred[engine_id],
                 "queue_full": self._admission_queue_full[engine_id],
-                "state_mismatches": (
-                    self._admission_local_state_mismatch[engine_id]
-                ),
             }
-            if self.router_policy == "least_batch_v2":
-                engine_metrics.update(
-                    {
-                        "waiting_snapshot": waiting,
-                        "pending_ingress_snapshot": pending_ingress,
-                        "projected_waiting": self._projected_waiting(
-                            engine_id
-                        ),
-                        "max_unscheduled_requests": (
-                            self._max_unscheduled_requests
-                        ),
-                        "unscheduled_window_remaining": max(
-                            0,
-                            self._max_unscheduled_requests
-                            - self._projected_waiting(engine_id),
-                        ),
-                        "kv_free_blocks_snapshot": (
-                            sum(
-                                rank.free_blocks
-                                for rank in snapshot.rank_loads
-                            )
-                            if snapshot is not None
-                            else None
-                        ),
-                        "kv_credit_remaining": (
-                            self._kv_remaining_blocks.get(engine_id)
-                        ),
-                        "kv_outstanding_charges": (
-                            self._kv_unscheduled_counts[engine_id]
-                        ),
-                        "kv_outstanding_blocks": (
-                            self._kv_outstanding_blocks[engine_id]
-                        ),
-                        "ingress_attempts": self._kv_ingress_attempts[
-                            engine_id
-                        ],
-                        "ingress_receipts": self._kv_ingress_receipts[
-                            engine_id
-                        ],
-                        "ingress_queue_full": (
-                            self._kv_ingress_queue_full[engine_id]
-                        ),
-                    }
-                )
             per_engine[str(engine_id)] = engine_metrics
-        flights: Mapping[int, _AdmissionBatchFlight | _IngressBatchFlight]
-        flights = (
-            self._ingress_batch_flights
-            if self.router_policy == "least_batch_v2"
-            else self._admission_flights
-        )
+        flights = self._admission_flights
+        now = perf_counter()
         return {
             "policy": self.router_policy,
             "global_pending": self.pending_global_count,
+            "pending_add": self.pending_add_count,
             "pending_rpc": len(flights),
             "pending_rpc_requests": sum(
                 len(flight.pending)
                 for flight in flights.values()
             ),
-            "admission_batch_size": self._admission_batch_size,
-            "max_unscheduled_requests": (
-                self._max_unscheduled_requests
-                if self.router_policy == "least_batch_v2"
-                else None
+            "oldest_pending_rpc_ms": max(
+                (
+                    max(0.0, now - flight.rpc_started_at) * 1000
+                    for flight in flights.values()
+                ),
+                default=0.0,
             ),
+            "admission_batch_size": self._admission_batch_size,
             "fallbacks": self._admission_fallbacks,
             "global_retries": self._admission_global_retries,
-            "state_mismatches": self._admission_state_mismatches,
-            "kv_gate_blocked": self._kv_gate_blocked,
-            "unscheduled_gate_blocked": (
-                self._unscheduled_gate_blocked
-            ),
             "future_ingress_aborts": len(self._future_ingress_aborts),
             "per_engine": per_engine,
         }

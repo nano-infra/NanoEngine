@@ -583,14 +583,14 @@ def test_delayed_ingress_ack_does_not_throttle_fixed_rate_dispatch(
     assert summary["goodput"]["attainment_percent"] == 100.0
 
 
-def test_authoritative_admission_ack_records_bootstrap_ttft(
+def test_planned_add_result_records_bootstrap_ttft_and_commit_timing(
     monkeypatch,
     tmp_path,
 ):
     benchmark = _load_benchmark_module(monkeypatch)
     clock = FakeClock()
 
-    class AuthoritativeAckEngine(DelayedAckEngine):
+    class PlannedReceiptEngine(DelayedAckEngine):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._first_schedule_emitted: set[int] = set()
@@ -604,13 +604,25 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
                     engine_id=ack.engine_id,
                     enqueued=ack.enqueued,
                     reason=ack.reason,
-                    admission_version=1,
+                    ingress_version=1,
                     router_pending_ms=25.0,
                     admission_rpc_ms=450.0,
-                    local_command_queue_ms=100.0,
-                    local_admission_ms=50.0,
                 )
                 for ack in super().poll_ingress_acks()
+            )
+
+        def poll_add_results(self):
+            return tuple(
+                AddResultEvent(
+                    request_id=result.request_id,
+                    engine_id=result.engine_id,
+                    accepted=result.accepted,
+                    reason=result.reason,
+                    admission_version=1,
+                    local_planned_queue_ms=100.0,
+                    local_admission_ms=50.0,
+                )
+                for result in super().poll_add_results()
             )
 
         def poll_first_schedule_events(self):
@@ -628,7 +640,7 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
                 for request_id in ready
             )
 
-    engine = AuthoritativeAckEngine(clock, ack_delay_ms=500)
+    engine = PlannedReceiptEngine(clock, ack_delay_ms=500)
     request_metrics_path = tmp_path / "requests.jsonl"
     summary_path = tmp_path / "summary.json"
     benchmark.run_benchmark(
@@ -657,15 +669,18 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     record = json.loads(
         request_metrics_path.read_text(encoding="utf-8").strip()
     )
-    assert record["ttft_source"] == "authoritative_admission_ack"
+    assert record["schema_version"] == 3
+    assert record["ttft_source"] == "planned_add_result"
     assert record["ttft_ms"] == 500.0
     assert record["bootstrap_ttft_ms"] == 500.0
     assert record["model_ttft_ms"] is None
     assert record["router_pending_ms"] == 25.0
     assert record["admission_rpc_ms"] == 450.0
-    assert record["local_command_queue_ms"] == 100.0
-    assert record["local_admission_ms"] == 50.0
-    assert record["admission_rpc_residual_ms"] == 300.0
+    assert record["local_command_queue_ms"] is None
+    assert record["local_admission_ms"] is None
+    assert record["staged_queue_ms"] == 100.0
+    assert record["planned_commit_ms"] == 50.0
+    assert record["admission_rpc_residual_ms"] is None
     assert record["frontend_ack_overhead_ms"] == 25.0
     assert record["first_schedule_latency_ms"] == 42.5
     assert (
@@ -691,9 +706,11 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     assert summary["model_ttft_ms"] is None
     assert summary["router_pending_ms"]["mean"] == 25.0
     assert summary["admission_rpc_ms"]["mean"] == 450.0
-    assert summary["local_command_queue_ms"]["mean"] == 100.0
-    assert summary["local_admission_ms"]["mean"] == 50.0
-    assert summary["admission_rpc_residual_ms"]["mean"] == 300.0
+    assert summary["local_command_queue_ms"] is None
+    assert summary["local_admission_ms"] is None
+    assert summary["staged_queue_ms"]["mean"] == 100.0
+    assert summary["planned_commit_ms"]["mean"] == 50.0
+    assert summary["admission_rpc_residual_ms"] is None
     assert summary["frontend_ack_overhead_ms"]["mean"] == 25.0
     assert summary["first_schedule_latency_ms"]["mean"] == 42.5
     assert summary["global_capacity_queue_ms"]["mean"] == 30.0

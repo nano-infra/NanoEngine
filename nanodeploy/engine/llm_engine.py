@@ -589,7 +589,7 @@ class LLMEngine:
         self._frontend_cycle_active = True
 
     def _poll_frontend_control_plane(self) -> None:
-        batches = self.deployment.poll_frontend_events()
+        batches = self.deployment.poll_ready_frontend_events()
         snapshots = tuple(batch.load for batch in batches)
         self.router.record_loads(snapshots)
 
@@ -601,9 +601,15 @@ class LLMEngine:
         ready_add_results = list(
             self.router.record_add_results(raw_add_results)
         )
-        self._frontend_ingress_acks.extend(
-            self.router.poll_ingress_acks()
-        )
+        try:
+            ingress_acks = self.router.poll_ingress_acks()
+        except BaseException:
+            # A timed-out staged-ingress receipt has an unknown ownership
+            # outcome. Stop the deployment instead of risking a payload retry
+            # or continuing with divergent Router/LocalEngine state.
+            self.deployment.close()
+            raise
+        self._frontend_ingress_acks.extend(ingress_acks)
         # Admission ACKs can make ADD results fetched in the same consolidated
         # RPC routable, so flush the router's early-event buffer immediately.
         ready_add_results.extend(self.router.record_add_results(()))
@@ -661,15 +667,17 @@ class LLMEngine:
 
         now = time.monotonic()
         if (
-            now - self._last_load_report_time
+            self.router.last_loads()
+            and now - self._last_load_report_time
             >= self.config.load_report_interval_ms / 1000
         ):
             self._last_load_report_time = now
+            current_snapshots = tuple(self.router.last_loads().values())
             self.metrics_manager.server_metric.update_waiting_requests(
-                sum(snapshot.waiting for snapshot in snapshots)
+                sum(snapshot.waiting for snapshot in current_snapshots)
             )
             self.metrics_manager.server_metric.update_running_requests(
-                sum(snapshot.running for snapshot in snapshots)
+                sum(snapshot.running for snapshot in current_snapshots)
             )
 
     def poll(self) -> tuple[FinishEvent, ...]:
@@ -786,6 +794,9 @@ class LLMEngine:
             "postprocess_latency_ms_total",
             "ingress_queue_delay_ms_total",
             "scheduler_add_ms_total",
+            "local_transient_retries",
+            "planned_commit_attempts",
+            "payload_retry_bytes",
             "decode_itl_ms_weighted_total",
             "decode_itl_token_count",
             "decode_itl_sample_count",
@@ -818,6 +829,9 @@ class LLMEngine:
         )
         admission_routing = self.router.admission_metrics()
         metrics["admission_routing"] = admission_routing
+        metrics["frontend_event_flights"] = (
+            self.deployment.frontend_event_flight_metrics()
+        )
         metrics["global_pending_admission"] = admission_routing[
             "global_pending"
         ]
@@ -903,6 +917,10 @@ class LLMEngine:
                 "reserved_slots",
                 "ingress_queue_delay_ms_total",
                 "scheduler_add_ms_total",
+                "local_transient_retries",
+                "staged_ingress_depth_max",
+                "planned_commit_attempts",
+                "payload_retry_bytes",
                 "decode_itl_ms_weighted_total",
                 "decode_itl_token_count",
                 "decode_itl_sample_count",

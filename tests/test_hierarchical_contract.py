@@ -422,7 +422,7 @@ def test_legacy_frontend_batch_master_reservation_is_counted_once():
     assert shadow.free_blocks == [2]
 
 
-def test_planned_admission_mismatch_keeps_local_fifo_clean():
+def test_planned_admission_mismatch_keeps_staged_sequences_retryable():
     config = make_hierarchical_config()
     local = LocalScheduler(
         config, config.hierarchical_topology.engine(0)
@@ -447,6 +447,32 @@ def test_planned_admission_mismatch_keeps_local_fifo_clean():
     assert not local.cpp_scheduler.waiting_migration
     assert not local.cpp_scheduler.running(0)
     assert local.is_finished()
+
+    planner = AdmissionPlanner(AdmissionPlannerConfig.from_config(config))
+    shadow = planner.shadow_from_snapshot(
+        local.load_snapshot(wave_id=1, quantum_id=0)
+    )
+    assert shadow is not None
+    retry_reservations = tuple(
+        planner.plan(shadow, command) for command in commands
+    )
+    assert all(reservation is not None for reservation in retry_reservations)
+
+    retried = local.commit_planned_batch(
+        commands,
+        tuple(
+            reservation
+            for reservation in retry_reservations
+            if reservation is not None
+        ),
+        sequences,
+    )
+
+    assert all(result.accepted for result in retried)
+    assert [sequence.seq_id for sequence in local.cpp_scheduler.running(0)] == [
+        10,
+        11,
+    ]
 
 
 def test_planned_admission_scans_live_records_once_per_batch():

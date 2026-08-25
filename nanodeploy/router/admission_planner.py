@@ -151,11 +151,13 @@ class AdmissionPlanner:
         reservation: AdmissionReservation,
         *,
         current_batch: bool = False,
+        count_queue_slot: bool = True,
     ) -> None:
         block_size = self.config.kvcache_block_size
         master = reservation.master_sp_idx
         shadow.master_counts[master] += 1
-        shadow.queue_slots += 1
+        if count_queue_slot:
+            shadow.queue_slots += 1
         if self.config.sp_master_selector == "RoundRobin":
             shadow.rr_cursor = (master + 1) % self.config.attention_sp
         for sp_idx, token_count in enumerate(
