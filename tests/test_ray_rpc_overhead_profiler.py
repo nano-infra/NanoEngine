@@ -9,6 +9,7 @@ from scripts.ray_rpc_overhead.profile_ray_rpc_scalability import (
     _estimated_pickle_bytes,
     _parse_positive_ints,
     _percentile,
+    _plan_actor_node_ids,
     _sample_token_rows,
     _stats,
 )
@@ -54,6 +55,43 @@ def test_profiler_disables_ray_uv_runtime_environment_detection() -> None:
     assert ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV is False
 
 
+def test_plan_actor_node_ids_pins_eight_workers_per_host() -> None:
+    nodes = [
+        {
+            "Alive": True,
+            "NodeID": "remote-node",
+            "NodeManagerAddress": "10.0.0.2",
+            "NodeManagerHostname": "remote",
+            "Resources": {},
+        },
+        {
+            "Alive": True,
+            "NodeID": "head-node",
+            "NodeManagerAddress": "10.0.0.1",
+            "NodeManagerHostname": "head",
+            "Resources": {"node:__internal_head__": 1.0},
+        },
+    ]
+
+    assignments, selected = _plan_actor_node_ids(
+        nodes,
+        max_workers=16,
+        workers_per_node=8,
+    )
+
+    assert assignments == ("head-node",) * 8 + ("remote-node",) * 8
+    assert [node["hostname"] for node in selected] == ["head", "remote"]
+
+
+def test_plan_actor_node_ids_rejects_insufficient_nodes() -> None:
+    with pytest.raises(RuntimeError, match="need 2 live Ray nodes"):
+        _plan_actor_node_ids(
+            [{"Alive": True, "NodeID": "only-node"}],
+            max_workers=16,
+            workers_per_node=8,
+        )
+
+
 def test_main_skips_ray_runtime_environment_hook(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -88,3 +126,41 @@ def test_main_skips_ray_runtime_environment_hook(
 
     assert init_kwargs["address"] == "local"
     assert init_kwargs["_skip_env_hook"] is True
+
+
+def test_main_connects_to_external_ray_without_local_only_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class ExpectedInit(Exception):
+        pass
+
+    init_kwargs = {}
+
+    def capture_init(**kwargs):
+        init_kwargs.update(kwargs)
+        raise ExpectedInit
+
+    monkeypatch.setattr(profiler.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(profiler.ray, "init", capture_init)
+
+    with pytest.raises(ExpectedInit):
+        profiler.main(
+            [
+                "--logical-workers",
+                "16",
+                "--batch-sizes",
+                "32",
+                "--ray-address",
+                "10.0.0.1:8776",
+                "--workers-per-node",
+                "8",
+                "--output-dir",
+                str(tmp_path / "results"),
+            ]
+        )
+
+    assert init_kwargs["address"] == "10.0.0.1:8776"
+    assert init_kwargs["_skip_env_hook"] is True
+    assert "_temp_dir" not in init_kwargs
+    assert "num_cpus" not in init_kwargs

@@ -9,9 +9,9 @@ real Ray actors with the same ``run`` call signature, sends the same empty
 
 The benchmark measures Ray actor submission and result round-trip overhead.  It
 does not launch ModelRunner, execute GPU kernels, or emulate DLSlime/RDMA
-traffic.  Logical workers are colocated in one isolated local Ray instance, so
-the results characterize Ray control-plane scaling rather than multi-node
-network bandwidth.
+traffic.  By default logical workers are colocated in one isolated local Ray
+instance.  An external Ray cluster and a fixed workers-per-node placement can
+also be supplied to measure the same control RPC across multiple hosts.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from typing import Sequence
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 @ray.remote(num_cpus=0)
@@ -63,6 +64,13 @@ class RayDecodeControlWorker:
 
     def ready(self) -> int:
         return self.logical_rank
+
+    def placement(self) -> dict[str, object]:
+        return {
+            "logical_rank": self.logical_rank,
+            "hostname": socket.gethostname(),
+            "node_id": str(ray.get_runtime_context().get_node_id()),
+        }
 
     def run(
         self,
@@ -157,6 +165,58 @@ def _estimated_pickle_bytes(batch_size_per_gpu: int, loop_count: int) -> tuple[i
         len(pickle.dumps(input_args, protocol=pickle.HIGHEST_PROTOCOL)),
         len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)),
     )
+
+
+def _plan_actor_node_ids(
+    nodes: Sequence[dict[str, object]],
+    *,
+    max_workers: int,
+    workers_per_node: int | None,
+) -> tuple[tuple[str | None, ...], list[dict[str, object]]]:
+    if workers_per_node is None:
+        return (None,) * max_workers, []
+
+    alive_nodes = [node for node in nodes if node.get("Alive", False)]
+
+    def node_sort_key(node: dict[str, object]) -> tuple[bool, str, str]:
+        resources = node.get("Resources", {})
+        is_head = bool(node.get("IsHeadNode", False)) or (
+            isinstance(resources, dict)
+            and "node:__internal_head__" in resources
+        )
+        return (
+            not is_head,
+            str(node.get("NodeManagerAddress", "")),
+            str(node.get("NodeID", "")),
+        )
+
+    alive_nodes.sort(key=node_sort_key)
+    required_nodes = math.ceil(max_workers / workers_per_node)
+    if len(alive_nodes) < required_nodes:
+        raise RuntimeError(
+            f"need {required_nodes} live Ray nodes for {max_workers} workers at "
+            f"{workers_per_node} workers/node, found {len(alive_nodes)}"
+        )
+
+    selected_nodes = alive_nodes[:required_nodes]
+    selected_node_ids = [str(node.get("NodeID", "")) for node in selected_nodes]
+    if any(not node_id for node_id in selected_node_ids):
+        raise RuntimeError("one or more selected Ray nodes have no NodeID")
+
+    assignments = tuple(
+        selected_node_ids[rank // workers_per_node]
+        for rank in range(max_workers)
+    )
+    selected_metadata = [
+        {
+            "node_id": str(node["NodeID"]),
+            "hostname": str(node.get("NodeManagerHostname", "")),
+            "address": str(node.get("NodeManagerAddress", "")),
+            "is_head": index == 0 and not node_sort_key(node)[0],
+        }
+        for index, node in enumerate(selected_nodes)
+    ]
+    return assignments, selected_metadata
 
 
 def _invoke_once(
@@ -335,6 +395,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-iterations", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument(
+        "--ray-address",
+        default="local",
+        help="Ray GCS address, or 'local' for a fresh single-node instance.",
+    )
+    parser.add_argument(
+        "--workers-per-node",
+        type=int,
+        help=(
+            "Hard-pin consecutive logical workers to Ray nodes in blocks of "
+            "this size; intended for controlled multi-node measurements."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
@@ -350,6 +423,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error("--warmup-iterations must be non-negative")
     if args.iterations <= 0:
         parser.error("--iterations must be positive")
+    if args.workers_per_node is not None and args.workers_per_node <= 0:
+        parser.error("--workers-per-node must be positive")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -357,32 +432,63 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _validate_args(args, parser)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    # Ray places Unix-domain sockets below its runtime directory. Keeping this
-    # path short avoids Linux's 107-byte AF_UNIX pathname limit even when the
-    # requested result directory is descriptive and deeply nested.
-    ray_temp_dir = Path(tempfile.mkdtemp(prefix="nd-ray-", dir="/tmp"))
+    ray_temp_dir: Path | None = None
+    ray_init_kwargs: dict[str, object] = {
+        "address": args.ray_address,
+        "_skip_env_hook": True,
+        "logging_level": "ERROR",
+    }
+    if args.ray_address == "local":
+        # Ray places Unix-domain sockets below its runtime directory. Keeping
+        # this path short avoids Linux's 107-byte AF_UNIX pathname limit.
+        ray_temp_dir = Path(tempfile.mkdtemp(prefix="nd-ray-", dir="/tmp"))
+        ray_init_kwargs.update(
+            {
+                "include_dashboard": False,
+                "num_cpus": min(os.cpu_count() or 1, max(args.logical_workers)),
+                "_temp_dir": str(ray_temp_dir),
+            }
+        )
 
     if ray.is_initialized():
         raise RuntimeError("profiler requires a fresh isolated Ray instance")
-    ray_context = ray.init(
-        address="local",
-        include_dashboard=False,
-        num_cpus=min(os.cpu_count() or 1, max(args.logical_workers)),
-        _temp_dir=str(ray_temp_dir),
-        _skip_env_hook=True,
-        logging_level="ERROR",
-    )
+    ray_context = ray.init(**ray_init_kwargs)
     records: list[dict[str, object]] = []
     actors: list[ray.actor.ActorHandle] = []
+    actor_placements: list[dict[str, object]] = []
+    selected_nodes: list[dict[str, object]] = []
     try:
         max_workers = max(args.logical_workers)
-        actors = [
-            RayDecodeControlWorker.remote(rank, args.loop_count)
-            for rank in range(max_workers)
-        ]
+        actor_node_ids, selected_nodes = _plan_actor_node_ids(
+            ray.nodes(),
+            max_workers=max_workers,
+            workers_per_node=args.workers_per_node,
+        )
+        for rank, node_id in enumerate(actor_node_ids):
+            actor = (
+                RayDecodeControlWorker.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id,
+                        soft=False,
+                    )
+                ).remote(rank, args.loop_count)
+                if node_id is not None
+                else RayDecodeControlWorker.remote(rank, args.loop_count)
+            )
+            actors.append(actor)
         ready_ranks = ray.get([actor.ready.remote() for actor in actors])
         if ready_ranks != list(range(max_workers)):
             raise RuntimeError("Ray actors did not preserve logical rank ordering")
+        actor_placements = ray.get([actor.placement.remote() for actor in actors])
+        for placement, expected_node_id in zip(actor_placements, actor_node_ids):
+            if (
+                expected_node_id is not None
+                and placement["node_id"] != expected_node_id
+            ):
+                raise RuntimeError(
+                    f"worker {placement['logical_rank']} ran on node "
+                    f"{placement['node_id']}, expected {expected_node_id}"
+                )
 
         total_cases = len(args.batch_sizes) * len(args.logical_workers)
         case_index = 0
@@ -426,8 +532,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "python": platform.python_version(),
         "ray_version": ray.__version__,
         "ray_address": ray_context.address_info.get("gcs_address", "local"),
-        "ray_temp_dir": str(ray_temp_dir),
+        "ray_temp_dir": str(ray_temp_dir) if ray_temp_dir is not None else None,
         "cpu_count": os.cpu_count(),
+        "selected_nodes": selected_nodes,
+        "actor_placements": actor_placements,
         "timed_scope": (
             "Ray actor run.remote submission plus ray.get of production-shaped "
             "decode token results"
@@ -437,8 +545,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "actor creation, batch payload construction, and result validation"
         ),
         "topology_limit": (
-            "all logical workers are colocated in one isolated Ray instance; "
-            "this is not a multi-node bandwidth simulation"
+            "logical workers are colocated in one isolated Ray instance"
+            if args.ray_address == "local"
+            else (
+                "actors use hard node affinity, but this measures Ray control "
+                "RPC traffic rather than DLSlime/RDMA data-plane bandwidth"
+            )
         ),
         "arguments": {
             key: str(value) if isinstance(value, Path) else value
