@@ -409,7 +409,7 @@ for rate in "${RATES[@]}"; do
 
     # 构建 Python 命令
     CMD=(
-        python -u "$PYTHON_SCRIPT"
+        python3 -u "$PYTHON_SCRIPT"
         --dataset csv
         --csv-path "$CSV_PATH"
         --max-request-tokens "$MAX_REQUEST_TOKENS"
