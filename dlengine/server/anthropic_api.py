@@ -273,10 +273,11 @@ def format_messages_response(
     text: str,
     gen: Any,
     use_tools: bool,
+    tools: Optional[list[dict]],
     input_tokens: int,
 ) -> dict:
     """Build the non-streaming Anthropic ``message`` response body."""
-    parsed = server.tool_parser.parse_full(text)
+    parsed = server.tool_parser.parse_full(text, tools=tools if use_tools else None)
     content_blocks: list[dict] = []
     if parsed.content:
         content_blocks.append({"type": "text", "text": parsed.content})
@@ -328,6 +329,7 @@ async def event_stream(
     stop: list[str],
     reasoning_open: bool,
     use_tools: bool,
+    tools: Optional[list[dict]],
     input_tokens: int,
 ) -> AsyncGenerator[bytes, None]:
     """Emit the Anthropic streaming SSE event sequence for one request.
@@ -372,7 +374,7 @@ async def event_stream(
             reasoning_open=reasoning_open,
         ):
             # Drop reasoning ("thinking") deltas; only stream the visible answer.
-            if gen.in_reasoning:
+            if gen.in_reasoning or not delta:
                 continue
             if not text_block_open:
                 index += 1
@@ -401,7 +403,9 @@ async def event_stream(
         tool_calls = []
         if use_tools and gen is not None:
             full_text = server.tokenizer.decode(gen.token_ids, skip_special_tokens=True)
-            tool_calls = server.tool_parser.parse_full(full_text).tool_calls
+            tool_calls = server.tool_parser.parse_full(
+                full_text, tools=tools
+            ).tool_calls
 
         # Anthropic messages must carry at least one content block.
         if not text_block_open and not tool_calls:
@@ -523,6 +527,7 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
                     text=text,
                     gen=gen,
                     use_tools=use_tools,
+                    tools=tools,
                     input_tokens=input_tokens,
                 )
             )
@@ -533,6 +538,7 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
             text="",
             gen=None,
             use_tools=use_tools,
+            tools=tools,
             input_tokens=input_tokens,
         )
         response["kv_transfer_params"] = {
@@ -564,6 +570,7 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
                 stop=stop,
                 reasoning_open=reasoning_open,
                 use_tools=use_tools,
+                tools=tools,
                 input_tokens=input_tokens,
             ),
             media_type="text/event-stream",
@@ -599,6 +606,7 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
             text=text,
             gen=gen,
             use_tools=use_tools,
+            tools=tools,
             input_tokens=input_tokens,
         )
     )
