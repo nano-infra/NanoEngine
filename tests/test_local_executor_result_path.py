@@ -44,7 +44,9 @@ class _Sequence:
 
     @staticmethod
     def block_ctx():
-        return SimpleNamespace(master_sp_idx=0)
+        raise AssertionError(
+            "LocalExecutor must reuse the frozen mastered-row layout"
+        )
 
 
 class _Batch:
@@ -58,6 +60,10 @@ class _Batch:
     per_rank_sequences = {
         0: [first_real, control_dummy, second_real]
     }
+    frozen_mastered_sequences = {
+        0: (first_real, control_dummy, second_real)
+    }
+    frozen_real_row_indices = {0: (0, 2)}
 
     @staticmethod
     def is_control_dummy(sequence):
@@ -107,4 +113,3 @@ def test_local_executor_preserves_real_rows_around_control_dummy(
         [_Batch.per_rank_sequences[0]],
         False,
     )
-

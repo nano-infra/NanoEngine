@@ -75,9 +75,9 @@ class Config:
     # field name is retained for configuration/fingerprint compatibility;
     # both scheduler architectures may enable it.
     hierarchical_quantum_diagnostics: bool = False
-    # Diagnostic-only positional result path. The default preserves the
-    # request-id dict/set/reorder implementation for controlled A/B testing.
-    hierarchical_result_fastpath: bool = False
+    # Positional result path reuses the scheduler's frozen row layout. Disable
+    # only for diagnostic A/B against the request-id dict/set rebuild path.
+    hierarchical_result_fastpath: bool = True
     # Ray remains the lifecycle/placement plane. RequestRouter<->LocalEngine
     # ingress always uses ZMQ. This option selects LocalEngine<->ModelRunner
     # quantum control/results; DLSlime continues to carry Sequence payloads.

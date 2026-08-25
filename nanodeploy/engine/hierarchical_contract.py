@@ -422,6 +422,8 @@ class LocalDecodeBatch:
     engine_id: int
     engine_has_real: bool
     per_rank_sequences: dict[int, list[Any]]
+    frozen_mastered_sequences: dict[int, tuple[Any, ...]]
+    frozen_real_row_indices: dict[int, tuple[int, ...]]
     request_master_global_rank: dict[int, int]
     frozen_request_order: dict[int, tuple[int, ...]]
     control_dummy_ids: frozenset[int]

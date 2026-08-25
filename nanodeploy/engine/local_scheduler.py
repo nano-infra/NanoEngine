@@ -113,6 +113,10 @@ class LocalScheduler:
             0 for _ in range(self.topology.attention_sp)
         ]
         self._last_itl_token_slots = 0
+        self._sp_idx_by_global_rank = {
+            global_rank: sp_idx
+            for sp_idx, global_rank in enumerate(self.topology.global_ranks)
+        }
 
     @property
     def cpp_scheduler(self) -> Scheduler:
@@ -625,44 +629,52 @@ class LocalScheduler:
 
         sequences = list(self._scheduler.plan_decode()[0])
         self._reconcile_preemptions()
-        control_dummy_ids = frozenset(
-            sequence.seq_id
-            for sequence in sequences
-            if self._state_manager.is_control_dummy(sequence)
-        )
-        control_dummy_object_ids = frozenset(
-            id(sequence)
-            for sequence in sequences
-            if self._state_manager.is_control_dummy(sequence)
-        )
-        real_sequences = [
-            sequence
-            for sequence in sequences
-            if id(sequence) not in control_dummy_object_ids
-        ]
-        self._inflight_ids = {sequence.seq_id for sequence in real_sequences}
-
-        request_master_global_rank = {
-            sequence.seq_id: self.topology.global_rank(
-                sequence.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
-            )
-            for sequence in real_sequences
+        mastered_sequence_lists = {
+            global_rank: [] for global_rank in self.topology.global_ranks
         }
-        frozen_request_order = {
-            global_rank: tuple(
-                sequence.seq_id
-                for sequence in real_sequences
-                if request_master_global_rank[sequence.seq_id] == global_rank
-            )
+        real_row_index_lists = {
+            global_rank: [] for global_rank in self.topology.global_ranks
+        }
+        request_order_lists = {
+            global_rank: [] for global_rank in self.topology.global_ranks
+        }
+        control_dummy_ids: set[int] = set()
+        control_dummy_object_ids: set[int] = set()
+        real_sequences: list[Sequence] = []
+        request_master_global_rank: dict[int, int] = {}
+        for sequence in sequences:
+            master_sp_idx = sequence.block_ctx(
+                BlockContextSlot.ACTIVE
+            ).master_sp_idx
+            global_rank = self.topology.global_rank(master_sp_idx)
+            mastered_sequences = mastered_sequence_lists[global_rank]
+            row_index = len(mastered_sequences)
+            mastered_sequences.append(sequence)
+            if self._state_manager.is_control_dummy(sequence):
+                control_dummy_ids.add(sequence.seq_id)
+                control_dummy_object_ids.add(id(sequence))
+                continue
+            real_sequences.append(sequence)
+            request_master_global_rank[sequence.seq_id] = global_rank
+            request_order_lists[global_rank].append(sequence.seq_id)
+            real_row_index_lists[global_rank].append(row_index)
+
+        frozen_mastered_sequences = {
+            global_rank: tuple(mastered_sequence_lists[global_rank])
             for global_rank in self.topology.global_ranks
         }
+        frozen_real_row_indices = {
+            global_rank: tuple(real_row_index_lists[global_rank])
+            for global_rank in self.topology.global_ranks
+        }
+        frozen_request_order = {
+            global_rank: tuple(request_order_lists[global_rank])
+            for global_rank in self.topology.global_ranks
+        }
+        self._inflight_ids = {sequence.seq_id for sequence in real_sequences}
         self._last_master_batch_sizes = [
-            len(
-                frozen_request_order[
-                    self.topology.global_rank(sp_idx=sp_idx)
-                ]
-            )
-            for sp_idx in range(self.topology.attention_sp)
+            len(frozen_request_order[global_rank])
+            for global_rank in self.topology.global_ranks
         ]
         per_rank_sequences = {
             global_rank: list(sequences)
@@ -674,11 +686,15 @@ class LocalScheduler:
             engine_id=self.engine_id,
             engine_has_real=bool(real_sequences),
             per_rank_sequences=per_rank_sequences,
+            frozen_mastered_sequences=frozen_mastered_sequences,
+            frozen_real_row_indices=frozen_real_row_indices,
             request_master_global_rank=request_master_global_rank,
             frozen_request_order=frozen_request_order,
-            control_dummy_ids=control_dummy_ids,
+            control_dummy_ids=frozenset(control_dummy_ids),
             _all_sequences=sequences,
-            _control_dummy_object_ids=control_dummy_object_ids,
+            _control_dummy_object_ids=frozenset(
+                control_dummy_object_ids
+            ),
         )
 
     def mark_first_forward_started(
@@ -829,17 +845,12 @@ class LocalScheduler:
             for request_id in self._inflight_ids
             if self._records[request_id].state == RequestState.ABORT_PENDING
         }
+        surviving_ids = tuple(
+            sorted(self._inflight_ids.difference(aborted_ids))
+        )
         completed_before = {
             request_id: self._records[request_id].sequence.num_completed_tokens
-            for request_id in self._inflight_ids.difference(aborted_ids)
-        }
-        master_sp_by_request = {
-            request_id: (
-                self._records[request_id]
-                .sequence.block_ctx(BlockContextSlot.ACTIVE)
-                .master_sp_idx
-            )
-            for request_id in completed_before
+            for request_id in surviving_ids
         }
         self._last_itl_token_slots = 0
         for request_id in sorted(aborted_ids):
@@ -850,33 +861,40 @@ class LocalScheduler:
         for sp_idx in range(self.topology.attention_sp):
             global_rank = self.topology.global_rank(sp_idx)
             result = results_by_rank[global_rank]
-            token_by_request = dict(
-                zip(
-                    result.mastered_request_ids,
-                    result.sampled_token_ids,
-                    strict=True,
+            mastered_sequences = batch.frozen_mastered_sequences[
+                global_rank
+            ]
+            real_row_indices = batch.frozen_real_row_indices[global_rank]
+            if len(real_row_indices) != len(result.sampled_token_ids):
+                raise RuntimeError(
+                    f"rank {global_rank} frozen real-row layout mismatch"
                 )
-            )
             rank_sequences: list[Sequence] = []
             rank_token_ids: list[list[int]] = []
-            for sequence in batch._all_sequences:
-                if (
-                    sequence.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
-                    != sp_idx
-                ):
-                    continue
-                if (
-                    sequence.seq_id in aborted_ids
-                    and not batch.is_control_dummy(sequence)
-                ):
+            real_result_index = 0
+            next_real_row = (
+                real_row_indices[0] if real_row_indices else None
+            )
+            for row_index, sequence in enumerate(mastered_sequences):
+                if row_index == next_real_row:
+                    tokens = result.sampled_token_ids[real_result_index]
+                    real_result_index += 1
+                    next_real_row = (
+                        real_row_indices[real_result_index]
+                        if real_result_index < len(real_row_indices)
+                        else None
+                    )
+                    if sequence.seq_id in aborted_ids:
+                        continue
+                    rank_sequences.append(sequence)
+                    rank_token_ids.append(list(tokens))
                     continue
                 rank_sequences.append(sequence)
-                if batch.is_control_dummy(sequence):
-                    rank_token_ids.append([0] * HIERARCHICAL_LOOP_COUNT)
-                else:
-                    rank_token_ids.append(
-                        list(token_by_request[sequence.seq_id])
-                    )
+                rank_token_ids.append([0] * HIERARCHICAL_LOOP_COUNT)
+            if real_result_index != len(result.sampled_token_ids):
+                raise RuntimeError(
+                    f"rank {global_rank} frozen real-row layout mismatch"
+                )
             dp_sp_sequences.append(rank_sequences)
             dp_sp_token_ids.append(rank_token_ids)
 
@@ -886,7 +904,8 @@ class LocalScheduler:
             metrics_manager=None,
             loop_count=HIERARCHICAL_LOOP_COUNT,
         )
-        for request_id, previous_tokens in completed_before.items():
+        for request_id in surviving_ids:
+            previous_tokens = completed_before[request_id]
             completed_tokens = self._records[
                 request_id
             ].sequence.num_completed_tokens
@@ -896,11 +915,14 @@ class LocalScheduler:
                     "hierarchical completed-token counter moved backwards: "
                     f"request_id={request_id}"
                 )
-            master_sp_idx = master_sp_by_request[request_id]
-            if not 0 <= master_sp_idx < self.topology.attention_sp:
+            master_global_rank = batch.request_master_global_rank[request_id]
+            master_sp_idx = self._sp_idx_by_global_rank.get(
+                master_global_rank
+            )
+            if master_sp_idx is None:
                 raise RuntimeError(
                     "decoded request has invalid master SP rank: "
-                    f"request_id={request_id}, sp_idx={master_sp_idx}"
+                    f"request_id={request_id}, rank={master_global_rank}"
                 )
             self._useful_decode_tokens += generated_tokens
             self._mastered_decode_tokens[master_sp_idx] += generated_tokens
@@ -909,7 +931,7 @@ class LocalScheduler:
                 if previous_tokens > 0
                 else max(0, generated_tokens - 1)
             )
-        for request_id in sorted(self._inflight_ids.difference(aborted_ids)):
+        for request_id in surviving_ids:
             record = self._records[request_id]
             if (
                 not record.first_token_emitted

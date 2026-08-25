@@ -1971,6 +1971,10 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
         per_rank_sequences = {
             0: [real_sequence, control_dummy, second_real_sequence]
         }
+        frozen_mastered_sequences = {
+            0: (real_sequence, control_dummy, second_real_sequence)
+        }
+        frozen_real_row_indices = {0: (0, 2)}
 
         @staticmethod
         def is_control_dummy(sequence):
@@ -2019,7 +2023,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
             "wave_id": 1,
             "quantum_id": 0,
             "global_rank": 0,
-            "real_batch_size": 1,
+            "real_batch_size": 2,
             "control_dummy_count": 1,
             "batch_kind": "real_or_mixed",
         }
@@ -2149,6 +2153,10 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
         real_sequence = FakeSequence(7)
         control_dummy = FakeSequence(-1)
         per_rank_sequences = {0: [real_sequence, control_dummy]}
+        frozen_mastered_sequences = {
+            0: (real_sequence, control_dummy)
+        }
+        frozen_real_row_indices = {0: (0,)}
 
         @staticmethod
         def is_control_dummy(sequence):

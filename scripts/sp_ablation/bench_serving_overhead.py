@@ -2102,7 +2102,7 @@ def main():
             args.quantum_log_path
         ),
         hierarchical_result_fastpath=(
-            os.getenv("NANODEPLOY_HIER_RESULT_FASTPATH", "0") == "1"
+            os.getenv("NANODEPLOY_HIER_RESULT_FASTPATH", "1") == "1"
         ),
         hierarchical_worker_transport=os.getenv(
             "NANODEPLOY_HIER_WORKER_TRANSPORT", "ray"

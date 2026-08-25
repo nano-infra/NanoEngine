@@ -53,7 +53,7 @@ class LocalExecutor:
         self.last_execution_traces: tuple[dict[str, Any], ...] = ()
         self._execution_trace_history: list[dict[str, Any]] = []
         self.result_fastpath_enabled = bool(
-            getattr(config, "hierarchical_result_fastpath", False)
+            getattr(config, "hierarchical_result_fastpath", True)
         )
         self.quantum_diagnostics_enabled = bool(
             getattr(config, "hierarchical_quantum_diagnostics", False)
@@ -215,29 +215,20 @@ class LocalExecutor:
         send_timestamp = time.time()
         futures: list[Any] = []
         zmq_commands: dict[int, DecodeCommand] = {}
-        mastered_by_rank: dict[int, list[Any]] = {}
         for global_rank, worker in zip(
             self.topology.global_ranks, self.workers, strict=True
         ):
-            mastered = [
-                sequence
-                for sequence in batch.per_rank_sequences[global_rank]
-                if sequence.block_ctx().master_sp_idx
-                == self.topology.engine_local_rank(global_rank)
-            ]
-            mastered_by_rank[global_rank] = mastered
+            mastered = batch.frozen_mastered_sequences[global_rank]
+            expected = batch.expected_request_ids(global_rank)
             trace_context = None
             if self.config.hierarchical_execution_trace:
                 trace_context = {
                     "wave_id": batch.wave_id,
                     "quantum_id": batch.quantum_id,
                     "global_rank": global_rank,
-                    "real_batch_size": len(
-                        batch.expected_request_ids(global_rank)
-                    ),
-                    "control_dummy_count": sum(
-                        batch.is_control_dummy(sequence)
-                        for sequence in mastered
+                    "real_batch_size": len(expected),
+                    "control_dummy_count": (
+                        len(mastered) - len(expected)
                     ),
                     "batch_kind": (
                         "real_or_mixed"
@@ -439,7 +430,9 @@ class LocalExecutor:
                         "invalid quantum diagnostic"
                     )
                 worker_diagnostics.append(dict(worker_diagnostic))
-            mastered_sequences = mastered_by_rank[global_rank]
+            mastered_sequences = batch.frozen_mastered_sequences[
+                global_rank
+            ]
             if len(token_rows) != len(mastered_sequences):
                 raise RuntimeError(
                     f"worker {global_rank} token row mismatch: "
@@ -448,17 +441,16 @@ class LocalExecutor:
             expected = batch.expected_request_ids(global_rank)
             index_begin = perf_counter()
             if self.result_fastpath_enabled:
-                actual_request_ids: list[int] = []
-                sampled_token_ids: list[tuple[int, ...]] = []
-                for sequence, tokens in zip(
-                    mastered_sequences, token_rows, strict=True
-                ):
-                    if batch.is_control_dummy(sequence):
-                        continue
-                    actual_request_ids.append(sequence.seq_id)
-                    sampled_token_ids.append(tuple(tokens))
-                actual_request_order = tuple(actual_request_ids)
-                packed_token_ids = tuple(sampled_token_ids)
+                real_row_indices = batch.frozen_real_row_indices[
+                    global_rank
+                ]
+                if len(real_row_indices) == len(expected):
+                    packed_token_ids = tuple(
+                        tuple(token_rows[row_index])
+                        for row_index in real_row_indices
+                    )
+                else:
+                    packed_token_ids = ()
             else:
                 token_by_request = {
                     sequence.seq_id: tuple(tokens)
@@ -475,13 +467,19 @@ class LocalExecutor:
 
             validate_begin = perf_counter()
             if self.result_fastpath_enabled:
-                valid_result = actual_request_order == expected
+                valid_result = len(packed_token_ids) == len(expected)
             else:
                 valid_result = set(actual_request_order) == set(expected)
             result_validate_latency_ms += (
                 perf_counter() - validate_begin
             ) * 1000
             if not valid_result:
+                if self.result_fastpath_enabled:
+                    raise RuntimeError(
+                        f"worker {global_rank} frozen real-row mismatch: "
+                        f"expected={len(expected)}, "
+                        f"got={len(real_row_indices)}"
+                    )
                 raise RuntimeError(
                     f"worker {global_rank} mastered request mismatch: "
                     f"expected={expected}, got={actual_request_order}"
@@ -493,10 +491,7 @@ class LocalExecutor:
                     global_rank,
                     HIERARCHICAL_LOOP_COUNT,
                     len(expected),
-                    sum(
-                        batch.is_control_dummy(sequence)
-                        for sequence in mastered_sequences
-                    ),
+                    len(mastered_sequences) - len(expected),
                     (
                         "real_or_mixed"
                         if batch.engine_has_real

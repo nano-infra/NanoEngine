@@ -575,6 +575,8 @@ def test_local_decode_batch_validates_rank_order_and_forward_count():
         engine_id=1,
         engine_has_real=True,
         per_rank_sequences={4: [], 5: []},
+        frozen_mastered_sequences={4: (), 5: ()},
+        frozen_real_row_indices={4: (), 5: ()},
         request_master_global_rank={10: 4},
         frozen_request_order={4: (10,), 5: ()},
         control_dummy_ids=frozenset({99}),
@@ -684,6 +686,14 @@ def test_local_scheduler_postprocess_preserves_frozen_positional_results():
         for request_id in request_ids
     }
     assert local.abort(aborted_id).status == "abort_pending"
+
+    class NonIterableSequenceList(list):
+        def __iter__(self):
+            raise AssertionError(
+                "postprocess must reuse the frozen per-rank layout"
+            )
+
+    batch._all_sequences = NonIterableSequenceList(batch._all_sequences)
 
     events = local.postprocess(
         batch,
