@@ -680,6 +680,11 @@ class OpenAIServer:
                 yield text[emitted:], gen
             finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
         gen.finish_reason = finish_reason
+        if holding_marker and emitted == 0:
+            # A tool-only completion can begin with a held marker and therefore
+            # produce no visible delta. Yield a state-only update so callers
+            # still receive the completed token list for tool parsing.
+            yield "", gen
 
     def _abort_request(self, req: _Request) -> None:
         """Best-effort engine-side abort for a request that hit a stop string."""
@@ -1088,6 +1093,8 @@ def build_app(server: OpenAIServer):
                         hold_markers=hold_markers,
                         reasoning_open=reasoning_open,
                     ):
+                        if not delta:
+                            continue
                         # Reasoning ("thinking") tokens go to reasoning_content;
                         # everything else is the user-visible answer.
                         if gen.in_reasoning:
@@ -1114,7 +1121,7 @@ def build_app(server: OpenAIServer):
                         full_text = server.tokenizer.decode(
                             gen.token_ids, skip_special_tokens=True
                         )
-                        parsed = server.tool_parser.parse_full(full_text)
+                        parsed = server.tool_parser.parse_full(full_text, tools=tools)
                         tool_delta: dict[str, Any] = {}
                         # Only attach reasoning here if it was not already
                         # streamed live (avoids duplicating the think region).
@@ -1208,7 +1215,7 @@ def build_app(server: OpenAIServer):
         # Always split off the reasoning region and any tool-call markup so the
         # think text never leaks into ``content`` (the template opens <think>
         # in the prompt, so the answer is preceded by reasoning + </think>).
-        parsed = server.tool_parser.parse_full(text)
+        parsed = server.tool_parser.parse_full(text, tools=tools if use_tools else None)
         message: dict[str, Any] = {
             "role": "assistant",
             "content": parsed.content if parsed.content is not None else "",

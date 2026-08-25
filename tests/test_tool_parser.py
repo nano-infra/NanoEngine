@@ -6,15 +6,15 @@ from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
 
 def test_kimi_k3_xtml_reasoning_response_and_tools():
     parsed = get_tool_parser("kimi_k3").parse_full(
-        '<|open|>think<|sep|>reason<|close|>think<|sep|>'
-        '<|open|>response<|sep|>answer<|close|>response<|sep|>'
-        '<|open|>tools<|sep|>'
+        "<|open|>think<|sep|>reason<|close|>think<|sep|>"
+        "<|open|>response<|sep|>answer<|close|>response<|sep|>"
+        "<|open|>tools<|sep|>"
         '<|open|>call tool="weather" index="1"<|sep|>'
         '<|open|>argument key="city" type="string"<|sep|>北京'
-        '<|close|>argument<|sep|>'
+        "<|close|>argument<|sep|>"
         '<|open|>argument key="days" type="integer"<|sep|>2'
-        '<|close|>argument<|sep|>'
-        '<|close|>call<|sep|><|close|>tools<|sep|>'
+        "<|close|>argument<|sep|>"
+        "<|close|>call<|sep|><|close|>tools<|sep|>"
     )
     assert parsed.reasoning == "reason"
     assert parsed.content == "answer"
@@ -50,6 +50,139 @@ def test_glm_tool_parser_arg_key_value_format():
         "query": "GLM tool parser",
         "limit": 5,
     }
+
+
+def test_glm_tool_parser_honors_declared_string_argument_type():
+    parsed = get_tool_parser("glm").parse_full(
+        "<tool_call>TaskUpdate"
+        "<arg_key>taskId</arg_key><arg_value>1</arg_value>"
+        "<arg_key>status</arg_key><arg_value>completed</arg_value>"
+        "</tool_call>",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "TaskUpdate",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "taskId": {"type": "string"},
+                            "status": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {
+        "taskId": "1",
+        "status": "completed",
+    }
+
+
+def test_glm_tool_parser_stringifies_json_values_for_string_schema():
+    parsed = get_tool_parser("glm5").parse_full(
+        "<tool_call>record"
+        "<arg_key>number</arg_key><arg_value>1</arg_value>"
+        "<arg_key>boolean</arg_key><arg_value>true</arg_value>"
+        "<arg_key>nullable</arg_key><arg_value>null</arg_value>"
+        "<arg_key>array</arg_key><arg_value>[1, 2]</arg_value>"
+        '<arg_key>object</arg_key><arg_value>{"a": 1}</arg_value>'
+        "</tool_call>",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "record",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "number": {"type": "string"},
+                            "boolean": {"type": "string"},
+                            "nullable": {"type": ["null", "string"]},
+                            "array": {"anyOf": [{"type": "array"}, {"type": "string"}]},
+                            "object": {"enum": ["object", 1]},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {
+        "number": "1",
+        "boolean": "True",
+        "nullable": "None",
+        "array": "[1, 2]",
+        "object": '{"a": 1}',
+    }
+
+
+def test_glm_tool_parser_preserves_inference_for_non_string_or_missing_schema():
+    text = (
+        "<tool_call>record"
+        "<arg_key>count</arg_key><arg_value>1</arg_value>"
+        "<arg_key>enabled</arg_key><arg_value>true</arg_value>"
+        "<arg_key>items</arg_key><arg_value>[1, 2]</arg_value>"
+        '<arg_key>metadata</arg_key><arg_value>{"a": 1}</arg_value>'
+        "<arg_key>unknown</arg_key><arg_value>2</arg_value>"
+        "</tool_call>"
+    )
+    parsed = get_tool_parser("glm").parse_full(
+        text,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "record",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                            "items": {"items": {"type": "integer"}},
+                            "metadata": {"properties": {"a": {"type": "integer"}}},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+    expected = {
+        "count": 1,
+        "enabled": True,
+        "items": [1, 2],
+        "metadata": {"a": 1},
+        "unknown": 2,
+    }
+    assert json.loads(parsed.tool_calls[0].function.arguments) == expected
+    assert (
+        json.loads(
+            get_tool_parser("glm").parse_full(text).tool_calls[0].function.arguments
+        )
+        == expected
+    )
+
+
+def test_glm_tool_parser_accepts_native_anthropic_schema_shape():
+    parsed = get_tool_parser("glm").parse_full(
+        "<tool_call>TaskUpdate"
+        "<arg_key>taskId</arg_key><arg_value>1</arg_value>"
+        "</tool_call>",
+        tools=[
+            {
+                "name": "TaskUpdate",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"taskId": {"type": "string"}},
+                },
+            }
+        ],
+    )
+
+    assert json.loads(parsed.tool_calls[0].function.arguments) == {"taskId": "1"}
 
 
 def test_glm_tool_parser_supports_empty_arguments_and_multiple_calls():
@@ -88,7 +221,7 @@ def test_skip_redundant_think_openers():
 
 
 def test_skip_redundant_think_openers_holds_partial_marker():
-    offset, need_more = _skip_redundant_think_openers("<think><thi", 0)
+    offset, need_more = _skip_redundant_think_openers("<think><thin", 0)
 
     assert offset == len("<think>")
     assert need_more is True

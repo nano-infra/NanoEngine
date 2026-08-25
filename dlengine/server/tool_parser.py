@@ -42,7 +42,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -120,6 +120,118 @@ def _coerce_value(raw: str):
         return s
 
 
+def _infer_json_schema_type(schema: Any) -> Optional[str]:
+    """Infer the primary JSON type from a parameter schema.
+
+    GLM emits argument values as untyped XML text. A direct ``type`` covers
+    most tool schemas, while the remaining cases mirror the JSON Schema forms
+    commonly emitted by OpenAI- and Anthropic-compatible clients.
+    """
+    if not isinstance(schema, dict):
+        return None
+
+    type_value = schema.get("type")
+    if isinstance(type_value, str):
+        return type_value
+    if isinstance(type_value, list) and type_value:
+        non_null_types = [item for item in type_value if item != "null"]
+        return non_null_types[0] if non_null_types else "string"
+
+    alternatives = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(alternatives, list):
+        types = [
+            inferred
+            for item in alternatives
+            if (inferred := _infer_json_schema_type(item)) is not None
+        ]
+        if types:
+            if len(set(types)) == 1:
+                return types[0]
+            return "string" if "string" in types else types[0]
+
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        if not enum:
+            return "string"
+        enum_types: set[str] = set()
+        for value in enum:
+            if value is None:
+                enum_types.add("null")
+            elif isinstance(value, bool):
+                enum_types.add("boolean")
+            elif isinstance(value, int):
+                enum_types.add("integer")
+            elif isinstance(value, float):
+                enum_types.add("number")
+            elif isinstance(value, str):
+                enum_types.add("string")
+            elif isinstance(value, list):
+                enum_types.add("array")
+            elif isinstance(value, dict):
+                enum_types.add("object")
+        if len(enum_types) == 1:
+            return enum_types.pop()
+        return "string"
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for item in all_of:
+            inferred = _infer_json_schema_type(item)
+            if inferred and inferred != "string":
+                return inferred
+        return "string"
+
+    if "properties" in schema:
+        return "object"
+    if "items" in schema:
+        return "array"
+    return None
+
+
+def _get_argument_type(
+    function_name: str, argument_name: str, tools: Optional[list[dict]]
+) -> Optional[str]:
+    """Return the declared type of one tool argument, if available."""
+    if not isinstance(tools, list):
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            parameters = function.get("parameters")
+        else:
+            # Accept native Anthropic definitions defensively. The Anthropic
+            # serving path normally converts them before reaching the parser.
+            name = tool.get("name")
+            parameters = tool.get("input_schema")
+        if name != function_name or not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        return _infer_json_schema_type(properties.get(argument_name))
+    return None
+
+
+def _coerce_glm_value(
+    raw: str,
+    function_name: str,
+    argument_name: str,
+    tools: Optional[list[dict]],
+):
+    """Coerce GLM XML text while honoring an explicit string schema."""
+    parsed_value = _coerce_value(raw)
+    if _get_argument_type(function_name, argument_name, tools) != "string":
+        return parsed_value
+    if isinstance(parsed_value, str):
+        return parsed_value
+    if isinstance(parsed_value, (dict, list)):
+        return json.dumps(parsed_value, ensure_ascii=False)
+    return str(parsed_value)
+
+
 class ToolParser:
     """Base class. Subclasses implement :meth:`parse_full`."""
 
@@ -128,7 +240,9 @@ class ToolParser:
     open_markers: tuple[str, ...] = ()
     reasoning_close_marker = "</think>"
 
-    def parse_full(self, text: str) -> ParsedOutput:  # pragma: no cover - abstract
+    def parse_full(
+        self, text: str, tools: Optional[list[dict]] = None
+    ) -> ParsedOutput:  # pragma: no cover - abstract
         raise NotImplementedError
 
 
@@ -139,7 +253,7 @@ class HermesToolParser(ToolParser):
 
     _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
-    def parse_full(self, text: str) -> ParsedOutput:
+    def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
         reasoning, text = _extract_reasoning(text)
 
         tool_calls: list[ToolCall] = []
@@ -173,7 +287,7 @@ class Qwen3XMLToolParser(ToolParser):
     _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
     _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
-    def parse_full(self, text: str) -> ParsedOutput:
+    def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
         reasoning, text = _extract_reasoning(text)
 
         tool_calls: list[ToolCall] = []
@@ -208,7 +322,7 @@ class GLMXMLToolParser(ToolParser):
         re.DOTALL,
     )
 
-    def parse_full(self, text: str) -> ParsedOutput:
+    def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
         reasoning, text = _extract_reasoning(text)
 
         tool_calls: list[ToolCall] = []
@@ -232,7 +346,7 @@ class GLMXMLToolParser(ToolParser):
                 key = p.group(1).strip()
                 if not key:
                     continue
-                args[key] = _coerce_value(p.group(2))
+                args[key] = _coerce_glm_value(p.group(2), name, key, tools)
             tool_calls.append(
                 ToolCall(
                     function=Function(
@@ -260,12 +374,14 @@ class KimiK3ToolParser(ToolParser):
     reasoning_close_marker = THINK_CLOSE
     open_markers = (THINK_OPEN, TOOLS_OPEN)
     _CALL_RE = re.compile(
-        r'<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>'
-        r'(?P<body>.*?)<\|close\|>call<\|sep\|>', re.DOTALL
+        r"<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
+        r"(?P<body>.*?)<\|close\|>call<\|sep\|>",
+        re.DOTALL,
     )
     _ARG_RE = re.compile(
-        r'<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>'
-        r'(?P<val>.*?)<\|close\|>argument<\|sep\|>', re.DOTALL
+        r"<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
+        r"(?P<val>.*?)<\|close\|>argument<\|sep\|>",
+        re.DOTALL,
     )
     _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
 
@@ -287,18 +403,18 @@ class KimiK3ToolParser(ToolParser):
             text = text.replace(cls.RESPONSE_CLOSE, "")
         return text.replace(cls.MESSAGE_CLOSE, "")
 
-    def parse_full(self, text: str) -> ParsedOutput:
+    def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
         reasoning = None
         think_start = text.find(self.THINK_OPEN)
         content_start = think_start + len(self.THINK_OPEN) if think_start >= 0 else 0
         think_end = text.find(self.THINK_CLOSE, content_start)
         if think_end >= 0:
             reasoning = text[content_start:think_end].strip() or None
-            text = text[think_end + len(self.THINK_CLOSE):]
+            text = text[think_end + len(self.THINK_CLOSE) :]
 
         tools_start = text.find(self.TOOLS_OPEN)
         normal = text if tools_start < 0 else text[:tools_start]
-        section = "" if tools_start < 0 else text[tools_start + len(self.TOOLS_OPEN):]
+        section = "" if tools_start < 0 else text[tools_start + len(self.TOOLS_OPEN) :]
         tools_end = section.find(self.TOOLS_CLOSE)
         if tools_end >= 0:
             section = section[:tools_end]
@@ -321,11 +437,17 @@ class KimiK3ToolParser(ToolParser):
                         arguments[key] = json.loads(raw)
                     except json.JSONDecodeError:
                         arguments[key] = raw
-            calls.append(ToolCall(function=Function(
-                name=name, arguments=json.dumps(arguments, ensure_ascii=False)
-            )))
+            calls.append(
+                ToolCall(
+                    function=Function(
+                        name=name, arguments=json.dumps(arguments, ensure_ascii=False)
+                    )
+                )
+            )
         content = self._unwrap_response(normal).strip()
-        return ParsedOutput(content=content or None, tool_calls=calls, reasoning=reasoning)
+        return ParsedOutput(
+            content=content or None, tool_calls=calls, reasoning=reasoning
+        )
 
 
 _REGISTRY: dict[str, type[ToolParser]] = {
