@@ -265,23 +265,67 @@ impl PrefixCacheCoordinator {
     }
 
     pub(crate) fn state_slot(&self, seq_id: u64) -> Option<i32> {
-        self.state.state_slots.get(seq_id)
+        self.state
+            .state_slots
+            .iter()
+            .find_map(|pool| pool.get(seq_id))
     }
 
     pub(crate) fn hisparse_slot(&self, seq_id: u64) -> Option<i32> {
-        self.state.hisparse_slots.get(seq_id)
+        self.state
+            .hisparse_slots
+            .iter()
+            .find_map(|pool| pool.get(seq_id))
     }
 
     pub(crate) fn ensure_state_slot(&mut self, seq_id: u64) -> Option<i32> {
-        self.state.state_slots.ensure(seq_id)
+        if let Some(slot) = self.state_slot(seq_id) {
+            return Some(slot);
+        }
+        let dp_idx = self.assignment(seq_id)?.0;
+        self.state.state_slots.get_mut(dp_idx)?.ensure(seq_id)
     }
 
-    pub(crate) fn can_ensure_state_slot(&self, seq_id: u64) -> bool {
-        self.state.state_slots.can_ensure(seq_id)
+    pub(crate) fn can_ensure_state_slot(&self, seq_id: u64, dp_idx: usize) -> bool {
+        self.state_slot(seq_id).is_some()
+            || self
+                .state
+                .state_slots
+                .get(dp_idx)
+                .is_some_and(|pool| pool.can_ensure(seq_id))
     }
 
     pub(crate) fn ensure_hisparse_slot(&mut self, seq_id: u64) -> Option<i32> {
-        self.state.hisparse_slots.ensure(seq_id)
+        if let Some(slot) = self.hisparse_slot(seq_id) {
+            return Some(slot);
+        }
+        let dp_idx = self.assignment(seq_id)?.0;
+        self.state.hisparse_slots.get_mut(dp_idx)?.ensure(seq_id)
+    }
+
+    pub(crate) fn can_ensure_hisparse_slot(&self, seq_id: u64, dp_idx: usize) -> bool {
+        self.hisparse_slot(seq_id).is_some()
+            || self
+                .state
+                .hisparse_slots
+                .get(dp_idx)
+                .is_some_and(|pool| pool.can_ensure(seq_id))
+    }
+
+    pub(crate) fn used_hisparse_slots(&self) -> i32 {
+        self.state
+            .hisparse_slots
+            .iter()
+            .map(|pool| pool.num_used_slots())
+            .sum()
+    }
+
+    pub(crate) fn total_hisparse_slots(&self) -> i32 {
+        self.state
+            .hisparse_slots
+            .iter()
+            .map(|pool| pool.num_slots())
+            .sum()
     }
 
     pub(crate) fn compressed_pages(&self, seq_id: u64) -> HashMap<i32, Vec<i32>> {

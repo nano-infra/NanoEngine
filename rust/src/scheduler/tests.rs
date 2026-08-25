@@ -103,6 +103,69 @@ fn make_single_slot_linear_scheduler() -> Scheduler {
     })
 }
 
+fn make_single_slot_mtp_scheduler() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 5,
+        max_num_seqs: 1,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "prefill".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: false,
+        cache_plan: CachePlan::new(1 << 1),
+    })
+}
+
+fn make_single_slot_hisparse_scheduler() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 0,
+        max_num_seqs: 1,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "decode".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: false,
+        cache_plan: CachePlan::new((1 << 1) | (1 << 6)),
+    })
+}
+
+fn make_two_dp_single_slot_mtp_hisparse_scheduler() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 5,
+        max_num_seqs: 1,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 2,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "decode".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: false,
+        cache_plan: CachePlan::new((1 << 1) | (1 << 6)),
+    })
+}
+
 fn make_scheduler_with_host_prefix_cache() -> Scheduler {
     Scheduler::new(SchedulerConfig {
         engine_id: "engine".to_string(),
@@ -218,6 +281,70 @@ fn exhausted_linear_state_slot_keeps_request_waiting() {
         let scheduled = scheduler.schedule_prefill(py).unwrap();
         assert!(scheduled[0].is_empty());
         assert_eq!(scheduler.waiting, vec![2]);
+    });
+}
+
+#[test]
+fn exhausted_mtp_handoff_slot_keeps_request_waiting() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_single_slot_mtp_scheduler();
+        add_tokens(py, &mut scheduler, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![1]);
+        add_tokens(py, &mut scheduler, 2, vec![4, 5, 6]).unwrap();
+
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert!(scheduled[0].is_empty());
+        assert_eq!(scheduler.waiting, vec![2]);
+        assert!(scheduler.cache.assignment(2).is_none());
+
+        scheduler.release_seq(1);
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert_eq!(scheduled[0], vec![2]);
+        assert_eq!(scheduler.cache.state_slot(2), Some(0));
+    });
+}
+
+#[test]
+fn exhausted_hisparse_slot_keeps_migration_waiting() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_single_slot_hisparse_scheduler();
+        add_tokens(py, &mut scheduler, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![1]);
+        add_tokens(py, &mut scheduler, 2, vec![4, 5, 6]).unwrap();
+
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert!(scheduled[0].is_empty());
+        assert_eq!(scheduler.waiting_migration, vec![2]);
+        assert!(scheduler.cache.assignment(2).is_none());
+
+        scheduler.release_seq(1);
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert_eq!(scheduled[0], vec![2]);
+        assert_eq!(scheduler.cache.hisparse_slot(2), Some(0));
+    });
+}
+
+#[test]
+fn max_num_seqs_and_slots_are_per_dp_rank() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_two_dp_single_slot_mtp_hisparse_scheduler();
+        add_tokens(py, &mut scheduler, 1, vec![1, 2, 3]).unwrap();
+        add_tokens(py, &mut scheduler, 2, vec![4, 5, 6]).unwrap();
+        add_tokens(py, &mut scheduler, 3, vec![7, 8, 9]).unwrap();
+
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert_eq!(scheduled, vec![vec![1], vec![2]]);
+        assert_eq!(scheduler.cache.state_slot(1), Some(0));
+        assert_eq!(scheduler.cache.state_slot(2), Some(0));
+        assert_eq!(scheduler.cache.hisparse_slot(1), Some(0));
+        assert_eq!(scheduler.cache.hisparse_slot(2), Some(0));
+        assert_eq!(scheduler.cache.used_hisparse_slots(), 2);
+        assert_eq!(scheduler.cache.total_hisparse_slots(), 2);
+        assert_eq!(scheduler.waiting_migration, vec![3]);
+        assert!(scheduler.cache.assignment(3).is_none());
     });
 }
 
