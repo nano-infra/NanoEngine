@@ -118,7 +118,8 @@ void bind_sp_state_manager(py::module_& m)
                          const std::string& dynamic_sp_bucket_policy,
                          bool               enable_non_uniform_split,
                          const std::string& sp_master_selector,
-                         int                fixed_sp_size) {
+                         int                fixed_sp_size,
+                         int                decode_quantum) {
                  return std::make_shared<SPStateManager>(engine_id,
                                                          attention_sp,
                                                          num_kvcache_blocks,
@@ -133,7 +134,8 @@ void bind_sp_state_manager(py::module_& m)
                                                          dynamic_sp_bucket_policy,
                                                          enable_non_uniform_split,
                                                          sp_master_selector,
-                                                         fixed_sp_size);
+                                                         fixed_sp_size,
+                                                         decode_quantum);
              }),
              py::arg("engine_id"),
              py::arg("attention_sp"),
@@ -149,7 +151,8 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("dynamic_sp_bucket_policy") = "",
              py::arg("enable_non_uniform_split"),
              py::arg("sp_master_selector"),
-             py::arg("fixed_sp_size") = 0)
+             py::arg("fixed_sp_size") = 0,
+             py::arg("decode_quantum") = 16)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 

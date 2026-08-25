@@ -255,6 +255,7 @@ class LocalScheduler:
                 ignore_eos=command.ignore_eos,
                 max_model_len=self.config.max_model_len,
                 vocab_size=self.config.hf_config.vocab_size,
+                quantum_size=self.config.loop_count,
             )
             if sequence.seq_id != command.request_id:
                 raise ValueError("Sequence request_id does not match ADD metadata")

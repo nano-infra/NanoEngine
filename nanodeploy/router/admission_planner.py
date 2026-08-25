@@ -7,6 +7,7 @@ from typing import Any
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AdmissionReservation,
+    HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
     round_up,
 )
@@ -29,6 +30,7 @@ class AdmissionPlannerConfig:
     enable_non_uniform_split: bool = False
     sp_master_selector: str = "LeastBatch"
     fixed_sp_size: int = 0
+    loop_count: int = HIERARCHICAL_LOOP_COUNT
 
     @classmethod
     def from_config(cls, config: Any) -> AdmissionPlannerConfig:
@@ -46,6 +48,7 @@ class AdmissionPlannerConfig:
             enable_non_uniform_split=config.enable_non_uniform_split,
             sp_master_selector=config.sp_master_selector,
             fixed_sp_size=config.fixed_sp_size,
+            loop_count=config.loop_count,
         )
 
     def __post_init__(self) -> None:
@@ -57,6 +60,7 @@ class AdmissionPlannerConfig:
             "max_num_recv_seqs": self.max_num_recv_seqs,
             "segment_size": self.segment_size,
             "queue_capacity": self.queue_capacity,
+            "loop_count": self.loop_count,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -397,7 +401,7 @@ class AdmissionPlanner:
     ) -> bool:
         block_size = self.config.kvcache_block_size
         master = reservation.master_sp_idx
-        padded_completion = round_up(max_tokens)
+        padded_completion = round_up(max_tokens, self.config.loop_count)
         for sp_idx, prompt_tokens in enumerate(
             reservation.dispatched_tokens
         ):

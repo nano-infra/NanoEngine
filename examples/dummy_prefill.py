@@ -93,7 +93,7 @@ def main():
     parser.add_argument(
         "--hierarchical-execution-trace",
         action="store_true",
-        help="Capture and validate every hierarchical 16-forward quantum.",
+        help="Capture and validate every hierarchical decode quantum.",
     )
     parser.add_argument(
         "--loop-count",
@@ -125,7 +125,7 @@ def main():
     path = os.path.expanduser(args.model_path)
     loop_count = args.loop_count
     if loop_count is None:
-        loop_count = 16 if args.scheduler_arch == "hierarchical" else 48
+        loop_count = 1 if args.scheduler_arch == "hierarchical" else 48
 
     decode = LLM(
         path,

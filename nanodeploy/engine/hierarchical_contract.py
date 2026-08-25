@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 
-HIERARCHICAL_LOOP_COUNT = 16
+HIERARCHICAL_LOOP_COUNT = 1
 CONTROL_DUMMY_SCHEMA_VERSION = 2
 UINT64_MAX = (1 << 64) - 1
 
@@ -61,6 +61,7 @@ def validate_add_request(
     ignore_eos: bool,
     max_model_len: int,
     vocab_size: int,
+    quantum_size: int = HIERARCHICAL_LOOP_COUNT,
 ) -> RequestValidation:
     if not 0 <= request_id <= UINT64_MAX:
         raise ValueError("request_id must fit uint64")
@@ -68,12 +69,14 @@ def validate_add_request(
         raise ValueError("prompt_len must be positive")
     if max_tokens < 1:
         raise ValueError("max_tokens must be at least 1")
-    if not ignore_eos:
-        raise ValueError("hierarchical scheduler requires ignore_eos=True")
+    if not isinstance(ignore_eos, bool):
+        raise ValueError("ignore_eos must be a bool")
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
+    if quantum_size <= 0:
+        raise ValueError("quantum_size must be positive")
 
-    padded_completion_len = round_up(max_tokens)
+    padded_completion_len = round_up(max_tokens, quantum_size)
     total_capacity_len = prompt_len + 1 + padded_completion_len
     if total_capacity_len > max_model_len:
         raise ValueError(

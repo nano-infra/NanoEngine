@@ -106,7 +106,7 @@ def main() -> None:
         max_num_seqs=8,
         max_model_len=1024,
         max_num_batched_tokens=1024,
-        loop_count=16,
+        loop_count=1,
         max_num_send_seqs=128,
         max_num_recv_seqs=130,
         kvcache_block_size=64,

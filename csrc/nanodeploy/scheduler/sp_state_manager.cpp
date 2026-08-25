@@ -92,7 +92,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                const std::string& dynamic_sp_bucket_policy,
                                bool               enable_non_uniform_split,
                                const std::string& sp_master_selector,
-                               int                fixed_sp_size) :
+                               int                fixed_sp_size,
+                               int                decode_quantum) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -105,7 +106,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     enable_dynamic_sp_bucket_policy_(enable_dynamic_sp_bucket_policy),
     num_recv_seqs_per_sp_(attention_sp, 0),
     enable_non_uniform_split_(enable_non_uniform_split),
-    fixed_sp_size_(fixed_sp_size)
+    fixed_sp_size_(fixed_sp_size),
+    decode_quantum_(decode_quantum)
 {
     // Initialize Strategy
     if (sp_master_selector == "LeastBatch") {
@@ -134,6 +136,9 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     }
     if (fixed_sp_size_ < 0 || fixed_sp_size_ > attention_sp_) {
         throw std::runtime_error("fixed_sp_size must be in [0, attention_sp]");
+    }
+    if (decode_quantum_ <= 0) {
+        throw std::runtime_error("decode_quantum must be positive");
     }
     if (fixed_sp_size_ > 0
         && (dynamic_sp_size_strategy_ != DynamicSPSizeStrategy::Legacy
@@ -187,27 +192,26 @@ std::optional<int> SPStateManager::select_bucket_sp_size(int seq_len) const
 void SPStateManager::initialize_dummy_seqs()
 {
     constexpr int kControlToken = 0;
-    constexpr int kDecodeQuantum = 16;
 
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         std::vector<int> token_ids = {kControlToken};
 
         auto dummy_seq = std::make_shared<Sequence>(token_ids,
                                                     1.0,   // temperature
-                                                    kDecodeQuantum,
+                                                    decode_quantum_,
                                                     true   // ignore_eos
         );
         dummy_seq->active(engine_id_, attention_sp_, 1);
         dummy_seq->block_ctx().master_sp_idx_ = sp_idx;
 
         // The first dispatched token is the deterministic bootstrap token.
-        // Reserve the complete 16-forward quantum before the object can be
+        // Reserve the complete decode quantum before the object can be
         // used so every worker receives a structurally valid block table.
         dummy_seq->append_token(kControlToken, BlockContextSlot::ACTIVE, sp_idx);
         dummy_seq->num_bootstrap_tokens = 1;
 
         block_manager[sp_idx]->allocate(*dummy_seq);
-        if (!block_manager[sp_idx]->may_append(*dummy_seq, kDecodeQuantum)) {
+        if (!block_manager[sp_idx]->may_append(*dummy_seq, decode_quantum_)) {
             throw std::runtime_error(
                 "Insufficient KV blocks for the permanent control dummy on SP rank "
                 + std::to_string(sp_idx));

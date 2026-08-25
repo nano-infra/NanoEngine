@@ -42,6 +42,7 @@ def make_hierarchical_config(**overrides) -> Config:
     values = {
         "model": str(DEEPSEEK_MODEL),
         "scheduler_arch": "hierarchical",
+        "loop_count": HIERARCHICAL_LOOP_COUNT,
         "mode": "decode",
         "dummy_prefill": True,
         "attention_dp": 2,
@@ -146,7 +147,7 @@ def test_complete_hierarchical_topology_whitelist(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("loop_count", 8, "loop_count=16"),
+        ("loop_count", 8, "loop_count=1"),
         ("mode", "hybrid", "mode='decode'"),
         ("dummy_prefill", False, "dummy_prefill=True"),
         ("ffn_ep", 4, "topology is not supported"),
@@ -167,6 +168,12 @@ def test_hierarchical_config_rejects_out_of_contract_values(
 ):
     with pytest.raises(ValueError, match=message):
         make_hierarchical_config(**{field: value})
+
+
+def test_hierarchical_config_accepts_loop_count_one():
+    config = make_hierarchical_config(loop_count=1)
+
+    assert config.loop_count == 1
 
 
 def test_hierarchical_config_uses_deepseek_v3_mla_contract():
@@ -190,30 +197,30 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     )
 
 
-def test_add_validation_rounds_completion_and_excludes_bootstrap():
+def test_add_validation_uses_loop_one_lifetime_and_excludes_bootstrap():
     validation = validate_add_request(
         request_id=7,
         prompt_len=3,
         max_tokens=17,
         ignore_eos=True,
-        max_model_len=36,
+        max_model_len=21,
         vocab_size=129280,
     )
 
-    assert round_up(17) == 32
+    assert round_up(17) == 17
     assert validation.original_prompt_len == 3
     assert validation.internal_prompt_len == 4
-    assert validation.padded_completion_len == 32
-    assert validation.total_capacity_len == 36
+    assert validation.padded_completion_len == 17
+    assert validation.total_capacity_len == 21
 
 
-def test_add_validation_rejects_bad_eos_and_padded_length():
-    with pytest.raises(ValueError, match="ignore_eos=True"):
+def test_add_validation_rejects_invalid_eos_flag_and_model_length():
+    with pytest.raises(ValueError, match="ignore_eos must be a bool"):
         validate_add_request(
             request_id=1,
             prompt_len=1,
             max_tokens=1,
-            ignore_eos=False,
+            ignore_eos=1,  # type: ignore[arg-type]
             max_model_len=64,
             vocab_size=129280,
         )
@@ -223,9 +230,24 @@ def test_add_validation_rejects_bad_eos_and_padded_length():
             prompt_len=2,
             max_tokens=17,
             ignore_eos=True,
-            max_model_len=34,
+            max_model_len=19,
             vocab_size=129280,
         )
+
+
+def test_add_validation_accepts_eos_enabled_loop_one_lifetime():
+    validation = validate_add_request(
+        request_id=1,
+        prompt_len=2,
+        max_tokens=3,
+        ignore_eos=False,
+        max_model_len=6,
+        vocab_size=129280,
+        quantum_size=1,
+    )
+
+    assert validation.padded_completion_len == 3
+    assert validation.total_capacity_len == 6
 
 
 def test_local_scheduler_validates_prompt_tokens_inside_cpp_sequence():
@@ -605,11 +627,11 @@ def test_local_decode_batch_validates_rank_order_and_forward_count():
         wave_id=invalid.wave_id,
         quantum_id=invalid.quantum_id,
         global_rank=invalid.global_rank,
-        forward_count=15,
+        forward_count=2,
         mastered_request_ids=invalid.mastered_request_ids,
         sampled_token_ids=invalid.sampled_token_ids,
     )
-    with pytest.raises(ValueError, match="exactly 16"):
+    with pytest.raises(ValueError, match="exactly 1"):
         batch.validate_worker_results([invalid, valid_results[1]])
 
 
@@ -635,10 +657,12 @@ def make_worker_results(
     ]
 
 
-def test_local_scheduler_bootstrap_and_final_overrun_accounting():
+def test_local_scheduler_loop_one_bootstrap_and_completion_accounting():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(1))
-    command, submitted_sequence = make_add(42, (10, 11, 12))
+    command, submitted_sequence = make_add(
+        42, (10, 11, 12), max_tokens=2
+    )
     result = local.add(command, submitted_sequence)
     assert result.accepted
     assert local.admit() == (42,)
@@ -689,16 +713,16 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert sum(load.master_assignments for load in first_load.rank_loads) == 1
     assert all(load.total_blocks == 32 for load in first_load.rank_loads)
     assert local.postprocess(first, make_worker_results(first)) == ()
-    assert sequence.num_completed_tokens == 16
-    assert local.last_itl_token_slots == 15
+    assert sequence.num_completed_tokens == 1
+    assert local.last_itl_token_slots == 0
     first_load = local.load_snapshot(wave_id=1, quantum_id=1)
     assert sum(
         load.mastered_decode_tokens for load in first_load.rank_loads
-    ) == 16
+    ) == 1
     first_token_events = local.drain_first_token_events()
     assert len(first_token_events) == 1
     assert first_token_events[0].request_id == 42
-    assert first_token_events[0].generated_count == 16
+    assert first_token_events[0].generated_count == 1
 
     assert local.admit() == ()
     final = local.plan_decode(wave_id=1, quantum_id=1)
@@ -709,7 +733,7 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     )
     assert len(events) == 1
     assert events[0].request_id == 42
-    assert events[0].generated_count == 17
+    assert events[0].generated_count == 2
     assert events[0].status == "FINISHED"
     assert events[0].first_forward_to_terminal_ms is not None
     assert events[0].first_forward_to_terminal_ms >= 0
@@ -718,9 +742,9 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert events[0].final_quantum_unused_decode_ms == 0.0
     assert events[0].global_capacity_queue_ms == 0
     assert local.drain_first_token_events() == ()
-    assert sequence.num_completed_tokens == 17
+    assert sequence.num_completed_tokens == 2
     assert local.last_itl_token_slots == 1
-    assert len(sequence.completion_token_ids) == 17
+    assert len(sequence.completion_token_ids) == 2
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.is_finished()
@@ -731,17 +755,46 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert duplicate.reason == "duplicate request in state FINISHED"
     assert local.abort(42).status == "already_terminal"
     load = local.load_snapshot(wave_id=1, quantum_id=2)
-    assert load.useful_decode_tokens == 17
-    assert load.raw_token_slots == 128
-    assert load.control_dummy_slots == 96
-    assert load.total_rank_forwards == 128
+    assert load.useful_decode_tokens == 2
+    assert load.raw_token_slots == 8
+    assert load.control_dummy_slots == 6
+    assert load.total_rank_forwards == 8
     assert load.all_dummy_rank_forwards == 0
     assert len(load.rank_loads) == config.attention_sp
     assert sum(load.active_master_requests for load in load.rank_loads) == 0
     assert sum(load.active_receiver_requests for load in load.rank_loads) == 0
     assert sum(load.active_dispatched_tokens for load in load.rank_loads) == 0
     assert sum(load.master_assignments for load in load.rank_loads) == 1
-    assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 17
+    assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 2
+
+
+def test_local_scheduler_loop_one_stops_on_eos_and_releases_capacity():
+    config = make_hierarchical_config()
+    config.eos = 1
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    command, sequence = make_add(
+        49,
+        (10, 11),
+        max_tokens=4,
+        ignore_eos=False,
+    )
+    assert local.add(command, sequence).accepted
+    assert local.admit() == (49,)
+
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+    local.mark_first_forward_started(batch)
+    events = local.postprocess(
+        batch,
+        make_worker_results(batch, token_base=config.eos),
+    )
+
+    assert [(event.request_id, event.generated_count, event.status) for event in events] == [
+        (49, 1, "FINISHED")
+    ]
+    assert sequence.completion_token_ids == [config.eos]
+    assert local.state_manager.num_running_seqs == 0
+    assert local.state_manager.num_running_tokens == 0
+    assert local.is_finished()
 
 
 def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
@@ -882,20 +935,20 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
     for request_id in (101, 102):
         command, sequence = make_add(
-            request_id, range(60), max_tokens=16
+            request_id, range(63), max_tokens=1
         )
         assert local.add(command, sequence).accepted
 
     assert local.admit() == (101, 102)
-    assert local.state_manager.num_running_tokens == 122
+    assert local.state_manager.num_running_tokens == 128
 
     batch = local.plan_decode(wave_id=1, quantum_id=0)
     assert batch.expected_request_ids(0) == (101,)
     waiting = list(local.cpp_scheduler.waiting_migration)
     assert [sequence.seq_id for sequence in waiting] == [102]
-    assert waiting[0].num_tokens == 60
+    assert waiting[0].num_tokens == 63
     assert waiting[0].num_bootstrap_tokens == 0
-    assert local.state_manager.num_running_tokens == 61
+    assert local.state_manager.num_running_tokens == 64
     assert local.load_snapshot(wave_id=1, quantum_id=0).preemption_count == 1
 
     local.mark_first_forward_started(batch)
@@ -907,9 +960,9 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
 
     assert local.admit() == (102,)
     readmitted = local.cpp_scheduler.running(0)[0]
-    assert readmitted.num_tokens == 61
+    assert readmitted.num_tokens == 64
     assert readmitted.num_bootstrap_tokens == 1
-    assert local.state_manager.num_running_tokens == 61
+    assert local.state_manager.num_running_tokens == 64
 
 
 def test_real_request_id_can_match_control_dummy_internal_id():
@@ -917,7 +970,7 @@ def test_real_request_id_can_match_control_dummy_internal_id():
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
     colliding_id = local.state_manager.dummy_seqs[0].seq_id
     command, sequence = make_add(
-        colliding_id, (10, 11), max_tokens=16
+        colliding_id, (10, 11), max_tokens=1
     )
     assert local.add(command, sequence).accepted
     assert local.admit() == (colliding_id,)

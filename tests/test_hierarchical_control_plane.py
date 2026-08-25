@@ -29,6 +29,7 @@ from nanodeploy.engine.hierarchical_contract import (
     FirstTokenEvent,
     FrontendEventBatch,
     FinishEvent,
+    HIERARCHICAL_LOOP_COUNT,
     IngressAck,
     LoadSnapshot,
     OwnerState,
@@ -163,7 +164,7 @@ def test_frontend_event_poll_timeout_is_fail_stop(monkeypatch):
     assert closed == [True]
 
 
-def test_finish_event_excludes_unused_final_quantum_decode_slots():
+def test_loop_one_finish_event_has_no_unused_decode_slots():
     event = FinishEvent(
         request_id=1,
         generated_count=17,
@@ -174,8 +175,8 @@ def test_finish_event_excludes_unused_final_quantum_decode_slots():
     )
 
     assert event.final_quantum_real_tokens == 1
-    assert event.final_quantum_unused_decode_ms == 150.0
-    assert event.first_forward_to_terminal_real_token_ms == 850.0
+    assert event.final_quantum_unused_decode_ms == 0.0
+    assert event.first_forward_to_terminal_real_token_ms == 1_000.0
 
     full_quantum = FinishEvent(
         request_id=2,
@@ -184,7 +185,7 @@ def test_finish_event_excludes_unused_final_quantum_decode_slots():
         engine_id=0,
         first_forward_to_terminal_ms=2_000.0,
     )
-    assert full_quantum.final_quantum_real_tokens == 16
+    assert full_quantum.final_quantum_real_tokens == 1
     assert full_quantum.final_quantum_unused_decode_ms == 0.0
     assert (
         full_quantum.first_forward_to_terminal_real_token_ms
@@ -1842,7 +1843,7 @@ def _trace(global_rank: int, wave_id: int, quantum_id: int) -> dict:
         "global_rank": global_rank,
         "wave_id": wave_id,
         "quantum_id": quantum_id,
-        "forward_count": 16,
+        "forward_count": HIERARCHICAL_LOOP_COUNT,
         "batch_kind": "all_control_dummy",
         "real_batch_size": 0,
         "control_dummy_count": 1,
@@ -1853,7 +1854,7 @@ def _trace(global_rank: int, wave_id: int, quantum_id: int) -> dict:
                 "forward_begin": float(inner_loop_idx),
                 "forward_end": float(inner_loop_idx + 1),
             }
-            for inner_loop_idx in range(16)
+            for inner_loop_idx in range(HIERARCHICAL_LOOP_COUNT)
         ),
     }
 
@@ -1911,8 +1912,8 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
             self.init_rpc_endpoint = RemoteMethod(("client",))
             result = (
                 [
-                    list(range(16)),
-                    [0] * 16,
+                    list(range(HIERARCHICAL_LOOP_COUNT)),
+                    [0] * HIERARCHICAL_LOOP_COUNT,
                 ],
                 1.0,
             )
@@ -1922,7 +1923,7 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
                         "wave_id": 1,
                         "quantum_id": 0,
                         "global_rank": 0,
-                        "forward_count": 16,
+                        "forward_count": HIERARCHICAL_LOOP_COUNT,
                         "real_batch_size": 1,
                         "control_dummy_count": 1,
                         "batch_kind": "real_or_mixed",
@@ -1931,7 +1932,9 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
                                 "inner_loop_idx": inner_loop_idx,
                                 "use_sp_a2a": False,
                             }
-                            for inner_loop_idx in range(16)
+                            for inner_loop_idx in range(
+                                HIERARCHICAL_LOOP_COUNT
+                            )
                         ),
                     },
                 )
@@ -2029,7 +2032,9 @@ def test_local_executor_uses_keyword_only_nested_actor_calls(
     }
     assert len(results) == 1
     assert results[0].mastered_request_ids == (7,)
-    assert results[0].sampled_token_ids == (tuple(range(16)),)
+    assert results[0].sampled_token_ids == (
+        tuple(range(HIERARCHICAL_LOOP_COUNT)),
+    )
     assert executor.result_rebuild_sample_count == 1
     assert executor.result_rebuild_latency_ms_total >= 0
     boundary = executor.execution_boundary_metrics()
@@ -2111,7 +2116,10 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
                     global_rank=0,
                     wave_id=1,
                     quantum_id=0,
-                    token_rows=[list(range(16)), [0] * 16],
+                    token_rows=[
+                        list(range(HIERARCHICAL_LOOP_COUNT)),
+                        [0] * HIERARCHICAL_LOOP_COUNT,
+                    ],
                     worker_end_time=time.time(),
                 ),
             )
@@ -2194,7 +2202,9 @@ def test_local_executor_zmq_branch_avoids_per_quantum_ray_calls(monkeypatch):
     ]
     assert worker.run_zmq_loop.calls == [{}]
     assert results[0].mastered_request_ids == (7,)
-    assert results[0].sampled_token_ids == (tuple(range(16)),)
+    assert results[0].sampled_token_ids == (
+        tuple(range(HIERARCHICAL_LOOP_COUNT)),
+    )
     server = FakeZmqServer.instance
     assert server is not None
     commands, _deadline = server.commands

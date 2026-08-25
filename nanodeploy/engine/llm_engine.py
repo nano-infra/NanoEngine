@@ -124,7 +124,8 @@ class LLMEngine:
 
         if config.scheduler_arch == "hierarchical":
             self.tokenizer = None
-            config.eos = getattr(config.hf_config, "eos_token_id", 1) or 1
+            eos_token_id = getattr(config.hf_config, "eos_token_id", None)
+            config.eos = 1 if eos_token_id is None else eos_token_id
             self.executor = None
             self.scheduler = None
             self.deployment = DeploymentManager(config)
@@ -157,7 +158,8 @@ class LLMEngine:
 
         if config.dummy_prefill:
             self.tokenizer = None
-            config.eos = getattr(config.hf_config, "eos_token_id", 1) or 1
+            eos_token_id = getattr(config.hf_config, "eos_token_id", None)
+            config.eos = 1 if eos_token_id is None else eos_token_id
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 config.model, use_fast=True, trust_remote_code=True

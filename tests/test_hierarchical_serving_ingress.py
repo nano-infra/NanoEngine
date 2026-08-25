@@ -135,7 +135,10 @@ class DelayedAckEngine:
 
 class SyntheticCentralEngine:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(scheduler_arch="legacy_global")
+        self.config = SimpleNamespace(
+            scheduler_arch="legacy_global",
+            loop_count=16,
+        )
         self.metrics_manager = MetricsManager()
         self._active = []
         self._pending_ingress: list[int] = []
@@ -696,7 +699,7 @@ def test_planned_add_result_records_bootstrap_ttft_and_commit_timing(
         == "hierarchical_real_token_execution_boundary"
     )
     assert record["first_forward_to_terminal_real_token_ms"] == 470.0
-    assert record["final_quantum_real_tokens"] == 16
+    assert record["final_quantum_real_tokens"] == 1
     assert record["final_quantum_unused_decode_ms"] == 0.0
     assert record["dispatch_normalized_latency_ms"] == 31.25
 
@@ -725,7 +728,7 @@ def test_planned_add_result_records_bootstrap_ttft_and_commit_timing(
     assert summary["dispatch_normalized_latency_ms"]["mean"] == 31.25
 
 
-def test_hierarchical_tpot_excludes_partial_final_quantum_tail(
+def test_hierarchical_loop_one_tpot_has_no_final_quantum_tail(
     monkeypatch,
     tmp_path,
 ):
@@ -765,10 +768,10 @@ def test_hierarchical_tpot_excludes_partial_final_quantum_tail(
     )
     assert record["first_forward_to_terminal_ms"] == 320.0
     assert record["final_quantum_real_tokens"] == 1
-    assert record["final_quantum_unused_decode_ms"] == 150.0
-    assert record["first_forward_to_terminal_real_token_ms"] == 170.0
+    assert record["final_quantum_unused_decode_ms"] == 0.0
+    assert record["first_forward_to_terminal_real_token_ms"] == 320.0
     assert record["global_capacity_queue_ms"] == 20.0
-    assert record["tpot_with_queue_ms"] == round(190.0 / 17, 6)
+    assert record["tpot_with_queue_ms"] == 20.0
 
 
 def test_centralized_tpot_excludes_partial_final_quantum_tail(

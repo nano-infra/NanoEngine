@@ -55,7 +55,7 @@ Scheduler::Scheduler(const std::string& engine_id,
             reserved_blocks_per_req_, segment_size_, dynamic_sp_size_strategy_,
             enable_dynamic_sp_bucket_policy, dynamic_sp_bucket_policy,
             enable_non_uniform_split,
-            sp_master_selector, fixed_sp_size);
+            sp_master_selector, fixed_sp_size, loop_count_);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);

@@ -57,7 +57,8 @@ public:
                    const std::string& dynamic_sp_bucket_policy,
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
-                   int                fixed_sp_size = 0);
+                   int                fixed_sp_size = 0,
+                   int                decode_quantum = 16);
 
     void set_dp_idx(int dp_idx)
     {
@@ -174,6 +175,7 @@ private:
 
     bool enable_non_uniform_split_;
     int  fixed_sp_size_;
+    int  decode_quantum_;
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;
