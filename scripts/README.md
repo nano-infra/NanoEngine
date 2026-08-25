@@ -1,5 +1,70 @@
 # Scripts README
 
+## `benchmark_least_batch_cpu.py`
+
+用途：仅用 CPU 验证 least-batch staged admission 的控制面改动，不启动 CUDA、
+Ray 集群、模型或 worker。
+
+- 使用真实 `RequestRouter` 测批量派发到 positive receipt 的流水线，并断言所有
+  请求都在 scheduler commit 数仍为 0 时进入 `PENDING_ADD`；
+- 使用真实 localhost ZMQ 协议、服务端 Sequence 解码和
+  `LocalEngineCore._stage_add_batch()`，验证 receipt 不等待 scheduler drain；
+- `--modeled-commit-gate-ms` 模拟旧 stop-and-wait 的门控延迟。该结果只是敏感性
+  模型，不是旧版本或线上 GPU 性能实测。
+
+运行默认的五轮基准并保留 JSON：
+
+```bash
+python3 scripts/benchmark_least_batch_cpu.py \
+  --requests 4096 \
+  --engines 2 \
+  --batch-size 64 \
+  --prompt-tokens 32 \
+  --modeled-commit-gate-ms 10 \
+  --repeats 5 \
+  --json-output docs-dev/2026-08-25/least_batch_cpu_benchmark.json
+```
+
+这个基准可以验证请求分发、receipt/commit 解耦、消息 batching、payload 单次传输
+和本地暂存深度；不能替代真实 GPU quantum、跨节点 Ray/RDMA、吞吐、TTFT 或 TPOT
+验收。
+
+## `benchmark_least_batch_ray_cpu.py`
+
+用途：从 Ray head 节点执行一条命令，把 CPU-only staged-ingress actors 硬绑定到
+两个 Ray 节点，并由 head 上的真实 `RequestRouter` 通过跨机 ZMQ 完成请求分发。
+Ray 只负责 actor 部署、状态读取和回收，Sequence payload 仍走 NanoDeploy 的真实
+ZMQ ingress 路径。
+
+前提：两个节点已经加入同一 Ray 集群，且各自声明至少 1 个 CPU 资源。脚本会在连接
+Ray 前自动移除当前进程的 HTTP(S)/ALL proxy 变量，不会申请 GPU 资源。
+
+```bash
+python3 -m scripts.benchmark_least_batch_ray_cpu \
+  --ray-address auto \
+  --ray-nodes 2 \
+  --engines 2 \
+  --requests 4096 \
+  --batch-size 64 \
+  --prompt-tokens 32 \
+  --repeats 5 \
+  --json-output docs-dev/2026-08-25/least_batch_ray_cpu_benchmark.json
+```
+
+默认按 Ray `NodeManagerAddress` 选择前两个存活 CPU 节点。需要固定机器时，各传
+一次 `--node-ip`：
+
+```bash
+python3 -m scripts.benchmark_least_batch_ray_cpu \
+  --ray-address auto --ray-nodes 2 \
+  --node-ip 10.0.0.1 --node-ip 10.0.0.2
+```
+
+计时包含 Router submit/planning、跨机 ZMQ send、服务端 Sequence decode、
+LocalEngine stage 和 receipt；不包含 Ray actor 启动和结束后的 stats RPC。该模式
+不启动 NanoDeploy GPU worker、模型或 scheduler commit，因此仍不能替代 RDMA、
+GPU quantum、TTFT/TPOT 的两机验收。
+
 ## `run_2node_rate30_6min_matrix.sh`
 
 用途：
