@@ -568,6 +568,63 @@ def test_planned_admission_scans_live_records_once_per_batch():
     assert records.yielded_records == load.running
 
 
+def test_plan_decode_freezes_load_during_existing_record_pass():
+    class CountingRecords(dict):
+        def __init__(self, records):
+            super().__init__(records)
+            self.values_calls = 0
+            self.items_calls = 0
+            self.yielded_records = 0
+
+        def values(self):
+            self.values_calls += 1
+            for record in super().values():
+                self.yielded_records += 1
+                yield record
+
+        def items(self):
+            self.items_calls += 1
+            for item in super().items():
+                self.yielded_records += 1
+                yield item
+
+    config = make_hierarchical_config()
+    local = LocalScheduler(
+        config, config.hierarchical_topology.engine(0)
+    )
+    request_ids = tuple(range(120, 132))
+    for request_id in request_ids:
+        command, sequence = make_add(request_id, (1, 2))
+        assert local.add(command, sequence).accepted
+    assert set(local.admit()) == set(request_ids)
+    records = CountingRecords(local._records)
+    local._records = records
+
+    batch = local.plan_decode(wave_id=4, quantum_id=7)
+
+    assert records.items_calls == 1
+    assert records.values_calls == 0
+    assert records.yielded_records == len(request_ids)
+    snapshot = batch.frozen_load_snapshot
+    assert snapshot is not None
+    assert (snapshot.wave_id, snapshot.quantum_id) == (4, 7)
+    assert snapshot.waiting == 0
+    assert snapshot.running == len(request_ids)
+    assert snapshot.useful_real_batch_size == len(request_ids)
+    assert sum(
+        rank_load.active_master_requests
+        for rank_load in snapshot.rank_loads
+    ) == len(request_ids)
+    assert sum(
+        rank_load.active_dispatched_tokens
+        for rank_load in snapshot.rank_loads
+    ) == sum(
+        records[request_id].sequence.num_tokens
+        for request_id in request_ids
+    )
+    assert snapshot == local.load_snapshot(wave_id=4, quantum_id=7)
+
+
 def test_local_decode_batch_validates_rank_order_and_forward_count():
     batch = LocalDecodeBatch(
         wave_id=3,

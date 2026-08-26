@@ -62,6 +62,15 @@ class _PlannedAdmission:
     reservation: AdmissionReservation | None
 
 
+@dataclass(slots=True)
+class _PendingConsensus:
+    reduced: torch.Tensor | None
+    work: Any | None
+    local_unfinished: bool
+    wave_id: int
+    quantum_id: int
+
+
 def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
     return tuple(
         {
@@ -1151,11 +1160,27 @@ class LocalEngineCore:
                 self._add_result_events.extend(results)
         self._publish_events(tuple(cancelled_events))
 
-    def _build_load_snapshot(self) -> LoadSnapshot:
-        snapshot = self.scheduler.load_snapshot(
-            wave_id=self._wave_id,
-            quantum_id=self._quantum_id,
-        )
+    def _build_load_snapshot(
+        self,
+        scheduler_snapshot: LoadSnapshot | None = None,
+    ) -> LoadSnapshot:
+        snapshot = scheduler_snapshot
+        if snapshot is None:
+            snapshot = self.scheduler.load_snapshot(
+                wave_id=self._wave_id,
+                quantum_id=self._quantum_id,
+            )
+        elif (
+            snapshot.engine_id != self.engine_id
+            or snapshot.wave_id != self._wave_id
+            or snapshot.quantum_id != self._quantum_id
+        ):
+            raise RuntimeError(
+                "frozen LocalScheduler load identity mismatch: "
+                f"expected=({self.engine_id}, {self._wave_id}, "
+                f"{self._quantum_id}), got=({snapshot.engine_id}, "
+                f"{snapshot.wave_id}, {snapshot.quantum_id})"
+            )
         with self._ingress_lock:
             pending_ingress = (
                 len(self._ingress_pending_ids)
@@ -1230,23 +1255,38 @@ class LocalEngineCore:
             decode_itl_sample_count=len(self._decode_itl_samples),
         )
 
-    def _refresh_cached_load(self) -> LoadSnapshot:
-        snapshot = self._build_load_snapshot()
+    def _refresh_cached_load(
+        self,
+        scheduler_snapshot: LoadSnapshot | None = None,
+    ) -> LoadSnapshot:
+        snapshot = self._build_load_snapshot(scheduler_snapshot)
         with self._load_lock:
             self._cached_load_snapshot = snapshot
         return snapshot
 
-    def _consensus(self, local_unfinished: bool) -> bool:
+    def _start_consensus(
+        self,
+        local_unfinished: bool,
+        *,
+        wave_id: int,
+        quantum_id: int,
+    ) -> _PendingConsensus:
         if self.config.attention_dp == 1:
-            return local_unfinished
+            return _PendingConsensus(
+                reduced=None,
+                work=None,
+                local_unfinished=local_unfinished,
+                wave_id=wave_id,
+                quantum_id=quantum_id,
+            )
         unfinished = int(local_unfinished)
         # MAX over x and -x yields the global maximum and negative minimum.
         local = torch.tensor(
             [
-                self._wave_id,
-                -self._wave_id,
-                self._quantum_id,
-                -self._quantum_id,
+                wave_id,
+                -wave_id,
+                quantum_id,
+                -quantum_id,
                 unfinished,
                 -unfinished,
             ],
@@ -1254,7 +1294,26 @@ class LocalEngineCore:
             device="cpu",
         )
         reduced = local.clone()
-        dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+        work = dist.all_reduce(
+            reduced,
+            op=dist.ReduceOp.MAX,
+            async_op=True,
+        )
+        return _PendingConsensus(
+            reduced=reduced,
+            work=work,
+            local_unfinished=local_unfinished,
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+        )
+
+    def _finish_consensus(self, pending: _PendingConsensus) -> bool:
+        if pending.work is None:
+            return pending.local_unfinished
+        pending.work.wait()
+        reduced = pending.reduced
+        if reduced is None:
+            raise RuntimeError("distributed consensus is missing its result")
         minimum = [-reduced[1].item(), -reduced[3].item(), -reduced[5].item()]
         maximum = [reduced[0].item(), reduced[2].item(), reduced[4].item()]
         if minimum[0] != maximum[0] or minimum[1] != maximum[1]:
@@ -1263,6 +1322,15 @@ class LocalEngineCore:
                 f"min={minimum}, max={maximum}"
             )
         return bool(maximum[2])
+
+    def _consensus(self, local_unfinished: bool) -> bool:
+        return self._finish_consensus(
+            self._start_consensus(
+                local_unfinished,
+                wave_id=self._wave_id,
+                quantum_id=self._quantum_id,
+            )
+        )
 
     def _pause_wave(self) -> None:
         with self._state_cv:
@@ -1325,15 +1393,26 @@ class LocalEngineCore:
                 # Close the ingress-drain/plan gap for aborts submitted after
                 # the first priority drain but before scheduler admission.
                 self._drain_queue(self._abort_commands)
-                self._refresh_cached_load()
                 with self._state_cv:
                     if self._stop:
                         return
-                    if not self._wave_running:
-                        self._state_cv.wait(timeout=0.1)
-                        continue
-                    wave_id = self._wave_id
-                    quantum_id = self._quantum_id
+                    wave_running = self._wave_running
+                    if wave_running:
+                        wave_id = self._wave_id
+                        quantum_id = self._quantum_id
+                if not wave_running:
+                    # Idle refreshes publish newly drained ingress. Active
+                    # quantums publish the snapshot frozen by plan_decode(),
+                    # avoiding another full live-record traversal here.
+                    self._refresh_cached_load()
+                    with self._state_cv:
+                        if self._stop:
+                            return
+                        if not self._wave_running:
+                            self._state_cv.wait(timeout=0.1)
+                            continue
+                        wave_id = self._wave_id
+                        quantum_id = self._quantum_id
 
                 quantum_begin = perf_counter()
                 quantum_started_at_unix_s = wall_time()
@@ -1341,23 +1420,55 @@ class LocalEngineCore:
                 self.scheduler.admit()
                 admission_latency_ms = (perf_counter() - begin) * 1000
                 self._admission_latency_ms_total += admission_latency_ms
-                self._refresh_cached_load()
-                begin = perf_counter()
-                batch = self.scheduler.plan_decode(
-                    wave_id=wave_id, quantum_id=quantum_id
-                )
-                schedule_latency_ms = (perf_counter() - begin) * 1000
-                self._schedule_latency_ms_total += schedule_latency_ms
-                pre_execute_snapshot = None
-                if self._quantum_diagnostics_enabled:
-                    pre_execute_snapshot = self.scheduler.load_snapshot(
-                        wave_id=wave_id,
-                        quantum_id=quantum_id,
-                    )
                 local_unfinished = not self.scheduler.is_finished()
-                begin = perf_counter()
-                global_unfinished = self._consensus(local_unfinished)
-                coordination_latency_ms = (perf_counter() - begin) * 1000
+                consensus_started = perf_counter()
+                pending_consensus = self._start_consensus(
+                    local_unfinished,
+                    wave_id=wave_id,
+                    quantum_id=quantum_id,
+                )
+                try:
+                    begin = perf_counter()
+                    batch = self.scheduler.plan_decode(
+                        wave_id=wave_id, quantum_id=quantum_id
+                    )
+                    schedule_latency_ms = (perf_counter() - begin) * 1000
+                    self._schedule_latency_ms_total += schedule_latency_ms
+                    frozen_load_snapshot = batch.frozen_load_snapshot
+                    if frozen_load_snapshot is None:
+                        raise RuntimeError(
+                            "planned decode batch is missing its frozen load"
+                        )
+                    pre_execute_snapshot = self._refresh_cached_load(
+                        frozen_load_snapshot
+                    )
+                except BaseException:
+                    # Both leaders have already entered the same collective.
+                    # Reap it before fail-stop teardown so no Gloo Work is
+                    # abandoned while preserving the original planning error.
+                    try:
+                        self._finish_consensus(pending_consensus)
+                    except BaseException:
+                        pass
+                    raise
+                consensus_wait_begin = perf_counter()
+                global_unfinished = self._finish_consensus(
+                    pending_consensus
+                )
+                consensus_finished = perf_counter()
+                coordination_latency_ms = (
+                    consensus_finished - consensus_wait_begin
+                ) * 1000
+                if pending_consensus.work is None:
+                    consensus_overlap_window_ms = 0.0
+                    consensus_total_ms = 0.0
+                else:
+                    consensus_overlap_window_ms = (
+                        consensus_wait_begin - consensus_started
+                    ) * 1000
+                    consensus_total_ms = (
+                        consensus_finished - consensus_started
+                    ) * 1000
                 self._coordination_latency_ms_total += coordination_latency_ms
                 if not global_unfinished:
                     self._pause_wave()
@@ -1416,10 +1527,6 @@ class LocalEngineCore:
                 self._publish_events(events)
                 post_execute_snapshot = self._refresh_cached_load()
                 if self._quantum_diagnostics_enabled:
-                    if pre_execute_snapshot is None:
-                        raise RuntimeError(
-                            "missing pre-execute quantum diagnostic snapshot"
-                        )
                     executor_diagnostic = (
                         self.executor.last_quantum_diagnostic
                     )
@@ -1468,6 +1575,10 @@ class LocalEngineCore:
                         "admission_ms": admission_latency_ms,
                         "schedule_ms": schedule_latency_ms,
                         "consensus_wait_ms": coordination_latency_ms,
+                        "consensus_overlap_window_ms": (
+                            consensus_overlap_window_ms
+                        ),
+                        "consensus_total_ms": consensus_total_ms,
                         "execute_ms": execute_latency_ms,
                         "postprocess_ms": postprocess_latency_ms,
                         "quantum_total_ms": (

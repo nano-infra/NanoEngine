@@ -926,16 +926,35 @@ def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
     engine._quantum_id = 11
     calls = []
 
-    def fake_all_reduce(tensor, *, op):
-        calls.append((tensor.tolist(), op))
-        tensor.copy_(tensor.new_tensor([7, -7, 11, -11, 1, 0]))
+    class FakeWork:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def wait(self):
+            calls.append("wait")
+            self.tensor.copy_(
+                self.tensor.new_tensor([7, -7, 11, -11, 1, 0])
+            )
+
+    def fake_all_reduce(tensor, *, op, async_op):
+        calls.append((tensor.tolist(), op, async_op))
+        return FakeWork(tensor)
 
     monkeypatch.setattr(
         "nanodeploy.engine.local_engine.dist.all_reduce", fake_all_reduce
     )
 
-    assert engine._consensus(local_unfinished=False)
-    assert calls == [([7, -7, 11, -11, 0, 0], dist.ReduceOp.MAX)]
+    pending = engine._start_consensus(
+        local_unfinished=False,
+        wave_id=7,
+        quantum_id=11,
+    )
+    assert calls == [
+        ([7, -7, 11, -11, 0, 0], dist.ReduceOp.MAX, True)
+    ]
+
+    assert engine._finish_consensus(pending)
+    assert calls[-1] == "wait"
 
 
 def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
@@ -946,13 +965,23 @@ def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
     engine.config = SimpleNamespace(attention_dp=2)
     engine._wave_id = 7
     engine._quantum_id = 11
-    calls = 0
+    calls = []
 
-    def fake_all_reduce(tensor, *, op):
-        nonlocal calls
-        calls += 1
+    class FakeWork:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def wait(self):
+            calls.append("wait")
+            self.tensor.copy_(
+                self.tensor.new_tensor([8, -7, 12, -11, 1, 0])
+            )
+
+    def fake_all_reduce(tensor, *, op, async_op):
         assert op == dist.ReduceOp.MAX
-        tensor.copy_(tensor.new_tensor([8, -7, 12, -11, 1, 0]))
+        assert async_op
+        calls.append("start")
+        return FakeWork(tensor)
 
     monkeypatch.setattr(
         "nanodeploy.engine.local_engine.dist.all_reduce", fake_all_reduce
@@ -962,8 +991,147 @@ def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
         RuntimeError,
         match=r"min=\[7, 11, 0\], max=\[8, 12, 1\]",
     ):
-        engine._consensus(local_unfinished=False)
-    assert calls == 1
+        engine._finish_consensus(
+            engine._start_consensus(
+                local_unfinished=False,
+                wave_id=7,
+                quantum_id=11,
+            )
+        )
+    assert calls == ["start", "wait"]
+
+
+def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    order = []
+    frozen_load = load_snapshot(0, 9, quantum_id=11)
+    post_load = replace(frozen_load, quantum_id=12)
+    batch = SimpleNamespace(
+        frozen_load_snapshot=frozen_load,
+        engine_has_real=True,
+    )
+
+    class FakeScheduler:
+        last_itl_token_slots = 0
+
+        @staticmethod
+        def admit():
+            order.append("admit")
+
+        @staticmethod
+        def is_finished():
+            return False
+
+        @staticmethod
+        def plan_decode(*, wave_id, quantum_id):
+            assert (wave_id, quantum_id) == (1, 11)
+            order.append("plan")
+            return batch
+
+        @staticmethod
+        def mark_first_forward_started(planned_batch):
+            assert planned_batch is batch
+            order.append("mark")
+            return ()
+
+        @staticmethod
+        def postprocess(planned_batch, results, *, execute_latency_ms):
+            assert planned_batch is batch
+            assert results == []
+            assert execute_latency_ms >= 0
+            order.append("postprocess")
+            engine._stop = True
+            return ()
+
+        @staticmethod
+        def drain_first_token_events():
+            return ()
+
+    class FakeExecutor:
+        @staticmethod
+        def activate_worker_transport(timeout):
+            assert timeout == 1.0
+            order.append("activate")
+
+        @staticmethod
+        def run(planned_batch, *, timeout):
+            assert planned_batch is batch
+            assert timeout == 2.0
+            order.append("execute")
+            return []
+
+        @staticmethod
+        def shutdown_worker_transport(*, timeout, failed):
+            assert (timeout, failed) == (2.0, False)
+            order.append("shutdown")
+            return ()
+
+    def refresh(snapshot=None):
+        if snapshot is None:
+            order.append("refresh_post")
+            return post_load
+        assert snapshot is frozen_load
+        order.append("refresh_frozen")
+        return snapshot
+
+    engine.config = SimpleNamespace(
+        attention_dp=2,
+        startup_timeout_s=1.0,
+        quantum_timeout_s=2.0,
+    )
+    engine.topology = SimpleNamespace(global_dp_idx=1)
+    engine.scheduler = FakeScheduler()
+    engine.executor = FakeExecutor()
+    engine._worker_transport_ready = threading.Event()
+    engine._failure = None
+    engine._stop = False
+    engine._wave_running = True
+    engine._wave_id = 1
+    engine._quantum_id = 11
+    engine._state_cv = threading.Condition()
+    engine._abort_commands = queue.Queue()
+    engine._normal_commands = queue.Queue()
+    engine._drain_ingress = lambda: None
+    engine._refresh_cached_load = refresh
+    engine._start_consensus = lambda *_args, **_kwargs: (
+        order.append("consensus_start")
+        or SimpleNamespace(work=object())
+    )
+    engine._finish_consensus = lambda _pending: (
+        order.append("consensus_wait") or True
+    )
+    engine._publish_first_schedule_events = lambda _events: None
+    engine._publish_first_token_events = lambda _events: None
+    engine._publish_events = lambda _events: None
+    engine._admission_latency_ms_total = 0.0
+    engine._schedule_latency_ms_total = 0.0
+    engine._coordination_latency_ms_total = 0.0
+    engine._execute_latency_ms_total = 0.0
+    engine._postprocess_latency_ms_total = 0.0
+    engine._decode_quantum_count = 0
+    engine._decode_itl_samples = []
+    engine._decode_itl_ms_weighted_total = 0.0
+    engine._decode_itl_token_count = 0
+    engine._quantum_diagnostics_enabled = False
+
+    engine._event_loop()
+
+    assert order == [
+        "activate",
+        "admit",
+        "consensus_start",
+        "plan",
+        "refresh_frozen",
+        "consensus_wait",
+        "mark",
+        "execute",
+        "postprocess",
+        "refresh_post",
+        "shutdown",
+    ]
+    assert engine._failure is None
+    assert engine._decode_quantum_count == 1
 
 
 def test_local_engine_drains_frontend_events_in_one_batch():

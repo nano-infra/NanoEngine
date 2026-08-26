@@ -55,6 +55,15 @@ def test_analyzer_validates_workload_and_normalizes_rank_time(tmp_path):
                     "postprocess_ms": 0.5,
                     "useful_real_batch_size": 2,
                     "attention_work_tokens": 30,
+                    "consensus_wait_ms": (
+                        0.7 if stage == "hierarchical" else None
+                    ),
+                    "consensus_overlap_window_ms": (
+                        1.1 if stage == "hierarchical" else None
+                    ),
+                    "consensus_total_ms": (
+                        1.8 if stage == "hierarchical" else None
+                    ),
                     "executor": {
                         "actor_submit_latency_ms": 1.0,
                         "send_seqs_latency_ms": 2.0,
@@ -135,6 +144,15 @@ def test_analyzer_validates_workload_and_normalizes_rank_time(tmp_path):
     assert comparison["runs"][1]["qdiag"][
         "worker_cpu_rank_time_ms_per_output_token"
     ] == 3.0 / 12.0
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "consensus_wait_ms"
+    ]["mean"] == 0.7
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "consensus_overlap_window_ms"
+    ]["mean"] == 1.1
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "consensus_total_ms"
+    ]["mean"] == 1.8
     assert comparison["pairs"][0][
         "corrected_tpot_delta_percent_hierarchical_vs_central"
     ] == 5.0

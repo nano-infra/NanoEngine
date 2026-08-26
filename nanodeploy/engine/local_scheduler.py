@@ -602,33 +602,54 @@ class LocalScheduler:
             list(self._scheduler.admit()[0])
         )
 
-    def _reconcile_preemptions(self) -> None:
+    def _reconcile_preemptions(self) -> tuple[int, int]:
         waiting_ids = {
             sequence.seq_id for sequence in self._scheduler.waiting_migration
         }
         running_ids = {
             sequence.seq_id for sequence in self._state_manager.running
         }
+        waiting = 0
+        running = 0
         for request_id, record in self._records.items():
-            if record.state.is_terminal or record.state == RequestState.ABORT_PENDING:
-                continue
-            if request_id in waiting_ids:
-                if record.sequence.num_bootstrap_tokens != 0:
-                    raise RuntimeError(
-                        "preempted request retained a bootstrap token"
-                    )
-                if record.state != RequestState.WAITING_ADMISSION:
-                    self._preemption_count += 1
-                record.state = RequestState.WAITING_ADMISSION
-            elif request_id in running_ids:
-                record.state = RequestState.RUNNING_DECODE
+            if not record.state.is_terminal and record.state != (
+                RequestState.ABORT_PENDING
+            ):
+                if request_id in waiting_ids:
+                    if record.sequence.num_bootstrap_tokens != 0:
+                        raise RuntimeError(
+                            "preempted request retained a bootstrap token"
+                        )
+                    if record.state != RequestState.WAITING_ADMISSION:
+                        self._preemption_count += 1
+                    record.state = RequestState.WAITING_ADMISSION
+                elif request_id in running_ids:
+                    record.state = RequestState.RUNNING_DECODE
+            if record.state == RequestState.WAITING_ADMISSION:
+                waiting += 1
+            elif record.state in {
+                RequestState.RUNNING_DECODE,
+                RequestState.ABORT_PENDING,
+            }:
+                running += 1
+            else:
+                raise RuntimeError(
+                    "LocalScheduler live record has invalid state: "
+                    f"request_id={record.sequence.seq_id}, "
+                    f"state={record.state.value}"
+                )
+        return waiting, running
 
     def plan_decode(self, *, wave_id: int, quantum_id: int) -> LocalDecodeBatch:
         if self._inflight_ids:
             raise RuntimeError("cannot freeze a second batch while one is in flight")
 
         sequences = list(self._scheduler.plan_decode()[0])
-        self._reconcile_preemptions()
+        waiting_count, running_count = self._reconcile_preemptions()
+        attention_sp = self.topology.attention_sp
+        master_counts = [0] * attention_sp
+        receiver_counts = [0] * attention_sp
+        dispatched_tokens = [0] * attention_sp
         mastered_sequence_lists = {
             global_rank: [] for global_rank in self.topology.global_ranks
         }
@@ -643,9 +664,8 @@ class LocalScheduler:
         real_sequences: list[Sequence] = []
         request_master_global_rank: dict[int, int] = {}
         for sequence in sequences:
-            master_sp_idx = sequence.block_ctx(
-                BlockContextSlot.ACTIVE
-            ).master_sp_idx
+            block_ctx = sequence.block_ctx(BlockContextSlot.ACTIVE)
+            master_sp_idx = block_ctx.master_sp_idx
             global_rank = self.topology.global_rank(master_sp_idx)
             mastered_sequences = mastered_sequence_lists[global_rank]
             row_index = len(mastered_sequences)
@@ -655,6 +675,13 @@ class LocalScheduler:
                 control_dummy_object_ids.add(id(sequence))
                 continue
             real_sequences.append(sequence)
+            master_counts[master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                block_ctx.num_dispatched_tokens
+            ):
+                dispatched_tokens[sp_idx] += token_count
+                if token_count > 0 and sp_idx != master_sp_idx:
+                    receiver_counts[sp_idx] += 1
             request_master_global_rank[sequence.seq_id] = global_rank
             request_order_lists[global_rank].append(sequence.seq_id)
             real_row_index_lists[global_rank].append(row_index)
@@ -676,6 +703,23 @@ class LocalScheduler:
             len(frozen_request_order[global_rank])
             for global_rank in self.topology.global_ranks
         ]
+        if running_count != len(real_sequences):
+            raise RuntimeError(
+                "planned decode batch does not cover all running requests: "
+                f"running={running_count}, planned={len(real_sequences)}"
+            )
+        active_load = _ActiveLoadState(
+            waiting=waiting_count,
+            running=running_count,
+            master_counts=tuple(master_counts),
+            receiver_counts=tuple(receiver_counts),
+            dispatched_tokens=tuple(dispatched_tokens),
+        )
+        frozen_load_snapshot = self._load_snapshot_from_active_state(
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+            active_load=active_load,
+        )
         per_rank_sequences = {
             global_rank: list(sequences)
             for global_rank in self.topology.global_ranks
@@ -691,6 +735,7 @@ class LocalScheduler:
             request_master_global_rank=request_master_global_rank,
             frozen_request_order=frozen_request_order,
             control_dummy_ids=frozenset(control_dummy_ids),
+            frozen_load_snapshot=frozen_load_snapshot,
             _all_sequences=sequences,
             _control_dummy_object_ids=frozenset(
                 control_dummy_object_ids
@@ -972,12 +1017,17 @@ class LocalScheduler:
     def is_finished(self) -> bool:
         return not self._records
 
-    def load_snapshot(self, *, wave_id: int, quantum_id: int) -> LoadSnapshot:
+    def _load_snapshot_from_active_state(
+        self,
+        *,
+        wave_id: int,
+        quantum_id: int,
+        active_load: _ActiveLoadState,
+    ) -> LoadSnapshot:
         free_blocks = [
             self._state_manager.block_manager[sp_idx].num_free_blocks
             for sp_idx in range(self.topology.attention_sp)
         ]
-        active_load = self._active_load_state()
         rank_loads = tuple(
             RankLoad(
                 global_rank=self.topology.global_rank(sp_idx=sp_idx),
@@ -1023,4 +1073,11 @@ class LocalScheduler:
             all_dummy_rank_forwards=self._all_dummy_rank_forwards,
             preemption_count=self._preemption_count,
             rank_loads=rank_loads,
+        )
+
+    def load_snapshot(self, *, wave_id: int, quantum_id: int) -> LoadSnapshot:
+        return self._load_snapshot_from_active_state(
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+            active_load=self._active_load_state(),
         )

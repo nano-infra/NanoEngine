@@ -17,6 +17,8 @@ from typing import Iterable
 STAGE_FIELDS = (
     "schedule_ms",
     "consensus_wait_ms",
+    "consensus_overlap_window_ms",
+    "consensus_total_ms",
     "execute_ms",
     "postprocess_ms",
     "quantum_total_ms",
@@ -463,6 +465,8 @@ def _render_html(comparison: dict) -> str:
             f"<td>{html.escape(run['run_id'])}</td>"
             f"<td>{_fmt(_metric_mean(qdiag, 'stage_ms', 'schedule_ms'))}</td>"
             f"<td>{_fmt(_metric_mean(qdiag, 'stage_ms', 'consensus_wait_ms'))}</td>"
+            f"<td>{_fmt(_metric_mean(qdiag, 'stage_ms', 'consensus_overlap_window_ms'))}</td>"
+            f"<td>{_fmt(_metric_mean(qdiag, 'stage_ms', 'consensus_total_ms'))}</td>"
             f"<td>{_fmt(_metric_mean(qdiag, 'executor_ms', 'actor_submit_latency_ms', 'worker_command_submit_latency_ms'))}</td>"
             f"<td>{_fmt(_metric_mean(qdiag, 'executor_ms', 'send_seqs_latency_ms'))}</td>"
             f"<td>{_fmt(_metric_mean(qdiag, 'worker_ms', 'prepare_update_host_ms'))}</td>"
@@ -499,7 +503,7 @@ code{{color:#8bd5ff}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap
 <div class="card verdict"><h2>Current diagnosis</h2><p>{diagnosis}</p></div>
 <div class="card"><h2>Runs</h2><table><thead><tr><th>Run</th><th>Stage</th><th>Corrected TPOT ms</th><th>Output tok/s</th><th>GPU rank time / output token</th><th>Worker CPU residual / output token</th><th>qdiag samples</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div>
 <div class="card"><h2>Adjacent paired deltas</h2><p class="muted">All deltas are hierarchical versus central.</p><table><thead><tr><th>Pair</th><th>Order</th><th>TPOT</th><th>Throughput</th><th>GPU rank time/token</th><th>Worker CPU residual/token</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div>
-<div class="card"><h2>Timing decomposition per quantum</h2><p class="muted">Means in milliseconds. Worker fields contain every rank sample; critical residual uses the slowest worker in each quantum.</p><table><thead><tr><th>Run</th><th>Schedule</th><th>Consensus</th><th>Actor submit</th><th>Send seqs</th><th>Worker prepare</th><th>GPU loop</th><th>Materialize</th><th>Critical CPU residual</th><th>Result rebuild</th><th>Postprocess</th></tr></thead><tbody>{''.join(decomposition_rows)}</tbody></table></div>
+<div class="card"><h2>Timing decomposition per quantum</h2><p class="muted">Means in milliseconds. Consensus wait is the exposed wait after planning; overlap window is work performed after async launch and before wait; total is launch-to-completion. Worker fields contain every rank sample; critical residual uses the slowest worker in each quantum.</p><table><thead><tr><th>Run</th><th>Schedule</th><th>Consensus wait</th><th>Consensus overlap window</th><th>Consensus total</th><th>Actor submit</th><th>Send seqs</th><th>Worker prepare</th><th>GPU loop</th><th>Materialize</th><th>Critical CPU residual</th><th>Result rebuild</th><th>Postprocess</th></tr></thead><tbody>{''.join(decomposition_rows)}</tbody></table></div>
 <div class="card"><h2>Interpretation</h2><p><code>GPU rank time / output token</code> sums CUDA-event time over every worker rank, then divides by identical actual output tokens. Worker CPU residual is <code>worker_total_ms - gpu_loop_ms</code> per rank. These totals remain comparable when hierarchical engines execute different numbers of denser quantums.</p></div>
 </main></body></html>"""
 

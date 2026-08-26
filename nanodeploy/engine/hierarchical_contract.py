@@ -427,6 +427,7 @@ class LocalDecodeBatch:
     request_master_global_rank: dict[int, int]
     frozen_request_order: dict[int, tuple[int, ...]]
     control_dummy_ids: frozenset[int]
+    frozen_load_snapshot: LoadSnapshot | None = None
     _all_sequences: list[Any] = field(repr=False, default_factory=list)
     _control_dummy_object_ids: frozenset[int] = field(
         repr=False, default_factory=frozenset
