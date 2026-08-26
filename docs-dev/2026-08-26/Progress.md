@@ -44,3 +44,45 @@ No GPU serving experiment or benchmark has been run. After final CPU review and
 commit, the next required evidence is a same-commit two-node sync qdiag run on
 the reinstalled DLSlime build. Per user instruction, record this checkpoint and
 stop before starting that GPU experiment.
+
+## Two-node rate-50 launch command (not run)
+
+This is the full non-smoke validation: two interleaved H/C pairs, four runs in
+the order `hierarchical -> central -> hierarchical -> central`. Each run sends
+15,000 requests at rate 50 for 300 seconds. The implementation under test is
+commit `f9fbe24`; the later Progress-only commit does not change runtime code.
+
+Run from the Ray head/driver node:
+
+```bash
+cd /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export SLIME_GID_INDEX=3
+export SLIME_QP_NUM=4
+export NANODEPLOY_HIER_RESULT_FASTPATH=1
+export NANODEPLOY_HIER_WORKER_TRANSPORT=ray
+
+RAY_ADDR=10.102.243.60:6380 \
+MASTER_ADDR=10.102.243.60:29500 \
+RATE=50 \
+DURATION_SECONDS=300 \
+NUM_REQUESTS=15000 \
+SMOKE=0 \
+CONTINUE_ON_ERROR=0 \
+RUN_ORDER="hierarchical central hierarchical central" \
+RUN_TAG="sync_control_overlap_rate50_$(date -u +%Y%m%d_%H%M%S)" \
+/bin/bash scripts/run_2node_rate40_qdiag_ab.sh
+```
+
+The runner writes all artifacts under `bench_logs/$RUN_TAG/`. On success,
+`run_manifest.tsv` must contain four successful rows. It then automatically
+generates `comparison.json` and `report.html`; the new hierarchical qdiag rows
+must contain `consensus_wait_ms`, `consensus_overlap_window_ms`, and
+`consensus_total_ms`.
+
+The exact command was validated with `DRY_RUN=1` at 2026-08-26T08:22:46Z. It
+expanded to four stages with the expected DP2/SP8, batch-192, loop-count-16,
+qdiag, address, rate, duration, and request-count arguments. No Ray connection
+or GPU workload was started.
