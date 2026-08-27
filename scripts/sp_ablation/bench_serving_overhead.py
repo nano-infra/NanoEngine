@@ -150,6 +150,21 @@ def parse_args():
         ],
         help="Hierarchical load-balancer policy (default: least_batch).",
     )
+    parser.add_argument(
+        "--moe-routing-simulation-strategy",
+        choices=["model", "uniform_random", "perfect_eplb"],
+        default="perfect_eplb",
+        help=(
+            "MoE expert-routing behavior used by the benchmark "
+            "(default: perfect_eplb)."
+        ),
+    )
+    parser.add_argument(
+        "--moe-routing-seed",
+        type=int,
+        default=0,
+        help="Random seed for simulated MoE routing (default: 0).",
+    )
     
     # Profiler arguments
     parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
@@ -2069,7 +2084,13 @@ def main():
         mode="decode",
         dummy_prefill=args.dummy_prefill,
         dummy_weight=True,
-        perfect_eplb=True,
+        perfect_eplb=(
+            args.moe_routing_simulation_strategy == "perfect_eplb"
+        ),
+        moe_routing_simulation_strategy=(
+            args.moe_routing_simulation_strategy
+        ),
+        seed=args.moe_routing_seed,
         attention_dp=args.dp,
         attention_sp=args.sp,
         attention_tp=args.tp,

@@ -274,6 +274,70 @@ def test_quantum_log_cli_accepts_both_scheduler_architectures(
         assert args.quantum_log_path == str(quantum_path)
 
 
+def test_uniform_random_moe_routing_cli_reaches_engine(monkeypatch):
+    benchmark = _load_benchmark_module(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["bench_serving_overhead.py"])
+    defaults = benchmark.parse_args()
+    assert defaults.moe_routing_simulation_strategy == "perfect_eplb"
+    assert defaults.moe_routing_seed == 0
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "bench_serving_overhead.py",
+            "--moe-routing-simulation-strategy",
+            "uniform_random",
+            "--moe-routing-seed",
+            "17",
+        ],
+    )
+    args = benchmark.parse_args()
+    captured = {}
+
+    def fake_llm(model_path, **kwargs):
+        captured["model_path"] = model_path
+        captured.update(kwargs)
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                hierarchical_quantum_diagnostics=False
+            ),
+            reset_execution_boundary_metrics=lambda: None,
+        )
+
+    monkeypatch.setattr(benchmark, "parse_args", lambda: args)
+    monkeypatch.setattr(benchmark, "LLM", fake_llm)
+    monkeypatch.setattr(benchmark, "print_model_config", lambda engine: None)
+    monkeypatch.setattr(
+        benchmark,
+        "run_warmup",
+        lambda engine, max_num_seqs, world_size: None,
+    )
+    monkeypatch.setattr(
+        benchmark, "get_dataset_generator", lambda parsed: iter(())
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "generate_arrival_times",
+        lambda num_requests, request_rate, burstiness: (),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "run_benchmark",
+        lambda *call_args, **call_kwargs: (0.0, {}, {}),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "calculate_and_print_metrics",
+        lambda *call_args, **call_kwargs: None,
+    )
+
+    benchmark.main()
+
+    assert captured["moe_routing_simulation_strategy"] == "uniform_random"
+    assert captured["seed"] == 17
+    assert captured["perfect_eplb"] is False
+
+
 def test_csv_dataset_skips_requests_above_total_token_limit(
     monkeypatch,
     tmp_path,

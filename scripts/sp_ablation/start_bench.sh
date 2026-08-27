@@ -27,6 +27,8 @@ DEFAULT_ROUTING="LeastBatch"
 DEFAULT_SCHEDULER_ARCH="legacy_global"
 DEFAULT_ROUTER_POLICY="least_batch"
 DEFAULT_SP_MASTER_SELECTOR="LeastBatch"
+DEFAULT_MOE_ROUTING_SIMULATION_STRATEGY="perfect_eplb"
+DEFAULT_MOE_ROUTING_SEED=0
 DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
@@ -63,6 +65,8 @@ ROUTING_STRATEGY="$DEFAULT_ROUTING"
 SCHEDULER_ARCH="$DEFAULT_SCHEDULER_ARCH"
 ROUTER_POLICY="${ROUTER_POLICY:-$DEFAULT_ROUTER_POLICY}"
 SP_MASTER_SELECTOR="${SP_MASTER_SELECTOR:-$DEFAULT_SP_MASTER_SELECTOR}"
+MOE_ROUTING_SIMULATION_STRATEGY="${MOE_ROUTING_SIMULATION_STRATEGY:-$DEFAULT_MOE_ROUTING_SIMULATION_STRATEGY}"
+MOE_ROUTING_SEED="${MOE_ROUTING_SEED:-$DEFAULT_MOE_ROUTING_SEED}"
 LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-$DEFAULT_FIXED_SP_SIZE}"
 SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
@@ -103,6 +107,8 @@ usage() {
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
     echo "  --router-policy <str>     round_robin | least_batch | least_cache | least_projected_load (default: $DEFAULT_ROUTER_POLICY)"
     echo "  --sp-master-selector <str> RoundRobin | LeastBatch | LeastCache (default: $DEFAULT_SP_MASTER_SELECTOR)"
+    echo "  --moe-routing-simulation-strategy <str> model | uniform_random | perfect_eplb (default: $DEFAULT_MOE_ROUTING_SIMULATION_STRATEGY)"
+    echo "  --moe-routing-seed <int>  Seed for simulated MoE routing (default: $DEFAULT_MOE_ROUTING_SEED)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
     echo "  --sp-backend <str>        hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
@@ -144,6 +150,8 @@ while [[ $# -gt 0 ]]; do
         --scheduler-arch)   SCHEDULER_ARCH="$2"; shift 2 ;;
         --router-policy)    ROUTER_POLICY="$2"; shift 2 ;;
         --sp-master-selector) SP_MASTER_SELECTOR="$2"; shift 2 ;;
+        --moe-routing-simulation-strategy) MOE_ROUTING_SIMULATION_STRATEGY="$2"; shift 2 ;;
+        --moe-routing-seed) MOE_ROUTING_SEED="$2"; shift 2 ;;
         --loop-count)       LOOP_COUNT="$2"; shift 2 ;;
         --fixed-sp-size)     FIXED_SP_SIZE="$2"; shift 2 ;;
         --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
@@ -203,6 +211,16 @@ case "$SP_MASTER_SELECTOR" in
     RoundRobin|LeastBatch|LeastCache) ;;
     *) echo "Error: Invalid SP master selector '$SP_MASTER_SELECTOR'."; exit 1 ;;
 esac
+
+case "$MOE_ROUTING_SIMULATION_STRATEGY" in
+    model|uniform_random|perfect_eplb) ;;
+    *) echo "Error: Invalid MoE routing simulation strategy '$MOE_ROUTING_SIMULATION_STRATEGY'."; exit 1 ;;
+esac
+
+if ! [[ "$MOE_ROUTING_SEED" =~ ^-?[0-9]+$ ]]; then
+    echo "Error: --moe-routing-seed must be an integer."
+    exit 1
+fi
 
 case "$SP_BACKEND" in
     hao_basic|nccl) ;;
@@ -287,6 +305,8 @@ echo "Routing     : $ROUTING_STRATEGY"
 echo "SchedArch   : $SCHEDULER_ARCH"
 echo "RouterPolicy: $ROUTER_POLICY"
 echo "SPMasterSel : $SP_MASTER_SELECTOR"
+echo "MoE Routing : $MOE_ROUTING_SIMULATION_STRATEGY"
+echo "MoE Seed    : $MOE_ROUTING_SEED"
 echo "LBCandRatio : $LEASTBATCH_TOKEN_CANDIDATE_RATIO"
 echo "BatchSz     : $BATCH_SIZE"
 echo "GPU Util    : $GPU_UTIL ($MEM_TAG)"
@@ -312,6 +332,7 @@ echo "================================================"
 log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
 log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH | RouterPolicy: $ROUTER_POLICY | SPMasterSelector: $SP_MASTER_SELECTOR"
+log_progress "MoERoutingSimulationStrategy=$MOE_ROUTING_SIMULATION_STRATEGY | MoERoutingSeed=$MOE_ROUTING_SEED"
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | MaxRequestTokens=${MAX_REQUEST_TOKENS:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
@@ -392,6 +413,15 @@ for rate in "${RATES[@]}"; do
     if [[ "$QUANTUM_DIAGNOSTICS" -ne 0 ]]; then
         extra_tags="${extra_tags}_qdiag"
     fi
+    case "$MOE_ROUTING_SIMULATION_STRATEGY" in
+        perfect_eplb) ;;
+        uniform_random)
+            extra_tags="${extra_tags}_moeUR_s${MOE_ROUTING_SEED}"
+            ;;
+        model)
+            extra_tags="${extra_tags}_moeModel"
+            ;;
+    esac
     if [[ -n "$RUN_LABEL" ]]; then
         extra_tags="${extra_tags}_${RUN_LABEL}"
     fi
@@ -434,6 +464,8 @@ for rate in "${RATES[@]}"; do
         --scheduler-arch "$SCHEDULER_ARCH"
         --router-policy "$ROUTER_POLICY"
         --sp-master-selector "$SP_MASTER_SELECTOR"
+        --moe-routing-simulation-strategy "$MOE_ROUTING_SIMULATION_STRATEGY"
+        --moe-routing-seed "$MOE_ROUTING_SEED"
         --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --dynamic-sp-bucket-preset "$DYNAMIC_SP_BUCKET_PRESET"
