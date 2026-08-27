@@ -76,8 +76,8 @@ def parse_args():
         help="Named sequence-length bucket policy.",
     )
 
-    parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+    parser.add_argument("--routing-strategy", type=str, default="RoundRobin",
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "LeastProjectedLoad"],
                         help="Routing strategy.")
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],

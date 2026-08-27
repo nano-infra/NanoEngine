@@ -57,7 +57,12 @@ class Config:
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.85
     gpu_memory_limit_gb: float | None = None
-    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+    routing_strategy: Literal[
+        "RoundRobin",
+        "LeastBatch",
+        "LeastCache",
+        "LeastProjectedLoad",
+    ] = "RoundRobin"
     scheduler_arch: Literal["legacy_global", "hierarchical"] = "legacy_global"
     router_policy: Literal[
         "round_robin",
@@ -229,10 +234,11 @@ class Config:
             "RoundRobin",
             "LeastBatch",
             "LeastCache",
+            "LeastProjectedLoad",
         }:
             raise ValueError(
                 "routing_strategy must be one of: "
-                "RoundRobin, LeastBatch, LeastCache"
+                "RoundRobin, LeastBatch, LeastCache, LeastProjectedLoad"
             )
         if self.hierarchical_worker_transport not in {"ray", "zmq"}:
             raise ValueError(

@@ -103,7 +103,7 @@ usage() {
     echo "  --gpu-mem <int>           GPU Memory Limit GB (default: $DEFAULT_GPU_MEM)"
     echo "  --max-model-len <int>     Max Model Len (default: $DEFAULT_MAX_MODEL_LEN)"
     echo "  --gpu-util <float>        GPU Memory Utilization (default: $DEFAULT_GPU_UTIL)"
-    echo "  --routing-strategy <str>  Routing Strategy (default: $DEFAULT_ROUTING)"
+    echo "  --routing-strategy <str>  RoundRobin | LeastBatch | LeastCache | LeastProjectedLoad (default: $DEFAULT_ROUTING)"
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
     echo "  --router-policy <str>     round_robin | least_batch | least_cache | least_projected_load (default: $DEFAULT_ROUTER_POLICY)"
     echo "  --sp-master-selector <str> RoundRobin | LeastBatch | LeastCache (default: $DEFAULT_SP_MASTER_SELECTOR)"
@@ -193,7 +193,7 @@ fi
 
 # ================= 校验逻辑 (Validation) =================
 case "$ROUTING_STRATEGY" in
-    RoundRobin|LeastBatch|LeastCache) ;;
+    RoundRobin|LeastBatch|LeastCache|LeastProjectedLoad) ;;
     *) echo "Error: Invalid routing strategy '$ROUTING_STRATEGY'."; exit 1 ;;
 esac
 
@@ -362,11 +362,12 @@ for rate in "${RATES[@]}"; do
     TIMESTAMP=$(TZ='Asia/Shanghai' date "+%Y%m%d_%H%M%S")
 
     # 策略标识字符串 (缩写)
-    # 路由缩写: LeastBatch->LB, LeastCache->LC, RoundRobin->RR
+    # 路由缩写: LeastBatch->LB, LeastCache->LC, LeastProjectedLoad->PL, RoundRobin->RR
     rt_short=""
     case "$ROUTING_STRATEGY" in
         LeastBatch)      rt_short="LB" ;;
         LeastCache)      rt_short="LC" ;;
+        LeastProjectedLoad) rt_short="PL" ;;
         RoundRobin)      rt_short="RR" ;;
         *)               rt_short="$ROUTING_STRATEGY" ;;
     esac

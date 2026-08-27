@@ -3,8 +3,9 @@ from pathlib import Path
 import pytest
 
 from nanodeploy.config import Config
-from nanodeploy.engine.llm_engine import LLMEngine
+from nanodeploy.engine.sequence import Sequence
 from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
+from nanodeploy.sampling_params import SamplingParams
 
 
 DEEPSEEK_MODEL = Path(
@@ -48,6 +49,10 @@ def make_config(**overrides) -> Config:
         ("RoundRobin", RoutingStrategy.RoundRobin),
         ("LeastBatch", RoutingStrategy.LeastBatch),
         ("LeastCache", RoutingStrategy.LeastCache),
+        (
+            "LeastProjectedLoad",
+            RoutingStrategy.LeastProjectedLoad,
+        ),
     ],
 )
 def test_legacy_routing_strategy(name, expected):
@@ -66,7 +71,41 @@ def test_routing_strategy_binding_only_exports_supported_values():
         "RoundRobin",
         "LeastBatch",
         "LeastCache",
+        "LeastProjectedLoad",
     }
+
+
+def test_legacy_least_projected_load_balances_work_and_batch():
+    scheduler = Scheduler(
+        make_config(
+            routing_strategy="LeastProjectedLoad",
+            mode="decode",
+            attention_dp=2,
+            attention_sp=1,
+        )
+    )
+    for request_id, prompt_len in enumerate((64, 1, 64, 1), start=1):
+        sequence = Sequence(
+            list(range(prompt_len)),
+            sampling_params=SamplingParams(
+                temperature=0.1,
+                max_tokens=16,
+                ignore_eos=True,
+            ),
+        )
+        sequence.seq_id = request_id
+        scheduler.add(sequence)
+
+    admitted = scheduler.admit()
+
+    assert [[sequence.seq_id for sequence in batch] for batch in admitted] == [
+        [1, 4],
+        [2, 3],
+    ]
+    assert [sum(sequence.num_tokens for sequence in batch) for batch in admitted] == [
+        65,
+        65,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -164,6 +203,8 @@ def test_removed_sp_debug_is_not_a_config_field():
 
 
 def test_llm_engine_rejects_removed_sp_debug_before_filtering_kwargs():
+    from nanodeploy.engine.llm_engine import LLMEngine
+
     with pytest.raises(TypeError, match="sp_debug was removed"):
         LLMEngine(str(DEEPSEEK_MODEL), sp_debug=True)
 
@@ -193,6 +234,8 @@ def test_removed_dynamic_sp_options_are_not_config_fields(option):
     ],
 )
 def test_llm_engine_rejects_removed_dynamic_sp_options(option):
+    from nanodeploy.engine.llm_engine import LLMEngine
+
     with pytest.raises(TypeError, match=f"{option} was removed"):
         LLMEngine(str(DEEPSEEK_MODEL), **{option: True})
 
@@ -208,6 +251,8 @@ def test_removed_latency_planner_options_are_not_config_fields(option):
 
 @pytest.mark.parametrize("option", REMOVED_LATENCY_PLANNER_OPTIONS)
 def test_llm_engine_rejects_removed_latency_planner_options(option):
+    from nanodeploy.engine.llm_engine import LLMEngine
+
     with pytest.raises(TypeError, match=f"{option} was removed"):
         LLMEngine(str(DEEPSEEK_MODEL), **{option: True})
 
@@ -221,6 +266,8 @@ def test_config_rejects_removed_long_short_sp8_strategy():
 
 
 def test_llm_engine_rejects_removed_long_short_sp8_strategy():
+    from nanodeploy.engine.llm_engine import LLMEngine
+
     with pytest.raises(ValueError, match="long_short_sp8.*was removed"):
         LLMEngine(
             str(DEEPSEEK_MODEL),

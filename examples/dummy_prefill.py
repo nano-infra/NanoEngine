@@ -24,7 +24,7 @@ def main():
         "--routing-strategy",
         type=str,
         default="RoundRobin",
-        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+        choices=["RoundRobin", "LeastBatch", "LeastCache", "LeastProjectedLoad"],
         help="Legacy scheduler routing strategy (default: RoundRobin)"
     )
     parser.add_argument(

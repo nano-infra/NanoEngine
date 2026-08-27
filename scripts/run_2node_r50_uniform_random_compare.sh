@@ -95,7 +95,6 @@ COMMON_ARGS=(
     --gpu-util 0.9
     --max-model-len 1000000
     --max-request-tokens 910000
-    --routing-strategy LeastBatch
     --sp-master-selector LeastBatch
     --loop-count 16
     --fixed-sp-size 0
@@ -114,19 +113,21 @@ run_stage() {
     local stage="$1"
     local scheduler_arch="$2"
     local router_policy="$3"
-    local worker_transport="$4"
-    local run_label="$5"
+    local routing_strategy="$4"
+    local worker_transport="$5"
+    local run_label="$6"
     local stage_log_dir="$COMPARE_LOG_DIR/$stage"
     local cmd=(
         bash "$START_BENCH_SH"
         "${COMMON_ARGS[@]}"
         --scheduler-arch "$scheduler_arch"
         --router-policy "$router_policy"
+        --routing-strategy "$routing_strategy"
         --run-label "$run_label"
         "$RATE"
     )
 
-    log "STAGE=$stage SCHEDULER_ARCH=$scheduler_arch ROUTER_POLICY=$router_policy WORKER_TRANSPORT=$worker_transport"
+    log "STAGE=$stage SCHEDULER_ARCH=$scheduler_arch ROUTING_STRATEGY=$routing_strategy ROUTER_POLICY=$router_policy WORKER_TRANSPORT=$worker_transport"
     if [[ "$DRY_RUN" == "1" ]]; then
         print_command "$stage_log_dir" "$worker_transport" "${cmd[@]}"
         return
@@ -150,14 +151,16 @@ log "SLIME_VISIBLE_DEVICES=$SLIME_VISIBLE_DEVICES SLIME_GID_INDEX=$SLIME_GID_IND
 run_stage \
     central \
     legacy_global \
-    least_batch \
+    least_projected_load \
+    LeastProjectedLoad \
     ray \
-    central_uniform_random
+    central_projected_load_uniform_random
 
 run_stage \
     hierarchical \
     hierarchical \
     least_projected_load \
+    LeastBatch \
     zmq \
     hierarchical_zmq_rppl_uniform_random
 

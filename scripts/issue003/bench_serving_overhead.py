@@ -94,7 +94,7 @@ def parse_args():
     )
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "LeastProjectedLoad"],
                         help="Routing strategy.")
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],

@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <tuple>
 
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "nanodeploy/sequence/sequence.h"
@@ -10,6 +12,33 @@
 #include "scheduler.h"
 
 namespace nanodeploy {
+
+namespace {
+
+using ProjectedLoadKey = std::tuple<std::int64_t,
+                                    std::int64_t,
+                                    std::int64_t,
+                                    std::int64_t,
+                                    int>;
+
+ProjectedLoadKey projected_load_key(int          dp_idx,
+                                    std::int64_t projected_work,
+                                    std::int64_t projected_batch,
+                                    std::int64_t total_work,
+                                    std::int64_t total_batch)
+{
+    const auto normalized_work  = projected_work * total_batch;
+    const auto normalized_batch = projected_batch * total_work;
+    return {
+        std::max(normalized_work, normalized_batch),
+        normalized_work + normalized_batch,
+        projected_batch,
+        projected_work,
+        dp_idx,
+    };
+}
+
+}  // namespace
 
 Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
@@ -413,6 +442,66 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
                 // Record metrics
+                if (seq->metric) {
+                    seq->metric->record_first_scheduled();
+                    if (mode_ == "decode") {
+                        seq->metric->record_decode_scheduled();
+                    }
+                }
+
+                scheduled = true;
+                break;
+            }
+        }
+        else if (routing_strategy == RoutingStrategy::LeastProjectedLoad) {
+            std::int64_t total_work  = seq->num_tokens;
+            std::int64_t total_batch = 1;
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                total_work += worker_state[dp_idx]->num_running_tokens();
+                total_batch += worker_state[dp_idx]->num_running_seqs();
+            }
+
+            std::vector<std::pair<ProjectedLoadKey, int>> candidates;
+            candidates.reserve(attention_dp_);
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                const std::int64_t projected_work =
+                    worker_state[dp_idx]->num_running_tokens() + seq->num_tokens;
+                const std::int64_t projected_batch =
+                    worker_state[dp_idx]->num_running_seqs() + 1;
+                candidates.emplace_back(
+                    projected_load_key(dp_idx,
+                                       projected_work,
+                                       projected_batch,
+                                       total_work,
+                                       total_batch),
+                    dp_idx);
+            }
+            std::sort(candidates.begin(), candidates.end());
+
+            for (const auto& candidate : candidates) {
+                const int selected_dp_idx = candidate.second;
+                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+                if (!can_allocate) {
+                    continue;
+                }
+
+                worker_state[selected_dp_idx]->allocate(*seq);
+
+                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx_ = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx_;
+
+                num_seqs[selected_dp_idx][master_sp_idx] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp_idx] +=
+                    (seq->num_tokens - seq->num_cached_tokens);
+
+                seq->status = SequenceStatus::RUNNING;
+
+                waiting_queue.pop_front();
+                worker_state[selected_dp_idx]->running.push_back(seq);
+                scheduled_seqs[selected_dp_idx].push_back(seq);
+
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
                     if (mode_ == "decode") {

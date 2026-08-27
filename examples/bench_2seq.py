@@ -51,8 +51,8 @@ def parse_args():
     parser.add_argument("--sp-backend", type=str, default="hao_basic",
                         choices=["hao_basic", "nccl"],
                         help="SP all-to-all backend.")
-    parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+    parser.add_argument("--routing-strategy", type=str, default="RoundRobin",
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "LeastProjectedLoad"],
                         help="Routing strategy.")
     
     args = parser.parse_args()

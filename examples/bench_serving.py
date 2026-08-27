@@ -73,8 +73,8 @@ def parse_args():
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
     parser.add_argument("--fixed-sp-size", type=int, default=0,
                         help="Fixed number of participating SP ranks per request (0 = disabled).")
-    parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+    parser.add_argument("--routing-strategy", type=str, default="RoundRobin",
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "LeastProjectedLoad"],
                         help="Routing strategy.")
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],

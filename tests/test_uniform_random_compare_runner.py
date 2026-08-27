@@ -29,9 +29,20 @@ def test_uniform_random_compare_runner_dry_run(tmp_path):
     assert "MOE_ROUTING_SEED=0" in progress
     assert progress.count("--moe-routing-simulation-strategy uniform_random") == 2
     assert progress.count("--moe-routing-seed 0") == 2
-    assert "STAGE=central SCHEDULER_ARCH=legacy_global" in progress
-    assert "ROUTER_POLICY=least_batch WORKER_TRANSPORT=ray" in progress
-    assert "STAGE=hierarchical SCHEDULER_ARCH=hierarchical" in progress
+    assert (
+        "STAGE=central SCHEDULER_ARCH=legacy_global "
+        "ROUTING_STRATEGY=LeastProjectedLoad"
+        in progress
+    )
+    assert (
+        "ROUTER_POLICY=least_projected_load WORKER_TRANSPORT=ray"
+        in progress
+    )
+    assert (
+        "STAGE=hierarchical SCHEDULER_ARCH=hierarchical "
+        "ROUTING_STRATEGY=LeastBatch"
+        in progress
+    )
     assert (
         "ROUTER_POLICY=least_projected_load WORKER_TRANSPORT=zmq"
         in progress
