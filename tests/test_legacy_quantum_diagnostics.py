@@ -122,10 +122,13 @@ def test_legacy_engine_emits_common_quantum_diagnostic(monkeypatch):
 
     assert len(samples) == 1
     sample = samples[0]
-    assert sample["schema_version"] == 2
+    assert sample["schema_version"] == 3
     assert sample["scheduler_arch"] == "legacy_global"
     assert sample["useful_real_batch_size"] == 1
     assert sample["attention_work_tokens"] == 64
     assert sample["rank_loads_before"][0]["free_blocks"] == 10
+    assert sample["ingress_drain_ms"] == 0.0
+    assert sample["leader_arrival_skew_ms"] == 0.0
+    assert sample["late_participant_collective_ms"] == 0.0
     assert sample["executor"] == executor_diagnostic
     assert engine.drain_quantum_diagnostics() == ()

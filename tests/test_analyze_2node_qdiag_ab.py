@@ -46,7 +46,7 @@ def test_analyzer_validates_workload_and_normalizes_rank_time(tmp_path):
             quantum_path,
             (
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "scheduler_arch": arch,
                     "engine_id": -1 if stage == "central" else 0,
                     "quantum_id": 0,
@@ -55,14 +55,23 @@ def test_analyzer_validates_workload_and_normalizes_rank_time(tmp_path):
                     "postprocess_ms": 0.5,
                     "useful_real_batch_size": 2,
                     "attention_work_tokens": 30,
-                    "consensus_wait_ms": (
+                    "ingress_drain_ms": (
+                        1.4 if stage == "hierarchical" else 0.0
+                    ),
+                    "consensus_exposed_wait_ms": (
                         0.7 if stage == "hierarchical" else None
                     ),
                     "consensus_overlap_window_ms": (
                         1.1 if stage == "hierarchical" else None
                     ),
-                    "consensus_total_ms": (
+                    "leader_rendezvous_ms": (
                         1.8 if stage == "hierarchical" else None
+                    ),
+                    "leader_arrival_skew_ms": (
+                        1.1 if stage == "hierarchical" else 0.0
+                    ),
+                    "late_participant_collective_ms": (
+                        0.7 if stage == "hierarchical" else 0.0
                     ),
                     "executor": {
                         "actor_submit_latency_ms": 1.0,
@@ -145,20 +154,30 @@ def test_analyzer_validates_workload_and_normalizes_rank_time(tmp_path):
         "worker_cpu_rank_time_ms_per_output_token"
     ] == 3.0 / 12.0
     assert comparison["runs"][1]["qdiag"]["stage_ms"][
-        "consensus_wait_ms"
+        "consensus_exposed_wait_ms"
     ]["mean"] == 0.7
     assert comparison["runs"][1]["qdiag"]["stage_ms"][
         "consensus_overlap_window_ms"
     ]["mean"] == 1.1
     assert comparison["runs"][1]["qdiag"]["stage_ms"][
-        "consensus_total_ms"
+        "leader_rendezvous_ms"
     ]["mean"] == 1.8
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "ingress_drain_ms"
+    ]["mean"] == 1.4
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "leader_arrival_skew_ms"
+    ]["mean"] == 1.1
+    assert comparison["runs"][1]["qdiag"]["stage_ms"][
+        "late_participant_collective_ms"
+    ]["mean"] == 0.7
     assert comparison["pairs"][0][
         "corrected_tpot_delta_percent_hierarchical_vs_central"
     ] == 5.0
     report = (tmp_path / "report.html").read_text(encoding="utf-8")
     assert "Two-node quantum diagnostic A/B" in report
     assert "GPU rank time / output token" in report
+    assert "Leader arrival skew" in report
 
 
 def test_analyzer_rejects_unpaired_run_order():
@@ -175,3 +194,74 @@ def test_analyzer_rejects_unpaired_run_order():
         assert "even run count" in str(exc)
     else:
         raise AssertionError("odd run count was accepted")
+
+
+def test_quantum_summary_uses_one_critical_value_per_leader_quantum():
+    root = Path(__file__).resolve().parents[1]
+    path = root / "utils_analysis" / "analyze_2node_qdiag_ab.py"
+    spec = importlib.util.spec_from_file_location("qdiag_analyzer", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    records = [
+        {
+            "schema_version": 3,
+            "wave_id": 1,
+            "quantum_id": 2,
+            "engine_id": 0,
+            "ingress_drain_ms": 1.0,
+            "leader_arrival_skew_ms": 3.0,
+            "late_participant_collective_ms": None,
+        },
+        {
+            "schema_version": 3,
+            "wave_id": 1,
+            "quantum_id": 2,
+            "engine_id": 1,
+            "ingress_drain_ms": 2.0,
+            "leader_arrival_skew_ms": 3.0,
+            "late_participant_collective_ms": 0.4,
+        },
+    ]
+
+    summary = module._quantum_summary(records, output_tokens=1)
+
+    assert summary["stage_ms"]["ingress_drain_ms"] == {
+        "samples": 1,
+        "total": 2.0,
+        "mean": 2.0,
+        "p50": 2.0,
+        "p95": 2.0,
+        "p99": 2.0,
+    }
+    assert summary["stage_ms"]["leader_arrival_skew_ms"]["mean"] == 3.0
+    assert summary["stage_ms"]["late_participant_collective_ms"][
+        "mean"
+    ] == 0.4
+
+
+def test_quantum_summary_keeps_legacy_consensus_metrics_separate():
+    root = Path(__file__).resolve().parents[1]
+    path = root / "utils_analysis" / "analyze_2node_qdiag_ab.py"
+    spec = importlib.util.spec_from_file_location("qdiag_analyzer", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    summary = module._quantum_summary(
+        [
+            {
+                "schema_version": 2,
+                "quantum_id": 7,
+                "consensus_wait_ms": 1.2,
+                "consensus_total_ms": 2.3,
+            }
+        ],
+        output_tokens=1,
+    )
+
+    stages = summary["stage_ms"]
+    assert stages["legacy_consensus_wait_ms"]["mean"] == 1.2
+    assert stages["legacy_consensus_total_ms"]["mean"] == 2.3
+    assert stages["leader_arrival_skew_ms"]["mean"] is None
+    assert stages["late_participant_collective_ms"]["mean"] is None

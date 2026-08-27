@@ -117,6 +117,13 @@ class LocalScheduler:
             global_rank: sp_idx
             for sp_idx, global_rank in enumerate(self.topology.global_ranks)
         }
+        self._active_load_cache: _ActiveLoadState | None = _ActiveLoadState(
+            waiting=0,
+            running=0,
+            master_counts=(0,) * self.topology.attention_sp,
+            receiver_counts=(0,) * self.topology.attention_sp,
+            dispatched_tokens=(0,) * self.topology.attention_sp,
+        )
 
     @property
     def cpp_scheduler(self) -> Scheduler:
@@ -137,7 +144,13 @@ class LocalScheduler:
     def _active_request_count(self) -> int:
         return len(self._records)
 
+    def _invalidate_active_load_state(self) -> None:
+        self._active_load_cache = None
+
     def _active_load_state(self) -> _ActiveLoadState:
+        cached = self._active_load_cache
+        if cached is not None:
+            return cached
         attention_sp = self.topology.attention_sp
         master_counts = [0] * attention_sp
         receiver_counts = [0] * attention_sp
@@ -173,9 +186,42 @@ class LocalScheduler:
                 dispatched_tokens[sp_idx] += token_count
                 if token_count > 0 and sp_idx != master_sp_idx:
                     receiver_counts[sp_idx] += 1
-        return _ActiveLoadState(
+        active_load = _ActiveLoadState(
             waiting=waiting,
             running=running,
+            master_counts=tuple(master_counts),
+            receiver_counts=tuple(receiver_counts),
+            dispatched_tokens=tuple(dispatched_tokens),
+        )
+        self._active_load_cache = active_load
+        return active_load
+
+    def _active_load_with_added_running(
+        self,
+        active_load: _ActiveLoadState,
+        sequences: tuple[Sequence, ...],
+    ) -> _ActiveLoadState:
+        master_counts = list(active_load.master_counts)
+        receiver_counts = list(active_load.receiver_counts)
+        dispatched_tokens = list(active_load.dispatched_tokens)
+        for sequence in sequences:
+            block_ctx = sequence.block_ctx(BlockContextSlot.ACTIVE)
+            master_sp_idx = block_ctx.master_sp_idx
+            if not 0 <= master_sp_idx < self.topology.attention_sp:
+                raise RuntimeError(
+                    "admitted request has invalid master SP rank: "
+                    f"request_id={sequence.seq_id}, sp_idx={master_sp_idx}"
+                )
+            master_counts[master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                block_ctx.num_dispatched_tokens
+            ):
+                dispatched_tokens[sp_idx] += token_count
+                if token_count > 0 and sp_idx != master_sp_idx:
+                    receiver_counts[sp_idx] += 1
+        return _ActiveLoadState(
+            waiting=active_load.waiting,
+            running=active_load.running + len(sequences),
             master_counts=tuple(master_counts),
             receiver_counts=tuple(receiver_counts),
             dispatched_tokens=tuple(dispatched_tokens),
@@ -299,6 +345,7 @@ class LocalScheduler:
             padded_completion_len=validation.padded_completion_len,
             scheduler_enqueued_at=perf_counter(),
         )
+        self._invalidate_active_load_state()
         return AddResult(
             request_id=command.request_id,
             accepted=True,
@@ -321,6 +368,7 @@ class LocalScheduler:
             )
         self._scheduler.waiting_migration.remove(record.sequence)
         self._records.pop(request_id)
+        self._invalidate_active_load_state()
 
     def try_admit_batch(
         self,
@@ -544,6 +592,14 @@ class LocalScheduler:
                     engine_id=self.engine_id,
                     reason="admission_state_mismatch",
                 )
+        admitted_sequences = tuple(
+            self._records[request_id].sequence
+            for request_id in admitted_ids
+        )
+        self._active_load_cache = self._active_load_with_added_running(
+            active_load,
+            admitted_sequences,
+        )
         return tuple(results)
 
     def _defer_admission(self, sequence: Sequence) -> None:
@@ -551,6 +607,7 @@ class LocalScheduler:
             raise RuntimeError("cannot defer a sequence that is not running")
         self._state_manager.running.remove(sequence)
         self._scheduler.preempt(0, sequence)
+        self._invalidate_active_load_state()
 
     def _finalize_admitted(
         self, admitted: list[Sequence]
@@ -594,13 +651,14 @@ class LocalScheduler:
                 )
             self._master_assignments[master_sp_idx] += 1
             record.state = RequestState.RUNNING_DECODE
+            self._invalidate_active_load_state()
             admitted_ids.append(sequence.seq_id)
         return tuple(admitted_ids)
 
     def admit(self) -> tuple[int, ...]:
-        return self._finalize_admitted(
-            list(self._scheduler.admit()[0])
-        )
+        admitted = list(self._scheduler.admit()[0])
+        self._invalidate_active_load_state()
+        return self._finalize_admitted(admitted)
 
     def _reconcile_preemptions(self) -> tuple[int, int]:
         waiting_ids = {
@@ -644,6 +702,7 @@ class LocalScheduler:
         if self._inflight_ids:
             raise RuntimeError("cannot freeze a second batch while one is in flight")
 
+        self._invalidate_active_load_state()
         sequences = list(self._scheduler.plan_decode()[0])
         waiting_count, running_count = self._reconcile_preemptions()
         attention_sp = self.topology.attention_sp
@@ -715,6 +774,7 @@ class LocalScheduler:
             receiver_counts=tuple(receiver_counts),
             dispatched_tokens=tuple(dispatched_tokens),
         )
+        self._active_load_cache = active_load
         frozen_load_snapshot = self._load_snapshot_from_active_state(
             wave_id=wave_id,
             quantum_id=quantum_id,
@@ -798,6 +858,7 @@ class LocalScheduler:
             return AbortResult(request_id=request_id, status="not_found")
         if request_id in self._inflight_ids:
             record.state = RequestState.ABORT_PENDING
+            self._invalidate_active_load_state()
             return AbortResult(request_id=request_id, status="abort_pending")
         if record.state == RequestState.WAITING_ADMISSION:
             self._scheduler.waiting_migration.remove(record.sequence)
@@ -860,6 +921,7 @@ class LocalScheduler:
         )
         self._records.pop(request_id)
         self._terminal_states[request_id] = record.state
+        self._invalidate_active_load_state()
 
     def postprocess(
         self,
@@ -949,6 +1011,7 @@ class LocalScheduler:
             metrics_manager=None,
             loop_count=HIERARCHICAL_LOOP_COUNT,
         )
+        self._invalidate_active_load_state()
         for request_id in surviving_ids:
             previous_tokens = completed_before[request_id]
             completed_tokens = self._records[

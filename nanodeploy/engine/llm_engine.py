@@ -674,7 +674,7 @@ class LLMEngine:
                     post_sch_end - post_sch_begin
                 ) * 1000
                 sample = {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "scheduler_arch": "legacy_global",
                     "engine_id": -1,
                     "wave_id": 0,
@@ -710,7 +710,13 @@ class LLMEngine:
                     ],
                     "admission_ms": 0.0,
                     "schedule_ms": schedule_ms,
-                    "consensus_wait_ms": 0.0,
+                    "ingress_drain_ms": 0.0,
+                    "consensus_exposed_wait_ms": 0.0,
+                    "consensus_overlap_window_ms": 0.0,
+                    "leader_arrival_unix_ns": None,
+                    "leader_arrival_skew_ms": 0.0,
+                    "leader_rendezvous_ms": 0.0,
+                    "late_participant_collective_ms": 0.0,
                     "execute_ms": model_runner_duration_ms,
                     "postprocess_ms": postprocess_ms,
                     "quantum_total_ms": (

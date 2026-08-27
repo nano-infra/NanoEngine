@@ -475,7 +475,7 @@ def test_planned_admission_mismatch_keeps_staged_sequences_retryable():
     ]
 
 
-def test_planned_admission_scans_live_records_once_per_batch():
+def test_planned_admission_reuses_cached_active_load_across_batch_and_snapshot():
     class CountingRecords(dict):
         def __init__(self, records):
             super().__init__(records)
@@ -528,6 +528,7 @@ def test_planned_admission_scans_live_records_once_per_batch():
         seed_sequences,
     )
     assert all(result.accepted for result in seed_results)
+    local.load_snapshot(wave_id=1, quantum_id=0)
 
     command_sequences = tuple(
         make_add(request_id, (1, 2))
@@ -553,17 +554,23 @@ def test_planned_admission_scans_live_records_once_per_batch():
     )
 
     assert all(result.accepted for result in results)
-    assert records.values_calls == 1
+    assert records.values_calls == 0
     assert records.items_calls == 0
-    assert records.yielded_records == len(seed_commands)
+    assert records.yielded_records == 0
 
     records.values_calls = 0
     records.yielded_records = 0
     load = local.load_snapshot(wave_id=1, quantum_id=0)
     assert load.running == len(seed_commands) + len(commands)
-    assert records.values_calls == 1
-    assert records.yielded_records == load.running
+    assert records.values_calls == 0
+    assert records.yielded_records == 0
     assert not local.is_finished()
+    assert records.values_calls == 0
+    assert records.yielded_records == 0
+
+    local._invalidate_active_load_state()
+    rebuilt = local.load_snapshot(wave_id=1, quantum_id=0)
+    assert rebuilt == load
     assert records.values_calls == 1
     assert records.yielded_records == load.running
 

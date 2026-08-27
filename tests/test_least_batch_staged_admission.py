@@ -192,6 +192,7 @@ def _local_engine_for_drain(scheduler, request_ids=(1, 2)):
     engine._failure = None
     engine._ingress_adds = queue.Queue()
     engine._ingress_head = None
+    engine._ingress_replay = deque()
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set(request_ids)
     engine._ingress_pending_ids = set(request_ids)
@@ -221,38 +222,168 @@ def _local_engine_for_drain(scheduler, request_ids=(1, 2)):
     return engine
 
 
+def test_planned_ingress_commits_one_boundary_batch():
+    class Scheduler:
+        def __init__(self):
+            self.calls = []
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            self.calls.append(
+                tuple(command.request_id for command in commands)
+            )
+            return tuple(
+                AddResult(command.request_id, True, 0)
+                for command in commands
+            )
+
+    scheduler = Scheduler()
+    engine = _local_engine_for_drain(scheduler, request_ids=(1, 2, 3))
+
+    engine._drain_ingress()
+
+    assert scheduler.calls == [(1, 2, 3)]
+    assert [event.request_id for event in engine.drain_add_results()] == [
+        1,
+        2,
+        3,
+    ]
+    assert engine._planned_commit_attempts == 3
+
+
+def test_planned_batch_mismatch_commits_prefix_and_retries_suffix_in_order():
+    class Scheduler:
+        def __init__(self):
+            self.calls = []
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            request_ids = tuple(command.request_id for command in commands)
+            self.calls.append(request_ids)
+            if request_ids == (1, 2, 3):
+                return (
+                    AddResult(1, True, 0),
+                    AddResult(2, False, 0, "admission_state_mismatch"),
+                    AddResult(3, False, 0, "admission_state_mismatch"),
+                )
+            assert request_ids == (2, 3)
+            return (AddResult(2, True, 0), AddResult(3, True, 0))
+
+    scheduler = Scheduler()
+    engine = _local_engine_for_drain(scheduler, request_ids=(1, 2, 3))
+
+    engine._drain_ingress()
+
+    assert scheduler.calls == [(1, 2, 3)]
+    assert [event.request_id for event in engine.drain_add_results()] == [1]
+    assert engine._ingress_head.command.request_id == 2
+    assert engine._local_transient_retries == 1
+
+    engine._drain_ingress()
+
+    assert scheduler.calls == [(1, 2, 3), (2, 3)]
+    assert [event.request_id for event in engine.drain_add_results()] == [2, 3]
+
+
+def test_planned_ingress_batch_respects_request_cap():
+    class Scheduler:
+        def __init__(self):
+            self.calls = []
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            request_ids = tuple(command.request_id for command in commands)
+            self.calls.append(request_ids)
+            return tuple(
+                AddResult(request_id, True, 0)
+                for request_id in request_ids
+            )
+
+    scheduler = Scheduler()
+    engine = _local_engine_for_drain(scheduler, request_ids=(1, 2, 3))
+    engine.config.max_ingress_batch_requests = 2
+
+    engine._drain_ingress()
+    assert scheduler.calls == [(1, 2)]
+    assert [event.request_id for event in engine.drain_add_results()] == [1, 2]
+
+    engine._drain_ingress()
+    assert scheduler.calls == [(1, 2), (3,)]
+    assert [event.request_id for event in engine.drain_add_results()] == [3]
+
+
+def test_abort_arriving_during_planned_batch_only_removes_its_request():
+    class Scheduler:
+        def __init__(self):
+            self.calls = []
+            self.events = ()
+
+        def commit_planned_batch(self, commands, reservations, sequences):
+            request_ids = tuple(command.request_id for command in commands)
+            self.calls.append(request_ids)
+            with engine._ingress_lock:
+                engine._cancelled_ingress_ids.add(2)
+            return tuple(
+                AddResult(request_id, True, 0)
+                for request_id in request_ids
+            )
+
+        def abort(self, request_id):
+            self.events = (FinishEvent(request_id, 0, "ABORTED", 0),)
+            return AbortResult(request_id, "aborted")
+
+        def drain_terminal_events(self):
+            events = self.events
+            self.events = ()
+            return events
+
+    scheduler = Scheduler()
+    engine = _local_engine_for_drain(scheduler, request_ids=(1, 2, 3))
+
+    engine._drain_ingress()
+
+    assert scheduler.calls == [(1, 2, 3)]
+    events = engine.drain_add_results()
+    assert [event.request_id for event in events] == [1, 3]
+    assert [event.admission_version for event in events] == [1, 2]
+    assert engine.drain_events() == (FinishEvent(2, 0, "ABORTED", 0),)
+    assert engine._reserved_request_ids == {1, 3}
+    assert engine._reserved_slots == 2
+
+
 def test_transient_planned_head_is_sticky_and_retried_locally():
     class Scheduler:
         def __init__(self):
             self.calls = []
 
         def commit_planned_batch(self, commands, reservations, sequences):
-            request_id = commands[0].request_id
-            self.calls.append(request_id)
-            if self.calls == [1]:
-                return (
+            request_ids = tuple(command.request_id for command in commands)
+            self.calls.append(request_ids)
+            if len(self.calls) == 1:
+                return tuple(
                     AddResult(
                         request_id,
                         False,
                         0,
                         "admission_state_mismatch",
-                    ),
+                    )
+                    for request_id in request_ids
                 )
-            return (AddResult(request_id, True, 0),)
+            return tuple(
+                AddResult(request_id, True, 0)
+                for request_id in request_ids
+            )
 
     scheduler = Scheduler()
     engine = _local_engine_for_drain(scheduler)
 
     engine._drain_ingress()
-    assert scheduler.calls == [1]
+    assert scheduler.calls == [(1, 2)]
     assert engine._ingress_head.command.request_id == 1
     assert engine.drain_add_results() == ()
 
     engine._drain_ingress()
-    assert scheduler.calls == [1, 1, 2]
+    assert scheduler.calls == [(1, 2), (1, 2)]
     assert [event.request_id for event in engine.drain_add_results()] == [1, 2]
     assert engine._local_transient_retries == 1
-    assert engine._planned_commit_attempts == 3
+    assert engine._planned_commit_attempts == 4
 
 
 def test_abort_arriving_during_commit_wins_atomic_handoff():

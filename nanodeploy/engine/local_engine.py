@@ -5,7 +5,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from time import perf_counter, time as wall_time
+from time import perf_counter, time as wall_time, time_ns as wall_time_ns
 from typing import Any
 
 import ray
@@ -69,6 +69,11 @@ class _PendingConsensus:
     local_unfinished: bool
     wave_id: int
     quantum_id: int
+    arrival_perf_s: float
+    arrival_unix_ns: int
+    leader_arrival_skew_ms: float = 0.0
+    leader_rendezvous_ms: float = 0.0
+    late_participant_collective_ms: float | None = None
 
 
 def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
@@ -112,6 +117,7 @@ class LocalEngineCore:
         self._abort_commands: queue.Queue[_LoopCommand] = queue.Queue()
         self._ingress_adds: queue.Queue[_IngressAdd] = queue.Queue()
         self._ingress_head: _IngressAdd | None = None
+        self._ingress_replay: deque[_IngressAdd] = deque()
         self._ingress_lock = threading.Lock()
         self._reserved_request_ids: set[int] = set()
         self._ingress_pending_ids: set[int] = set()
@@ -1009,6 +1015,210 @@ class LocalEngineCore:
             if self._reserved_slots < 0:
                 raise RuntimeError("negative LocalEngine ingress reservation")
 
+    def _take_ingress(self) -> _IngressAdd | None:
+        if self._ingress_head is not None:
+            ingress = self._ingress_head
+            self._ingress_head = None
+            return ingress
+        if self._ingress_replay:
+            return self._ingress_replay.popleft()
+        try:
+            return self._ingress_adds.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _restore_ingress_prefix(
+        self, ingresses: tuple[_IngressAdd, ...]
+    ) -> None:
+        if not ingresses:
+            return
+        if self._ingress_head is not None:
+            raise RuntimeError("LocalEngine ingress retry head is already occupied")
+        self._ingress_head = ingresses[0]
+        self._ingress_replay.extendleft(reversed(ingresses[1:]))
+
+    def _cancel_uncommitted_ingress(
+        self,
+        ingress: _IngressAdd,
+        cancelled_events: list[FinishEvent],
+    ) -> bool:
+        request_id = ingress.command.request_id
+        with self._ingress_lock:
+            if request_id not in self._cancelled_ingress_ids:
+                return False
+            self._cancelled_ingress_ids.discard(request_id)
+            self._ingress_pending_ids.discard(request_id)
+        cancelled_events.append(
+            FinishEvent(
+                request_id=request_id,
+                generated_count=0,
+                status="ABORTED",
+                engine_id=self.engine_id,
+            )
+        )
+        return True
+
+    def _reconcile_committed_ingress_abort(
+        self,
+        ingress: _IngressAdd,
+        result: AddResult,
+        cancelled_events: list[FinishEvent],
+    ) -> None:
+        request_id = ingress.command.request_id
+        if result.accepted:
+            abort_result = self.scheduler.abort(request_id)
+            scheduler_events = self.scheduler.drain_terminal_events()
+            if (
+                abort_result.status != "aborted"
+                or len(scheduler_events) != 1
+                or scheduler_events[0].request_id != request_id
+                or scheduler_events[0].status != "ABORTED"
+            ):
+                raise RuntimeError(
+                    "LocalScheduler failed to reconcile an ingress abort "
+                    f"after commit: request={request_id}, "
+                    f"result={abort_result}, events={scheduler_events}"
+                )
+            cancelled_events.extend(scheduler_events)
+            return
+        cancelled_events.append(
+            FinishEvent(
+                request_id=request_id,
+                generated_count=0,
+                status="ABORTED",
+                engine_id=self.engine_id,
+            )
+        )
+
+    def _commit_planned_ingress_batch(
+        self,
+        ingresses: tuple[_IngressAdd, ...],
+        results: list[AddResultEvent],
+        cancelled_events: list[FinishEvent],
+    ) -> tuple[int, tuple[_IngressAdd, ...]]:
+        active_ingresses: list[_IngressAdd] = []
+        processed = 0
+        for ingress in ingresses:
+            if self._cancel_uncommitted_ingress(
+                ingress, cancelled_events
+            ):
+                processed += 1
+            else:
+                active_ingresses.append(ingress)
+        if not active_ingresses:
+            return processed, ()
+
+        active = tuple(active_ingresses)
+        add_begin = perf_counter()
+        self._planned_commit_attempts += len(active)
+        committed = tuple(
+            self.scheduler.commit_planned_batch(
+                tuple(ingress.command for ingress in active),
+                tuple(
+                    ingress.reservation
+                    for ingress in active
+                    if ingress.reservation is not None
+                ),
+                tuple(ingress.sequence for ingress in active),
+            )
+        )
+        if len(committed) != len(active):
+            raise RuntimeError(
+                "LocalScheduler planned ingress result count mismatch: "
+                f"commands={len(active)}, results={len(committed)}"
+            )
+        local_admission_ms = (perf_counter() - add_begin) * 1000
+        self._scheduler_add_ms_total += local_admission_ms
+
+        cancelled_after_commit: set[int] = set()
+        retry_index: int | None = None
+        admission_versions: list[int | None] = [None] * len(active)
+        with self._ingress_lock:
+            for index, (ingress, result) in enumerate(
+                zip(active, committed, strict=True)
+            ):
+                request_id = ingress.command.request_id
+                if result.request_id != request_id:
+                    raise RuntimeError(
+                        "LocalScheduler ingress result request mismatch: "
+                        f"expected={request_id}, got={result.request_id}"
+                    )
+                cancelled = request_id in self._cancelled_ingress_ids
+                if cancelled:
+                    self._cancelled_ingress_ids.discard(request_id)
+                    cancelled_after_commit.add(request_id)
+                transient_mismatch = (
+                    not result.accepted
+                    and result.reason == "admission_state_mismatch"
+                )
+                if (
+                    retry_index is None
+                    and transient_mismatch
+                    and not cancelled
+                ):
+                    retry_index = index
+                deferred = (
+                    retry_index is not None
+                    and index >= retry_index
+                    and not cancelled
+                )
+                if deferred and result.accepted:
+                    raise RuntimeError(
+                        "LocalScheduler accepted planned ingress after a "
+                        "state mismatch"
+                    )
+                if not deferred:
+                    self._ingress_pending_ids.discard(request_id)
+                if not deferred and not cancelled and result.accepted:
+                    self._admission_version += 1
+                    admission_versions[index] = self._admission_version
+
+        retry_suffix: tuple[_IngressAdd, ...] = ()
+        if retry_index is not None:
+            self._local_transient_retries += 1
+            retry_suffix = tuple(
+                ingress
+                for ingress in active[retry_index:]
+                if ingress.command.request_id
+                not in cancelled_after_commit
+            )
+
+        for index, (ingress, result) in enumerate(
+            zip(active, committed, strict=True)
+        ):
+            request_id = ingress.command.request_id
+            cancelled = request_id in cancelled_after_commit
+            deferred = (
+                retry_index is not None
+                and index >= retry_index
+                and not cancelled
+            )
+            if deferred:
+                continue
+            processed += 1
+            staged_queue_ms = max(
+                0.0, (add_begin - ingress.enqueued_at) * 1000
+            )
+            self._ingress_queue_delay_ms_total += staged_queue_ms
+            if cancelled:
+                self._reconcile_committed_ingress_abort(
+                    ingress, result, cancelled_events
+                )
+                continue
+            event = AddResultEvent(
+                request_id=result.request_id,
+                engine_id=self.engine_id,
+                accepted=result.accepted,
+                reason=result.reason,
+                admission_version=admission_versions[index],
+                local_planned_queue_ms=staged_queue_ms,
+                local_admission_ms=local_admission_ms,
+            )
+            results.append(event)
+            if not result.accepted:
+                self._release_reservation(request_id)
+        return processed, retry_suffix
+
     def _drain_ingress(self) -> None:
         begin = perf_counter()
         drain_budget_ms = self.config.max_ingress_drain_ms
@@ -1023,53 +1233,54 @@ class LocalEngineCore:
                 >= drain_budget_ms
             ):
                 break
-            if self._ingress_head is None:
-                try:
-                    self._ingress_head = self._ingress_adds.get_nowait()
-                except queue.Empty:
-                    break
-            ingress = self._ingress_head
+            ingress = self._take_ingress()
+            if ingress is None:
+                break
             command = ingress.command
-            with self._ingress_lock:
-                cancelled = (
-                    command.request_id in self._cancelled_ingress_ids
-                )
-            if cancelled:
-                with self._ingress_lock:
-                    self._cancelled_ingress_ids.discard(command.request_id)
-                    self._ingress_pending_ids.discard(command.request_id)
-                self._ingress_head = None
-                cancelled_events.append(
-                    FinishEvent(
-                        request_id=command.request_id,
-                        generated_count=0,
-                        status="ABORTED",
-                        engine_id=self.engine_id,
+            if ingress.reservation is not None:
+                planned = [ingress]
+                while processed + len(planned) < (
+                    self.config.max_ingress_batch_requests
+                ):
+                    if (
+                        drain_budget_ms > 0
+                        and (perf_counter() - begin) * 1000
+                        >= drain_budget_ms
+                    ):
+                        break
+                    next_ingress = self._take_ingress()
+                    if next_ingress is None:
+                        break
+                    if next_ingress.reservation is None:
+                        self._restore_ingress_prefix((next_ingress,))
+                        break
+                    planned.append(next_ingress)
+                committed_count, retry_suffix = (
+                    self._commit_planned_ingress_batch(
+                        tuple(planned), results, cancelled_events
                     )
                 )
+                processed += committed_count
+                if retry_suffix:
+                    self._restore_ingress_prefix(retry_suffix)
+                    break
+                continue
+
+            if self._cancel_uncommitted_ingress(
+                ingress, cancelled_events
+            ):
                 processed += 1
                 continue
             add_begin = perf_counter()
-            if ingress.reservation is None:
-                try:
-                    result = self.scheduler.add(command, ingress.sequence)
-                except BaseException as exc:
-                    result = AddResult(
-                        request_id=command.request_id,
-                        accepted=False,
-                        engine_id=self.engine_id,
-                        reason=f"{type(exc).__name__}: {exc}",
-                    )
-            else:
-                # Planned admission may have partially mutated scheduler state
-                # before an unexpected exception. Fail the LocalEngine instead
-                # of reporting a safe rejection with an uncertain outcome.
-                self._planned_commit_attempts += 1
-                result = self.scheduler.commit_planned_batch(
-                    (command,),
-                    (ingress.reservation,),
-                    (ingress.sequence,),
-                )[0]
+            try:
+                result = self.scheduler.add(command, ingress.sequence)
+            except BaseException as exc:
+                result = AddResult(
+                    request_id=command.request_id,
+                    accepted=False,
+                    engine_id=self.engine_id,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
             if result.request_id != command.request_id:
                 raise RuntimeError(
                     "LocalScheduler ingress result request mismatch: "
@@ -1077,67 +1288,27 @@ class LocalEngineCore:
                 )
             local_admission_ms = (perf_counter() - add_begin) * 1000
             self._scheduler_add_ms_total += local_admission_ms
-            transient_mismatch = (
-                ingress.reservation is not None
-                and not result.accepted
-                and result.reason == "admission_state_mismatch"
-            )
             with self._ingress_lock:
                 cancelled = (
                     command.request_id in self._cancelled_ingress_ids
                 )
                 if cancelled:
                     self._cancelled_ingress_ids.discard(command.request_id)
-                if cancelled or not transient_mismatch:
-                    # This is the atomic ingress-to-scheduler ownership handoff.
-                    # An abort after this point cannot leave a stale tombstone:
-                    # submit_abort will enqueue a normal scheduler abort.
-                    self._ingress_pending_ids.discard(command.request_id)
-                if (
-                    not cancelled
-                    and result.accepted
-                    and ingress.reservation is not None
-                ):
-                    self._admission_version += 1
-                    admission_version = self._admission_version
-                else:
-                    admission_version = None
-            if transient_mismatch and not cancelled:
-                self._local_transient_retries += 1
-                break
+                # This is the atomic ingress-to-scheduler ownership handoff.
+                # An abort after this point cannot leave a stale tombstone:
+                # submit_abort will enqueue a normal scheduler abort.
+                self._ingress_pending_ids.discard(command.request_id)
+                admission_version = None
 
             processed += 1
             staged_queue_ms = max(
                 0.0, (add_begin - ingress.enqueued_at) * 1000
             )
             self._ingress_queue_delay_ms_total += staged_queue_ms
-            self._ingress_head = None
             if cancelled:
-                if result.accepted:
-                    abort_result = self.scheduler.abort(command.request_id)
-                    scheduler_events = self.scheduler.drain_terminal_events()
-                    if (
-                        abort_result.status != "aborted"
-                        or len(scheduler_events) != 1
-                        or scheduler_events[0].request_id
-                        != command.request_id
-                        or scheduler_events[0].status != "ABORTED"
-                    ):
-                        raise RuntimeError(
-                            "LocalScheduler failed to reconcile an ingress "
-                            f"abort after commit: request={command.request_id}, "
-                            f"result={abort_result}, events={scheduler_events}"
-                        )
-                    cancelled_events.extend(scheduler_events)
-                else:
-                    cancelled_events.append(
-                        FinishEvent(
-                            request_id=command.request_id,
-                            generated_count=0,
-                            status="ABORTED",
-                            engine_id=self.engine_id,
-                        )
-                    )
+                self._reconcile_committed_ingress_abort(
+                    ingress, result, cancelled_events
+                )
                 continue
             event = AddResultEvent(
                 request_id=result.request_id,
@@ -1271,6 +1442,8 @@ class LocalEngineCore:
         wave_id: int,
         quantum_id: int,
     ) -> _PendingConsensus:
+        arrival_perf_s = perf_counter()
+        arrival_unix_ns = wall_time_ns()
         if self.config.attention_dp == 1:
             return _PendingConsensus(
                 reduced=None,
@@ -1278,6 +1451,9 @@ class LocalEngineCore:
                 local_unfinished=local_unfinished,
                 wave_id=wave_id,
                 quantum_id=quantum_id,
+                arrival_perf_s=arrival_perf_s,
+                arrival_unix_ns=arrival_unix_ns,
+                late_participant_collective_ms=0.0,
             )
         unfinished = int(local_unfinished)
         # MAX over x and -x yields the global maximum and negative minimum.
@@ -1289,6 +1465,8 @@ class LocalEngineCore:
                 -quantum_id,
                 unfinished,
                 -unfinished,
+                arrival_unix_ns,
+                -arrival_unix_ns,
             ],
             dtype=torch.int64,
             device="cpu",
@@ -1305,12 +1483,15 @@ class LocalEngineCore:
             local_unfinished=local_unfinished,
             wave_id=wave_id,
             quantum_id=quantum_id,
+            arrival_perf_s=arrival_perf_s,
+            arrival_unix_ns=arrival_unix_ns,
         )
 
     def _finish_consensus(self, pending: _PendingConsensus) -> bool:
         if pending.work is None:
             return pending.local_unfinished
         pending.work.wait()
+        consensus_finished = perf_counter()
         reduced = pending.reduced
         if reduced is None:
             raise RuntimeError("distributed consensus is missing its result")
@@ -1320,6 +1501,23 @@ class LocalEngineCore:
             raise RuntimeError(
                 "LocalEngine leader wave/quantum mismatch: "
                 f"min={minimum}, max={maximum}"
+            )
+        latest_arrival_ns = int(reduced[6].item())
+        earliest_arrival_ns = -int(reduced[7].item())
+        if earliest_arrival_ns > latest_arrival_ns:
+            raise RuntimeError(
+                "LocalEngine leader arrival range is invalid: "
+                f"min={earliest_arrival_ns}, max={latest_arrival_ns}"
+            )
+        pending.leader_arrival_skew_ms = (
+            latest_arrival_ns - earliest_arrival_ns
+        ) / 1_000_000
+        pending.leader_rendezvous_ms = max(
+            0.0, (consensus_finished - pending.arrival_perf_s) * 1000
+        )
+        if pending.arrival_unix_ns == latest_arrival_ns:
+            pending.late_participant_collective_ms = (
+                pending.leader_rendezvous_ms
             )
         return bool(maximum[2])
 
@@ -1388,7 +1586,11 @@ class LocalEngineCore:
             self._worker_transport_ready.set()
             while True:
                 self._drain_queue(self._abort_commands)
+                ingress_drain_begin = perf_counter()
                 self._drain_ingress()
+                ingress_drain_ms = (
+                    perf_counter() - ingress_drain_begin
+                ) * 1000
                 self._drain_queue(self._normal_commands)
                 # Close the ingress-drain/plan gap for aborts submitted after
                 # the first priority drain but before scheduler admission.
@@ -1461,13 +1663,9 @@ class LocalEngineCore:
                 ) * 1000
                 if pending_consensus.work is None:
                     consensus_overlap_window_ms = 0.0
-                    consensus_total_ms = 0.0
                 else:
                     consensus_overlap_window_ms = (
                         consensus_wait_begin - consensus_started
-                    ) * 1000
-                    consensus_total_ms = (
-                        consensus_finished - consensus_started
                     ) * 1000
                 self._coordination_latency_ms_total += coordination_latency_ms
                 if not global_unfinished:
@@ -1541,7 +1739,7 @@ class LocalEngineCore:
                             "LocalExecutor quantum diagnostic identity mismatch"
                         )
                     sample = {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "scheduler_arch": "hierarchical",
                         "engine_id": self.engine_id,
                         "wave_id": wave_id,
@@ -1574,11 +1772,23 @@ class LocalEngineCore:
                         ),
                         "admission_ms": admission_latency_ms,
                         "schedule_ms": schedule_latency_ms,
-                        "consensus_wait_ms": coordination_latency_ms,
+                        "ingress_drain_ms": ingress_drain_ms,
+                        "consensus_exposed_wait_ms": coordination_latency_ms,
                         "consensus_overlap_window_ms": (
                             consensus_overlap_window_ms
                         ),
-                        "consensus_total_ms": consensus_total_ms,
+                        "leader_arrival_unix_ns": (
+                            pending_consensus.arrival_unix_ns
+                        ),
+                        "leader_arrival_skew_ms": (
+                            pending_consensus.leader_arrival_skew_ms
+                        ),
+                        "leader_rendezvous_ms": (
+                            pending_consensus.leader_rendezvous_ms
+                        ),
+                        "late_participant_collective_ms": (
+                            pending_consensus.late_participant_collective_ms
+                        ),
                         "execute_ms": execute_latency_ms,
                         "postprocess_ms": postprocess_latency_ms,
                         "quantum_total_ms": (

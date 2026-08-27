@@ -1192,6 +1192,14 @@ def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
     engine._wave_id = 7
     engine._quantum_id = 11
     calls = []
+    clock = iter((10.0, 10.002))
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_engine.perf_counter", lambda: next(clock)
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_engine.wall_time_ns",
+        lambda: 1_003_000_000,
+    )
 
     class FakeWork:
         def __init__(self, tensor):
@@ -1200,7 +1208,18 @@ def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
         def wait(self):
             calls.append("wait")
             self.tensor.copy_(
-                self.tensor.new_tensor([7, -7, 11, -11, 1, 0])
+                self.tensor.new_tensor(
+                    [
+                        7,
+                        -7,
+                        11,
+                        -11,
+                        1,
+                        0,
+                        1_003_000_000,
+                        -1_000_000_000,
+                    ]
+                )
             )
 
     def fake_all_reduce(tensor, *, op, async_op):
@@ -1217,11 +1236,27 @@ def test_local_engine_consensus_uses_one_collective_for_global_or(monkeypatch):
         quantum_id=11,
     )
     assert calls == [
-        ([7, -7, 11, -11, 0, 0], dist.ReduceOp.MAX, True)
+        (
+            [
+                7,
+                -7,
+                11,
+                -11,
+                0,
+                0,
+                1_003_000_000,
+                -1_003_000_000,
+            ],
+            dist.ReduceOp.MAX,
+            True,
+        )
     ]
 
     assert engine._finish_consensus(pending)
     assert calls[-1] == "wait"
+    assert pending.leader_arrival_skew_ms == 3.0
+    assert pending.leader_rendezvous_ms == pytest.approx(2.0)
+    assert pending.late_participant_collective_ms == pytest.approx(2.0)
 
 
 def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
@@ -1241,7 +1276,9 @@ def test_local_engine_consensus_detects_mismatched_ids_with_one_collective(
         def wait(self):
             calls.append("wait")
             self.tensor.copy_(
-                self.tensor.new_tensor([8, -7, 12, -11, 1, 0])
+                self.tensor.new_tensor(
+                    [8, -7, 12, -11, 1, 0, 2_000, -1_000]
+                )
             )
 
     def fake_all_reduce(tensor, *, op, async_op):
@@ -1316,6 +1353,12 @@ def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
             return ()
 
     class FakeExecutor:
+        last_quantum_diagnostic = {
+            "engine_id": 0,
+            "wave_id": 1,
+            "quantum_id": 11,
+        }
+
         @staticmethod
         def activate_worker_transport(timeout):
             assert timeout == 1.0
@@ -1347,6 +1390,7 @@ def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
         startup_timeout_s=1.0,
         quantum_timeout_s=2.0,
     )
+    engine.engine_id = 0
     engine.topology = SimpleNamespace(global_dp_idx=1)
     engine.scheduler = FakeScheduler()
     engine.executor = FakeExecutor()
@@ -1363,7 +1407,13 @@ def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
     engine._refresh_cached_load = refresh
     engine._start_consensus = lambda *_args, **_kwargs: (
         order.append("consensus_start")
-        or SimpleNamespace(work=object())
+        or SimpleNamespace(
+            work=object(),
+            arrival_unix_ns=1_000_000_000,
+            leader_arrival_skew_ms=0.0,
+            leader_rendezvous_ms=0.0,
+            late_participant_collective_ms=None,
+        )
     )
     engine._finish_consensus = lambda _pending: (
         order.append("consensus_wait") or True
@@ -1380,7 +1430,9 @@ def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
     engine._decode_itl_samples = []
     engine._decode_itl_ms_weighted_total = 0.0
     engine._decode_itl_token_count = 0
-    engine._quantum_diagnostics_enabled = False
+    engine._quantum_diagnostics_enabled = True
+    engine._quantum_diagnostics = []
+    engine._quantum_diagnostics_lock = threading.Lock()
 
     engine._event_loop()
 
@@ -1399,6 +1451,13 @@ def test_local_engine_overlaps_consensus_with_plan_and_waits_before_execute():
     ]
     assert engine._failure is None
     assert engine._decode_quantum_count == 1
+    assert len(engine._quantum_diagnostics) == 1
+    sample = engine._quantum_diagnostics[0]
+    assert sample["schema_version"] == 3
+    assert sample["ingress_drain_ms"] >= 0.0
+    assert sample["consensus_exposed_wait_ms"] >= 0.0
+    assert sample["leader_arrival_skew_ms"] == 0.0
+    assert sample["late_participant_collective_ms"] is None
 
 
 def test_local_engine_drains_frontend_events_in_one_batch():
@@ -1812,6 +1871,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._failure = None
     engine._ingress_adds = queue.Queue()
     engine._ingress_head = None
+    engine._ingress_replay = deque()
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = set()
     engine._ingress_pending_ids = set()
@@ -1945,18 +2005,22 @@ def test_local_engine_transient_planned_head_retries_without_reordering():
             self.calls = []
 
         def commit_planned_batch(self, commands, reservations, sequences):
-            request_id = commands[0].request_id
-            self.calls.append(request_id)
-            if self.calls == [1]:
-                return (
+            request_ids = tuple(command.request_id for command in commands)
+            self.calls.append(request_ids)
+            if len(self.calls) == 1:
+                return tuple(
                     AddResult(
                         request_id,
                         False,
                         engine_id=0,
                         reason="admission_state_mismatch",
-                    ),
+                    )
+                    for request_id in request_ids
                 )
-            return (AddResult(request_id, True, engine_id=0),)
+            return tuple(
+                AddResult(request_id, True, engine_id=0)
+                for request_id in request_ids
+            )
 
     actor_class = LocalEngineCore.__ray_metadata__.modified_class
     engine = object.__new__(actor_class)
@@ -1969,6 +2033,7 @@ def test_local_engine_transient_planned_head_retries_without_reordering():
     engine._failure = None
     engine._ingress_adds = queue.Queue()
     engine._ingress_head = None
+    engine._ingress_replay = deque()
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = {1, 2}
     engine._ingress_pending_ids = {1, 2}
@@ -2000,17 +2065,17 @@ def test_local_engine_transient_planned_head_retries_without_reordering():
         )
 
     engine._drain_ingress()
-    assert engine.scheduler.calls == [1]
+    assert engine.scheduler.calls == [(1, 2)]
     assert engine._ingress_head.command.request_id == 1
-    assert engine._ingress_adds.qsize() == 1
+    assert engine._ingress_adds.qsize() == 0
     assert engine.drain_add_results() == ()
 
     engine._drain_ingress()
-    assert engine.scheduler.calls == [1, 1, 2]
+    assert engine.scheduler.calls == [(1, 2), (1, 2)]
     assert engine._ingress_head is None
     assert [event.request_id for event in engine.drain_add_results()] == [1, 2]
     assert engine._local_transient_retries == 1
-    assert engine._planned_commit_attempts == 3
+    assert engine._planned_commit_attempts == 4
 
 
 def test_local_engine_abort_during_planned_commit_wins_ownership_handoff():
@@ -2044,6 +2109,7 @@ def test_local_engine_abort_during_planned_commit_wins_ownership_handoff():
     engine._failure = None
     engine._ingress_adds = queue.Queue()
     engine._ingress_head = None
+    engine._ingress_replay = deque()
     engine._ingress_lock = threading.Lock()
     engine._reserved_request_ids = {1}
     engine._ingress_pending_ids = {1}
