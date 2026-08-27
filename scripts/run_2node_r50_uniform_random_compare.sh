@@ -15,9 +15,10 @@ RATE="${RATE:-50}"
 DURATION_SECONDS="${DURATION_SECONDS:-300}"
 NUM_REQUESTS="${NUM_REQUESTS:-$(awk -v rate="$RATE" -v seconds="$DURATION_SECONDS" 'BEGIN {printf "%d", rate * seconds}')}"
 MOE_ROUTING_SEED="${MOE_ROUTING_SEED:-0}"
+ROUNDS="${ROUNDS:-2}"
 DRY_RUN="${DRY_RUN:-0}"
 
-RUN_TAG="${RUN_TAG:-two_node_r50_uniform_random_4way_$(date -u +%Y%m%d_%H%M%S)}"
+RUN_TAG="${RUN_TAG:-two_node_r50_uniform_random_2round_4way_$(date -u +%Y%m%d_%H%M%S)}"
 COMPARE_LOG_DIR="${COMPARE_LOG_DIR:-$ROOT_DIR/bench_logs/$RUN_TAG}"
 PROGRESS_LOG="$COMPARE_LOG_DIR/compare.progress"
 
@@ -44,7 +45,7 @@ print_command() {
     } | tee -a "$PROGRESS_LOG"
 }
 
-for value_name in DURATION_SECONDS NUM_REQUESTS; do
+for value_name in DURATION_SECONDS NUM_REQUESTS ROUNDS; do
     value="${!value_name}"
     if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: $value_name must be a positive integer." >&2
@@ -145,39 +146,46 @@ log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 log "MODEL_PATH=$MODEL_PATH"
 log "DATASET_PATH=$DATASET_PATH"
 log "RATE=$RATE DURATION_SECONDS=$DURATION_SECONDS NUM_REQUESTS=$NUM_REQUESTS"
+log "ROUNDS=$ROUNDS EXPERIMENTS_PER_ROUND=4 TOTAL_EXPERIMENTS=$((ROUNDS * 4))"
 log "MOE_ROUTING_SIMULATION_STRATEGY=uniform_random MOE_ROUTING_SEED=$MOE_ROUTING_SEED"
 log "SLIME_VISIBLE_DEVICES=$SLIME_VISIBLE_DEVICES SLIME_GID_INDEX=$SLIME_GID_INDEX SLIME_QP_NUM=$SLIME_QP_NUM"
 
-run_stage \
-    central_least_batch \
-    legacy_global \
-    least_batch \
-    LeastBatch \
-    ray \
-    central_least_batch_uniform_random
+for ((round = 1; round <= ROUNDS; ++round)); do
+    log "ROUND_START round=$round/$ROUNDS"
 
-run_stage \
-    hierarchical_least_batch \
-    hierarchical \
-    least_batch \
-    LeastBatch \
-    zmq \
-    hierarchical_zmq_least_batch_uniform_random
+    run_stage \
+        "round${round}_central_least_batch" \
+        legacy_global \
+        least_batch \
+        LeastBatch \
+        ray \
+        "round${round}_central_least_batch_uniform_random"
 
-run_stage \
-    central_least_projected_load \
-    legacy_global \
-    least_projected_load \
-    LeastProjectedLoad \
-    ray \
-    central_projected_load_uniform_random
+    run_stage \
+        "round${round}_hierarchical_least_batch" \
+        hierarchical \
+        least_batch \
+        LeastBatch \
+        zmq \
+        "round${round}_hierarchical_zmq_least_batch_uniform_random"
 
-run_stage \
-    hierarchical_least_projected_load \
-    hierarchical \
-    least_projected_load \
-    LeastBatch \
-    zmq \
-    hierarchical_zmq_rppl_uniform_random
+    run_stage \
+        "round${round}_central_least_projected_load" \
+        legacy_global \
+        least_projected_load \
+        LeastProjectedLoad \
+        ray \
+        "round${round}_central_projected_load_uniform_random"
+
+    run_stage \
+        "round${round}_hierarchical_least_projected_load" \
+        hierarchical \
+        least_projected_load \
+        LeastBatch \
+        zmq \
+        "round${round}_hierarchical_zmq_rppl_uniform_random"
+
+    log "ROUND_DONE round=$round/$ROUNDS"
+done
 
 log "COMPARE_DONE log_dir=$COMPARE_LOG_DIR"
