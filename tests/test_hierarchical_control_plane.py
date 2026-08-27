@@ -363,6 +363,7 @@ def load_snapshot(
     ingress_version: int = 0,
     capacity_epoch: int = 0,
     reserved_slots: int | None = None,
+    active_dispatched_tokens: int = 0,
 ) -> LoadSnapshot:
     return LoadSnapshot(
         engine_id=engine_id,
@@ -392,6 +393,7 @@ def load_snapshot(
                 total_blocks=max(256, free_blocks_min + 1),
                 master_assignments=running,
                 mastered_decode_tokens=0,
+                active_dispatched_tokens=active_dispatched_tokens,
                 control_dummy_blocks=1,
             ),
         ),
@@ -637,6 +639,271 @@ def test_router_least_batch_drains_global_pending_with_tentative_counts():
         router.owner(request_id).state == OwnerState.PENDING_INGRESS
         for request_id in (1, 2, 3, 4)
     )
+
+
+def test_router_least_batch_balances_count_not_prompt_work():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
+
+    for request_id, prompt_len in enumerate((64, 1, 64, 1), start=1):
+        submit_request(
+            router,
+            request_id=request_id,
+            prompt_token_ids=tuple(range(prompt_len)),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1, 3]
+    assert [command.request_id for command in engines[1].commands] == [2, 4]
+    assert [
+        sum(command.num_tokens for command in engine.commands)
+        for engine in engines.values()
+    ] == [128, 2]
+
+
+def test_router_least_projected_load_balances_prompt_work_and_batch():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_projected_load",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
+
+    for request_id, prompt_len in enumerate((64, 1, 64, 1), start=1):
+        submit_request(
+            router,
+            request_id=request_id,
+            prompt_token_ids=tuple(range(prompt_len)),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1, 4]
+    assert [command.request_id for command in engines[1].commands] == [2, 3]
+    assert [
+        sum(command.num_tokens for command in engine.commands)
+        for engine in engines.values()
+    ] == [65, 65]
+
+
+def test_router_least_projected_load_uses_live_context():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_projected_load",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (
+            load_snapshot(
+                0,
+                100,
+                running=1,
+                active_dispatched_tokens=100,
+            ),
+            load_snapshot(
+                1,
+                100,
+                running=1,
+                active_dispatched_tokens=10,
+            ),
+        )
+    )
+
+    submit_request(
+        router,
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert engines[0].commands == []
+    assert [command.request_id for command in engines[1].commands] == [1]
+    metrics = router.admission_metrics()["per_engine"]
+    assert metrics["0"]["projected_attention_work"] == 100
+    assert metrics["1"]["projected_attention_work"] == 11
+
+
+def test_router_least_projected_load_does_not_make_prompt_strictly_primary():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_projected_load",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (
+            load_snapshot(
+                0,
+                100,
+                running=1,
+                active_dispatched_tokens=100,
+            ),
+            load_snapshot(
+                1,
+                100,
+                running=10,
+                active_dispatched_tokens=90,
+            ),
+        )
+    )
+
+    submit_request(
+        router,
+        request_id=1,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1]
+    assert engines[1].commands == []
+
+
+def test_router_least_projected_load_score_ignores_max_tokens():
+    def route_with(max_tokens: tuple[int, ...]) -> dict[int, list[int]]:
+        engines = {
+            0: FakeAsyncEngine(0),
+            1: FakeAsyncEngine(1),
+        }
+        router = RequestRouter(
+            engines,
+            router_policy="least_projected_load",
+            admission_planner_config=planner_config(),
+        )
+        router.record_loads(
+            (load_snapshot(0, 100), load_snapshot(1, 100))
+        )
+        for request_id, (prompt_len, output_limit) in enumerate(
+            zip((64, 1, 64, 1), max_tokens, strict=True), start=1
+        ):
+            submit_request(
+                router,
+                request_id=request_id,
+                prompt_token_ids=tuple(range(prompt_len)),
+                max_tokens=output_limit,
+                temperature=0.1,
+                ignore_eos=True,
+            )
+        assert router.poll_ingress_acks() == ()
+        return {
+            engine_id: [
+                command.request_id for command in engine.commands
+            ]
+            for engine_id, engine in engines.items()
+        }
+
+    expected = {0: [1, 4], 1: [2, 3]}
+    assert route_with((16, 16, 16, 16)) == expected
+    assert route_with((1, 64, 2, 32)) == expected
+
+
+def test_router_least_projected_load_matches_count_for_equal_prompts():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_projected_load",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
+    for request_id in range(1, 5):
+        submit_request(
+            router,
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1, 3]
+    assert [command.request_id for command in engines[1].commands] == [2, 4]
+
+
+def test_router_least_projected_load_reconciles_tentative_work_to_snapshot():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_projected_load",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 100),))
+    submit_request(
+        router,
+        request_id=1,
+        prompt_token_ids=tuple(range(64)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    metrics = router.admission_metrics()["per_engine"]["0"]
+    assert metrics["tentative_admissions"] == 1
+    assert metrics["projected_attention_work"] == 64
+
+    engine.handles[0]["ready"] = True
+    ack = router.poll_ingress_acks()
+    assert len(ack) == 1 and ack[0].enqueued
+    router.record_add_results(
+        (AddResultEvent(1, 0, True, admission_version=1),)
+    )
+    router.record_loads(
+        (
+            load_snapshot(
+                0,
+                84,
+                running=1,
+                admission_version=1,
+                ingress_version=1,
+                reserved_slots=1,
+                active_dispatched_tokens=64,
+            ),
+        )
+    )
+
+    metrics = router.admission_metrics()["per_engine"]["0"]
+    assert metrics["tentative_admissions"] == 0
+    assert metrics["attention_work_snapshot"] == 64
+    assert metrics["projected_attention_work"] == 64
 
 
 def test_router_least_batch_does_not_double_count_staged_snapshot_slot():

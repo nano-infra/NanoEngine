@@ -28,11 +28,19 @@ RouterPolicy = Literal[
     "round_robin",
     "least_batch",
     "least_cache",
+    "least_projected_load",
 ]
 _ROUTER_POLICIES = frozenset(
-    {"round_robin", "least_batch", "least_cache"}
+    {
+        "round_robin",
+        "least_batch",
+        "least_cache",
+        "least_projected_load",
+    }
 )
-_GLOBAL_QUEUE_POLICIES = frozenset({"least_batch"})
+_GLOBAL_QUEUE_POLICIES = frozenset(
+    {"least_batch", "least_projected_load"}
+)
 
 
 class EngineTransport(Protocol):
@@ -113,7 +121,7 @@ class _AdmissionBatchFlight:
 
 
 @dataclass(slots=True)
-class _LeastBatchCharge:
+class _PlannedAdmissionCharge:
     engine_id: int
     reservation: AdmissionReservation
     ingress_version: int | None = None
@@ -174,7 +182,7 @@ class RequestRouter:
             AdmissionPlanner(admission_planner_config)
             if (
                 admission_planner_config is not None
-                and router_policy == "least_batch"
+                and router_policy in _GLOBAL_QUEUE_POLICIES
             )
             else None
         )
@@ -190,8 +198,10 @@ class RequestRouter:
         self._loads: dict[int, LoadSnapshot] = {}
         self._estimated_free_blocks: dict[int, int] = {}
         self._cache_charges: dict[int, tuple[int, int]] = {}
-        self._least_batch_charges: dict[int, _LeastBatchCharge] = {}
-        self._least_batch_tentative_counts = {
+        self._planned_admission_charges: dict[
+            int, _PlannedAdmissionCharge
+        ] = {}
+        self._tentative_admission_counts = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
         self._admission_attempts = {
@@ -267,8 +277,56 @@ class RequestRouter:
     def _projected_batch(self, engine_id: int) -> int:
         snapshot = self._loads.get(engine_id)
         running = snapshot.running if snapshot is not None else 0
-        tentative = self._least_batch_tentative_counts[engine_id]
+        tentative = self._tentative_admission_counts[engine_id]
         return running + tentative
+
+    def _snapshot_attention_work(self, engine_id: int) -> int:
+        snapshot = self._loads.get(engine_id)
+        if snapshot is None:
+            return 0
+        return sum(
+            rank.active_dispatched_tokens for rank in snapshot.rank_loads
+        )
+
+    def _projected_attention_work(self, engine_id: int) -> int:
+        tentative = sum(
+            sum(charge.reservation.dispatched_tokens)
+            for charge in self._planned_admission_charges.values()
+            if charge.engine_id == engine_id
+        )
+        return self._snapshot_attention_work(engine_id) + tentative
+
+    @staticmethod
+    def _normalized_projected_load_key(
+        *,
+        engine_id: int,
+        projected_work: int,
+        projected_batch: int,
+        total_work: int,
+        total_batch: int,
+    ) -> tuple[int, int, int, int, int]:
+        """Balance attention work and request count without fitted weights.
+
+        The first term is the candidate engine's dominant normalized share.
+        Cross multiplication keeps the comparison exact and avoids a fixed
+        token-per-request conversion factor. The second term breaks equal
+        dominant shares by their combined normalized load.
+        """
+        dominant = max(
+            projected_work * total_batch,
+            projected_batch * total_work,
+        )
+        combined = (
+            projected_work * total_batch
+            + projected_batch * total_work
+        )
+        return (
+            dominant,
+            combined,
+            projected_batch,
+            projected_work,
+            engine_id,
+        )
 
     def _estimate_request_blocks(
         self,
@@ -291,6 +349,35 @@ class RequestRouter:
         max_tokens: int,
     ) -> tuple[int, ...]:
         if self.router_policy in _GLOBAL_QUEUE_POLICIES:
+            if self.router_policy == "least_projected_load":
+                work_by_engine = {
+                    engine_id: self._projected_attention_work(engine_id)
+                    for engine_id in self._ready_engine_ids
+                }
+                batch_by_engine = {
+                    engine_id: self._projected_batch(engine_id)
+                    for engine_id in self._ready_engine_ids
+                }
+                total_work = sum(work_by_engine.values()) + prompt_len
+                total_batch = sum(batch_by_engine.values()) + 1
+                return tuple(
+                    sorted(
+                        self._ready_engine_ids,
+                        key=lambda engine_id: (
+                            self._normalized_projected_load_key(
+                                engine_id=engine_id,
+                                projected_work=(
+                                    work_by_engine[engine_id] + prompt_len
+                                ),
+                                projected_batch=(
+                                    batch_by_engine[engine_id] + 1
+                                ),
+                                total_work=total_work,
+                                total_batch=total_batch,
+                            )
+                        ),
+                    )
+                )
             # Match the centralized scheduler's node ordering:
             # (running + tentative admissions, dp_idx).
             return tuple(
@@ -356,18 +443,18 @@ class RequestRouter:
         if engine_id in self._estimated_free_blocks:
             self._estimated_free_blocks[engine_id] += request_blocks
 
-    def _charge_least_batch(
+    def _charge_planned_admission(
         self,
         *,
         request_id: int,
         engine_id: int,
         reservation: AdmissionReservation,
     ) -> None:
-        if self.router_policy != "least_batch":
+        if self.router_policy not in _GLOBAL_QUEUE_POLICIES:
             return
-        if request_id in self._least_batch_charges:
+        if request_id in self._planned_admission_charges:
             raise RuntimeError(
-                f"duplicate least-batch charge for {request_id}"
+                f"duplicate planned-admission charge for {request_id}"
             )
         if (
             reservation.request_id != request_id
@@ -378,28 +465,31 @@ class RequestRouter:
                 f"request={request_id}, engine={engine_id}, "
                 f"reservation={reservation}"
             )
-        self._least_batch_charges[request_id] = _LeastBatchCharge(
+        self._planned_admission_charges[
+            request_id
+        ] = _PlannedAdmissionCharge(
             engine_id, reservation
         )
-        self._least_batch_tentative_counts[engine_id] += 1
+        self._tentative_admission_counts[engine_id] += 1
 
-    def _refund_least_batch(self, request_id: int) -> None:
-        charge = self._least_batch_charges.pop(request_id, None)
+    def _refund_planned_admission(self, request_id: int) -> None:
+        charge = self._planned_admission_charges.pop(request_id, None)
         if charge is None:
             return
-        self._least_batch_tentative_counts[charge.engine_id] -= 1
-        if self._least_batch_tentative_counts[charge.engine_id] < 0:
+        self._tentative_admission_counts[charge.engine_id] -= 1
+        if self._tentative_admission_counts[charge.engine_id] < 0:
             raise RuntimeError(
-                "negative least-batch tentative admission count"
+                "negative planned tentative admission count"
             )
 
-    def _commit_least_batch(
+    def _commit_planned_admission(
         self, request_id: int, admission_version: int | None
     ) -> None:
-        charge = self._least_batch_charges.get(request_id)
+        charge = self._planned_admission_charges.get(request_id)
         if charge is None:
             raise RuntimeError(
-                f"missing least-batch charge for request {request_id}"
+                "missing planned-admission charge for request "
+                f"{request_id}"
             )
         if admission_version is None:
             raise RuntimeError(
@@ -415,7 +505,7 @@ class RequestRouter:
             # The consolidated load/event poll can observe the commit before
             # the admission ObjectRef is resolved. Do not apply the same
             # reservation twice during the next dispatch in this cycle.
-            self._refund_least_batch(request_id)
+            self._refund_planned_admission(request_id)
 
     def add(
         self,
@@ -637,7 +727,7 @@ class RequestRouter:
         planner = self._admission_planner
         if planner is None:
             raise RuntimeError(
-                "least_batch async admission requires "
+                "global planned admission requires "
                 "admission_planner_config"
             )
         shadows: dict[int, AdmissionShadow] = {}
@@ -648,7 +738,7 @@ class RequestRouter:
             shadow = planner.shadow_from_snapshot(snapshot)
             if shadow is None:
                 continue
-            for charge in self._least_batch_charges.values():
+            for charge in self._planned_admission_charges.values():
                 if charge.engine_id == engine_id:
                     planner.apply_reservation(
                         shadow,
@@ -668,7 +758,7 @@ class RequestRouter:
         planner = self._admission_planner
         if planner is None:
             raise RuntimeError(
-                "least_batch async admission requires "
+                "global planned admission requires "
                 "admission_planner_config"
             )
         shadows = self._admission_shadows()
@@ -687,29 +777,106 @@ class RequestRouter:
         capacity_blocked = False
         while self._global_pending and available:
             pending_global = self._global_pending[0]
-            candidates = sorted(
-                available,
-                key=lambda candidate: (
-                    self._projected_batch(candidate)
-                    + len(batches.get(candidate, ())),
-                    candidate,
-                ),
-            )
-            selected: tuple[int, AdmissionReservation] | None = None
-            for engine_id in candidates:
-                candidate_shadow = shadows[engine_id].copy()
-                reservation = planner.plan(
-                    candidate_shadow, pending_global.command
+            selected: tuple[
+                int, AdmissionReservation, AdmissionShadow
+            ] | None = None
+            if self.router_policy == "least_batch":
+                candidates = sorted(
+                    available,
+                    key=lambda candidate: (
+                        self._projected_batch(candidate)
+                        + len(batches.get(candidate, ())),
+                        candidate,
+                    ),
                 )
-                if reservation is None:
-                    continue
-                selected = (engine_id, reservation)
-                shadows[engine_id] = candidate_shadow
-                break
+                for engine_id in candidates:
+                    candidate_shadow = shadows[engine_id].copy()
+                    reservation = planner.plan(
+                        candidate_shadow, pending_global.command
+                    )
+                    if reservation is None:
+                        continue
+                    selected = (
+                        engine_id,
+                        reservation,
+                        candidate_shadow,
+                    )
+                    break
+            else:
+                base_work = {
+                    engine_id: sum(shadow.dispatched_tokens)
+                    for engine_id, shadow in shadows.items()
+                }
+                base_batch = {
+                    engine_id: sum(shadow.master_counts)
+                    for engine_id, shadow in shadows.items()
+                }
+                base_work_total = sum(base_work.values())
+                base_batch_total = sum(base_batch.values())
+                feasible: list[
+                    tuple[
+                        tuple[int, int, int, int, int],
+                        int,
+                        AdmissionReservation,
+                        AdmissionShadow,
+                    ]
+                ] = []
+                for engine_id in sorted(available):
+                    candidate_shadow = shadows[engine_id].copy()
+                    reservation = planner.plan(
+                        candidate_shadow, pending_global.command
+                    )
+                    if reservation is None:
+                        continue
+                    # max_tokens has already served as a hard KV-lifetime
+                    # eligibility check inside planner.plan(). The load score
+                    # itself uses only current context plus the prompt and the
+                    # projected active request count.
+                    projected_work = sum(
+                        candidate_shadow.dispatched_tokens
+                    )
+                    projected_batch = sum(
+                        candidate_shadow.master_counts
+                    )
+                    total_work = (
+                        base_work_total
+                        - base_work[engine_id]
+                        + projected_work
+                    )
+                    total_batch = (
+                        base_batch_total
+                        - base_batch[engine_id]
+                        + projected_batch
+                    )
+                    key = self._normalized_projected_load_key(
+                        engine_id=engine_id,
+                        projected_work=projected_work,
+                        projected_batch=projected_batch,
+                        total_work=total_work,
+                        total_batch=total_batch,
+                    )
+                    feasible.append(
+                        (
+                            key,
+                            engine_id,
+                            reservation,
+                            candidate_shadow,
+                        )
+                    )
+                if feasible:
+                    _, engine_id, reservation, candidate_shadow = min(
+                        feasible, key=lambda candidate: candidate[0]
+                    )
+                    selected = (
+                        engine_id,
+                        reservation,
+                        candidate_shadow,
+                    )
             if selected is None:
                 capacity_blocked = True
                 break
-            engine_id, reservation = selected
+            engine_id, reservation, selected_shadow = selected
+            shadows[engine_id] = selected_shadow
             self._global_pending.popleft()
             batches.setdefault(engine_id, []).append(
                 (pending_global, reservation)
@@ -736,7 +903,7 @@ class RequestRouter:
                 self._owners[command.request_id] = RequestOwner(
                     OwnerState.PENDING_INGRESS, engine_id
                 )
-                self._charge_least_batch(
+                self._charge_planned_admission(
                     request_id=command.request_id,
                     engine_id=engine_id,
                     reservation=reservation,
@@ -770,7 +937,7 @@ class RequestRouter:
             except BaseException:
                 for pending_global in batch:
                     request_id = pending_global.command.request_id
-                    self._refund_least_batch(request_id)
+                    self._refund_planned_admission(request_id)
                     self._owners[request_id] = RequestOwner(
                         OwnerState.PENDING_GLOBAL
                     )
@@ -867,7 +1034,7 @@ class RequestRouter:
                     ack.request_id != request_id
                     or ack.engine_id != engine_id
                 ):
-                    self._refund_least_batch(request_id)
+                    self._refund_planned_admission(request_id)
                     self._owners.pop(request_id, None)
                     raise RuntimeError(
                         "LocalEngine returned an inconsistent admission ACK: "
@@ -892,7 +1059,7 @@ class RequestRouter:
                             ack.capacity_epoch,
                         )
                     self._admission_queue_full[engine_id] += 1
-                    self._refund_least_batch(request_id)
+                    self._refund_planned_admission(request_id)
                     self._owners[request_id] = RequestOwner(
                         OwnerState.PENDING_GLOBAL
                     )
@@ -913,10 +1080,11 @@ class RequestRouter:
                             "planned ingress receipt did not carry an ingress "
                             f"version: request={request_id}"
                         )
-                    charge = self._least_batch_charges.get(request_id)
+                    charge = self._planned_admission_charges.get(request_id)
                     if charge is None:
                         raise RuntimeError(
-                            "missing least-batch charge for ingress receipt: "
+                            "missing planned-admission charge for ingress "
+                            "receipt: "
                             f"request={request_id}"
                         )
                     charge.ingress_version = ack.ingress_version
@@ -925,7 +1093,7 @@ class RequestRouter:
                         OwnerState.PENDING_ADD, engine_id
                     )
                 else:
-                    self._refund_least_batch(request_id)
+                    self._refund_planned_admission(request_id)
                     capacity_queue_ms = self._global_capacity_queue_ms.pop(
                         request_id, 0.0
                     )
@@ -966,7 +1134,7 @@ class RequestRouter:
     def poll_ingress_acks(self) -> tuple[IngressAck, ...]:
         acks = list(self._immediate_ingress_acks)
         self._immediate_ingress_acks.clear()
-        if self.router_policy == "least_batch":
+        if self.router_policy in _GLOBAL_QUEUE_POLICIES:
             acks.extend(self._poll_centralized_admission())
             return tuple(acks)
         for request_id, pending in tuple(self._pending_ingress.items()):
@@ -988,7 +1156,7 @@ class RequestRouter:
                 )
             if ack.request_id != request_id or ack.engine_id != engine_id:
                 self._refund_cache(request_id)
-                self._refund_least_batch(request_id)
+                self._refund_planned_admission(request_id)
                 self._owners.pop(request_id, None)
                 self._pending_ingress.pop(request_id, None)
                 raise RuntimeError(
@@ -1045,7 +1213,7 @@ class RequestRouter:
                     )
             else:
                 self._refund_cache(request_id)
-                self._refund_least_batch(request_id)
+                self._refund_planned_admission(request_id)
                 self._global_capacity_queue_ms.pop(request_id, None)
                 self._owners.pop(request_id, None)
                 self._rejected_request_ids.add(request_id)
@@ -1097,8 +1265,8 @@ class RequestRouter:
                     f"engine={event.engine_id}, owner={owner}"
                 )
             if event.accepted:
-                if self.router_policy == "least_batch":
-                    self._commit_least_batch(
+                if self.router_policy in _GLOBAL_QUEUE_POLICIES:
+                    self._commit_planned_admission(
                         event.request_id, event.admission_version
                     )
                     self._admission_commits[event.engine_id] += 1
@@ -1108,7 +1276,7 @@ class RequestRouter:
             else:
                 self._future_ingress_aborts.discard(event.request_id)
                 self._refund_cache(event.request_id)
-                self._refund_least_batch(event.request_id)
+                self._refund_planned_admission(event.request_id)
                 self._global_capacity_queue_ms.pop(event.request_id, None)
                 self._owners.pop(event.request_id)
                 self._rejected_request_ids.add(event.request_id)
@@ -1202,7 +1370,7 @@ class RequestRouter:
         self._owners.pop(event.request_id)
         self._future_ingress_aborts.discard(event.request_id)
         self._refund_cache(event.request_id)
-        self._refund_least_batch(event.request_id)
+        self._refund_planned_admission(event.request_id)
         event = replace(
             event,
             global_capacity_queue_ms=self._global_capacity_queue_ms.pop(
@@ -1291,7 +1459,7 @@ class RequestRouter:
         self._loads.update(loads)
         for engine_id, snapshot in loads.items():
             for request_id, charge in tuple(
-                self._least_batch_charges.items()
+                self._planned_admission_charges.items()
             ):
                 if (
                     charge.engine_id == engine_id
@@ -1299,7 +1467,7 @@ class RequestRouter:
                     and snapshot.admission_version
                     >= charge.admission_version
                 ):
-                    self._refund_least_batch(request_id)
+                    self._refund_planned_admission(request_id)
             previous = previous_loads[engine_id]
             if (
                 previous is not None
@@ -1328,11 +1496,18 @@ class RequestRouter:
         for engine_id in self._ready_engine_ids:
             snapshot = self._loads.get(engine_id)
             running = snapshot.running if snapshot is not None else 0
-            tentative = self._least_batch_tentative_counts[engine_id]
+            tentative = self._tentative_admission_counts[engine_id]
+            snapshot_attention_work = self._snapshot_attention_work(
+                engine_id
+            )
             engine_metrics = {
                 "running_snapshot": running,
                 "tentative_admissions": tentative,
                 "projected_batch": self._projected_batch(engine_id),
+                "attention_work_snapshot": snapshot_attention_work,
+                "projected_attention_work": (
+                    self._projected_attention_work(engine_id)
+                ),
                 "attempts": self._admission_attempts[engine_id],
                 "batch_messages": self._admission_batches[engine_id],
                 "positive_receipts": self._admission_receipts[engine_id],

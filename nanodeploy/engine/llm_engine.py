@@ -215,8 +215,8 @@ class LLMEngine:
                     AdmissionPlannerConfig.from_config(config)
                 ),
             )
-            # LeastBatch also needs an authoritative running-count baseline
-            # before draining its global admission queue.
+            # Planned global policies need an authoritative load baseline
+            # before draining their admission queue.
             self.router.record_loads(
                 self.deployment.load_snapshots()
             )

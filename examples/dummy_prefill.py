@@ -35,6 +35,7 @@ def main():
             "round_robin",
             "least_batch",
             "least_cache",
+            "least_projected_load",
         ],
         help="Hierarchical load-balancer policy (default: least_batch)",
     )

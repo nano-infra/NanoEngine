@@ -37,6 +37,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_REQUEST_TOKENS="${MAX_REQUEST_TOKENS:-910000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
+ROUTER_POLICY="${ROUTER_POLICY:-least_batch}"
 # Keep periodic scheduler snapshots off for the paired run: only the common
 # quantum stream is enabled, avoiding asymmetric hierarchical polling work.
 DIAGNOSTIC_LOG_INTERVAL="${DIAGNOSTIC_LOG_INTERVAL:-0}"
@@ -129,6 +130,7 @@ log "MODEL_PATH=$MODEL_PATH"
 log "DATASET_PATH=$DATASET_PATH"
 log "RUN_ORDER=$RUN_ORDER"
 log "RATE=$RATE DURATION_SECONDS=$DURATION_SECONDS NUM_REQUESTS=$NUM_REQUESTS"
+log "ROUTER_POLICY=$ROUTER_POLICY"
 log "SLIME_VISIBLE_DEVICES=$SLIME_VISIBLE_DEVICES SLIME_GID_INDEX=$SLIME_GID_INDEX SLIME_QP_NUM=$SLIME_QP_NUM"
 log "DRY_RUN=$DRY_RUN SMOKE=$SMOKE CONTINUE_ON_ERROR=$CONTINUE_ON_ERROR"
 
@@ -161,7 +163,7 @@ for stage in "${STAGES[@]}"; do
         --max-request-tokens "$MAX_REQUEST_TOKENS"
         --routing-strategy LeastBatch
         --scheduler-arch "$STAGE_ARCH"
-        --router-policy least_batch
+        --router-policy "$ROUTER_POLICY"
         --sp-master-selector LeastBatch
         --loop-count "$LOOP_COUNT"
         --fixed-sp-size 0
