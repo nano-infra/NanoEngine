@@ -17,7 +17,7 @@ NUM_REQUESTS="${NUM_REQUESTS:-$(awk -v rate="$RATE" -v seconds="$DURATION_SECOND
 MOE_ROUTING_SEED="${MOE_ROUTING_SEED:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
-RUN_TAG="${RUN_TAG:-two_node_r50_uniform_random_compare_$(date -u +%Y%m%d_%H%M%S)}"
+RUN_TAG="${RUN_TAG:-two_node_r50_uniform_random_4way_$(date -u +%Y%m%d_%H%M%S)}"
 COMPARE_LOG_DIR="${COMPARE_LOG_DIR:-$ROOT_DIR/bench_logs/$RUN_TAG}"
 PROGRESS_LOG="$COMPARE_LOG_DIR/compare.progress"
 
@@ -149,7 +149,23 @@ log "MOE_ROUTING_SIMULATION_STRATEGY=uniform_random MOE_ROUTING_SEED=$MOE_ROUTIN
 log "SLIME_VISIBLE_DEVICES=$SLIME_VISIBLE_DEVICES SLIME_GID_INDEX=$SLIME_GID_INDEX SLIME_QP_NUM=$SLIME_QP_NUM"
 
 run_stage \
-    central \
+    central_least_batch \
+    legacy_global \
+    least_batch \
+    LeastBatch \
+    ray \
+    central_least_batch_uniform_random
+
+run_stage \
+    hierarchical_least_batch \
+    hierarchical \
+    least_batch \
+    LeastBatch \
+    zmq \
+    hierarchical_zmq_least_batch_uniform_random
+
+run_stage \
+    central_least_projected_load \
     legacy_global \
     least_projected_load \
     LeastProjectedLoad \
@@ -157,7 +173,7 @@ run_stage \
     central_projected_load_uniform_random
 
 run_stage \
-    hierarchical \
+    hierarchical_least_projected_load \
     hierarchical \
     least_projected_load \
     LeastBatch \
