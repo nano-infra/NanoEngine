@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Two-node rate-50 four-way scheduling comparison</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --panel-2: #eef2f5;
+      --text: #17212b;
+      --muted: #596875;
+      --line: #d6dee5;
+      --central: #b45309;
+      --central-soft: #fff2dc;
+      --hier: #087f5b;
+      --hier-soft: #dff7ed;
+      --best: #075985;
+      --best-soft: #e0f2fe;
+      --warn: #9a3412;
+      --warn-soft: #fff1e8;
+      --shadow: 0 12px 30px rgba(23, 33, 43, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10161c;
+        --panel: #182129;
+        --panel-2: #202c35;
+        --text: #e8eef3;
+        --muted: #aab8c3;
+        --line: #33434f;
+        --central: #f5a94f;
+        --central-soft: #3a2b18;
+        --hier: #65d6ad;
+        --hier-soft: #17382e;
+        --best: #7dd3fc;
+        --best-soft: #153345;
+        --warn: #fdba74;
+        --warn-soft: #42291b;
+        --shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    .shell { max-width: 1180px; margin: 0 auto; padding: 34px 24px 64px; }
+    header {
+      padding: 32px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: linear-gradient(135deg, var(--panel), var(--best-soft));
+      box-shadow: var(--shadow);
+    }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 46px); line-height: 1.08; }
+    h2 { margin: 0 0 18px; font-size: 25px; }
+    h3 { margin: 28px 0 12px; font-size: 18px; }
+    p { margin: 10px 0; }
+    .eyebrow {
+      color: var(--best);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .lead { max-width: 900px; margin-top: 16px; color: var(--muted); font-size: 18px; }
+    .verdict {
+      margin-top: 22px;
+      padding: 18px 20px;
+      border-left: 5px solid var(--hier);
+      border-radius: 10px;
+      background: var(--hier-soft);
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin: 26px 0 18px;
+      padding: 6px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+    }
+    .tab-button {
+      flex: 1;
+      min-width: 150px;
+      padding: 11px 16px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+    }
+    .tab-button.active { background: var(--best-soft); color: var(--best); }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    .panel {
+      margin: 18px 0;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .span-3 { grid-column: span 3; }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-12 { grid-column: span 12; }
+    .metric {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--panel-2);
+    }
+    .metric .value { margin-top: 5px; color: var(--hier); font-size: 28px; font-weight: 800; }
+    .metric .label { color: var(--muted); font-size: 13px; }
+    .metric .detail { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .callout {
+      margin: 16px 0;
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel-2);
+    }
+    .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+    .callout strong { display: block; margin-bottom: 4px; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; font-variant-numeric: tabular-nums; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: right; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    th:first-child, td:first-child { text-align: left; }
+    tr.best { background: var(--best-soft); font-weight: 700; }
+    .table-wrap { overflow-x: auto; }
+    .pill {
+      display: inline-block;
+      margin: 3px 4px 3px 0;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow .node {
+      display: grid;
+      place-items: center;
+      min-height: 92px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel-2);
+      text-align: center;
+      font-weight: 700;
+    }
+    .flow .arrow { display: grid; place-items: center; color: var(--muted); font-size: 25px; }
+    .flow.central .node { border-top: 4px solid var(--central); }
+    .flow.hier .node { border-top: 4px solid var(--hier); }
+    .bar-row { display: grid; grid-template-columns: 210px 1fr 90px; gap: 12px; align-items: center; margin: 12px 0; }
+    .bar-track { height: 18px; overflow: hidden; border-radius: 999px; background: var(--panel-2); }
+    .bar { height: 100%; border-radius: inherit; }
+    .bar.central { background: var(--central); }
+    .bar.hier { background: var(--hier); }
+    .bar.best { background: var(--best); }
+    .delta-good { color: var(--hier); font-weight: 800; }
+    .delta-bad { color: var(--central); font-weight: 800; }
+    code { padding: 2px 5px; border-radius: 5px; background: var(--panel-2); }
+    pre { overflow-x: auto; padding: 16px; border-radius: 10px; background: var(--panel-2); }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    a { color: var(--best); }
+    .small { color: var(--muted); font-size: 12px; }
+    .footer { margin-top: 24px; color: var(--muted); text-align: center; font-size: 12px; }
+    @media (max-width: 850px) {
+      .span-3, .span-4, .span-6 { grid-column: span 12; }
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); }
+      .bar-row { grid-template-columns: 1fr; }
+      header, .panel { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="eyebrow">NanoDeploy · experiment report · 2026-08-27</div>
+      <h1>Two-node rate-50 four-way scheduling comparison</h1>
+      <p class="lead">
+        Two repetitions compare centralized and hierarchical scheduling with
+        LeastBatch and ProjectedLoad on an identical 15,000-request trace.
+      </p>
+      <div class="verdict">
+        Hierarchical + ProjectedLoad is the clear winner. The architecture
+        contributes roughly 7% lower TPOT; ProjectedLoad adds roughly 2% by
+        reducing attention-work skew. The architecture win is host/control-path
+        savings—not faster GPU execution or a cheaper <code>schedule()</code> call.
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="Report sections">
+      <button class="tab-button active" data-tab="overview">Overview</button>
+      <button class="tab-button" data-tab="breakdown">Critical-path breakdown</button>
+      <button class="tab-button" data-tab="boundaries">Metric boundaries</button>
+      <button class="tab-button" data-tab="validity">Validity & next steps</button>
+    </nav>
+
+    <section id="overview" class="tab active">
+      <div class="grid">
+        <div class="metric span-3"><div class="label">Best mean TPOT</div><div class="value">72.122 ms</div><div class="detail">−9.189% vs Central-LB</div></div>
+        <div class="metric span-3"><div class="label">Best TPOT p99</div><div class="value">80.015 ms</div><div class="detail">−10.667% vs Central-LB</div></div>
+        <div class="metric span-3"><div class="label">Best Arrival E2E</div><div class="value">44.375 s</div><div class="detail">−9.191% vs Central-LB</div></div>
+        <div class="metric span-3"><div class="label">Best drain time</div><div class="value">78.454 s</div><div class="detail">−15.515% vs Central-LB</div></div>
+      </div>
+
+      <article class="panel">
+        <h2>Experiment contract</h2>
+        <p>
+          The run covers 2026-08-27 15:11:31–16:19:01 UTC. Each repetition
+          executes Central-LB, Hierarchical-LB, Central-PL, then Hierarchical-PL.
+        </p>
+        <div>
+          <span class="pill">DeepSeek-V3</span><span class="pill">DP2 / SP8 / TP1</span>
+          <span class="pill">50 req/s</span><span class="pill">300 s arrival window</span>
+          <span class="pill">15,000 requests/run</span><span class="pill">batch 192</span>
+          <span class="pill">loop 16</span><span class="pill">hao_basic</span>
+          <span class="pill">full CUDA graph</span><span class="pill">uniform_random MoE, seed 0</span>
+          <span class="pill">quantum diagnostics enabled</span>
+        </div>
+        <p>
+          All eight runs receive the same scheduled arrival trace, 67,140,699
+          prompt tokens, and 9,006,376 output tokens. Central and hierarchical
+          request IDs have a constant warmup offset, but request lengths match
+          exactly by arrival position.
+        </p>
+        <div class="callout">
+          <strong>Validity checks passed</strong>
+          Every run completed 15,000/15,000 requests with zero failures,
+          rejection, fallback, global retry, preemption, or local transient
+          retry. Corrected TPOT &lt; 100 ms/token goodput is 100% in all runs.
+        </div>
+      </article>
+
+      <article class="panel">
+        <h2>Two-repetition average</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Configuration</th><th>TPOT mean</th><th>TPOT p95</th><th>TPOT p99</th><th>Arrival E2E mean</th><th>Arrival E2E p99</th><th>Runtime</th><th>Drain</th></tr></thead>
+            <tbody>
+              <tr><td>Central + LeastBatch</td><td>79.420 ms</td><td>88.968 ms</td><td>89.569 ms</td><td>48.867 s</td><td>87.956 s</td><td>394.998 s</td><td>92.861 s</td></tr>
+              <tr><td>Central + ProjectedLoad</td><td>77.437 ms</td><td>85.652 ms</td><td>86.006 ms</td><td>47.649 s</td><td>85.103 s</td><td>392.581 s</td><td>90.445 s</td></tr>
+              <tr><td>Hierarchical + LeastBatch</td><td>73.638 ms</td><td>81.754 ms</td><td>82.637 ms</td><td>45.298 s</td><td>81.257 s</td><td>381.634 s</td><td>79.498 s</td></tr>
+              <tr class="best"><td>Hierarchical + ProjectedLoad</td><td>72.122 ms</td><td>79.356 ms</td><td>80.015 ms</td><td>44.375 s</td><td>79.154 s</td><td>380.590 s</td><td>78.454 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small">Arrival E2E is scheduled arrival to benchmark-observed completion. Lower is better.</p>
+
+        <h3>Mean TPOT visual</h3>
+        <div class="bar-row"><span>Central + LeastBatch</span><div class="bar-track"><div class="bar central" style="width:100%"></div></div><strong>79.420</strong></div>
+        <div class="bar-row"><span>Central + ProjectedLoad</span><div class="bar-track"><div class="bar central" style="width:97.5%"></div></div><strong>77.437</strong></div>
+        <div class="bar-row"><span>Hierarchical + LeastBatch</span><div class="bar-track"><div class="bar hier" style="width:92.7%"></div></div><strong>73.638</strong></div>
+        <div class="bar-row"><span>Hierarchical + ProjectedLoad</span><div class="bar-track"><div class="bar best" style="width:90.8%"></div></div><strong>72.122</strong></div>
+      </article>
+
+      <article class="panel">
+        <h2>Effect decomposition</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Comparison</th><th>TPOT mean</th><th>TPOT p95</th><th>TPOT p99</th><th>Arrival E2E mean</th><th>Arrival E2E p99</th><th>Drain</th></tr></thead>
+            <tbody>
+              <tr><td>Hier vs central · LeastBatch</td><td>−7.280%</td><td>−8.109%</td><td>−7.740%</td><td>−7.304%</td><td>−7.616%</td><td>−14.391%</td></tr>
+              <tr><td>Hier vs central · ProjectedLoad</td><td>−6.863%</td><td>−7.350%</td><td>−6.966%</td><td>−6.869%</td><td>−6.990%</td><td>−13.258%</td></tr>
+              <tr><td>PL vs LB · central</td><td>−2.497%</td><td>−3.727%</td><td>−3.977%</td><td>−2.493%</td><td>−3.244%</td><td>−2.602%</td></tr>
+              <tr><td>PL vs LB · hierarchical</td><td>−2.059%</td><td>−2.933%</td><td>−3.172%</td><td>−2.036%</td><td>−2.588%</td><td>−1.313%</td></tr>
+              <tr class="best"><td>Best vs Central-LB</td><td>−9.189%</td><td>−10.803%</td><td>−10.667%</td><td>−9.191%</td><td>−10.007%</td><td>−15.515%</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          The best stack raises complete-window output throughput by about 3.8%.
+          Runtime moves less than request latency because every run contains the
+          same roughly 302-second arrival trace; most separation is in drain.
+        </p>
+        <p>
+          Hierarchical-PL beats Central-LB on corrected TPOT for 99.86% and
+          99.82% of arrival-matched requests in repetitions one and two. Arrival
+          E2E win rates are 99.69% and 99.67%. Requests sharing a quantum are not
+          independent system repetitions, so these rates show breadth—not a
+          30,000-trial confidence interval.
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>ProjectedLoad mechanism</h2>
+        <div class="grid">
+          <div class="metric span-3"><div class="label">Central-LB rank-work CV</div><div class="value" style="color:var(--central)">8.88%</div></div>
+          <div class="metric span-3"><div class="label">Hierarchical-LB rank-work CV</div><div class="value" style="color:var(--central)">5.22%</div></div>
+          <div class="metric span-3"><div class="label">Central-PL rank-work CV</div><div class="value">1.65%</div></div>
+          <div class="metric span-3"><div class="label">Hierarchical-PL rank-work CV</div><div class="value">1.87%</div></div>
+        </div>
+        <p>
+          ProjectedLoad compresses cross-rank attention-work skew from roughly
+          5–9% to roughly 2%. This supports load balance as the mechanism behind
+          its additional 2.1–2.5% mean and 3.2–4.0% p99 TPOT improvement.
+        </p>
+        <div class="callout">
+          <strong>Magnitude needs more repetitions</strong>
+          Hierarchical ProjectedLoad improves mean TPOT by 3.29% in repetition
+          one and 0.80% in repetition two. Direction is consistent; exact mean
+          effect size is not established. Its p99 gains are steadier at 3.23%
+          and 3.11%.
+        </div>
+      </article>
+    </section>
+
+    <section id="breakdown" class="tab">
+      <article class="panel">
+        <h2>How the global critical path was reconstructed</h2>
+        <p>
+          Central diagnostics contain one global record per quantum.
+          Hierarchical diagnostics contain one record per engine, so records are
+          grouped by <code>(wave_id, quantum_id)</code> and the engine with the
+          maximum <code>quantum_total_ms</code> is selected as the global critical
+          record. Totals below are averaged across the two repetitions.
+        </p>
+        <pre>known non-executor = schedule + admission + exposed consensus wait + postprocess
+host residual      = quantum_total - execute - known non-executor</pre>
+      </article>
+
+      <article class="panel">
+        <h2>LeastBatch architecture comparison</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Accumulated critical-path component</th><th>Central</th><th>Hierarchical</th><th>Hier delta</th></tr></thead>
+            <tbody>
+              <tr><td><code>executor.run</code></td><td>373.276 s</td><td>377.791 s</td><td class="delta-bad">+4.515 s (+1.21%)</td></tr>
+              <tr><td>Known non-executor stages</td><td>1.726 s</td><td>3.117 s</td><td class="delta-bad">+1.391 s</td></tr>
+              <tr><td>Unattributed in-quantum host residual</td><td>13.754 s</td><td>0.715 s</td><td class="delta-good">−13.039 s</td></tr>
+              <tr><td>Outside recorded decode quantums</td><td>≈6.242 s</td><td>≈0.011 s</td><td class="delta-good">−6.231 s</td></tr>
+              <tr class="best"><td>Benchmark runtime</td><td>394.998 s</td><td>381.634 s</td><td class="delta-good">−13.364 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel">
+        <h2>ProjectedLoad architecture comparison</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Accumulated critical-path component</th><th>Central</th><th>Hierarchical</th><th>Hier delta</th></tr></thead>
+            <tbody>
+              <tr><td><code>executor.run</code></td><td>371.227 s</td><td>376.873 s</td><td class="delta-bad">+5.647 s (+1.52%)</td></tr>
+              <tr><td>Known non-executor stages</td><td>1.671 s</td><td>2.920 s</td><td class="delta-bad">+1.248 s</td></tr>
+              <tr><td>Unattributed in-quantum host residual</td><td>13.436 s</td><td>0.696 s</td><td class="delta-good">−12.740 s</td></tr>
+              <tr><td>Outside recorded decode quantums</td><td>≈6.248 s</td><td>≈0.102 s</td><td class="delta-good">−6.146 s</td></tr>
+              <tr class="best"><td>Benchmark runtime</td><td>392.581 s</td><td>380.590 s</td><td class="delta-good">−11.991 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel">
+        <h2>Where the win is—and is not</h2>
+        <div class="grid">
+          <div class="callout warn span-4">
+            <strong>Not faster GPU/model execution</strong>
+            Cumulative executor time is 1.2–1.5% higher under hierarchical
+            scheduling. GPU rank time per output token is also slightly higher.
+          </div>
+          <div class="callout warn span-4">
+            <strong>Not a cheaper schedule() call</strong>
+            LeastBatch scheduling rises from 0.705 s to 0.881 s accumulated,
+            about 1.61 ms versus 1.98 ms per global critical quantum.
+          </div>
+          <div class="callout span-4">
+            <strong>Yes: host critical-path savings</strong>
+            Roughly 13 s of in-quantum residual and 6 s outside decode quantums
+            leave the serialized centralized path.
+          </div>
+        </div>
+
+        <h3>Centralized critical path</h3>
+        <div class="flow central" aria-label="Centralized critical path diagram">
+          <div class="node">Synchronous frontend add<br><span class="small">≈6–6.6 s accumulated</span></div>
+          <div class="arrow">→</div>
+          <div class="node">One global scheduler step<br><span class="small">≈31.4 ms residual / quantum</span></div>
+          <div class="arrow">→</div>
+          <div class="node">Global DP2 executor<br><span class="small">single serialized host path</span></div>
+        </div>
+
+        <h3>Hierarchical critical path</h3>
+        <div class="flow hier" aria-label="Hierarchical critical path diagram">
+          <div class="node">Timely staged ingress<br><span class="small">≈0.2 ms dispatch lag</span></div>
+          <div class="arrow">→</div>
+          <div class="node">Independent LocalSchedulers<br><span class="small">≈1.6 ms residual / critical quantum</span></div>
+          <div class="arrow">→</div>
+          <div class="node">Parallel engine progress<br><span class="small">higher explicit coordination, lower serialization</span></div>
+        </div>
+
+        <p>
+          Central synchronous add acceptance averages 0.40–0.44 ms/request.
+          Across 15,000 requests, that is 6–6.6 seconds and is consistent with
+          most of the centralized time outside recorded decode quantums. Under
+          Poisson bursts it also accumulates into visible dispatch lag.
+        </p>
+        <p>
+          The supported interpretation is therefore broad: hierarchical
+          scheduling removes centralized host orchestration and ingress
+          serialization from the critical path. It does not make the scheduler
+          algorithm itself cheaper.
+        </p>
+      </article>
+    </section>
+
+    <section id="boundaries" class="tab">
+      <article class="panel">
+        <h2>TTFT values are not directly comparable</h2>
+        <div class="grid">
+          <div class="metric span-4"><div class="label">Central displayed TTFT</div><div class="value" style="color:var(--central)">≈3 ms</div><div class="detail">legacy Sequence bootstrap metric</div></div>
+          <div class="metric span-4"><div class="label">Hier displayed TTFT</div><div class="value">584–596 ms</div><div class="detail">dispatch → authoritative planned AddResult</div></div>
+          <div class="metric span-4"><div class="label">Hier model TTFT</div><div class="value">1.72–1.78 s</div><div class="detail">central model TTFT unavailable</div></div>
+        </div>
+        <p>
+          Centralized scheduling records 607–626 ms mean dispatch lag, while
+          hierarchical dispatch lag is about 0.2 ms. Hierarchical dispatches on
+          time and puts most admission wait in the staged queue: 570–584 ms on
+          average, versus only about 2.8 ms for admission RPC itself.
+        </p>
+        <div class="callout warn">
+          <strong>Use Arrival E2E for the end-to-end comparison</strong>
+          Scheduled-arrival-to-completion contains both placements of delay and
+          still favors hierarchical scheduling by 6.9–7.3% at the same Router
+          policy. This run cannot establish cross-architecture model TTFT because
+          central model-first-token time is absent.
+        </div>
+      </article>
+
+      <article class="panel">
+        <h2>Corrected TPOT contract</h2>
+        <p>
+          Corrected <code>tpot_with_queue_ms</code> uses a scheduler execution
+          boundary for both architectures, keeps GPU-capacity queue time, and
+          removes unused decode slots from the final fixed 16-loop quantum. It
+          excludes benchmark dispatch, non-capacity RPC/command pickup, and
+          non-capacity waiting before first scheduler execution.
+        </p>
+        <p>
+          This is why the TPOT result is useful for steady-state scheduling, but
+          Arrival E2E remains necessary for user-visible end-to-end behavior.
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>Tail diagnostic retained</h2>
+        <p>
+          Hierarchical ProjectedLoad repetition two contains a rare control-path
+          outlier: global-capacity-queue max is 300.528 ms and admission-RPC max
+          is 323.793 ms. Capacity-queue p99 remains zero and admission-RPC p99 is
+          5.478 ms, with no failure or retry. It does not change the aggregate
+          conclusion but should remain visible in future tail comparisons.
+        </p>
+      </article>
+    </section>
+
+    <section id="validity" class="tab">
+      <article class="panel">
+        <h2>What is confirmed</h2>
+        <div class="verdict">
+          In this instrumented rate-50 comparison, the hierarchical stack lowers
+          latency primarily by removing centralized host-side orchestration and
+          synchronous ingress serialization from the critical path. It does not
+          win through lower GPU execution time or a faster measured
+          <code>schedule()</code>. ProjectedLoad adds a separate load-balance gain.
+        </div>
+        <p>
+          This uses “scheduling overhead” in the broad system sense of
+          centralized control-path serialization. It must not be shortened to
+          “the scheduling algorithm became cheaper.”
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>What is not yet confirmed</h2>
+        <ul>
+          <li>
+            The roughly 13-second central quantum residual is not subdivided. It
+            contains metrics updates, output construction, rank-load diagnostic
+            payload construction, per-step logging, and Python bookkeeping
+            between measured stage boundaries.
+          </li>
+          <li>
+            Quantum diagnostics are enabled everywhere, but their implementation
+            cost may be asymmetric. The result localizes the gain to the host
+            path; it does not fully separate production orchestration from
+            diagnostic overhead.
+          </li>
+          <li>
+            Central uses Ray worker transport and hierarchical uses ZMQ. The
+            experiment compares current deployable stacks, not an isolated
+            scheduler-architecture coefficient.
+          </li>
+          <li>
+            Every repetition uses the same C-LB, H-LB, C-PL, H-PL order, so
+            time/order drift is not counterbalanced.
+          </li>
+          <li>
+            Two system repetitions establish a consistent direction, not a
+            precise effect-size confidence interval or capacity knee.
+          </li>
+        </ul>
+      </article>
+
+      <article class="panel">
+        <h2>Recommended confirmation runs</h2>
+        <ol>
+          <li>Repeat the four-way comparison with quantum diagnostics disabled.</li>
+          <li>Add timers around central pre-executor bookkeeping, postprocess-to-return work, diagnostic construction, logging, and frontend add.</li>
+          <li>Isolate worker transport where the runtime supports it.</li>
+          <li>Counterbalance configurations with ABBA or Latin-square ordering over at least four repetitions.</li>
+          <li>Sweep above rate 50 to locate each stack's goodput/capacity knee.</li>
+        </ol>
+        <p>
+          For the current production choice at rate 50, evidence favors
+          <code>hierarchical + least_projected_load</code>. These follow-ups are
+          for causal attribution and capacity characterization, not because the
+          observed whole-stack ordering is ambiguous.
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>Artifacts and definitions</h2>
+        <ul>
+          <li><a href="../../bench_logs/two_node_r50_uniform_random_2round_4way_20260827_151131/compare.progress">Experiment progress</a></li>
+          <li><a href="../../scripts/run_2node_r50_uniform_random_compare.sh">Four-way runner</a></li>
+          <li><a href="../../scripts/README.md#默认-tpot-口径">Serving metric definitions</a></li>
+          <li><a href="../../utils_analysis/analyze_2node_qdiag_ab.py">Quantum A/B analyzer</a></li>
+        </ul>
+        <p>All request summaries, JSONL records, quantum diagnostics, and console logs are under:</p>
+        <pre>bench_logs/two_node_r50_uniform_random_2round_4way_20260827_151131/</pre>
+      </article>
+    </section>
+
+    <p class="footer">Generated from the completed eight-run comparison; no runtime code was changed for this report.</p>
+  </main>
+
+  <script>
+    const buttons = [...document.querySelectorAll('.tab-button')];
+    const tabs = [...document.querySelectorAll('.tab')];
+
+    function activate(name, updateHash = true) {
+      const target = document.getElementById(name) ? name : 'overview';
+      buttons.forEach((button) => {
+        const active = button.dataset.tab === target;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+      });
+      tabs.forEach((tab) => tab.classList.toggle('active', tab.id === target));
+      if (updateHash) history.replaceState(null, '', `#${target}`);
+    }
+
+    buttons.forEach((button) => button.addEventListener('click', () => activate(button.dataset.tab)));
+    activate(location.hash.slice(1), false);
+  </script>
+</body>
+</html>
