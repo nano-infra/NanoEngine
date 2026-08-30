@@ -20,7 +20,7 @@ The control plane may be shared by multiple deployments when each deployment use
 - Ray workers can reach the Ray head and control-plane endpoints.
 - Redis and `dlslime-ctrl` are reachable through addresses advertised to every worker.
 - The installed DLSlime build provides topology resources, `transport="auto"`, PeerAgent-owned Fabric allocation, and named-region I/O.
-- For Fabric transport, each worker exposes one membership-ready GPU and a usable IMEX channel. The participating prefill and decode workers belong to a common Fabric domain.
+- For Fabric transport, each worker exposes one membership-ready GPU and a usable IMEX channel. The participating prefill and decode workers belong to a common Fabric domain and share an accessible IMEX channel.
 - For RDMA transport, both roles omit Fabric placement and expose compatible RDMA resources.
 
 Do not mix a Fabric-advertising role with a role that publishes no Fabric placement. The router deliberately treats one-sided metadata as incompatible.
@@ -113,12 +113,12 @@ Each engine service publishes a resource with this shape:
 
 An engine either publishes one valid placement per worker or an empty placement list. Partial publication and multiple domains inside one engine fail registration. The router applies the following compatibility rule:
 
-| Prefill placement | Decode placement            | Result                                                   |
-| ----------------- | --------------------------- | -------------------------------------------------------- |
-| Both empty        | Both empty                  | Pair through the existing RDMA path.                     |
-| Non-empty         | Intersecting Fabric domains | Pair; PeerAgent selects the compatible Fabric transport. |
-| Non-empty         | Disjoint Fabric domains     | Do not pair.                                             |
-| Empty             | Non-empty, or the reverse   | Do not pair.                                             |
+| Prefill placement | Decode placement                      | Result                                                   |
+| ----------------- | ------------------------------------- | -------------------------------------------------------- |
+| Both empty        | Both empty                            | Pair through the existing RDMA path.                     |
+| Non-empty         | Common Fabric domain and IMEX channel | Pair; PeerAgent selects the compatible Fabric transport. |
+| Non-empty         | Disjoint domain or IMEX channels      | Do not pair.                                             |
+| Empty             | Non-empty, or the reverse             | Do not pair.                                             |
 
 Hybrid services remain routable independently of P/D placement matching.
 
@@ -150,7 +150,7 @@ curl -sS "${CTRL_ADDRESS}/list_entities" \
   -d '{"entity_type":"service"}'
 ```
 
-For a Fabric deployment, verify that every placement is membership-ready, the placement count equals the engine worker count, IMEX channel lists are non-empty, and the selected prefill/decode domains intersect. For RDMA, verify that both placement lists are empty.
+For a Fabric deployment, verify that every placement is membership-ready, the placement count equals the engine worker count, IMEX channel lists are non-empty, and the selected prefill/decode placements share both a Fabric domain and an IMEX channel. For RDMA, verify that both placement lists are empty.
 
 Then send a small request through the router:
 
@@ -163,9 +163,9 @@ curl -sS http://router.example:3001/v1/chat/completions \
 ## Troubleshooting
 
 - **No model appears at the router:** confirm that both roles use the same served model, control address, and scope. Inspect service heartbeats and role metadata.
-- **Prefill and decode are healthy but not paired:** compare `resource.placements`. One-sided, partial, or disjoint Fabric metadata is intentionally rejected.
+- **Prefill and decode are healthy but not paired:** compare `resource.placements`. One-sided, partial, or transport-incompatible Fabric metadata is intentionally rejected.
 - **Fabric allocation is not enabled:** confirm that topology reports exactly one membership-ready visible GPU, an IMEX channel, and a DLSlime build with Fabric allocation support.
-- **Automatic transport fails:** inspect both PeerAgent topology resources. Automatic selection requires a common Fabric domain or compatible RDMA resources and does not silently fall back to TCP.
+- **Automatic transport fails:** inspect both PeerAgent topology resources. Automatic selection requires a common Fabric domain and IMEX channel, or compatible RDMA resources, and does not silently fall back to TCP.
 - **Named-region transfer is rejected:** compare the published region names and lengths on both roles. Cache layouts, block size, attention sharding, and model architecture must be compatible.
 - **A Ray worker cannot load the model:** mount the checkpoint at the same path on every worker. Startup fails early when a worker sees no safetensors shards.
 - **Control-plane state is stale:** confirm heartbeats, then restart only the affected service. Keep Redis, `dlslime-ctrl`, engines, and router in the same scope.
