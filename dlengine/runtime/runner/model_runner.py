@@ -1485,6 +1485,13 @@ class ModelRunner:
             rank=dist.get_rank(),
         )
         self.cache_transfer.set_peer_agent_context(self.peer_agent_context)
+        cache_context.peer_context = self.peer_agent_context
+        cache_context.peer_fabric_enabled = bool(
+            self.peer_agent_context is not None
+            and self.peer_agent_context.supports_cuda_fabric()
+        )
+        if cache_context.peer_fabric_enabled:
+            logger.info("PeerAgent CUDA Fabric cache allocation enabled")
         if self.weight_context is not None:
             self.weight_context.set_peer_agent_context(self.peer_agent_context)
         if self.peer_agent_context is not None:

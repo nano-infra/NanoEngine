@@ -54,15 +54,20 @@ def get_gqa_block_bytes(context) -> int:
 
 
 def allocate_gqa_kvcache(context) -> None:
-    context.kv_cache = torch.empty(
-        2,
-        context.num_hidden_layers,
-        context.num_local_kvcache_blocks,
-        context.block_size,
-        context.num_local_kv_heads,
-        context.head_dim,
-        dtype=context.dtype,
-        device=context.device,
+    from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+    context.kv_cache = allocate_device_tensor(
+        context,
+        "kv_cache",
+        (
+            2,
+            context.num_hidden_layers,
+            context.num_local_kvcache_blocks,
+            context.block_size,
+            context.num_local_kv_heads,
+            context.head_dim,
+        ),
+        context.dtype,
     )
 
 

@@ -16,6 +16,28 @@ from dlengine.runtime.context.cache.gdn import (
 from dlengine.runtime.context.cache.indexer import allocate_indexer_cache
 
 
+def allocate_device_tensor(
+    context, name: str, shape: tuple[int, ...], dtype, *, zero: bool = False
+):
+    """Allocate ordinary device storage or PeerAgent-owned Fabric storage."""
+    peer_context = getattr(context, "peer_context", None)
+    if (
+        getattr(context, "peer_fabric_enabled", False)
+        and peer_context is not None
+        and str(context.device).startswith("cuda")
+    ):
+        return peer_context.allocate_tensor(name, shape, dtype, zero=zero)
+
+    import torch
+
+    device = torch.device(context.device)
+    pin_memory = device.type == "cpu" and torch.cuda.is_available()
+    tensor = torch.empty(shape, dtype=dtype, device=device, pin_memory=pin_memory)
+    if zero:
+        tensor.zero_()
+    return tensor
+
+
 class KVCacheAllocatorMixin:
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
@@ -108,4 +130,4 @@ class KVCacheAllocatorMixin:
         )
 
 
-__all__ = ["KVCacheAllocatorMixin"]
+__all__ = ["KVCacheAllocatorMixin", "allocate_device_tensor"]
