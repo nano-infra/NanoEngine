@@ -50,6 +50,14 @@ def configure_mla_cache(context) -> None:
 
 def get_mla_block_bytes(context) -> int:
     if context.is_fp8_kvcache:
+        if context.raw_fp8_mla_layout:
+            context._fp8_head_dim = context.head_dim
+            return (
+                context.num_hidden_layers
+                * context.block_size
+                * context.num_local_kv_heads
+                * context.head_dim
+            )
         # FP8 MLA layout per token:
         #   NoPE:  kv_lora_rank bytes (float8_e4m3fn)
         #   Scale: (kv_lora_rank // tile_size) * 4 bytes (float32 per tile)
@@ -80,6 +88,19 @@ def allocate_mla_kvcache(context) -> None:
     device = torch.device(context.device)
     cpu_pinned = device.type == "cpu" and torch.cuda.is_available()
     if context.is_fp8_kvcache:
+        if context.raw_fp8_mla_layout:
+            context.kv_cache = torch.empty(
+                1,
+                context.num_hidden_layers,
+                context.num_local_kvcache_blocks,
+                context.block_size,
+                1,
+                context.head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+                pin_memory=cpu_pinned,
+            )
+            return
         # FP8 MLA: allocate (block_size+1) rows per block for stride padding,
         # then slice back to block_size. This ensures the FlashMLA kernel
         # never reads out-of-bounds on the last row.

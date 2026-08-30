@@ -323,17 +323,29 @@ class BlackwellMLAAttention(HopperAttention):
         self.hisparse_k_cache = self.hisparse_v_cache = torch.tensor([])
 
     def forward(self, q, k, v, sparse_indices=None, write_kv_cache=True):
-        del v, sparse_indices
+        del v
         context = get_batch_context()
         if context.is_prefill:
             raise RuntimeError(
                 "BlackwellMLAAttention is decode-only; MLA prefill must use "
                 "the non-absorbed FA4 path in DeepseekV2Attention."
             )
+        fp8_cache = self.k_cache.dtype == torch.float8_e4m3fn
+        if fp8_cache:
+            fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            q = q.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+            k = k.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
         if write_kv_cache and self.k_cache.numel() and not context.is_dummy:
-            from dlengine.runtime.kernel.triton.generic.kv_store import store_kcache
+            if fp8_cache:
+                from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
+                    store_kcache_fp8,
+                )
 
-            store_kcache(k, self.k_cache, context.slot_mapping)
+                store_kcache_fp8(k, self.k_cache, context.slot_mapping)
+            else:
+                from dlengine.runtime.kernel.triton.generic.kv_store import store_kcache
+
+                store_kcache(k, self.k_cache, context.slot_mapping)
 
         ntps = context.num_tokens_per_seq
         batch_size = q.shape[0] // ntps
@@ -352,20 +364,32 @@ class BlackwellMLAAttention(HopperAttention):
         seq_lens = context.context_lens[0, :batch_size]
         kv_cache = self.k_cache
         if kv_cache.ndim == 4 and kv_cache.shape[2] == 1:
-            kv_cache = kv_cache.squeeze(2)
+            # FlashInfer expects [pages, heads, page_size, dim]. The singleton
+            # dimension is the KV-head axis, not the page-size axis.
+            kv_cache = kv_cache.permute(0, 2, 1, 3)
+        sparse_mla_top_k = 0
+        if sparse_indices is not None and fp8_cache:
+            if sparse_indices.shape[0] != batch_size:
+                raise RuntimeError(
+                    "Sparse MLA index batch does not match query batch: "
+                    f"{sparse_indices.shape[0]} != {batch_size}"
+                )
+            sparse_mla_top_k = sparse_indices.shape[-1]
+            block_tables = sparse_indices.to(dtype=torch.int32).unsqueeze(1)
         if not block_tables.is_contiguous():
             block_tables = block_tables.contiguous()
         # TRTLLM-GEN groups 128 tokens when constructing its paged schedule.
         # Therefore the page-table width must be a multiple of 128/page_size.
         # Scheduler metadata is intentionally trimmed to the active pages, so
         # pad only its unused tail; seq_lens remains the authoritative bound.
-        page_group = 128 // kv_cache.shape[1]
-        remainder = block_tables.shape[1] % page_group
-        if remainder:
-            padding = block_tables.new_zeros(
-                (block_tables.shape[0], page_group - remainder)
-            )
-            block_tables = torch.cat((block_tables, padding), dim=1)
+        if sparse_mla_top_k == 0:
+            page_group = 128 // kv_cache.shape[2]
+            remainder = block_tables.shape[1] % page_group
+            if remainder:
+                padding = block_tables.new_zeros(
+                    (block_tables.shape[0], page_group - remainder)
+                )
+                block_tables = torch.cat((block_tables, padding), dim=1)
         if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
             seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
         out = torch.empty(
@@ -382,12 +406,16 @@ class BlackwellMLAAttention(HopperAttention):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=block_tables.shape[1] * kv_cache.shape[1],
-            sparse_mla_top_k=0,
+            max_seq_len=(
+                int(seq_lens.max().item())
+                if sparse_mla_top_k and not torch.cuda.is_current_stream_capturing()
+                else context.block_tables.shape[-1] * self.k_cache.shape[1]
+            ),
+            sparse_mla_top_k=sparse_mla_top_k,
             out=out,
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
-            backend="auto",
+            backend="trtllm-gen" if fp8_cache else "auto",
             is_var_seq=True,
             uses_shared_paged_kv_idx=True,
         )
