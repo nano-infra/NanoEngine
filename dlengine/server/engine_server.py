@@ -50,6 +50,12 @@ def _event_token_ids(event: dict) -> list[int]:
     token_ids = event.get("token_ids")
     if token_ids:
         return token_ids
+    # A decode engine reports a migrated sequence as newly running after its
+    # KV-only handoff step.  No model token was sampled in that step: the
+    # prefill token is already seeded by ``submit_migrated``.  Falling back to
+    # ``last_token`` here emits that prefill token a second time.
+    if event.get("is_new_running", False):
+        return []
     if event.get("num_tokens", 0) > 0:
         return [event["last_token"]]
     return []
