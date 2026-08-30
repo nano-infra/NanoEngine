@@ -10,6 +10,7 @@ logger = get_logger()
 @dataclasses.dataclass
 class RunnerConfig:
     max_num_seqs: int | None = None
+    max_num_batched_tokens: int = 4096
     dummy_weight: bool = False
     dummy_eplb: bool = False
     enable_eplb: bool = False
@@ -45,6 +46,7 @@ def get_runner_config() -> RunnerConfig:
 
 def set_runner_config(
     max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
     dummy_weight: Optional[bool] = None,
     dummy_eplb: Optional[bool] = None,
     enable_eplb: Optional[bool] = None,
@@ -59,6 +61,11 @@ def set_runner_config(
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
         max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=(
+            int(max_num_batched_tokens)
+            if max_num_batched_tokens is not None
+            else 4096
+        ),
         dummy_weight=dummy_weight,
         dummy_eplb=dummy_eplb,
         enable_eplb=enable_eplb,

@@ -26,6 +26,17 @@ def _swizzle_blockscale(scale):
     )
 
 
+def _interleave_w13_halves(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert checkpoint [Gate, Up] halves to CuteDSL v2 [Up, Gate] tiles."""
+    split = tensor.shape[1] // 2
+    gate = tensor[:, :split]
+    up = tensor[:, split:]
+    chunks = []
+    for up_chunk, gate_chunk in zip(up.split(64, dim=1), gate.split(64, dim=1)):
+        chunks.extend((up_chunk, gate_chunk))
+    return torch.cat(chunks, dim=1).contiguous()
+
+
 class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
     """ModelOpt NVFP4 experts sharded over the FFN EP axis."""
 
@@ -145,6 +156,50 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
         self.input2_quant = (1.0 / input2).float().contiguous()
         self.g2_alphas = (input2 * self.down_scale_2).float().contiguous()
 
+        if self.ep_size == 1:
+            # SGLang's non-DeepEP path uses CuteDSL v2. It has a different
+            # contract from the masked v1 kernel used by DeepEP: W13 is
+            # [Up, Gate] interleaved in 64-row tiles and blockscales use the
+            # MMA layout. Keep this conversion isolated to EP1.
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+            self.gate_up_proj.data = _interleave_w13_halves(self.gate_up_proj.data)
+            self.gate_up_scale.data = _interleave_w13_halves(
+                self.gate_up_scale.data
+            )
+            self.gate_up_scale.data = convert_sf_to_mma_layout(
+                _swizzle_blockscale(self.gate_up_scale.data)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(-1),
+                m=self.gate_up_proj.shape[1],
+                k=self.hidden_size,
+                num_groups=self.num_local_experts,
+                sf_vec_size=16,
+            )
+            self.down_scale.data = convert_sf_to_mma_layout(
+                _swizzle_blockscale(self.down_scale.data)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(-1),
+                m=self.down_proj.shape[1],
+                k=self.intermediate_size,
+                num_groups=self.num_local_experts,
+                sf_vec_size=16,
+            )
+            self.local_input1_quant = (1.0 / input1).reshape(1).float()
+            input2_scalar = self.down_input_scale.max().float()
+            self.local_input2_quant = (1.0 / input2_scalar).reshape(1).float()
+            self.local_g1_alphas = (
+                self.gate_up_scale_2[:, 0] / self.local_input1_quant
+            ).float().contiguous()
+            self.local_g2_alphas = (
+                self.down_scale_2 / self.local_input2_quant
+            ).float().contiguous()
+            self._local_wrapper = None
+            self._prepared = True
+            return
+
         # CuteDSL v1 uses original [Gate, Up] weights. Only block scales
         # are swizzled; TRT-LLM row permutation would corrupt this path.
         self.gate_up_scale.data = _swizzle_blockscale(self.gate_up_scale.data)
@@ -192,9 +247,15 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
             return dispatcher.combine(recv_x)
 
         recv_tokens = recv_x.shape[0]
-        # Every received token may select the same local expert. Size for that
-        # worst case so skewed routing cannot be silently truncated.
-        max_m = max(128, recv_tokens * self.top_k)
+        # A/B against the last known-good NVFP4 implementation.  The later
+        # worst-case sizing changes the masked-GEMM M bucket even for small,
+        # normally distributed batches.
+        max_m = max(
+            128,
+            2
+            * (recv_tokens * self.top_k + self.num_local_experts - 1)
+            // self.num_local_experts,
+        )
         local_dispatcher = LocalPaddedDispatcher(
             num_local_experts=self.num_local_experts,
             max_m=max_m,
@@ -247,13 +308,55 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
         )
         return dispatcher.combine(expert_out, recv_ids, recv_weights)
 
+    def _compute_local(self, hidden_states, topk_ids, topk_weights):
+        """Run the SGLang-aligned CuteDSL v2 standard path for EP1."""
+        from flashinfer import ActivationType, CuteDslMoEWrapper, fp4_quantize
+
+        if self._local_wrapper is None:
+            from dlengine.runtime.runner.runner_config import get_runner_config
+
+            max_tokens = get_runner_config().max_num_batched_tokens or 4096
+            with torch.inference_mode(False):
+                self._local_wrapper = CuteDslMoEWrapper(
+                    num_experts=self.num_experts,
+                    top_k=self.top_k,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size,
+                    use_cuda_graph=False,
+                    max_num_tokens=max_tokens,
+                    num_local_experts=self.num_local_experts,
+                    local_expert_offset=0,
+                    output_dtype=torch.bfloat16,
+                    device=str(self.gate_up_proj.device),
+                    activation_type=ActivationType.Swiglu,
+                )
+
+        x_fp4, x_sf = fp4_quantize(
+            input=hidden_states,
+            global_scale=self.local_input1_quant,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=False,
+            backend="cute-dsl",
+        )
+        return self._local_wrapper.run(
+            x=x_fp4,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
+            w1_weight=self.gate_up_proj,
+            w1_weight_sf=self.gate_up_scale,
+            w1_alpha=self.local_g1_alphas,
+            fc2_input_scale=self.local_input2_quant,
+            w2_weight=self.down_proj,
+            w2_weight_sf=self.down_scale,
+            w2_alpha=self.local_g2_alphas,
+        )
+
     def forward(self, hidden_states, topk_ids, topk_weights, is_prefill=True):
         if not self._prepared:
             raise RuntimeError("NVFP4 expert weights have not been prepared")
         if self.ep_size <= 1:
-            raise NotImplementedError(
-                "ModelOpt NVFP4 CuteDSL currently requires EP > 1"
-            )
+            return self._compute_local(hidden_states, topk_ids, topk_weights)
         if is_prefill:
             return self._compute_prefill_ep(hidden_states, topk_ids, topk_weights)
         return self._compute_decode_ep(hidden_states, topk_ids, topk_weights)
