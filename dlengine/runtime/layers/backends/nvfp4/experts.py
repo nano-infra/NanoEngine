@@ -192,12 +192,9 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
             return dispatcher.combine(recv_x)
 
         recv_tokens = recv_x.shape[0]
-        max_m = max(
-            128,
-            2
-            * (recv_tokens * self.top_k + self.num_local_experts - 1)
-            // self.num_local_experts,
-        )
+        # Every received token may select the same local expert. Size for that
+        # worst case so skewed routing cannot be silently truncated.
+        max_m = max(128, recv_tokens * self.top_k)
         local_dispatcher = LocalPaddedDispatcher(
             num_local_experts=self.num_local_experts,
             max_m=max_m,

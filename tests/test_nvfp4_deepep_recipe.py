@@ -134,9 +134,9 @@ def test_prefill_uses_normal_dispatch_and_local_padding(monkeypatch):
         expert_context.ExpertContext, "get_instance", Mock(return_value=context)
     )
     dispatcher = Mock()
-    recv_x = torch.empty(3, 4)
-    recv_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
-    recv_weights = torch.ones(3, 2)
+    recv_x = torch.empty(100, 4)
+    recv_ids = torch.zeros(100, 2, dtype=torch.int64)
+    recv_weights = torch.ones(100, 2)
     dispatcher.dispatch.return_value = (
         recv_x,
         recv_ids,
@@ -158,6 +158,8 @@ def test_prefill_uses_normal_dispatch_and_local_padding(monkeypatch):
     monkeypatch.setattr(local_dispatch, "LocalPaddedDispatcher", local_cls)
 
     experts = _experts()
+    # Capacity must cover the maximally skewed routing case: T * top_k.
+    expected_max_m = recv_x.shape[0] * experts.top_k
     experts._run_masked_experts = Mock(return_value=padded)
     experts._compute_prefill_ep(
         torch.empty(2, 4), torch.tensor([[0, 1], [1, 0]]), torch.ones(2, 2)
@@ -168,4 +170,5 @@ def test_prefill_uses_normal_dispatch_and_local_padding(monkeypatch):
     experts._run_masked_experts.assert_called_once_with(
         (padded, None), masked_m, experts.input1_quant
     )
+    assert local_cls.call_args.kwargs["max_m"] == expected_max_m
     dispatcher.combine.assert_called_once_with(recv_x)
