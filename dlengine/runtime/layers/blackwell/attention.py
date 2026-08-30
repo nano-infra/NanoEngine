@@ -334,7 +334,6 @@ class BlackwellMLAAttention(HopperAttention):
         if fp8_cache:
             fp8_max = torch.finfo(torch.float8_e4m3fn).max
             q = q.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
-            k = k.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
         if write_kv_cache and self.k_cache.numel() and not context.is_dummy:
             if fp8_cache:
                 from dlengine.runtime.kernel.triton.hopper.fp8_utils import (

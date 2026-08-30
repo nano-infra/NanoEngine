@@ -775,7 +775,7 @@ class P2PCacheTransfer:
                 ):
                     # Conv state
                     remote_conv_mr_info = peer_agent.get_mr_info(peer_alias, "gdn_conv")
-                    if remote_conv_mr_info:
+                    if conn.transport == "nvlink" or remote_conv_mr_info:
                         remote_conv_mr = "gdn_conv"
                         local_conv_mr = "gdn_conv"
                         if local_conv_mr is None:
@@ -809,7 +809,7 @@ class P2PCacheTransfer:
                     remote_rec_mr_info = peer_agent.get_mr_info(
                         peer_alias, "gdn_recurrent"
                     )
-                    if remote_rec_mr_info:
+                    if conn.transport == "nvlink" or remote_rec_mr_info:
                         remote_rec_mr = "gdn_recurrent"
                         local_rec_mr = "gdn_recurrent"
                         if local_rec_mr is None:
@@ -851,7 +851,7 @@ class P2PCacheTransfer:
                     remote_handoff_info = peer_agent.get_mr_info(
                         peer_alias, _MTP_HANDOFF_BUFFER_ID
                     )
-                    if remote_handoff_info:
+                    if conn.transport == "nvlink" or remote_handoff_info:
                         remote_handoff_mr = _MTP_HANDOFF_BUFFER_ID
                         local_handoff_mr = _MTP_HANDOFF_BUFFER_ID
                         if local_handoff_mr is None:
@@ -911,7 +911,7 @@ class P2PCacheTransfer:
                         remote_info = peer_agent.get_mr_info(
                             peer_alias, f"dsv4_compressed_r{ratio}"
                         )
-                        if not remote_info:
+                        if conn.transport != "nvlink" and not remote_info:
                             raise RuntimeError(
                                 f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
                             )
@@ -959,7 +959,7 @@ class P2PCacheTransfer:
                                 )
                             mr_name = f"dsv4_compressor_{kind}_r{ratio}"
                             remote_info = peer_agent.get_mr_info(peer_alias, mr_name)
-                            if not remote_info:
+                            if conn.transport != "nvlink" and not remote_info:
                                 raise RuntimeError(
                                     f"Failed to get {mr_name} MR info for {peer_alias}"
                                 )
@@ -996,7 +996,7 @@ class P2PCacheTransfer:
                     remote_indexer_mr_info = peer_agent.get_mr_info(
                         peer_alias, "indexer_cache"
                     )
-                    if remote_indexer_mr_info:
+                    if conn.transport == "nvlink" or remote_indexer_mr_info:
                         remote_indexer_mr = "indexer_cache"
                         local_indexer_mr = "indexer_cache"
                         page_bytes = self.layout.indexer_page_num_bytes()
@@ -1031,9 +1031,10 @@ class P2PCacheTransfer:
                 coalesce_started = time.perf_counter()
                 rdma_ops = _coalesce_rdma_ops(rdma_ops)
                 coalesce_ms = (time.perf_counter() - coalesce_started) * 1000
-                _validate_named_region_ops(
-                    peer_agent, peer_alias, rdma_ops, self._local_mr_sizes
-                )
+                if conn.transport != "nvlink":
+                    _validate_named_region_ops(
+                        peer_agent, peer_alias, rdma_ops, self._local_mr_sizes
+                    )
                 transfer_gib = sum(op[4] for op in rdma_ops) / (1024**3)
 
                 prepared_reads.append(

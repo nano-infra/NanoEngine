@@ -188,7 +188,18 @@ class RayExecutor:
     def _init_with_new_pg(self):
         """Initialize workers by creating new placement groups (existing logic)."""
         # Define the maximum number of workers packed into one node-sized PG.
-        workers_per_node = 8
+        gpu_counts = [
+            int(node.get("Resources", {}).get("GPU", 0) or 0)
+            for node in ray.nodes()
+            if node.get("Alive", True)
+            and int(node.get("Resources", {}).get("GPU", 0) or 0) > 0
+        ]
+        if not gpu_counts:
+            raise RuntimeError("No alive GPU nodes found in the Ray cluster")
+        # Use the smallest node size so a worker group is schedulable on every
+        # GPU node, including homogeneous multi-node clusters with fewer than
+        # eight GPUs per host.
+        workers_per_node = min(gpu_counts)
 
         # A configured master is a legacy node-placement override. With the
         # default None, PGs carry no node hint and Ray chooses available nodes.

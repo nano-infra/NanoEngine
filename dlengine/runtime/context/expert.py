@@ -1,8 +1,11 @@
+import logging
 from typing import Any, Optional
 
 import torch
 
 from dlengine.runtime.context import BaseContext
+
+logger = logging.getLogger(__name__)
 
 try:
     import deep_ep  # type: ignore
@@ -17,6 +20,16 @@ def _require_deep_ep():
             "Please install DeepEP to use this feature."
         )
     return deep_ep
+
+
+def _is_mnnvl_fabric_supported() -> bool:
+    """Return whether the current CUDA device belongs to an MNNVL fabric."""
+    try:
+        from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+        return bool(is_mnnvl_fabric_supported(torch.cuda.current_device()))
+    except (ImportError, RuntimeError):
+        return False
 
 
 class ExpertContext(BaseContext):
@@ -124,13 +137,30 @@ class ExpertContext(BaseContext):
         # num_qps_per_rank: DLBlas uses max(num_sms, num_local_experts) for combined buffer
         num_qps_per_rank = max(self.num_sms, num_local_experts)
 
+        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+        buffer_kwargs = dict(
+            low_latency_mode=True,
+            num_qps_per_rank=num_qps_per_rank,
+            allow_nvlink_for_low_latency_mode=True,
+            allow_mnnvl=use_mnnvl_fabric,
+        )
+        # CUDA 13 DeepEP builds require the fabric allocator explicitly. CUDA 12
+        # builds select it internally and do not consistently expose this option.
+        cuda_major = int(torch.version.cuda.split(".", 1)[0]) if torch.version.cuda else 0
+        if cuda_major >= 13 and use_mnnvl_fabric:
+            buffer_kwargs["use_fabric"] = True
+        logger.info(
+            "Initializing DeepEP buffer: ep_size=%d, allow_mnnvl=%s, use_fabric=%s",
+            ep_size,
+            use_mnnvl_fabric,
+            buffer_kwargs.get("use_fabric", False),
+        )
+
         self.buffer = deep_ep.Buffer(
             ep_group,
             num_nvl_bytes=num_nvl_bytes,
             num_rdma_bytes=num_rdma_bytes,
-            low_latency_mode=True,
-            num_qps_per_rank=num_qps_per_rank,
-            allow_nvlink_for_low_latency_mode=True,
+            **buffer_kwargs,
         )
         self.buffer.set_num_sms(self.num_sms)
 

@@ -302,6 +302,7 @@ class ModelRunner:
 
         set_runner_config(
             max_num_seqs=config.max_num_seqs,
+            max_num_batched_tokens=config.max_num_batched_tokens,
             dummy_weight=config.dummy_weight,
             dummy_eplb=config.dummy_eplb,
             enable_eplb=config.enable_eplb,

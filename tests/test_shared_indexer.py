@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from dlengine.runtime.layers.indexer import _expand_decode_context_lens
+from dlengine.runtime.layers.indexer import (
+    _expand_decode_context_lens,
+    _uses_linear_mtp_indexer_path,
+)
 from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
     _can_use_fused_indexer_topk,
     _get_indexer_mode,
@@ -175,6 +178,12 @@ def test_dummy_decode_context_lens_do_not_underflow():
 
     assert expanded.shape == (1, 8)
     assert torch.equal(expanded, torch.ones_like(expanded))
+
+
+def test_long_prefill_does_not_use_linear_mtp_indexer_path():
+    assert not _uses_linear_mtp_indexer_path(is_prefill=True, ntps=22)
+    assert not _uses_linear_mtp_indexer_path(is_prefill=False, ntps=2)
+    assert _uses_linear_mtp_indexer_path(is_prefill=False, ntps=3)
 
 
 def test_fused_indexer_topk_is_limited_to_exact_context_range():

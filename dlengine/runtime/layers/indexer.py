@@ -69,6 +69,11 @@ logger = get_logger()
 INDEXER_QUANT_BLOCK_SIZE = 128
 
 
+def _uses_linear_mtp_indexer_path(*, is_prefill: bool, ntps: int) -> bool:
+    """Return whether the wide per-position MTP scoring path is required."""
+    return not is_prefill and ntps > 2
+
+
 def _per_token_cast_to_fp8_ue8m0(x: torch.Tensor):
     """Graph-safe per-token FP8 quantization with UE8M0 scales.
 
@@ -1144,9 +1149,16 @@ class Indexer(nn.Module):
         # retain the fallback for standalone Indexer calls and tests.
         from dlengine.runtime.context.batch import get_batch_context
 
-        schedule_meta = get_batch_context().indexer_schedule_meta
+        batch_context = get_batch_context()
+        schedule_meta = batch_context.indexer_schedule_meta
         block_tables_i32 = block_tables.to(torch.int32)
-        if ntps <= 2:
+        # A regular prefill can have many tokens per sequence.  The wide
+        # per-position fallback below is specifically for linear MTP verify
+        # during decode; treating a long prompt as MTP changes the indexer
+        # computation and corrupts the target-model logits.
+        if not _uses_linear_mtp_indexer_path(
+            is_prefill=batch_context.is_prefill, ntps=ntps
+        ):
             if schedule_meta is None:
                 schedule_meta = self.build_schedule_metadata(context_lens_for_gemm)
             logits = deep_gemm.fp8_paged_mqa_logits(

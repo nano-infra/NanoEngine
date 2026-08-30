@@ -177,6 +177,25 @@ def dequantize_and_unpack_mla(
     return result
 
 
+def restore_mla_fp8_cache_rows(cache_rows: torch.Tensor) -> torch.Tensor:
+    """Restore either supported FP8 MLA cache ABI to logical BF16 rows.
+
+    Blackwell decode uses the raw 512-NoPE + 64-RoPE FP8 layout, while the
+    FlashMLA sparse path uses the packed 656-byte layout with scales and a
+    BF16 RoPE tail. PP chunked prefill may read its own cache before decode,
+    so it must distinguish the layouts instead of unconditionally unpacking.
+    """
+    width = cache_rows.shape[-1]
+    if width == D_TOTAL:
+        return cache_rows.to(torch.bfloat16)
+    if width == FP8_BYTES_PER_TOKEN:
+        return dequantize_and_unpack_mla(cache_rows.view(torch.uint8))
+    raise ValueError(
+        f"Unsupported FP8 MLA cache row width {width}; "
+        f"expected raw={D_TOTAL} or packed={FP8_BYTES_PER_TOKEN}"
+    )
+
+
 # ---------- Triton kernel: FP8 quantize + scatter to paged cache ----------
 
 
