@@ -71,6 +71,17 @@ PACKED_EXPERT_SCALE_RE = re.compile(
 )
 
 
+def _discover_weight_files(path: str) -> list[str]:
+    """Return checkpoint shards or fail on the worker that cannot see them."""
+    weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    if not weight_files:
+        raise FileNotFoundError(
+            f"No safetensors checkpoint shards found under model path {path!r} "
+            "on this worker. The model path must be visible from every Ray worker."
+        )
+    return weight_files
+
+
 def default_weight_loader(param, tensor):
     """Default weight loader (copy directly)."""
     param.data.copy_(tensor)
@@ -156,7 +167,7 @@ def iterate_mtp_weights(
     This is the inverse of iterate_weights() which skips MTP weights.
     Also includes embed_tokens and lm_head weights needed for MTP.
     """
-    weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    weight_files = _discover_weight_files(path)
     pbar = tqdm(weight_files, desc="Loading MTP weights", unit="files")
 
     try:
@@ -213,7 +224,7 @@ def iterate_weights(
         - weight_name: cleaned name (VLM prefix stripped)
         - raw_weight_name: original name in safetensors file
     """
-    weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    weight_files = _discover_weight_files(path)
     pbar = tqdm(weight_files, desc="Loading weights", unit="files")
 
     try:
@@ -271,7 +282,7 @@ def _load_model_generic(model: nn.Module, path: str, num_hidden_layers: int | No
     block_size = getattr(quant_config, "block_size", [128, 128])
 
     # Collect all weight files
-    weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    weight_files = _discover_weight_files(path)
     pbar = tqdm(weight_files, desc="Loading weights", unit="files")
 
     skipped_count = 0

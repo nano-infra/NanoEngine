@@ -1,7 +1,29 @@
 from types import SimpleNamespace
 
 import dlengine.runtime.runner.loader as loader
+import pytest
 import torch
+
+
+def test_discover_weight_files_rejects_worker_invisible_path(monkeypatch):
+    monkeypatch.setattr(loader, "glob", lambda _: [])
+
+    with pytest.raises(FileNotFoundError, match="visible from every Ray worker"):
+        loader._discover_weight_files("/missing/model")
+
+
+def test_iterate_weights_fails_before_tensor_iteration(monkeypatch):
+    monkeypatch.setattr(loader, "glob", lambda _: [])
+
+    with pytest.raises(FileNotFoundError, match="/missing/model"):
+        next(loader.iterate_weights("/missing/model"))
+
+
+def test_iterate_mtp_weights_fails_before_tensor_iteration(monkeypatch):
+    monkeypatch.setattr(loader, "glob", lambda _: [])
+
+    with pytest.raises(FileNotFoundError, match="/missing/model"):
+        next(loader.iterate_mtp_weights("/missing/model"))
 
 
 def test_ep_filter_keeps_only_local_experts(monkeypatch):
