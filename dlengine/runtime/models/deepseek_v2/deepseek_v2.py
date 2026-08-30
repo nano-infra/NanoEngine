@@ -1654,16 +1654,16 @@ class DeepseekV2Attention(nn.Module):
                         if k_cached_raw.shape[0] > 0:
                             k_cached_raw = k_cached_raw.squeeze(1)
                             if k_cache.dtype == torch.float8_e4m3fn:
-                                dequantize_fn = getattr(self, "_dequantize_fn", None)
-                                if dequantize_fn is None:
+                                restore_fn = getattr(
+                                    self, "_restore_fp8_cache_fn", None
+                                )
+                                if restore_fn is None:
                                     from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
-                                        dequantize_and_unpack_mla as dequantize_fn,
+                                        restore_mla_fp8_cache_rows as restore_fn,
                                     )
 
-                                    self._dequantize_fn = dequantize_fn
-                                k_cached_raw = dequantize_fn(
-                                    k_cached_raw.view(torch.uint8)
-                                )
+                                    self._restore_fp8_cache_fn = restore_fn
+                                k_cached_raw = restore_fn(k_cached_raw)
                             key_states_for_sparse = _interleave_cached_fresh(
                                 k_cached_raw.unsqueeze(1),
                                 key_states_3d,
@@ -1765,14 +1765,14 @@ class DeepseekV2Attention(nn.Module):
                     if k_cache.dtype == torch.float8_e4m3fn:
                         # FP8 packed cache (656 bytes/token): dequantize+unpack
                         # back to bf16 [total_cached, 576] before BF16 matmuls.
-                        dequantize_fn = getattr(self, "_dequantize_fn", None)
-                        if dequantize_fn is None:
+                        restore_fn = getattr(self, "_restore_fp8_cache_fn", None)
+                        if restore_fn is None:
                             from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
-                                dequantize_and_unpack_mla as dequantize_fn,
+                                restore_mla_fp8_cache_rows as restore_fn,
                             )
 
-                            self._dequantize_fn = dequantize_fn
-                        k_cached_raw = dequantize_fn(k_cached_raw.view(torch.uint8))
+                            self._restore_fp8_cache_fn = restore_fn
+                        k_cached_raw = restore_fn(k_cached_raw)
                     # k_cached_raw: [total_cached, 576]
                     comp_cached = k_cached_raw[:, : self.kv_lora_rank]
                     kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
