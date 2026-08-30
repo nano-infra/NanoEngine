@@ -480,6 +480,13 @@ def detect_parser_name(
     use a JSON object inside ``<tool_call>``. Fall back to the model path, then
     to Hermes.
     """
+    ident = f"{model_path} {served_model_name}".lower()
+    if "kimi-k3" in ident or "kimi_k3" in ident:
+        return "kimi_k3"
+    # The GLM-5 parser pair has model-specific defaults. Check its identity
+    # before the generic XML template, which cannot distinguish GLM versions.
+    if any(tag in ident for tag in ("glm-5", "glm_5", "glm5")):
+        return "glm47"
     if chat_template:
         if "<arg_key>" in chat_template or "<arg_value>" in chat_template:
             return "glm"
@@ -487,9 +494,6 @@ def detect_parser_name(
             return "qwen3_xml"
         if "<tool_call>" in chat_template:
             return "hermes"
-    ident = f"{model_path} {served_model_name}".lower()
-    if "kimi-k3" in ident or "kimi_k3" in ident:
-        return "kimi_k3"
     if "glm" in ident:
         return "glm"
     if "qwen3.5" in ident or "qwen3-coder" in ident or "qwen3_coder" in ident:

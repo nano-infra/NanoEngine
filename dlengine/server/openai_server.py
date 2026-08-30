@@ -186,7 +186,9 @@ class OpenAIServer:
             getattr(tokenizer, "chat_template", None),
         )
         self.tool_parser_name = tool_call_parser or detected_parser
-        self.reasoning_parser_name = reasoning_parser or self.tool_parser_name
+        self.reasoning_parser_name = reasoning_parser or (
+            "glm45" if self.tool_parser_name == "glm47" else self.tool_parser_name
+        )
         self.tool_parser = get_tool_parser(self.tool_parser_name)
         logger.info(f"Tool-call parser: {self.tool_parser_name}")
         # NOTE: request/metric dumping (``--dump_requests_redis``) is performed
