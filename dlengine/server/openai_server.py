@@ -214,13 +214,18 @@ class OpenAIServer:
         if not requested:
             return None
         key = requested.strip().rstrip("/")
-        if key in self._model_aliases:
+        aliases_lower = {alias.lower() for alias in self._model_aliases}
+        if key in self._model_aliases or key.lower() in aliases_lower:
             return self.served_model_name
         expanded = os.path.expanduser(key)
-        if expanded.rstrip("/") in self._model_aliases:
+        if (
+            expanded.rstrip("/") in self._model_aliases
+            or expanded.rstrip("/").lower() in aliases_lower
+        ):
             return self.served_model_name
         try:
-            if os.path.realpath(expanded).rstrip("/") in self._model_aliases:
+            resolved = os.path.realpath(expanded).rstrip("/")
+            if resolved in self._model_aliases or resolved.lower() in aliases_lower:
                 return self.served_model_name
         except OSError:
             pass
