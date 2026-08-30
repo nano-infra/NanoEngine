@@ -168,6 +168,12 @@ class CacheTensorLayout:
             * self.dtype_itemsize
         )
 
+    def block_num_bytes(self) -> int:
+        """Return payload bytes, excluding any inter-block padding."""
+        if self.is_fp8_kvcache and self.mode == "mla":
+            return self.block_size * self.fp8_head_dim
+        return self.block_stride(1)
+
     def layer_stride(self, layer_idx: int, block_idx: int) -> int:
         # DSv4 HCA allocates one extra dummy page per layer.
         layer_blocks = self.num_blocks + 1 if self.mode == "dsv4" else self.num_blocks
@@ -263,6 +269,9 @@ class P2PCacheLayout:
 
     def block_stride(self, block_idx: int) -> int:
         return self.local().block_stride(block_idx)
+
+    def block_num_bytes(self) -> int:
+        return self.local().block_num_bytes()
 
     def local_kv_stride(self, kv_idx: int, layer_idx: int, block_idx: int) -> int:
         return self.local().kv_stride(kv_idx, layer_idx, block_idx)

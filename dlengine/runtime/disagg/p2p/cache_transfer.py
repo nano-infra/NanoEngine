@@ -747,7 +747,7 @@ class P2PCacheTransfer:
                         engine_id,
                         remote_num_layers,
                     )
-                    length = self.layout.block_stride(1)
+                    length = self.layout.block_num_bytes()
 
                     if local_off < 0 or remote_off < 0 or length <= 0:
                         logger.error(

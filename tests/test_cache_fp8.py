@@ -127,6 +127,7 @@ class TestCacheContextFP8:
         stride = self._layout(ctx).block_stride(1)
         expected = (64 + 1) * 656  # FP8 blocks include one padding row.
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
+        assert self._layout(ctx).block_num_bytes() == 64 * 656
 
     def test_block_stride_bf16(self):
         """block_stride should return correct byte offset for BF16."""
@@ -134,6 +135,7 @@ class TestCacheContextFP8:
         stride = self._layout(ctx).block_stride(1)
         expected = 64 * 1 * 576 * 2  # block_size * kv_heads * head_dim * bf16_size
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
+        assert self._layout(ctx).block_num_bytes() == expected
 
     def test_raw_fp8_allocate_shape_and_stride(self):
         ctx = self._make_cache_context(is_fp8=True, raw_fp8=True)
@@ -143,6 +145,7 @@ class TestCacheContextFP8:
         assert ctx.kv_cache.dtype == torch.float8_e4m3fn
         assert ctx.kv_cache.stride(2) == 64 * ctx.kv_cache.stride(3)
         assert self._layout(ctx).block_stride(1) == 64 * 576
+        assert self._layout(ctx).block_num_bytes() == 64 * 576
 
 
 if __name__ == "__main__":
