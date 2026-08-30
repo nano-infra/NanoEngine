@@ -269,6 +269,8 @@ class DeepEPTokenDispatcherLowLatency:
         topk_weights: torch.Tensor,
         num_experts: Optional[int] = None,
         use_fp8: bool = True,
+        use_nvfp4: bool = False,
+        x_global_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if num_experts is None:
             num_experts = self.num_experts
@@ -280,6 +282,11 @@ class DeepEPTokenDispatcherLowLatency:
             + num_experts
         ) // num_experts
 
+        quant_kwargs = {"use_fp8": use_fp8}
+        if use_nvfp4:
+            quant_kwargs["use_nvfp4"] = True
+        if x_global_scale is not None:
+            quant_kwargs["x_global_scale"] = x_global_scale
         (
             packed_recv_hidden,
             masked_m,
@@ -291,7 +298,7 @@ class DeepEPTokenDispatcherLowLatency:
             topk_idx,
             self.num_max_dispatch_tokens_per_rank,
             num_experts,
-            use_fp8=use_fp8,
+            **quant_kwargs,
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )

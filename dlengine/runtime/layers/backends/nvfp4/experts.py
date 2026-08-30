@@ -151,26 +151,78 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
         self.down_scale.data = _swizzle_blockscale(self.down_scale.data)
         self._prepared = True
 
-    def forward(self, hidden_states, topk_ids, topk_weights, is_prefill=True):
-        if not self._prepared:
-            raise RuntimeError("NVFP4 expert weights have not been prepared")
-        if self.ep_size <= 1:
-            raise NotImplementedError(
-                "ModelOpt NVFP4 CuteDSL currently requires EP > 1"
-            )
-
-        # Match the verified SGLang recipe for both prefill and decode:
-        # DeepEP low-latency dispatch -> masked CuteDSL grouped GEMMs -> combine.
-        from dlengine.runtime.context.expert import ExpertContext
+    def _run_masked_experts(self, hidden_states, masked_m, input_global_scale):
         from dlengine.runtime.kernel.cutedsl_nvfp4_moe import (
             flashinfer_cutedsl_moe_masked,
         )
+
+        return flashinfer_cutedsl_moe_masked(
+            hidden_states=hidden_states,
+            input_global_scale=input_global_scale,
+            w1=self.gate_up_proj,
+            w1_blockscale=self.gate_up_scale,
+            w1_alpha=self.g1_alphas,
+            w2=self.down_proj,
+            a2_global_scale=self.input2_quant,
+            w2_blockscale=self.down_scale,
+            w2_alpha=self.g2_alphas,
+            masked_m=masked_m.to(torch.int32),
+            activation="silu",
+        )
+
+    def _compute_prefill_ep(self, hidden_states, topk_ids, topk_weights):
+        """Run prefill with DeepEP normal dispatch and padded local experts."""
+        from dlengine.runtime.context.expert import ExpertContext
+        from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
+        from dlengine.runtime.layers.token_dispatcher import DeepEPTokenDispatcherNormal
+
+        ExpertContext.get_instance().transition_to_normal()
+        dispatcher = DeepEPTokenDispatcherNormal(
+            group=self.ep_group,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=self.hidden_size,
+            params_dtype=torch.bfloat16,
+            expert_alignment=1,
+        )
+        recv_x, recv_ids, recv_weights, _, _, _ = dispatcher.dispatch(
+            hidden_states, topk_ids, topk_weights
+        )
+        if recv_x.shape[0] == 0:
+            return dispatcher.combine(recv_x)
+
+        recv_tokens = recv_x.shape[0]
+        max_m = max(
+            128,
+            2
+            * (recv_tokens * self.top_k + self.num_local_experts - 1)
+            // self.num_local_experts,
+        )
+        local_dispatcher = LocalPaddedDispatcher(
+            num_local_experts=self.num_local_experts,
+            max_m=max_m,
+            hidden_size=self.hidden_size,
+            top_k=self.top_k,
+            max_num_tokens=recv_tokens,
+            device=self.gate_up_proj.device,
+        )
+        padded_x, masked_m, _ = local_dispatcher.dispatch(recv_x, recv_ids)
+        expert_out = self._run_masked_experts(
+            (padded_x, None), masked_m, self.input1_quant
+        )
+        recv_out = local_dispatcher.combine(
+            expert_out, recv_ids, recv_weights, recv_tokens
+        )
+        return dispatcher.combine(recv_out)
+
+    def _compute_decode_ep(self, hidden_states, topk_ids, topk_weights):
+        """Run decode with DeepEP low-latency native NVFP4 dispatch."""
+        from dlengine.runtime.context.expert import ExpertContext
         from dlengine.runtime.layers.token_dispatcher import (
             DeepEPTokenDispatcherLowLatency,
         )
 
-        ctx = ExpertContext.get_instance()
-        ctx.transition_to_low_latency()
+        ExpertContext.get_instance().transition_to_low_latency()
         dispatcher = DeepEPTokenDispatcherLowLatency(
             group=self.ep_group,
             num_experts=self.num_experts,
@@ -184,23 +236,27 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
             topk_weights,
             self.num_experts,
             use_fp8=False,
+            use_nvfp4=True,
+            x_global_scale=self.input1_quant,
         )
-        if isinstance(recv_x, tuple):
-            recv_hidden, recv_scale = recv_x
-        else:
-            recv_hidden, recv_scale = recv_x, None
-
-        expert_out = flashinfer_cutedsl_moe_masked(
-            hidden_states=(recv_hidden, recv_scale),
-            input_global_scale=self.input1_quant,
-            w1=self.gate_up_proj,
-            w1_blockscale=self.gate_up_scale,
-            w1_alpha=self.g1_alphas,
-            w2=self.down_proj,
-            a2_global_scale=self.input2_quant,
-            w2_blockscale=self.down_scale,
-            w2_alpha=self.g2_alphas,
-            masked_m=masked_m.to(torch.int32),
-            activation="silu",
+        recv_hidden, recv_scale = (
+            recv_x if isinstance(recv_x, tuple) else (recv_x, None)
+        )
+        # DeepEP has already quantized the activation when it returns NVFP4 scales.
+        # Passing input1_quant again would apply the global scale twice.
+        input_global_scale = None if recv_scale is not None else self.input1_quant
+        expert_out = self._run_masked_experts(
+            (recv_hidden, recv_scale), masked_m, input_global_scale
         )
         return dispatcher.combine(expert_out, recv_ids, recv_weights)
+
+    def forward(self, hidden_states, topk_ids, topk_weights, is_prefill=True):
+        if not self._prepared:
+            raise RuntimeError("NVFP4 expert weights have not been prepared")
+        if self.ep_size <= 1:
+            raise NotImplementedError(
+                "ModelOpt NVFP4 CuteDSL currently requires EP > 1"
+            )
+        if is_prefill:
+            return self._compute_prefill_ep(hidden_states, topk_ids, topk_weights)
+        return self._compute_decode_ep(hidden_states, topk_ids, topk_weights)
