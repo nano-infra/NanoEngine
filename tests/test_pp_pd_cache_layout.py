@@ -108,10 +108,15 @@ def test_recurrent_mtp_handoff_rdma_uses_remote_and_local_state_slots(monkeypatc
             return SimpleNamespace(endpoint=self.endpoint)
 
         def get_mr_info(self, peer_alias, name):
-            return object() if name == "mtp_handoff" else None
+            return (
+                {"length": handoff.numel() * handoff.element_size()}
+                if name == "mtp_handoff"
+                else None
+            )
 
-        def get_handle(self, name, peer_alias=None):
-            return f"remote:{name}"
+        def read(self, peer_alias, ops, _stream):
+            self.endpoint.ops = ops
+            return Completion()
 
     class PeerContext:
         alias = "local"
@@ -137,6 +142,7 @@ def test_recurrent_mtp_handoff_rdma_uses_remote_and_local_state_slots(monkeypatc
     transfer = Transfer(SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5))
     transfer.set_peer_agent_context(PeerContext(Agent(endpoint)))
     transfer._local_mtp_handoff_mr_handler = "local:mtp_handoff"
+    transfer._local_mr_sizes["mtp_handoff"] = handoff.numel() * handoff.element_size()
     transfer.remote_max_num_seqs["prefill"] = 4
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
@@ -146,9 +152,7 @@ def test_recurrent_mtp_handoff_rdma_uses_remote_and_local_state_slots(monkeypatc
         mtp_handoff_assigns={"prefill": {"peer": [(3, 1)]}},
     )
 
-    assert endpoint.ops == [
-        ("local:mtp_handoff", "remote:mtp_handoff", 3 * 48, 1 * 48, 48)
-    ]
+    assert endpoint.ops == [("mtp_handoff", "mtp_handoff", 1 * 48, 3 * 48, 48)]
 
 
 def test_rdma_ops_coalesce_only_when_both_regions_are_contiguous():
@@ -201,10 +205,14 @@ def test_rdma_reads_submit_all_before_wait_and_drain_after_failure(monkeypatch):
             return SimpleNamespace(endpoint=endpoints[alias])
 
         def get_mr_info(self, _peer_alias, name):
-            return object() if name == "mtp_handoff" else None
+            return (
+                {"length": handoff.numel() * handoff.element_size()}
+                if name == "mtp_handoff"
+                else None
+            )
 
-        def get_handle(self, name, peer_alias=None):
-            return f"remote:{peer_alias}:{name}"
+        def read(self, peer_alias, ops, stream):
+            return endpoints[peer_alias].read(ops, stream)
 
     class PeerContext:
         alias = "local"
@@ -227,6 +235,7 @@ def test_rdma_reads_submit_all_before_wait_and_drain_after_failure(monkeypatch):
     transfer = Transfer(SimpleNamespace(mtp_handoff=handoff, mtp_num_drafts=5))
     transfer.set_peer_agent_context(PeerContext())
     transfer._local_mtp_handoff_mr_handler = "local:mtp_handoff"
+    transfer._local_mr_sizes["mtp_handoff"] = handoff.numel() * handoff.element_size()
     transfer.remote_max_num_seqs["prefill"] = 4
     monkeypatch.setattr(
         torch.cuda, "synchronize", lambda: events.append(("sync", None))

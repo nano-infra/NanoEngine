@@ -89,45 +89,57 @@ def allocate_mla_kvcache(context) -> None:
     cpu_pinned = device.type == "cpu" and torch.cuda.is_available()
     if context.is_fp8_kvcache:
         if context.raw_fp8_mla_layout:
-            context.kv_cache = torch.empty(
-                1,
-                context.num_hidden_layers,
-                context.num_local_kvcache_blocks,
-                context.block_size,
-                1,
-                context.head_dim,
-                dtype=torch.float8_e4m3fn,
-                device=device,
-                pin_memory=cpu_pinned,
+            from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+            context.kv_cache = allocate_device_tensor(
+                context,
+                "kv_cache",
+                (
+                    1,
+                    context.num_hidden_layers,
+                    context.num_local_kvcache_blocks,
+                    context.block_size,
+                    1,
+                    context.head_dim,
+                ),
+                torch.float8_e4m3fn,
             )
             return
         # FP8 MLA: allocate (block_size+1) rows per block for stride padding,
         # then slice back to block_size. This ensures the FlashMLA kernel
         # never reads out-of-bounds on the last row.
-        kv_cache_padded = torch.empty(
-            1,
-            context.num_hidden_layers,
-            context.num_local_kvcache_blocks,
-            context.block_size + 1,
-            1,
-            context._fp8_head_dim,
-            dtype=torch.float8_e4m3fn,
-            device=device,
-            pin_memory=cpu_pinned,
+        from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+        kv_cache_padded = allocate_device_tensor(
+            context,
+            "kv_cache",
+            (
+                1,
+                context.num_hidden_layers,
+                context.num_local_kvcache_blocks,
+                context.block_size + 1,
+                1,
+                context._fp8_head_dim,
+            ),
+            torch.float8_e4m3fn,
         )
         context.kv_cache = kv_cache_padded[:, :, :, : context.block_size, :, :]
         return
 
-    context.kv_cache = torch.empty(
-        1,
-        context.num_hidden_layers,
-        context.num_local_kvcache_blocks,
-        context.block_size,
-        context.num_local_kv_heads,
-        context.head_dim,
-        dtype=context.dtype,
-        device=device,
-        pin_memory=cpu_pinned,
+    from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+    context.kv_cache = allocate_device_tensor(
+        context,
+        "kv_cache",
+        (
+            1,
+            context.num_hidden_layers,
+            context.num_local_kvcache_blocks,
+            context.block_size,
+            context.num_local_kv_heads,
+            context.head_dim,
+        ),
+        context.dtype,
     )
 
 

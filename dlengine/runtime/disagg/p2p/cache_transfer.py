@@ -62,8 +62,8 @@ def _coalesce_rdma_ops(
             if coalesced:
                 previous = coalesced[-1]
                 same_handlers = previous[:2] == op[:2]
-                remote_contiguous = previous[2] + previous[4] == op[2]
-                local_contiguous = previous[3] + previous[4] == op[3]
+                local_contiguous = previous[2] + previous[4] == op[2]
+                remote_contiguous = previous[3] + previous[4] == op[3]
                 fits = previous[4] + op[4] <= max_bytes
                 if same_handlers and remote_contiguous and local_contiguous and fits:
                     coalesced[-1] = (
@@ -76,6 +76,36 @@ def _coalesce_rdma_ops(
                     continue
             coalesced.append(op)
     return coalesced
+
+
+def _validate_named_region_ops(
+    peer_agent, peer_alias: str, ops: list[tuple], local_region_sizes: dict[str, int]
+) -> None:
+    """Validate canonical named reads before submitting them to a transport."""
+    remote_sizes: dict[str, int] = {}
+    for op_idx, (local_name, remote_name, local_off, remote_off, length) in enumerate(
+        ops
+    ):
+        local_size = local_region_sizes.get(local_name)
+        if local_size is None:
+            raise RuntimeError(f"Local memory region {local_name!r} is not registered")
+        if remote_name not in remote_sizes:
+            remote_info = peer_agent.get_mr_info(peer_alias, remote_name)
+            if not remote_info:
+                raise RuntimeError(
+                    f"Remote memory region {remote_name!r} is not registered for "
+                    f"peer {peer_alias!r}"
+                )
+            remote_sizes[remote_name] = int(remote_info["length"])
+        remote_size = remote_sizes[remote_name]
+        if min(local_off, remote_off, length) < 0 or length == 0:
+            raise RuntimeError(f"Invalid named transfer operation {op_idx}: {op!r}")
+        if local_off + length > local_size or remote_off + length > remote_size:
+            raise RuntimeError(
+                f"Named transfer operation {op_idx} exceeds region bounds: "
+                f"local={local_name}[{local_off}:{local_off + length}]/{local_size}, "
+                f"remote={remote_name}[{remote_off}:{remote_off + length}]/{remote_size}"
+            )
 
 
 def _tensor_storage_span_num_bytes(tensor: torch.Tensor) -> int:
@@ -136,6 +166,7 @@ def initialize_migration_state(context) -> None:
     context._local_dsv4_compressor_kv_mr_handlers = {}
     context._local_dsv4_compressor_score_mr_handlers = {}
     context._local_dsv4_compressor_counts_mr_handlers = {}
+    context._local_mr_sizes = {}
     context._engine_info_cache = None
 
 
@@ -197,12 +228,18 @@ class P2PCacheTransfer:
 
             # Register KV cache
             kv_size = _tensor_storage_span_num_bytes(self.kv_cache)
-            self._local_mr_handler = peer_agent.register_memory_region(
-                _KV_CACHE_BUFFER_ID,
-                self.kv_cache.data_ptr(),
-                int(self.kv_cache.storage_offset()),
-                kv_size,
-            )
+            if getattr(peer_context, "owns_memory_region", lambda _name: False)(
+                _KV_CACHE_BUFFER_ID
+            ):
+                self._local_mr_handler = _KV_CACHE_BUFFER_ID
+            else:
+                self._local_mr_handler = peer_agent.register_memory_region(
+                    _KV_CACHE_BUFFER_ID,
+                    self.kv_cache.data_ptr(),
+                    int(self.kv_cache.storage_offset()),
+                    kv_size,
+                )
+            self._local_mr_sizes[_KV_CACHE_BUFFER_ID] = kv_size
             logger.info(
                 f"PeerAgent started: alias={agent_alias}, server={server_url}, "
                 f"kv_cache MR handler={self._local_mr_handler}"
@@ -218,6 +255,7 @@ class P2PCacheTransfer:
                     int(self.mtp_handoff.storage_offset()),
                     handoff_size,
                 )
+                self._local_mr_sizes[_MTP_HANDOFF_BUFFER_ID] = handoff_size
                 logger.info(
                     "Registered MTP handoff MR: handler=%s, slots=%s, "
                     "drafts=%s, size=%s bytes",
@@ -247,6 +285,7 @@ class P2PCacheTransfer:
                         cold_size,
                     )
                 )
+                self._local_mr_sizes[_HISPARSE_COLD_KV_BUFFER_ID] = cold_size
                 logger.info(
                     "Registered HiSparse host cold KV MR: handler=%s, size=%.2f GiB",
                     self._local_hisparse_cold_mr_handler,
@@ -277,6 +316,8 @@ class P2PCacheTransfer:
                         recurrent_size,
                     )
                 )
+                self._local_mr_sizes["gdn_conv"] = conv_size
+                self._local_mr_sizes["gdn_recurrent"] = recurrent_size
                 logger.info(
                     f"Registered GDN MRs: conv={self._local_gdn_conv_mr_handler}, "
                     f"recurrent={self._local_gdn_recurrent_mr_handler}"
@@ -286,12 +327,15 @@ class P2PCacheTransfer:
             if self.indexer_cache is not None:
                 indexer_buf = self.indexer_cache.buffer
                 indexer_size = indexer_buf.numel() * indexer_buf.itemsize
-                self._local_indexer_mr_handler = peer_agent.register_memory_region(
-                    "indexer_cache",
-                    indexer_buf.data_ptr(),
-                    0,
-                    indexer_size,
-                )
+                if getattr(peer_context, "owns_memory_region", lambda _name: False)(
+                    "indexer_cache"
+                ):
+                    self._local_indexer_mr_handler = "indexer_cache"
+                else:
+                    self._local_indexer_mr_handler = peer_agent.register_memory_region(
+                        "indexer_cache", indexer_buf.data_ptr(), 0, indexer_size
+                    )
+                self._local_mr_sizes["indexer_cache"] = indexer_size
                 logger.info(
                     f"Registered IndexerCache MR: handler={self._local_indexer_mr_handler}"
                 )
@@ -309,6 +353,9 @@ class P2PCacheTransfer:
                     buf.numel() * buf.itemsize,
                 )
                 self._local_dsv4_compressed_mr_handlers[ratio] = handler
+                self._local_mr_sizes[f"dsv4_compressed_r{ratio}"] = (
+                    buf.numel() * buf.itemsize
+                )
                 logger.info(
                     f"Registered DSv4 compressed cache MR: ratio={ratio}, "
                     f"handler={handler}, size={buf.numel() * buf.itemsize / 1e9:.2f} GB"
@@ -346,6 +393,24 @@ class P2PCacheTransfer:
                         int(buf.storage_offset()),
                         buf.numel() * buf.itemsize,
                     )
+                )
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_kv_flat", None) or {}
+            ).items():
+                self._local_mr_sizes[f"dsv4_compressor_kv_r{ratio}"] = (
+                    buf.numel() * buf.itemsize
+                )
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_score_flat", None) or {}
+            ).items():
+                self._local_mr_sizes[f"dsv4_compressor_score_r{ratio}"] = (
+                    buf.numel() * buf.itemsize
+                )
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_counts_flat", None) or {}
+            ).items():
+                self._local_mr_sizes[f"dsv4_compressor_counts_r{ratio}"] = (
+                    buf.numel() * buf.itemsize
                 )
             if self._local_dsv4_compressor_kv_mr_handlers:
                 logger.info(
@@ -644,32 +709,14 @@ class P2PCacheTransfer:
                     raise RuntimeError(f"Failed to get endpoint for {peer_alias}")
                 endpoint = conn.endpoint
 
-                remote_mr_handler = None
-                local_mr_handler = self._local_mr_handler
-                if assign_batch:
-                    remote_mr_info = peer_agent.get_mr_info(
-                        peer_alias, _KV_CACHE_BUFFER_ID
-                    )
-                    if remote_mr_info is None:
-                        raise RuntimeError(
-                            f"Failed to get {_KV_CACHE_BUFFER_ID} MR info for "
-                            f"{peer_alias}"
-                        )
-                    remote_mr_handler = peer_agent.get_handle(
-                        _KV_CACHE_BUFFER_ID, peer_alias=peer_alias
-                    )
-                    if local_mr_handler is None:
-                        raise RuntimeError(
-                            f"Local MR handler not available for "
-                            f"{_KV_CACHE_BUFFER_ID}"
-                        )
-                    logger.debug(
-                        f"Remote MR for {peer_alias}: handler={remote_mr_handler}, "
-                        f"local_handler={local_mr_handler}"
+                local_mr_name = _KV_CACHE_BUFFER_ID
+                if assign_batch and self._local_mr_handler is None:
+                    raise RuntimeError(
+                        f"Local memory region {_KV_CACHE_BUFFER_ID!r} is not registered"
                     )
                 use_hisparse_cold = self._local_hisparse_cold_mr_handler is not None
                 if assign_batch and use_hisparse_cold:
-                    local_mr_handler = self._local_hisparse_cold_mr_handler
+                    local_mr_name = _HISPARSE_COLD_KV_BUFFER_ID
 
                 # Build KV cache RDMA ops
                 rdma_ops: list[tuple] = []
@@ -700,13 +747,8 @@ class P2PCacheTransfer:
                         engine_id,
                         remote_num_layers,
                     )
-                    length = self.layout.block_stride(1)
+                    length = self.layout.block_num_bytes()
 
-                    if local_mr_handler is None or remote_mr_handler is None:
-                        logger.error(
-                            f"[Op {op_idx}] Invalid MR handlers: local={local_mr_handler}, remote={remote_mr_handler}"
-                        )
-                        continue
                     if local_off < 0 or remote_off < 0 or length <= 0:
                         logger.error(
                             f"[Op {op_idx}] Invalid offsets/length: local_off={local_off}, remote_off={remote_off}, length={length}"
@@ -715,10 +757,10 @@ class P2PCacheTransfer:
 
                     rdma_ops.append(
                         (
-                            local_mr_handler,
-                            remote_mr_handler,
-                            remote_off,
+                            local_mr_name,
+                            _KV_CACHE_BUFFER_ID,
                             local_off,
+                            remote_off,
                             length,
                         )
                     )
@@ -734,10 +776,8 @@ class P2PCacheTransfer:
                     # Conv state
                     remote_conv_mr_info = peer_agent.get_mr_info(peer_alias, "gdn_conv")
                     if remote_conv_mr_info:
-                        remote_conv_mr = peer_agent.get_handle(
-                            "gdn_conv", peer_alias=peer_alias
-                        )
-                        local_conv_mr = self._local_gdn_conv_mr_handler
+                        remote_conv_mr = "gdn_conv"
+                        local_conv_mr = "gdn_conv"
                         if local_conv_mr is None:
                             raise RuntimeError("Local gdn_conv MR is not registered")
                         conv_len = self.layout.gdn_conv_slot_num_bytes()
@@ -751,11 +791,11 @@ class P2PCacheTransfer:
                                 (
                                     local_conv_mr,
                                     remote_conv_mr,
-                                    self.layout.remote_gdn_conv_stride(
-                                        remote_layer_idx, remote_slot, engine_id
-                                    ),
                                     self.layout.gdn_conv_stride(
                                         local_layer_idx, local_slot
+                                    ),
+                                    self.layout.remote_gdn_conv_stride(
+                                        remote_layer_idx, remote_slot, engine_id
                                     ),
                                     conv_len,
                                 )
@@ -770,10 +810,8 @@ class P2PCacheTransfer:
                         peer_alias, "gdn_recurrent"
                     )
                     if remote_rec_mr_info:
-                        remote_rec_mr = peer_agent.get_handle(
-                            "gdn_recurrent", peer_alias=peer_alias
-                        )
-                        local_rec_mr = self._local_gdn_recurrent_mr_handler
+                        remote_rec_mr = "gdn_recurrent"
+                        local_rec_mr = "gdn_recurrent"
                         if local_rec_mr is None:
                             raise RuntimeError(
                                 "Local gdn_recurrent MR is not registered"
@@ -789,11 +827,11 @@ class P2PCacheTransfer:
                                 (
                                     local_rec_mr,
                                     remote_rec_mr,
-                                    self.layout.remote_gdn_recurrent_stride(
-                                        remote_layer_idx, remote_slot, engine_id
-                                    ),
                                     self.layout.gdn_recurrent_stride(
                                         local_layer_idx, local_slot
+                                    ),
+                                    self.layout.remote_gdn_recurrent_stride(
+                                        remote_layer_idx, remote_slot, engine_id
                                     ),
                                     rec_len,
                                 )
@@ -814,10 +852,8 @@ class P2PCacheTransfer:
                         peer_alias, _MTP_HANDOFF_BUFFER_ID
                     )
                     if remote_handoff_info:
-                        remote_handoff_mr = peer_agent.get_handle(
-                            _MTP_HANDOFF_BUFFER_ID, peer_alias=peer_alias
-                        )
-                        local_handoff_mr = self._local_mtp_handoff_mr_handler
+                        remote_handoff_mr = _MTP_HANDOFF_BUFFER_ID
+                        local_handoff_mr = _MTP_HANDOFF_BUFFER_ID
                         if local_handoff_mr is None:
                             raise RuntimeError("Local MTP handoff MR is not registered")
                         row_bytes = (
@@ -840,8 +876,8 @@ class P2PCacheTransfer:
                                 (
                                     local_handoff_mr,
                                     remote_handoff_mr,
-                                    remote_slot * row_bytes,
                                     local_slot * row_bytes,
+                                    remote_slot * row_bytes,
                                     row_bytes,
                                 )
                             )
@@ -880,20 +916,19 @@ class P2PCacheTransfer:
                                 f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
                             )
                             continue
-                        remote_handler = peer_agent.get_handle(
-                            f"dsv4_compressed_r{ratio}", peer_alias=peer_alias
-                        )
+                        remote_handler = f"dsv4_compressed_r{ratio}"
+                        local_handler = f"dsv4_compressed_r{ratio}"
                         page_bytes = self.layout.compressed_page_bytes(ratio)
                         for local_rli, remote_rli, rpage, lpage in ops:
                             rdma_ops.append(
                                 (
                                     local_handler,
                                     remote_handler,
-                                    self.layout.remote_compressed_stride(
-                                        ratio, remote_rli, rpage, engine_id
-                                    ),
                                     self.layout.local_compressed_stride(
                                         ratio, local_rli, lpage
+                                    ),
+                                    self.layout.remote_compressed_stride(
+                                        ratio, remote_rli, rpage, engine_id
                                     ),
                                     page_bytes,
                                 )
@@ -929,9 +964,8 @@ class P2PCacheTransfer:
                                     f"Failed to get {mr_name} MR info for {peer_alias}"
                                 )
                                 continue
-                            remote_handler = peer_agent.get_handle(
-                                mr_name, peer_alias=peer_alias
-                            )
+                            remote_handler = mr_name
+                            local_handler = mr_name
                             row_bytes = self.layout.compressor_state_row_bytes(
                                 ratio, kind
                             )
@@ -940,15 +974,15 @@ class P2PCacheTransfer:
                                     (
                                         local_handler,
                                         remote_handler,
+                                        self.layout.local_compressor_state_stride(
+                                            ratio, local_rli, lslot, kind
+                                        ),
                                         self.layout.remote_compressor_state_stride(
                                             ratio,
                                             remote_rli,
                                             rslot,
                                             kind,
                                             engine_id,
-                                        ),
-                                        self.layout.local_compressor_state_stride(
-                                            ratio, local_rli, lslot, kind
                                         ),
                                         row_bytes,
                                     )
@@ -963,10 +997,8 @@ class P2PCacheTransfer:
                         peer_alias, "indexer_cache"
                     )
                     if remote_indexer_mr_info:
-                        remote_indexer_mr = peer_agent.get_handle(
-                            "indexer_cache", peer_alias=peer_alias
-                        )
-                        local_indexer_mr = self._local_indexer_mr_handler
+                        remote_indexer_mr = "indexer_cache"
+                        local_indexer_mr = "indexer_cache"
                         page_bytes = self.layout.indexer_page_num_bytes()
                         for (
                             local_layer_idx,
@@ -978,11 +1010,11 @@ class P2PCacheTransfer:
                                 (
                                     local_indexer_mr,
                                     remote_indexer_mr,
-                                    self.layout.remote_indexer_stride(
-                                        remote_layer_idx, remote_block, engine_id
-                                    ),
                                     self.layout.local_indexer_stride(
                                         local_layer_idx, local_block
+                                    ),
+                                    self.layout.remote_indexer_stride(
+                                        remote_layer_idx, remote_block, engine_id
                                     ),
                                     page_bytes,
                                 )
@@ -999,12 +1031,14 @@ class P2PCacheTransfer:
                 coalesce_started = time.perf_counter()
                 rdma_ops = _coalesce_rdma_ops(rdma_ops)
                 coalesce_ms = (time.perf_counter() - coalesce_started) * 1000
+                _validate_named_region_ops(
+                    peer_agent, peer_alias, rdma_ops, self._local_mr_sizes
+                )
                 transfer_gib = sum(op[4] for op in rdma_ops) / (1024**3)
 
                 prepared_reads.append(
                     {
                         "peer_alias": peer_alias,
-                        "endpoint": endpoint,
                         "rdma_ops": rdma_ops,
                         "original_op_count": original_op_count,
                         "coalesce_ms": coalesce_ms,
@@ -1018,7 +1052,9 @@ class P2PCacheTransfer:
         for prepared in prepared_reads:
             try:
                 submitted_at = time.perf_counter()
-                slot = prepared["endpoint"].read(prepared["rdma_ops"], None)
+                slot = peer_agent.read(
+                    prepared["peer_alias"], prepared["rdma_ops"], None
+                )
                 prepared["submit_ms"] = (time.perf_counter() - submitted_at) * 1000
                 if slot is None:
                     raise RuntimeError("endpoint.read returned None")

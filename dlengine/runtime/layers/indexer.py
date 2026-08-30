@@ -234,6 +234,7 @@ class IndexerCache:
         page_size: int,
         head_dim: int,
         device: str = "cuda",
+        buffer: torch.Tensor | None = None,
     ):
         self.num_layers = num_layers
         self.num_pages = num_pages
@@ -242,11 +243,17 @@ class IndexerCache:
         self.quant_block_size = INDEXER_QUANT_BLOCK_SIZE
         self.bytes_per_token = head_dim + head_dim // self.quant_block_size * 4
         # Single contiguous buffer: (num_layers, num_pages, page_size * bytes_per_token)
-        self.buffer = torch.zeros(
-            (num_layers, num_pages, page_size * self.bytes_per_token),
-            dtype=torch.uint8,
-            device=device,
+        shape = (num_layers, num_pages, page_size * self.bytes_per_token)
+        self.buffer = (
+            torch.zeros(shape, dtype=torch.uint8, device=device)
+            if buffer is None
+            else buffer
         )
+        if tuple(self.buffer.shape) != shape or self.buffer.dtype != torch.uint8:
+            raise ValueError(
+                f"IndexerCache buffer must be uint8 with shape {shape}, "
+                f"got dtype={self.buffer.dtype}, shape={tuple(self.buffer.shape)}"
+            )
 
     @property
     def buffers(self) -> list[torch.Tensor]:

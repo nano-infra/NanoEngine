@@ -170,6 +170,9 @@ class CacheContext(KVCacheAllocatorMixin):
     num_host_kvcache_blocks = 0
     num_remote_kvcache_blocks: dict[str, int] = None
     host_kv_cache: torch.Tensor | None = None
+    # Optional PeerAgent-owned CUDA Fabric allocator for PD cache storage.
+    peer_context: Any = None
+    peer_fabric_enabled: bool = False
 
     # used for MLA mode
     kv_lora_rank: int = 0

@@ -14,7 +14,9 @@ class PeerContext(BaseContext):
     agent: Any
     alias: str
     server_url: str
-    device: str
+    device: str | None
+    rank: int = 0
+    memory_regions: dict[str, Any] = field(default_factory=dict)
     ib_port: int = 1
     qp_num: int = 1
     connected_peers: set[str] = field(default_factory=set)
@@ -53,12 +55,6 @@ class PeerContext(BaseContext):
         ):
             server_url = f"http://{server_url}"
 
-        if device is None:
-            available_nics = dlslime.available_nic()
-            if not available_nics:
-                raise RuntimeError("No available NICs found")
-            device = available_nics[0]
-
         agent = start_peer_agent_fn(
             ctrl_url=server_url,
             alias=alias,
@@ -72,6 +68,7 @@ class PeerContext(BaseContext):
             device=device,
             ib_port=1,
             qp_num=int(os.environ.get("SLIME_QP_NUM", 1) if qp_num is None else qp_num),
+            rank=0,
         )
 
     @classmethod
@@ -87,17 +84,82 @@ class PeerContext(BaseContext):
             if cache_context.engine_id is not None
             else None
         )
-        device = (
-            _select_cache_peer_device()
-            if cache_context.ctrl_address is not None and alias is not None
-            else None
-        )
-        return cls.start_peer_agent(
+        context = cls.start_peer_agent(
             ctrl_address=cache_context.ctrl_address,
             alias=alias,
-            device=device,
+            device=None,
             scope=cache_context.ctrl_scope,
         )
+        if context is not None:
+            context.rank = rank
+        return context
+
+    def supports_cuda_fabric(self) -> bool:
+        """Return whether the local worker published usable CUDA Fabric topology."""
+        if not callable(getattr(self.agent, "allocate_memory_region", None)):
+            return False
+        resource = self.agent.get_resource(self.alias) or {}
+        cuda_caps = (resource.get("runtime_capabilities") or {}).get("cuda") or {}
+        imex_channels = (cuda_caps.get("imex") or {}).get("channel_ids") or []
+        accelerators = resource.get("accelerators") or []
+        ready = [
+            accelerator
+            for accelerator in accelerators
+            if (accelerator.get("mnnvl") or {}).get("membership_ready")
+        ]
+        return len(ready) == 1 and bool(imex_channels)
+
+    def allocate_tensor(
+        self, name: str, shape: tuple[int, ...], dtype: Any, *, zero: bool = False
+    ):
+        """Create a PyTorch tensor backed by a PeerAgent-owned Fabric region."""
+        import math
+
+        import torch
+
+        if name in self.memory_regions:
+            raise ValueError(f"Fabric memory region {name!r} already exists")
+        numel = math.prod(int(dim) for dim in shape)
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        region = self.agent.allocate_memory_region(name, numel * itemsize)
+
+        class _CudaBytes:
+            def __init__(self, ptr: int, size: int) -> None:
+                self.__cuda_array_interface__ = {
+                    "shape": (size,),
+                    "typestr": "|u1",
+                    "data": (ptr, False),
+                    "version": 3,
+                    "strides": None,
+                }
+
+        owner = _CudaBytes(region.ptr, region.length)
+        raw = torch.as_tensor(owner, device="cuda")
+        tensor = raw.view(dtype).view(shape)
+        if zero:
+            tensor.zero_()
+        # Retain every owner for at least as long as the tensor/cache context.
+        self.memory_regions[name] = (region, owner, raw)
+        return tensor
+
+    def owns_memory_region(self, name: str) -> bool:
+        return name in self.memory_regions
+
+    def _connect_to(self, peer_alias: str):
+        """Prefer automatic transport selection with old-DLSlime RDMA fallback."""
+        try:
+            return self.agent.connect_to(
+                peer_alias,
+                transport="auto",
+                ib_port=self.ib_port,
+                qp_num=self.qp_num,
+            )
+        except ValueError as error:
+            if "unsupported transport" not in str(error):
+                raise
+            return self.agent.connect_to(
+                peer_alias, ib_port=self.ib_port, qp_num=self.qp_num
+            )
 
     def is_connected(self, peer_alias: str) -> bool:
         """Return whether this PeerAgent already connected to ``peer_alias``."""
@@ -108,11 +170,7 @@ class PeerContext(BaseContext):
         if self.is_connected(peer_alias):
             return
 
-        conn = self.agent.connect_to(
-            peer_alias,
-            ib_port=self.ib_port,
-            qp_num=self.qp_num,
-        )
+        conn = self._connect_to(peer_alias)
         if conn.wait(timeout=timeout) is False:
             raise RuntimeError(f"Timed out waiting for connection to {peer_alias}")
         self.connected_peers.add(peer_alias)
@@ -125,14 +183,7 @@ class PeerContext(BaseContext):
         if not new_peers:
             return []
 
-        pending_conns = [
-            self.agent.connect_to(
-                peer,
-                ib_port=self.ib_port,
-                qp_num=self.qp_num,
-            )
-            for peer in new_peers
-        ]
+        pending_conns = [self._connect_to(peer) for peer in new_peers]
         newly_connected = []
         for peer, conn in zip(new_peers, pending_conns, strict=True):
             if conn.wait(timeout=timeout) is False:
@@ -147,6 +198,10 @@ class PeerContext(BaseContext):
 
     def clear_context(self) -> None:
         self.connected_peers.clear()
+        regions = list(self.memory_regions.values())
+        self.memory_regions.clear()
+        for region, _owner, _raw in regions:
+            region.close()
 
     def reset_context(self) -> None:
         self.clear_context()

@@ -27,14 +27,20 @@ def get_dsv4_block_bytes(context) -> int:
 def allocate_dsv4_kvcache(context) -> None:
     # DSv4 HCA paged cache: [num_layers, num_pages+1, page_size, 1, 584].
     # Extra +1 page is a dummy absorbing invalid writes (graph-safe).
-    context.kv_cache = torch.zeros(
-        context.num_hidden_layers,
-        context.num_local_kvcache_blocks + 1,
-        context.block_size,
-        1,
-        DSV4_BYTES_PER_TOKEN,
-        dtype=torch.uint8,
-        device=context.device,
+    from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+    context.kv_cache = allocate_device_tensor(
+        context,
+        "kv_cache",
+        (
+            context.num_hidden_layers,
+            context.num_local_kvcache_blocks + 1,
+            context.block_size,
+            1,
+            DSV4_BYTES_PER_TOKEN,
+        ),
+        torch.uint8,
+        zero=True,
     )
     logger.info(
         f"DSv4 HCA cache: {context.kv_cache.shape} (incl dummy page), "

@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
 from dlengine.runtime.context import BaseContext
 
 INDEXER_QUANT_BLOCK_SIZE = 128
@@ -54,12 +56,24 @@ def allocate_indexer_cache(context, hf_config) -> None:
     if index_head_dim == 0:
         return
 
+    from dlengine.runtime.context.cache._allocator import allocate_device_tensor
+
+    bytes_per_token = index_head_dim + index_head_dim // INDEXER_QUANT_BLOCK_SIZE * 4
+    shape = (
+        context.num_hidden_layers,
+        context.num_local_kvcache_blocks,
+        context.block_size * bytes_per_token,
+    )
+    buffer = allocate_device_tensor(
+        context, "indexer_cache", shape, torch.uint8, zero=True
+    )
     context.indexer_cache = IndexerCache(
         num_layers=context.num_hidden_layers,
         num_pages=context.num_local_kvcache_blocks,
         page_size=context.block_size,
         head_dim=index_head_dim,
         device=context.device,
+        buffer=buffer,
     )
 
 
