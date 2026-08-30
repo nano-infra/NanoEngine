@@ -534,6 +534,7 @@ class DeepseekV2MoE(nn.Module):
             tp_size=self.tp_size,
             ep_group=self.ep_group,
             tp_group=self.tp_group,
+            quantization_config=quantization_config,
             n_group=self.n_group,
             topk_group=self.topk_group,
             norm_topk_prob=self.norm_topk_prob,
@@ -1598,7 +1599,11 @@ class DeepseekV2Attention(nn.Module):
                 and context.cu_seqlens_q is not None
             )
             total_cached = 0
-            if nsa_prefill and context.cu_seqlens_k is not None:
+            if (
+                nsa_prefill
+                and context.block_tables is not None
+                and context.cu_seqlens_k is not None
+            ):
                 total_cached = int(
                     (context.cu_seqlens_k[-1] - context.cu_seqlens_q[-1]).item()
                 )

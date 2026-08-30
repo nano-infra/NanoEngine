@@ -185,8 +185,7 @@ class HopperBackendFactory(BackendFactory):
             HopperDistributedRoutedExperts,
         )
 
-        # Pass quant config; ignore any stale quantization_config in kwargs
-        kwargs.pop("quantization_config", None)
+        quantization_config = kwargs.pop("quantization_config", self.quant_config)
         return HopperDistributedRoutedExperts(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -194,7 +193,7 @@ class HopperBackendFactory(BackendFactory):
             top_k=top_k,
             ep_size=ep_size,
             tp_size=tp_size,
-            quantization_config=self.quant_config,
+            quantization_config=quantization_config,
             **kwargs,
         )
 

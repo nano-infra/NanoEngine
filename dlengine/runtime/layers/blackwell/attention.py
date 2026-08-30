@@ -368,13 +368,16 @@ class BlackwellMLAAttention(HopperAttention):
             kv_cache = kv_cache.permute(0, 2, 1, 3)
         sparse_mla_top_k = 0
         if sparse_indices is not None and fp8_cache:
-            if sparse_indices.shape[0] != batch_size:
+            expected_rows = batch_size * ntps
+            if sparse_indices.shape[0] != expected_rows:
                 raise RuntimeError(
-                    "Sparse MLA index batch does not match query batch: "
-                    f"{sparse_indices.shape[0]} != {batch_size}"
+                    "Sparse MLA index rows do not match query tokens: "
+                    f"{sparse_indices.shape[0]} != {expected_rows}"
                 )
             sparse_mla_top_k = sparse_indices.shape[-1]
-            block_tables = sparse_indices.to(dtype=torch.int32).unsqueeze(1)
+            block_tables = sparse_indices.to(dtype=torch.int32).reshape(
+                batch_size, ntps, sparse_mla_top_k
+            )
         if not block_tables.is_contiguous():
             block_tables = block_tables.contiguous()
         # TRTLLM-GEN groups 128 tokens when constructing its paged schedule.

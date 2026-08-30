@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import dlengine.runtime.runner.loader as loader
+from dlengine.runtime.models.deepseek_v2 import deepseek_v2_mtp_loader
 import pytest
 import torch
 
@@ -71,3 +72,41 @@ def test_iterate_weights_filters_before_get_tensor(monkeypatch):
         "model.layers.3.self_attn.q_proj.weight",
     ]
     assert calls == names
+
+
+def test_mtp_loader_delegates_expert_layout_to_backend(monkeypatch):
+    calls = []
+
+    class Experts:
+        def load_expert_weight(self, expert_idx, projection, kind, tensor, *, ep_rank):
+            calls.append((expert_idx, projection, kind, tensor.shape, ep_rank))
+            return True
+
+    class Model:
+        config = SimpleNamespace(
+            num_hidden_layers=78,
+            num_nextn_predict_layers=1,
+        )
+        quantization_config = None
+        mtp_start_layer_idx = 78
+
+        def get_submodule(self, name):
+            assert name == "layers.78.mtp_block.mlp.routed_experts"
+            return Experts()
+
+        def named_parameters(self):
+            return []
+
+        def modules(self):
+            return []
+
+    monkeypatch.setattr(
+        deepseek_v2_mtp_loader,
+        "get_dist_context",
+        lambda: SimpleNamespace(ffn_ep_rank=2),
+    )
+    tensor = torch.zeros(2048, 1024, dtype=torch.uint8)
+    weights = iter([("model.layers.78.mlp.experts.3.down_proj.weight", "raw", tensor)])
+    deepseek_v2_mtp_loader.load_weights(Model(), weights)
+
+    assert calls == [(3, "down_proj", "weight", tensor.shape, 2)]
