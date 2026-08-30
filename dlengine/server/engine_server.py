@@ -45,6 +45,16 @@ def build_stepout_payload(seq_id, token_ids, status) -> bytes:
     return encode_stepout(seq_id, token_ids, status)
 
 
+def _event_token_ids(event: dict) -> list[int]:
+    """Read step tokens while remaining compatible with legacy schedulers."""
+    token_ids = event.get("token_ids")
+    if token_ids:
+        return token_ids
+    if event.get("num_tokens", 0) > 0:
+        return [event["last_token"]]
+    return []
+
+
 class BackendService:
     """Backend service that runs LLM engine and processes requests from queue."""
 
@@ -349,16 +359,16 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
                 if event["is_finished"]:
                     stepout_batch.append(
-                        (seq_id, event.get("token_ids", []), SequenceStatus.FINISHED)
+                        (seq_id, _event_token_ids(event), SequenceStatus.FINISHED)
                     )
                     service._freed_sequences.discard(seq_id)
                 elif event["is_to_be_migrated"]:
                     payload = event.get("migration_payload")
                     if payload is not None:
                         service._send_migration_payload(bytes(payload))
-                elif event.get("token_ids"):
+                elif token_ids := _event_token_ids(event):
                     stepout_batch.append(
-                        (seq_id, event["token_ids"], SequenceStatus.RUNNING)
+                        (seq_id, token_ids, SequenceStatus.RUNNING)
                     )
 
             service._send_stepout_batch(stepout_batch)
