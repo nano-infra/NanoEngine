@@ -59,6 +59,7 @@ nav:
   - Get Started:
       - Installation: installation.md
       - Production Serving: online-serving.md
+      - Transport-neutral P/D: pd-fabric-deployment.md
   - Reference:
       - Feature Matrix: features.md
       - Supported Models: supported-models.md
