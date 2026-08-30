@@ -120,3 +120,81 @@ def test_blackwell_prefill_packs_strided_qkv_views(monkeypatch):
     assert output.shape == q.shape
     assert len(calls) == 1
     assert all(tensor.is_contiguous() for tensor in calls[0][:3])
+
+
+def _make_blackwell_mla(monkeypatch, calls):
+    def fake_decode(**kwargs):
+        calls.append(kwargs)
+        kwargs["out"].fill_(1)
+        return kwargs["out"]
+
+    monkeypatch.setattr(attention, "_trtllm_mla_decode_func", fake_decode)
+    monkeypatch.setattr(
+        attention,
+        "_get_trtllm_workspace",
+        lambda device: torch.zeros(1, dtype=torch.uint8, device=device),
+    )
+    impl = attention.BlackwellMLAAttention(
+        num_heads=8,
+        head_dim=576,
+        scale=0.125,
+        num_kv_heads=1,
+        v_head_dim=512,
+        mla_qk_nope_head_dim=128,
+    )
+    impl.k_cache = torch.zeros(4, 64, 1, 576, dtype=torch.float8_e4m3fn)
+    return impl
+
+
+def test_blackwell_raw_fp8_mla_uses_page_size_axis(monkeypatch):
+    calls = []
+    impl = _make_blackwell_mla(monkeypatch, calls)
+    q = torch.zeros(2, 8, 576, dtype=torch.bfloat16)
+    k = torch.zeros(2, 1, 576, dtype=torch.bfloat16)
+    page_table = torch.tensor([[[0], [1]]], dtype=torch.int32)
+    context_lens = torch.tensor([[4, 7]], dtype=torch.int32)
+    set_batch_context(
+        is_prefill=False,
+        context_lens=context_lens,
+        block_tables=page_table,
+        num_tokens_per_seq=1,
+    )
+
+    output = impl.forward(q, k, torch.empty(0), write_kv_cache=False)
+
+    assert output.shape == (2, 8, 512)
+    call = calls[0]
+    assert call["query"].dtype == torch.float8_e4m3fn
+    assert call["kv_cache"].shape == (4, 1, 64, 576)
+    assert call["block_tables"].shape == (2, 2)
+    assert call["sparse_mla_top_k"] == 0
+    assert call["max_seq_len"] == 64
+    assert call["backend"] == "trtllm-gen"
+
+
+def test_blackwell_raw_fp8_sparse_mla_uses_sparse_page_table(monkeypatch):
+    calls = []
+    impl = _make_blackwell_mla(monkeypatch, calls)
+    q = torch.zeros(2, 8, 576, dtype=torch.bfloat16)
+    k = torch.zeros(2, 1, 576, dtype=torch.bfloat16)
+    sparse_indices = torch.tensor([[3, 1, 0], [2, 1, 0]], dtype=torch.int64)
+    set_batch_context(
+        is_prefill=False,
+        context_lens=torch.tensor([[4, 7]], dtype=torch.int32),
+        block_tables=torch.tensor([[[0], [1]]], dtype=torch.int32),
+        num_tokens_per_seq=1,
+    )
+
+    impl.forward(
+        q,
+        k,
+        torch.empty(0),
+        sparse_indices=sparse_indices,
+        write_kv_cache=False,
+    )
+
+    call = calls[0]
+    assert call["block_tables"].shape == (2, 1, 3)
+    assert call["block_tables"].dtype == torch.int32
+    assert call["sparse_mla_top_k"] == 3
+    assert call["max_seq_len"] == 7

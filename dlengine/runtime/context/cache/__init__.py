@@ -175,6 +175,9 @@ class CacheContext(KVCacheAllocatorMixin):
     kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0
     is_fp8_kvcache: bool = False
+    # Native TRTLLM-GEN MLA stores raw FP8 [NoPE | RoPE] rows. FlashMLA's
+    # FP8 cache uses a packed layout with per-tile scale metadata.
+    raw_fp8_mla_layout: bool = False
 
     # NSA Indexer (V3.2 only)
     index_head_dim: int = 0  # 128 for V3.2, 0 otherwise
@@ -486,6 +489,7 @@ def set_cache_context(
     qk_rope_head_dim: int = 0,
     index_head_dim: int = 0,
     is_fp8_kvcache: bool = False,
+    raw_fp8_mla_layout: bool = False,
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla", "dsv4"] = "gqa",
@@ -507,6 +511,7 @@ def set_cache_context(
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
         is_fp8_kvcache=is_fp8_kvcache,
+        raw_fp8_mla_layout=raw_fp8_mla_layout,
         block_size=block_size,
         num_hidden_layers=num_hidden_layers,
         attention_tp=attention_tp,

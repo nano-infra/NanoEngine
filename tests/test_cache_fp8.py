@@ -15,7 +15,7 @@ from dlengine.runtime.disagg.p2p.cache_layout import CacheTensorLayout
 
 class TestCacheContextFP8:
 
-    def _make_cache_context(self, is_fp8: bool):
+    def _make_cache_context(self, is_fp8: bool, *, raw_fp8: bool = False):
         """Create a CacheContext with minimal init by bypassing __post_init__."""
         ctx = object.__new__(CacheContext)
         ctx.num_kv_heads = 1
@@ -31,6 +31,7 @@ class TestCacheContextFP8:
         ctx.kv_lora_rank = 512
         ctx.qk_rope_head_dim = 64
         ctx.is_fp8_kvcache = is_fp8
+        ctx.raw_fp8_mla_layout = raw_fp8
         ctx.num_local_kvcache_blocks = -1
         ctx.num_remote_kvcache_blocks = {}
         ctx.kv_cache = None
@@ -58,6 +59,7 @@ class TestCacheContextFP8:
             mode=ctx.mode,
             is_fp8_kvcache=ctx.is_fp8_kvcache,
             fp8_head_dim=ctx._fp8_head_dim,
+            raw_fp8_mla_layout=ctx.raw_fp8_mla_layout,
         )
 
     def test_fp8_allocate_shape(self):
@@ -132,6 +134,15 @@ class TestCacheContextFP8:
         stride = self._layout(ctx).block_stride(1)
         expected = 64 * 1 * 576 * 2  # block_size * kv_heads * head_dim * bf16_size
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
+
+    def test_raw_fp8_allocate_shape_and_stride(self):
+        ctx = self._make_cache_context(is_fp8=True, raw_fp8=True)
+        ctx.allocate_kvcache(10)
+
+        assert ctx.kv_cache.shape == (1, 4, 10, 64, 1, 576)
+        assert ctx.kv_cache.dtype == torch.float8_e4m3fn
+        assert ctx.kv_cache.stride(2) == 64 * ctx.kv_cache.stride(3)
+        assert self._layout(ctx).block_stride(1) == 64 * 576
 
 
 if __name__ == "__main__":

@@ -1314,8 +1314,7 @@ class ModelRunner:
         # Packed FP8 caches include scale metadata and are not ABI-compatible.
         from dlengine.runtime.layers import get_backend
 
-        if getattr(get_backend(), "hardware_backend", "") == "blackwell":
-            is_fp8_kvcache = False
+        hardware_backend = getattr(get_backend(), "hardware_backend", "")
         if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
             logger.warning(
                 "Disabling FP8 MLA KV cache because MLA reference fallback is "
@@ -1323,6 +1322,7 @@ class ModelRunner:
                 mla_head_dim,
             )
             is_fp8_kvcache = False
+        raw_fp8_mla_layout = is_fp8_kvcache and hardware_backend == "blackwell"
         if cache_plan.has_hisparse() and cache_plan.has_mla() and not is_fp8_kvcache:
             raise RuntimeError("HiSparse requires FP8 MLA KV cache")
 
@@ -1371,6 +1371,7 @@ class ModelRunner:
             qk_rope_head_dim=qk_rope_head_dim,
             index_head_dim=index_head_dim,
             is_fp8_kvcache=is_fp8_kvcache,
+            raw_fp8_mla_layout=raw_fp8_mla_layout,
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,

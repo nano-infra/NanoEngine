@@ -256,6 +256,14 @@ def store_kcache_fp8(
         slot_mapping: [N] int32 — target slot indices (-1 = skip)
                       slot = block_idx * block_size + offset_in_block
     """
+    if k_cache.shape[-1] == key.shape[-1]:
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        raw_key = key.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+        from dlengine.runtime.kernel.triton.generic.kv_store import store_kcache
+
+        store_kcache(raw_key, k_cache, slot_mapping)
+        return
+
     N = key.shape[0]
     key_2d = key.view(N, D_TOTAL)
     cache_bytes = k_cache.view(torch.uint8)

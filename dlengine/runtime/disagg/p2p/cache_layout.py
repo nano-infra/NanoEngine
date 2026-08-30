@@ -22,6 +22,7 @@ class CacheTensorLayout:
     mode: str
     is_fp8_kvcache: bool = False
     fp8_head_dim: int = 0
+    raw_fp8_mla_layout: bool = False
     gdn_num_slots: int = 0
     gdn_conv_stride0: int = 0
     gdn_conv_stride1: int = 0
@@ -86,6 +87,7 @@ class CacheTensorLayout:
             mode=context.mode,
             is_fp8_kvcache=context.is_fp8_kvcache,
             fp8_head_dim=getattr(context, "_fp8_head_dim", 0),
+            raw_fp8_mla_layout=bool(getattr(context, "raw_fp8_mla_layout", False)),
             gdn_num_slots=context.gdn_num_slots,
             gdn_conv_stride0=gdn_conv_stride0,
             gdn_conv_stride1=gdn_conv_stride1,
@@ -130,6 +132,7 @@ class CacheTensorLayout:
             mode=local_layout.mode,
             is_fp8_kvcache=local_layout.is_fp8_kvcache,
             fp8_head_dim=local_layout.fp8_head_dim,
+            raw_fp8_mla_layout=local_layout.raw_fp8_mla_layout,
             gdn_num_slots=gdn_num_slots or local_layout.gdn_num_slots,
             gdn_conv_stride0=(
                 (gdn_num_slots or local_layout.gdn_num_slots)
@@ -155,7 +158,8 @@ class CacheTensorLayout:
         if self.mode == "dsv4":
             return block_idx * self.block_size * DSV4_BYTES_PER_TOKEN
         if self.is_fp8_kvcache and self.mode == "mla":
-            return block_idx * (self.block_size + 1) * self.fp8_head_dim
+            rows = self.block_size if self.raw_fp8_mla_layout else self.block_size + 1
+            return block_idx * rows * self.fp8_head_dim
         return (
             block_idx
             * self.block_size

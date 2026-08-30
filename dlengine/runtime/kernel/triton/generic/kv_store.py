@@ -56,7 +56,8 @@ def store_kcache_kernel(
     # Compute flat offsets in key: [N, *, D] with stride key_stride along N
 
     key_offsets = pid_n * key_stride + offs
-    key_vals = tl.load(key_ptr + key_offsets, mask=mask, other=0)
+    key_vals = tl.load(key_ptr + key_offsets, mask=mask, other=0.0)
+    key_vals = key_vals.to(k_cache_ptr.dtype.element_ty)
 
     # Compute flat offsets in cache: we assume slot-major, contiguous D region
 
