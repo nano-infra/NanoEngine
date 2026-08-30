@@ -23,3 +23,15 @@ def test_event_token_ids_does_not_invent_token_for_empty_legacy_event():
     event = {"last_token": 0, "num_tokens": 0}
 
     assert _event_token_ids(event) == []
+
+
+def test_event_token_ids_does_not_repeat_migrated_prefill_token():
+    event = {
+        "token_ids": [],
+        "last_token": 17,
+        "num_tokens": 23,
+        "is_new_running": True,
+        "source_engine_id": "prefill-engine",
+    }
+
+    assert _event_token_ids(event) == []
