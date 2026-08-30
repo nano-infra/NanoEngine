@@ -1,6 +1,7 @@
 import json
+from types import SimpleNamespace
 
-from dlengine.server.openai_server import _skip_redundant_think_openers
+from dlengine.server.openai_server import _skip_redundant_think_openers, OpenAIServer
 from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
 
 
@@ -199,6 +200,42 @@ def test_glm_tool_parser_supports_empty_arguments_and_multiple_calls():
     assert json.loads(parsed.tool_calls[1].function.arguments) == {"path": "/tmp/a.py"}
 
 
+def test_detect_glm5_parser_precedes_generic_chat_template():
+    template = (
+        "<tool_call>{function-name}"
+        "<arg_key>{arg-key}</arg_key><arg_value>{arg-value}</arg_value>"
+        "</tool_call>"
+    )
+
+    assert detect_parser_name("/models/GLM-5.2", "GLM-5.2", template) == "glm47"
+
+
+def test_glm5_server_selects_tool_and_reasoning_parser_pair():
+    server = OpenAIServer(
+        worker=None,
+        tokenizer=SimpleNamespace(chat_template="<tool_call><arg_key>"),
+        served_model_name="GLM-5.2",
+        model_path="/models/GLM-5.2",
+    )
+
+    assert server.tool_parser_name == "glm47"
+    assert server.reasoning_parser_name == "glm45"
+
+
+def test_glm5_server_preserves_explicit_parser_overrides():
+    server = OpenAIServer(
+        worker=None,
+        tokenizer=SimpleNamespace(chat_template="<tool_call><arg_key>"),
+        served_model_name="GLM-5.2",
+        model_path="/models/GLM-5.2",
+        tool_call_parser="hermes",
+        reasoning_parser="glm5",
+    )
+
+    assert server.tool_parser_name == "hermes"
+    assert server.reasoning_parser_name == "glm5"
+
+
 def test_detect_glm_parser_from_local_chat_template():
     template = (
         "<tool_call>{function-name}"
@@ -208,7 +245,7 @@ def test_detect_glm_parser_from_local_chat_template():
 
     assert (
         detect_parser_name("/mnt/h_public/GLM-5-Int4-Porvider", "glm5", template)
-        == "glm"
+        == "glm47"
     )
 
 
