@@ -158,8 +158,13 @@ def test_prefill_uses_normal_dispatch_and_local_padding(monkeypatch):
     monkeypatch.setattr(local_dispatch, "LocalPaddedDispatcher", local_cls)
 
     experts = _experts()
-    # Capacity must cover the maximally skewed routing case: T * top_k.
-    expected_max_m = recv_x.shape[0] * experts.top_k
+    # Match the SGLang-aligned masked-GEMM bucket used by the implementation.
+    expected_max_m = max(
+        128,
+        2
+        * (recv_x.shape[0] * experts.top_k + experts.num_local_experts - 1)
+        // experts.num_local_experts,
+    )
     experts._run_masked_experts = Mock(return_value=padded)
     experts._compute_prefill_ep(
         torch.empty(2, 4), torch.tensor([[0, 1], [1, 0]]), torch.ones(2, 2)

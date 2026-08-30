@@ -105,7 +105,7 @@ def test_recurrent_mtp_handoff_rdma_uses_remote_and_local_state_slots(monkeypatc
             self.endpoint = endpoint
 
         def query_connection(self, _):
-            return SimpleNamespace(endpoint=self.endpoint)
+            return SimpleNamespace(endpoint=self.endpoint, transport="rdma")
 
         def get_mr_info(self, peer_alias, name):
             return (
@@ -202,7 +202,7 @@ def test_rdma_reads_submit_all_before_wait_and_drain_after_failure(monkeypatch):
 
     class Agent:
         def query_connection(self, alias):
-            return SimpleNamespace(endpoint=endpoints[alias])
+            return SimpleNamespace(endpoint=endpoints[alias], transport="rdma")
 
         def get_mr_info(self, _peer_alias, name):
             return (
