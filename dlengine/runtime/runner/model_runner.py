@@ -51,6 +51,10 @@ from dlengine.runtime.runner.vision_embed import VisionEmbedManager
 from dlengine.utils.network import get_free_port, get_local_ip
 
 
+def _supports_multi_step_mtp(hardware: str) -> bool:
+    return hardware in {"hopper", "blackwell"}
+
+
 def _wire_mla_hisparse_modules(
     modules, hot_cache: torch.Tensor, layer_id: int, device
 ) -> int:
@@ -450,9 +454,10 @@ class ModelRunner:
                     "multi-step MTP is currently supported only for "
                     "GlmMoeDsaForCausalLM"
                 )
-            if backend_selection.hardware != "hopper":
+            if not _supports_multi_step_mtp(backend_selection.hardware):
                 raise ValueError(
-                    "GLM multi-step MTP currently requires the Hopper backend"
+                    "GLM multi-step MTP currently requires the Hopper or "
+                    "Blackwell backend"
                 )
         model_loader = architecture_loaders.get(model_architecture)
         if model_loader is None:

@@ -5,8 +5,39 @@ from torch import nn
 
 import dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp as mtp_module
 import dlengine.runtime.models.deepseek_v2.deepseek_v2_mtp_loader as loader_module
+import dlengine.runtime.runner.model_runner as model_runner_module
+import dlengine.runtime.runner.mtp_runner as mtp_runner_module
 from dlengine.engine.llm_component import LLMComponent
 from dlengine.runtime.runner.model_runner import _wire_mla_hisparse_modules
+
+
+def test_glm_mtp_honors_predictor_quantization_ignore():
+    config = SimpleNamespace(
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "ignore": ["model.layers.78*"],
+        }
+    )
+
+    predictor = mtp_module._mtp_layer_quantization_config(config, 78)
+    base = mtp_module._mtp_layer_quantization_config(config, 77)
+
+    assert predictor.quant_method is None
+    assert not predictor.is_modelopt_nvfp4
+    assert base.is_modelopt_nvfp4
+
+
+def test_multi_step_mtp_backend_support_includes_blackwell():
+    assert model_runner_module._supports_multi_step_mtp("hopper")
+    assert model_runner_module._supports_multi_step_mtp("blackwell")
+    assert not model_runner_module._supports_multi_step_mtp("gpu_generic")
+
+
+def test_flash_mla_metadata_is_not_used_on_blackwell():
+    config = SimpleNamespace(kv_lora_rank=512)
+    assert mtp_runner_module._requires_flash_mla_metadata(config, (9, 0))
+    assert not mtp_runner_module._requires_flash_mla_metadata(config, (10, 0))
 
 
 class _FakeMTPLayer(nn.Module):

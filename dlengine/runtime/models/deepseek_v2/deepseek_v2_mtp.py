@@ -8,6 +8,8 @@ through a full DeepseekV2DecoderLayer.
 Reference: vLLM deepseek_mtp.py
 """
 
+import fnmatch
+
 import torch
 import torch.nn as nn
 
@@ -19,6 +21,18 @@ from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
 )
 from dlengine.runtime.models.quant_config import QuantizationConfig
 from dlengine.runtime.models.pp_utils import get_pp_layer_range
+
+
+def _mtp_layer_quantization_config(config, layer_idx: int) -> QuantizationConfig:
+    """Resolve predictor quantization using the checkpoint's ignore patterns."""
+    raw_config = getattr(config, "quantization_config", None) or {}
+    layer_name = f"model.layers.{layer_idx}"
+    ignored = any(
+        fnmatch.fnmatchcase(layer_name, pattern)
+        or fnmatch.fnmatchcase(f"{layer_name}.", pattern)
+        for pattern in raw_config.get("ignore", ())
+    )
+    return QuantizationConfig() if ignored else QuantizationConfig(**raw_config)
 
 
 class DeepSeekMTPSharedHead(nn.Module):
@@ -124,7 +138,7 @@ class DeepSeekMTP(nn.Module):
             {
                 str(idx): DeepSeekMTPLayer(
                     config,
-                    self.quantization_config,
+                    _mtp_layer_quantization_config(config, idx),
                     idx,
                     cache_layer_idx=self.mtp_cache_start_idx
                     + idx

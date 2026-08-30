@@ -28,6 +28,11 @@ from dlengine.runtime.runner.input_preparer import prepare_sample_from_aux
 logger = get_logger("DLENGINE")
 
 
+def _requires_flash_mla_metadata(hf_config, cuda_capability: tuple[int, int]) -> bool:
+    """Hopper MLA uses flash-mla metadata; Blackwell uses FlashInfer instead."""
+    return getattr(hf_config, "kv_lora_rank", 0) > 0 and cuda_capability[0] < 10
+
+
 def _nonempty_ragged_bounds(
     cu_seqlens: torch.Tensor, num_seqs: int
 ) -> list[int] | None:
@@ -517,7 +522,10 @@ class MTPRunner:
         context.slot_mapping = slot_mapping.to(torch.int32).reshape(-1)
         context.num_tokens_per_seq = width
 
-        if getattr(self.config.hf_config, "kv_lora_rank", 0) > 0:
+        if _requires_flash_mla_metadata(
+            self.config.hf_config,
+            torch.cuda.get_device_capability(),
+        ):
             import flash_mla
 
             tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()

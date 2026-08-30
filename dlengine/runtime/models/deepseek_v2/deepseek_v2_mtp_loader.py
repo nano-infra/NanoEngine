@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from dlengine.logging import get_logger
+from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.runner.loader import (
     _dequant_fp8_block,
     default_weight_loader,
@@ -205,6 +206,20 @@ def load_weights(
 
         # Per-expert weights
         if "experts." in name and EXPERT_RE.match(name):
+            match = EXPERT_RE.match(name)
+            expert_module = model.get_submodule(f"{match.group(1)}.routed_experts")
+            custom_loader = getattr(expert_module, "load_expert_weight", None)
+            if callable(custom_loader):
+                ctx = get_dist_context()
+                if custom_loader(
+                    int(match.group(2)),
+                    match.group(3),
+                    match.group(4),
+                    tensor,
+                    ep_rank=getattr(ctx, "ffn_ep_rank", 0),
+                ):
+                    loaded_count += 1
+                    continue
             if load_per_expert_weight(model, name, tensor, config):
                 loaded_count += 1
                 continue

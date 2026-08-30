@@ -198,3 +198,34 @@ def test_blackwell_raw_fp8_sparse_mla_uses_sparse_page_table(monkeypatch):
     assert call["block_tables"].dtype == torch.int32
     assert call["sparse_mla_top_k"] == 3
     assert call["max_seq_len"] == 7
+
+
+def test_blackwell_raw_fp8_sparse_mla_preserves_multi_token_rows(monkeypatch):
+    calls = []
+    impl = _make_blackwell_mla(monkeypatch, calls)
+    batch_size = 2
+    tokens_per_seq = 3
+    q = torch.zeros(batch_size * tokens_per_seq, 8, 576, dtype=torch.bfloat16)
+    k = torch.zeros(batch_size * tokens_per_seq, 1, 576, dtype=torch.bfloat16)
+    sparse_indices = torch.arange(24, dtype=torch.int64).reshape(6, 4)
+    set_batch_context(
+        is_prefill=False,
+        context_lens=torch.tensor([[7, 9]], dtype=torch.int32),
+        block_tables=torch.tensor([[[0], [1]]], dtype=torch.int32),
+        num_tokens_per_seq=tokens_per_seq,
+    )
+
+    impl.forward(
+        q,
+        k,
+        torch.empty(0),
+        sparse_indices=sparse_indices,
+        write_kv_cache=False,
+    )
+
+    call = calls[0]
+    assert call["block_tables"].shape == (batch_size, tokens_per_seq, 4)
+    assert torch.equal(
+        call["block_tables"], sparse_indices.to(torch.int32).reshape(2, 3, 4)
+    )
+    assert call["sparse_mla_top_k"] == 4
