@@ -465,7 +465,12 @@ class LLMComponent(LLM):
 
         zmq_host = get_advertise_host(self.config.host)
 
+        from dlengine.runtime.context.peer import normalize_peer_placements
+
         peer_addrs = self.executor.get_peer_agent_addrs()
+        placements = normalize_peer_placements(
+            self.executor.get_peer_agent_placements(), self.config.world_size
+        )
         # Compute gdn_num_slots to match allocate_gdn_states logic. The active
         # region includes gdn_state_cache_slots parked slots for session-scoped
         # state caching, so active = max_num_seqs + gdn_state_cache_slots:
@@ -557,6 +562,7 @@ class LLMComponent(LLM):
             kind=self.config.mode,
             endpoint={"host": zmq_host, "port": self.config.port},
             metadata=metadata,
+            resource={"schema_version": 1, "placements": placements},
         )
         if ok:
             # start_heartbeat is a no-op if the thread is already running

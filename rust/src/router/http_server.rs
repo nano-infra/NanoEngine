@@ -54,7 +54,7 @@ fn check_engine_availability(pool: &ModelPool) -> Option<Response> {
     if pool.get_next_http_hybrid().is_some() {
         return None;
     }
-    if pool.get_next_http_prefill().is_some() && pool.get_next_http_decode().is_some() {
+    if pool.get_next_http_pd_pair().is_some() {
         return None;
     }
     Some(
@@ -302,14 +302,11 @@ async fn route_generation_request(
         if let Some(url) = pool.get_next_http_hybrid() {
             HttpRoute::Hybrid(url.to_string())
         } else {
-            let prefill_url = pool
-                .get_next_http_prefill()
-                .expect("prefill checked above")
-                .to_string();
-            let decode_url = pool
-                .get_next_http_decode()
-                .expect("decode checked above")
-                .to_string();
+            let (prefill_url, decode_url) = pool
+                .get_next_http_pd_pair()
+                .expect("compatible PD pair checked above");
+            let prefill_url = prefill_url.to_string();
+            let decode_url = decode_url.to_string();
             HttpRoute::Pd {
                 prefill_url,
                 decode_url,
@@ -500,6 +497,7 @@ mod tests {
                 .then(|| "http://decode".to_string())
                 .into_iter()
                 .collect(),
+            http_engine_fabric_domains: Default::default(),
         }
     }
 

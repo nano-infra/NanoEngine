@@ -10,12 +10,12 @@ pub struct ModelPool {
     pub http_hybrid_engines: Vec<String>,
     pub http_prefill_engines: Vec<String>,
     pub http_decode_engines: Vec<String>,
+    pub http_engine_fabric_domains: HashMap<String, HashSet<String>>,
 }
 
 impl ModelPool {
     pub fn has_http_route(&self) -> bool {
-        !self.http_hybrid_engines.is_empty()
-            || (!self.http_prefill_engines.is_empty() && !self.http_decode_engines.is_empty())
+        !self.http_hybrid_engines.is_empty() || self.get_next_http_pd_pair().is_some()
     }
 
     pub fn get_next_http_hybrid(&self) -> Option<&str> {
@@ -29,12 +29,41 @@ impl ModelPool {
     pub fn get_next_http_decode(&self) -> Option<&str> {
         self.http_decode_engines.first().map(String::as_str)
     }
+
+    pub fn get_next_http_pd_pair(&self) -> Option<(&str, &str)> {
+        for prefill in &self.http_prefill_engines {
+            let prefill_domains = self
+                .http_engine_fabric_domains
+                .get(prefill)
+                .cloned()
+                .unwrap_or_default();
+            for decode in &self.http_decode_engines {
+                let decode_domains = self
+                    .http_engine_fabric_domains
+                    .get(decode)
+                    .cloned()
+                    .unwrap_or_default();
+                let compatible = if prefill_domains.is_empty() && decode_domains.is_empty() {
+                    true
+                } else if prefill_domains.is_empty() || decode_domains.is_empty() {
+                    false
+                } else {
+                    !prefill_domains.is_disjoint(&decode_domains)
+                };
+                if compatible {
+                    return Some((prefill.as_str(), decode.as_str()));
+                }
+            }
+        }
+        None
+    }
 }
 
 struct HttpEngineInfo {
     engine_id: String,
     role: String,
     url: String,
+    fabric_domains: HashSet<String>,
 }
 
 pub struct EngineManager {
@@ -134,10 +163,24 @@ impl EngineManager {
             .unwrap_or("hybrid")
             .to_ascii_lowercase();
         let engine_id = Self::entity_id(info).unwrap_or_else(|| "unknown".to_string());
+        let fabric_domains = info
+            .get("resource")
+            .and_then(|value| value.get("placements"))
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|placement| {
+                placement
+                    .get("fabric_domain_id")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .collect();
         Some(HttpEngineInfo {
             engine_id,
             role,
             url: format!("{}://{}:{}", protocol, connect_host, port),
+            fabric_domains,
         })
     }
 
@@ -173,6 +216,8 @@ impl EngineManager {
         if !engines.contains(&info.url) {
             engines.push(info.url.clone());
         }
+        pool.http_engine_fabric_domains
+            .insert(info.url.clone(), info.fabric_domains.clone());
         info!(
             "Added HTTP {} engine: {} -> {} for model {}",
             info.role, info.engine_id, info.url, model_key
@@ -316,6 +361,7 @@ impl EngineManager {
             pool.http_hybrid_engines.retain(|u| u != &url);
             pool.http_prefill_engines.retain(|u| u != &url);
             pool.http_decode_engines.retain(|u| u != &url);
+            pool.http_engine_fabric_domains.remove(&url);
         }
         self.engine_model_map.remove(engine_id);
         info!("Removed HTTP DLEngine node: {} -> {}", engine_id, url);
@@ -371,5 +417,71 @@ impl EngineManager {
         }
 
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pd_pool(prefill_domains: &[&str], decode_domains: &[&str]) -> ModelPool {
+        let prefill = "http://prefill".to_string();
+        let decode = "http://decode".to_string();
+        let mut domains = HashMap::new();
+        domains.insert(
+            prefill.clone(),
+            prefill_domains
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        );
+        domains.insert(
+            decode.clone(),
+            decode_domains
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        );
+        ModelPool {
+            http_prefill_engines: vec![prefill],
+            http_decode_engines: vec![decode],
+            http_engine_fabric_domains: domains,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pd_pair_preserves_rdma_when_both_placements_are_empty() {
+        assert!(pd_pool(&[], &[]).get_next_http_pd_pair().is_some());
+    }
+
+    #[test]
+    fn pd_pair_accepts_intersecting_fabric_domains() {
+        assert!(pd_pool(&["fabric-a", "fabric-b"], &["fabric-b"])
+            .get_next_http_pd_pair()
+            .is_some());
+    }
+
+    #[test]
+    fn pd_pair_rejects_disjoint_fabric_domains() {
+        assert!(pd_pool(&["fabric-a"], &["fabric-b"])
+            .get_next_http_pd_pair()
+            .is_none());
+    }
+
+    #[test]
+    fn pd_pair_rejects_one_sided_fabric_metadata() {
+        assert!(pd_pool(&["fabric-a"], &[])
+            .get_next_http_pd_pair()
+            .is_none());
+        assert!(pd_pool(&[], &["fabric-a"])
+            .get_next_http_pd_pair()
+            .is_none());
+    }
+
+    #[test]
+    fn hybrid_route_is_independent_of_pd_placement() {
+        let mut pool = pd_pool(&["fabric-a"], &["fabric-b"]);
+        pool.http_hybrid_engines.push("http://hybrid".to_string());
+        assert!(pool.has_http_route());
     }
 }
