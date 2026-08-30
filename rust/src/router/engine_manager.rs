@@ -10,7 +10,13 @@ pub struct ModelPool {
     pub http_hybrid_engines: Vec<String>,
     pub http_prefill_engines: Vec<String>,
     pub http_decode_engines: Vec<String>,
-    pub http_engine_fabric_domains: HashMap<String, HashSet<String>>,
+    pub http_engine_fabric_placements: HashMap<String, HttpFabricPlacement>,
+}
+
+#[derive(Clone, Default)]
+pub struct HttpFabricPlacement {
+    pub advertised: bool,
+    pub routes: HashSet<String>,
 }
 
 impl ModelPool {
@@ -32,23 +38,25 @@ impl ModelPool {
 
     pub fn get_next_http_pd_pair(&self) -> Option<(&str, &str)> {
         for prefill in &self.http_prefill_engines {
-            let prefill_domains = self
-                .http_engine_fabric_domains
+            let prefill_placement = self
+                .http_engine_fabric_placements
                 .get(prefill)
                 .cloned()
                 .unwrap_or_default();
             for decode in &self.http_decode_engines {
-                let decode_domains = self
-                    .http_engine_fabric_domains
+                let decode_placement = self
+                    .http_engine_fabric_placements
                     .get(decode)
                     .cloned()
                     .unwrap_or_default();
-                let compatible = if prefill_domains.is_empty() && decode_domains.is_empty() {
+                let compatible = if !prefill_placement.advertised && !decode_placement.advertised {
                     true
-                } else if prefill_domains.is_empty() || decode_domains.is_empty() {
+                } else if !prefill_placement.advertised || !decode_placement.advertised {
                     false
                 } else {
-                    !prefill_domains.is_disjoint(&decode_domains)
+                    !prefill_placement
+                        .routes
+                        .is_disjoint(&decode_placement.routes)
                 };
                 if compatible {
                     return Some((prefill.as_str(), decode.as_str()));
@@ -63,7 +71,7 @@ struct HttpEngineInfo {
     engine_id: String,
     role: String,
     url: String,
-    fabric_domains: HashSet<String>,
+    fabric_placement: HttpFabricPlacement,
 }
 
 pub struct EngineManager {
@@ -163,24 +171,39 @@ impl EngineManager {
             .unwrap_or("hybrid")
             .to_ascii_lowercase();
         let engine_id = Self::entity_id(info).unwrap_or_else(|| "unknown".to_string());
-        let fabric_domains = info
+        let placements = info
             .get("resource")
             .and_then(|value| value.get("placements"))
-            .and_then(|value| value.as_array())
+            .and_then(|value| value.as_array());
+        let advertised = placements.is_some_and(|placements| !placements.is_empty());
+        let routes = placements
             .into_iter()
             .flatten()
-            .filter_map(|placement| {
-                placement
+            .map(|placement| {
+                let Some(domain) = placement
                     .get("fabric_domain_id")
                     .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
+                else {
+                    return HashSet::new();
+                };
+                placement
+                    .get("imex_channel_ids")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|channel| channel.as_u64())
+                    .map(|channel| format!("{domain}:{channel}"))
+                    .collect()
             })
-            .collect();
+            .reduce(|common: HashSet<String>, current| {
+                common.intersection(&current).cloned().collect()
+            })
+            .unwrap_or_default();
         Some(HttpEngineInfo {
             engine_id,
             role,
             url: format!("{}://{}:{}", protocol, connect_host, port),
-            fabric_domains,
+            fabric_placement: HttpFabricPlacement { advertised, routes },
         })
     }
 
@@ -216,8 +239,8 @@ impl EngineManager {
         if !engines.contains(&info.url) {
             engines.push(info.url.clone());
         }
-        pool.http_engine_fabric_domains
-            .insert(info.url.clone(), info.fabric_domains.clone());
+        pool.http_engine_fabric_placements
+            .insert(info.url.clone(), info.fabric_placement.clone());
         info!(
             "Added HTTP {} engine: {} -> {} for model {}",
             info.role, info.engine_id, info.url, model_key
@@ -361,7 +384,7 @@ impl EngineManager {
             pool.http_hybrid_engines.retain(|u| u != &url);
             pool.http_prefill_engines.retain(|u| u != &url);
             pool.http_decode_engines.retain(|u| u != &url);
-            pool.http_engine_fabric_domains.remove(&url);
+            pool.http_engine_fabric_placements.remove(&url);
         }
         self.engine_model_map.remove(engine_id);
         info!("Removed HTTP DLEngine node: {} -> {}", engine_id, url);
@@ -423,28 +446,23 @@ impl EngineManager {
 mod tests {
     use super::*;
 
-    fn pd_pool(prefill_domains: &[&str], decode_domains: &[&str]) -> ModelPool {
+    fn placement(routes: &[&str]) -> HttpFabricPlacement {
+        HttpFabricPlacement {
+            advertised: !routes.is_empty(),
+            routes: routes.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    fn pd_pool(prefill_routes: &[&str], decode_routes: &[&str]) -> ModelPool {
         let prefill = "http://prefill".to_string();
         let decode = "http://decode".to_string();
-        let mut domains = HashMap::new();
-        domains.insert(
-            prefill.clone(),
-            prefill_domains
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-        );
-        domains.insert(
-            decode.clone(),
-            decode_domains
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-        );
+        let mut placements = HashMap::new();
+        placements.insert(prefill.clone(), placement(prefill_routes));
+        placements.insert(decode.clone(), placement(decode_routes));
         ModelPool {
             http_prefill_engines: vec![prefill],
             http_decode_engines: vec![decode],
-            http_engine_fabric_domains: domains,
+            http_engine_fabric_placements: placements,
             ..Default::default()
         }
     }
@@ -455,32 +473,46 @@ mod tests {
     }
 
     #[test]
-    fn pd_pair_accepts_intersecting_fabric_domains() {
-        assert!(pd_pool(&["fabric-a", "fabric-b"], &["fabric-b"])
+    fn pd_pair_accepts_common_fabric_route() {
+        assert!(pd_pool(&["fabric-a:0", "fabric-a:1"], &["fabric-a:1"])
             .get_next_http_pd_pair()
             .is_some());
     }
 
     #[test]
-    fn pd_pair_rejects_disjoint_fabric_domains() {
-        assert!(pd_pool(&["fabric-a"], &["fabric-b"])
+    fn pd_pair_rejects_disjoint_imex_channels() {
+        assert!(pd_pool(&["fabric-a:0"], &["fabric-a:1"])
             .get_next_http_pd_pair()
             .is_none());
     }
 
     #[test]
     fn pd_pair_rejects_one_sided_fabric_metadata() {
-        assert!(pd_pool(&["fabric-a"], &[])
+        assert!(pd_pool(&["fabric-a:0"], &[])
             .get_next_http_pd_pair()
             .is_none());
-        assert!(pd_pool(&[], &["fabric-a"])
+        assert!(pd_pool(&[], &["fabric-a:0"])
             .get_next_http_pd_pair()
             .is_none());
     }
 
     #[test]
+    fn fabric_metadata_without_common_route_is_not_rdma() {
+        let mut pool = pd_pool(&[], &["fabric-a:0"]);
+        pool.http_engine_fabric_placements.insert(
+            "http://prefill".to_string(),
+            HttpFabricPlacement {
+                advertised: true,
+                routes: HashSet::new(),
+            },
+        );
+        assert!(pool.get_next_http_pd_pair().is_none());
+    }
+
+    #[test]
+
     fn hybrid_route_is_independent_of_pd_placement() {
-        let mut pool = pd_pool(&["fabric-a"], &["fabric-b"]);
+        let mut pool = pd_pool(&["fabric-a:0"], &["fabric-a:1"]);
         pool.http_hybrid_engines.push("http://hybrid".to_string());
         assert!(pool.has_http_route());
     }

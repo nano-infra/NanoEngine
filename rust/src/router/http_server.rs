@@ -497,7 +497,7 @@ mod tests {
                 .then(|| "http://decode".to_string())
                 .into_iter()
                 .collect(),
-            http_engine_fabric_domains: Default::default(),
+            http_engine_fabric_placements: Default::default(),
         }
     }
 
