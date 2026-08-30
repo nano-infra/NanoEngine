@@ -7,6 +7,33 @@ from typing import Any
 from dlengine.runtime.context import BaseContext
 
 
+def normalize_peer_placements(
+    placements: list[dict | None], world_size: int
+) -> list[dict]:
+    """Validate an engine's placement publication or preserve RDMA mode."""
+    if len(placements) != world_size:
+        raise RuntimeError(
+            f"Engine expected {world_size} worker placements, got {len(placements)}"
+        )
+    present = [placement for placement in placements if placement is not None]
+    if not present:
+        return []
+    if len(present) != world_size:
+        raise RuntimeError(
+            "Engine has partial Fabric placement metadata; every worker must "
+            "publish placement or every worker must use the RDMA path"
+        )
+    ranks = sorted(int(placement["rank"]) for placement in present)
+    if ranks != list(range(world_size)):
+        raise RuntimeError(f"Engine placement ranks are invalid: {ranks}")
+    domains = {str(placement["fabric_domain_id"]) for placement in present}
+    if len(domains) != 1:
+        raise RuntimeError(
+            f"Engine workers span incompatible Fabric domains: {sorted(domains)}"
+        )
+    return sorted(present, key=lambda placement: int(placement["rank"]))
+
+
 @dataclass
 class PeerContext(BaseContext):
     """Owns the worker PeerAgent lifecycle and transport settings."""
@@ -108,6 +135,35 @@ class PeerContext(BaseContext):
             if (accelerator.get("mnnvl") or {}).get("membership_ready")
         ]
         return len(ready) == 1 and bool(imex_channels)
+
+    def local_placement(self) -> dict[str, Any] | None:
+        """Return normalized placement metadata for the visible Fabric GPU."""
+        if not self.supports_cuda_fabric():
+            return None
+        resource = self.agent.get_resource(self.alias) or {}
+        cuda_caps = (resource.get("runtime_capabilities") or {}).get("cuda") or {}
+        accelerators = [
+            accelerator
+            for accelerator in (resource.get("accelerators") or [])
+            if (accelerator.get("mnnvl") or {}).get("membership_ready")
+        ]
+        accelerator = accelerators[0]
+        fabric = accelerator["mnnvl"]
+        cluster_uuid = str(fabric["cluster_uuid"]).lower()
+        clique_id = int(fabric["clique_id"])
+        return {
+            "rank": self.rank,
+            "peer_agent_id": self.alias,
+            "gpu_uuid": accelerator["uuid"],
+            "cluster_uuid": cluster_uuid,
+            "clique_id": clique_id,
+            "fabric_domain_id": f"{cluster_uuid}:{clique_id}",
+            "topology_epoch": int(resource.get("topology_epoch", 0)),
+            "membership_ready": True,
+            "imex_channel_ids": list(
+                ((cuda_caps.get("imex") or {}).get("channel_ids") or [])
+            ),
+        }
 
     def allocate_tensor(
         self, name: str, shape: tuple[int, ...], dtype: Any, *, zero: bool = False
@@ -216,4 +272,4 @@ def _select_cache_peer_device() -> str | None:
     return select_peer_device()
 
 
-__all__ = ["PeerAgentContext", "PeerContext"]
+__all__ = ["PeerAgentContext", "PeerContext", "normalize_peer_placements"]

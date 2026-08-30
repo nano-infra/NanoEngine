@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from dlengine.runtime.context.cache._allocator import allocate_device_tensor
-from dlengine.runtime.context.peer import PeerContext
+from dlengine.runtime.context.peer import normalize_peer_placements, PeerContext
 from dlengine.runtime.disagg.p2p.cache_transfer import _validate_named_region_ops
 from dlengine.runtime.layers.indexer import IndexerCache
 
@@ -22,10 +22,32 @@ def test_fabric_capability_requires_one_ready_gpu_and_imex_channel():
     agent = Mock()
     agent.get_resource.return_value = {
         "runtime_capabilities": {"cuda": {"imex": {"channel_ids": [0]}}},
-        "accelerators": [{"uuid": "GPU-a", "mnnvl": {"membership_ready": True}}],
+        "accelerators": [
+            {
+                "uuid": "GPU-a",
+                "mnnvl": {
+                    "membership_ready": True,
+                    "cluster_uuid": "CLUSTER-A",
+                    "clique_id": 7,
+                },
+            }
+        ],
+        "topology_epoch": 3,
     }
 
-    assert _peer_context(agent).supports_cuda_fabric()
+    context = _peer_context(agent)
+    assert context.supports_cuda_fabric()
+    assert context.local_placement() == {
+        "rank": 0,
+        "peer_agent_id": "engine:0",
+        "gpu_uuid": "GPU-a",
+        "cluster_uuid": "cluster-a",
+        "clique_id": 7,
+        "fabric_domain_id": "cluster-a:7",
+        "topology_epoch": 3,
+        "membership_ready": True,
+        "imex_channel_ids": [0],
+    }
 
     agent.get_resource.return_value["runtime_capabilities"]["cuda"]["imex"][
         "channel_ids"
@@ -105,3 +127,27 @@ def test_named_region_bounds_are_checked_before_submission():
             [("kv_cache", "kv_cache", 1, 64, 64)],
             {"kv_cache": 64},
         )
+
+
+def _placement(rank: int, domain: str = "fabric-a") -> dict:
+    return {"rank": rank, "fabric_domain_id": domain}
+
+
+def test_engine_placement_validation_preserves_all_rdma_workers():
+    assert normalize_peer_placements([None, None], 2) == []
+
+
+def test_engine_placement_validation_sorts_one_fabric_domain():
+    placements = [_placement(1), _placement(0)]
+
+    assert normalize_peer_placements(placements, 2) == [
+        _placement(0),
+        _placement(1),
+    ]
+
+
+def test_engine_placement_validation_rejects_partial_or_mixed_domains():
+    with pytest.raises(RuntimeError, match="partial Fabric placement"):
+        normalize_peer_placements([_placement(0), None], 2)
+    with pytest.raises(RuntimeError, match="incompatible Fabric domains"):
+        normalize_peer_placements([_placement(0), _placement(1, "fabric-b")], 2)

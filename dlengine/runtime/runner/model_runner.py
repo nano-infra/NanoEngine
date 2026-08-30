@@ -982,6 +982,12 @@ class ModelRunner:
         """Return the peer agent address for this rank."""
         return self.cache_transfer.get_peer_agent_addr()
 
+    def get_peer_agent_placement(self) -> dict | None:
+        """Return normalized Fabric placement for this worker, when available."""
+        if self.peer_agent_context is None:
+            return None
+        return self.peer_agent_context.local_placement()
+
     def start_dlslime_server(self, driver_alias: str) -> str:
         """Start a dedicated DLSLime server for executor transport."""
         if self._dlslime_alias is not None:

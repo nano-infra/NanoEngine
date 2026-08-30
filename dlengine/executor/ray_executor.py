@@ -429,6 +429,10 @@ class RayExecutor:
         """Get peer agent addresses from all workers."""
         return self.collective_rpc("get_peer_agent_addr")
 
+    def get_peer_agent_placements(self) -> list[dict | None]:
+        """Get normalized per-rank Fabric placements from all workers."""
+        return self.collective_rpc("get_peer_agent_placement")
+
     def p2p_disconnect(self, remote_name: str):
         return self.collective_rpc("p2p_disconnect", (remote_name,))
 

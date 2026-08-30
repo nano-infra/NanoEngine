@@ -1663,11 +1663,22 @@ def register_with_ctrl(
     client.check_connection()
 
     def _do_register() -> bool:
+        resource = None
+        if engine_id is not None:
+            backend = client.get_entity_info(engine_id)
+            if backend is None:
+                logger.error(
+                    "Cannot publish HTTP engine placement: backend entity %s is missing",
+                    engine_id,
+                )
+                return False
+            resource = backend.get("resource")
         return client.register(
             entity_id,
             kind=CTRL_ENTITY_KIND,
             endpoint=endpoint,
             metadata=metadata,
+            resource=resource,
         )
 
     if _do_register():
