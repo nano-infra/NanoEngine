@@ -268,7 +268,7 @@ async fn forward_http_pd(
 
 async fn route_generation_request(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
+    Json(mut payload): Json<Value>,
     endpoint: &'static str,
 ) -> Response {
     let Some(model_key) = request_model(&payload) else {
@@ -282,8 +282,15 @@ async fn route_generation_request(
 
     let route = {
         let mgr = state.engine_manager.lock().await;
-        let pool = match mgr.model_pools.get(&model_key) {
-            Some(pool) => pool,
+        let canonical_model = mgr.resolve_model_key(&model_key).map(str::to_string);
+        let pool = match canonical_model
+            .as_deref()
+            .and_then(|key| mgr.model_pools.get(key))
+        {
+            Some(pool) => {
+                payload["model"] = Value::String(canonical_model.unwrap());
+                pool
+            }
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -358,7 +365,7 @@ async fn anthropic_messages(state: State<Arc<AppState>>, payload: Json<Value>) -
 
 async fn anthropic_count_tokens(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
+    Json(mut payload): Json<Value>,
 ) -> Response {
     let Some(model_key) = request_model(&payload) else {
         return (
@@ -370,8 +377,15 @@ async fn anthropic_count_tokens(
 
     let route = {
         let mgr = state.engine_manager.lock().await;
-        let pool = match mgr.model_pools.get(&model_key) {
-            Some(pool) => pool,
+        let canonical_model = mgr.resolve_model_key(&model_key).map(str::to_string);
+        let pool = match canonical_model
+            .as_deref()
+            .and_then(|key| mgr.model_pools.get(key))
+        {
+            Some(pool) => {
+                payload["model"] = Value::String(canonical_model.unwrap());
+                pool
+            }
             None => {
                 return (
                     StatusCode::NOT_FOUND,

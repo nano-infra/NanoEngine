@@ -110,6 +110,15 @@ impl EngineManager {
         keys
     }
 
+    pub fn resolve_model_key(&self, requested: &str) -> Option<&str> {
+        if let Some((key, _)) = self.model_pools.get_key_value(requested) {
+            return Some(key.as_str());
+        }
+        self.available_model_keys()
+            .into_iter()
+            .find(|key| key.eq_ignore_ascii_case(requested))
+    }
+
     pub fn routable_model_keys(&self) -> Vec<&str> {
         let mut keys: Vec<&str> = self
             .model_pools
@@ -515,5 +524,22 @@ mod tests {
         let mut pool = pd_pool(&["fabric-a:0"], &["fabric-a:1"]);
         pool.http_hybrid_engines.push("http://hybrid".to_string());
         assert!(pool.has_http_route());
+    }
+
+    #[test]
+    fn model_lookup_preserves_canonical_case() {
+        let mut manager = EngineManager::new();
+        manager
+            .model_pools
+            .insert("GLM-5.2-NVFP4".to_string(), ModelPool::default());
+
+        assert_eq!(
+            manager.resolve_model_key("glm-5.2-nvfp4"),
+            Some("GLM-5.2-NVFP4")
+        );
+        assert_eq!(
+            manager.resolve_model_key("GLM-5.2-NVFP4"),
+            Some("GLM-5.2-NVFP4")
+        );
     }
 }
