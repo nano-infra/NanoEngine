@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fig9 DPSK 中心化与去中心化 Scheduler 性能分析</title>
+<style>
+:root {
+  --bg: #eef3f6;
+  --panel: #ffffff;
+  --ink: #14212b;
+  --muted: #62727e;
+  --line: #d8e2e8;
+  --central: #d97706;
+  --central-soft: #ffedd5;
+  --decentral: #047857;
+  --decentral-soft: #d1fae5;
+  --accent: #075985;
+  --accent-soft: #e0f2fe;
+  --danger: #b42318;
+  --danger-soft: #fee4e2;
+  --warn: #9a3412;
+  --warn-soft: #fff1e6;
+  --shadow: 0 8px 28px rgba(20, 33, 43, .07);
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 8% 0%, #d9edf5 0, transparent 28rem),
+    var(--bg);
+  color: var(--ink);
+  font: 15px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1320px; margin: auto; padding: 28px 20px 64px; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -.025em; }
+h2 { margin: 0 0 14px; font-size: 23px; }
+h3 { margin: 0 0 8px; font-size: 17px; }
+p { margin: 8px 0; }
+a { color: var(--accent); }
+code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: #edf3f6;
+  font: .92em ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.hero {
+  position: relative;
+  overflow: hidden;
+  padding: 28px 30px;
+  border: 1px solid #c8dce7;
+  border-left: 6px solid var(--accent);
+  border-radius: 16px;
+  background: linear-gradient(135deg, #fff 0%, #f5fbfe 72%, #e2f3fa 100%);
+  box-shadow: var(--shadow);
+}
+.hero::after {
+  position: absolute;
+  right: -65px;
+  top: -85px;
+  width: 230px;
+  height: 230px;
+  border: 38px solid rgba(7, 89, 133, .06);
+  border-radius: 50%;
+  content: "";
+}
+.eyebrow {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.subtitle { max-width: 920px; color: var(--muted); font-size: 16px; }
+.badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.badge {
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255,255,255,.86);
+  color: #40515d;
+  font-size: 12px;
+  font-weight: 700;
+}
+.tabs {
+  position: sticky;
+  z-index: 10;
+  top: 0;
+  display: flex;
+  gap: 8px;
+  margin: 20px 0 14px;
+  padding: 10px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(238, 243, 246, .92);
+  backdrop-filter: blur(12px);
+}
+.tabs button {
+  flex: 0 0 auto;
+  padding: 9px 15px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: #4d5e69;
+  cursor: pointer;
+  font-weight: 750;
+}
+.tabs button.active { border-color: var(--accent); background: var(--accent); color: white; }
+.tab { display: none; }
+.tab.active { display: block; animation: fade .18s ease-out; }
+@keyframes fade { from { opacity: .5; transform: translateY(3px); } }
+.card {
+  margin-bottom: 14px;
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 3px 14px rgba(20,33,43,.035);
+}
+.grid { display: grid; gap: 14px; }
+.grid.kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; }
+.grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.kpi {
+  min-height: 143px;
+  padding: 17px;
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--accent);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.kpi.central { border-top-color: var(--central); }
+.kpi.decentral { border-top-color: var(--decentral); }
+.kpi.warn { border-top-color: var(--warn); }
+.kpi .label { color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; }
+.kpi strong { display: block; margin: 5px 0 2px; font-size: 30px; line-height: 1.12; }
+.kpi small { color: var(--muted); }
+.callout {
+  margin: 12px 0;
+  padding: 13px 15px;
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+.callout.good { border-left-color: var(--decentral); background: var(--decentral-soft); }
+.callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+.plain-list { margin: 8px 0 0; padding-left: 20px; }
+.plain-list li { margin: 6px 0; }
+.arch {
+  display: grid;
+  grid-template-columns: 1fr 44px 1fr;
+  gap: 10px;
+  align-items: stretch;
+  margin-top: 15px;
+}
+.arch-side { padding: 15px; border: 1px solid var(--line); border-radius: 12px; }
+.arch-side.central { background: #fffaf4; }
+.arch-side.decentral { background: #f2fcf7; }
+.arch-title { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+.central .dot { background: var(--central); }
+.decentral .dot { background: var(--decentral); }
+.flow { display: flex; align-items: center; gap: 7px; margin-top: 14px; }
+.node {
+  flex: 1;
+  padding: 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+.arrow { color: #7a8b96; font-size: 19px; }
+.versus { display: grid; place-items: center; color: var(--muted); font-size: 12px; font-weight: 900; }
+.mini-nodes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; flex: 1.5; }
+.mini-nodes span { padding: 10px 3px; border-radius: 6px; background: #e8f8f0; text-align: center; font-size: 11px; }
+.chart-title { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; }
+.legend span::before { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 2px; content: ""; }
+.legend .lc::before { background: var(--central); }
+.legend .ld::before { background: var(--decentral); }
+.bar-chart { margin-top: 12px; }
+.bar-group { display: grid; grid-template-columns: 126px 1fr; gap: 10px; margin: 12px 0; align-items: center; }
+.bar-label { color: #344550; font-size: 12px; font-weight: 750; }
+.bar-label small { display: block; color: var(--muted); font-weight: 500; }
+.bar-lines { display: grid; gap: 5px; }
+.bar-line { display: grid; grid-template-columns: 1fr 74px; gap: 8px; align-items: center; }
+.track { height: 13px; overflow: hidden; border-radius: 999px; background: #edf2f4; }
+.fill { height: 100%; min-width: 2px; border-radius: inherit; }
+.fill.central { background: linear-gradient(90deg, #f59e0b, var(--central)); }
+.fill.decentral { background: linear-gradient(90deg, #10b981, var(--decentral)); }
+.bar-value { color: #44545f; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th { position: sticky; top: 0; background: #edf3f6; color: #40515d; font-size: 11px; letter-spacing: .03em; text-transform: uppercase; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+tbody tr:hover { background: #f8fbfc; }
+.good-text { color: var(--decentral); font-weight: 800; }
+.bad-text { color: var(--danger); font-weight: 800; }
+.neutral-text { color: var(--warn); font-weight: 800; }
+.pill { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #edf3f6; font-size: 11px; font-weight: 800; }
+.pill.good { background: var(--decentral-soft); color: var(--decentral); }
+.pill.bad { background: var(--danger-soft); color: var(--danger); }
+.metric-def {
+  display: grid;
+  grid-template-columns: 142px 1fr;
+  gap: 9px;
+  padding: 10px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.metric-def:last-child { border-bottom: 0; }
+.metric-def strong { color: #40515d; }
+.footnote { color: var(--muted); font-size: 12px; }
+.source-list { display: grid; gap: 8px; }
+.source-list a { display: block; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fbfc; text-decoration: none; }
+.source-list a:hover { border-color: var(--accent); }
+footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: center; }
+@media (max-width: 940px) {
+  .grid.kpis, .grid.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid.two, .arch { grid-template-columns: 1fr; }
+  .versus { min-height: 24px; }
+}
+@media (max-width: 620px) {
+  main { padding: 16px 10px 42px; }
+  .hero, .card { padding: 17px 15px; }
+  .grid.kpis, .grid.three { grid-template-columns: 1fr; }
+  .bar-group { grid-template-columns: 95px 1fr; }
+  .metric-def { grid-template-columns: 1fr; gap: 2px; }
+}
+</style>
+</head>
+<body>
+<main>
+<header class="hero">
+  <div class="eyebrow">NanoDeploy · Scheduler CPU analysis</div>
+  <h1>Fig9 DPSK：中心化与去中心化性能对比</h1>
+  <p class="subtitle">基于 2026-08-31 本机 full-sampling 结果。比较混合 admission + decode 场景下的 scheduler-only critical path，并把延迟收益、尾延迟、aggregate CPU 成本和控制面边界分开解释。</p>
+  <div class="badges">
+    <span class="badge">10 / 10 case PASS</span>
+    <span class="badge">4 / 32 logical nodes</span>
+    <span class="badge">Admission n=10 / case</span>
+    <span class="badge">Decode n=100 / case</span>
+    <span class="badge">CPU-only · CUDA hidden</span>
+    <span class="badge">seed=0</span>
+  </div>
+</header>
+
+<nav class="tabs" aria-label="报告页签">
+  <button class="active" data-tab="summary">结论</button>
+  <button data-tab="admission">Admission</button>
+  <button data-tab="decode">Decode</button>
+  <button data-tab="scaling">扩展性与 CPU 成本</button>
+  <button data-tab="method">口径与限制</button>
+</nav>
+
+<section id="summary" class="tab active">
+  <div class="grid kpis">
+    <article class="kpi decentral">
+      <div class="label">32-node admission critical path</div>
+      <strong>5.87×</strong>
+      <small>去中心化几何平均加速；逐点 4.67–8.80×，5/5 胜出。</small>
+    </article>
+    <article class="kpi decentral">
+      <div class="label">32-node decode mean</div>
+      <strong>13.27×</strong>
+      <small>去中心化几何平均加速；逐点 11.96–15.82×。</small>
+    </article>
+    <article class="kpi">
+      <div class="label">4-node decode mean</div>
+      <strong>2.45×</strong>
+      <small>去中心化几何平均加速；5/5 workload 均更快。</small>
+    </article>
+    <article class="kpi warn">
+      <div class="label">32-node aggregate decode CPU</div>
+      <strong>+20.8%</strong>
+      <small>相对中心化的几何平均总 CPU 增量；低 critical path 不等于少做工作。</small>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>一句话结论</h2>
+    <div class="callout good"><strong>结果支持“去中心化能显著压低大规模 scheduler critical path”。</strong>在 32 logical nodes 模型中，admission 和 decode mean 对所有五个 Fig9 点都取得明确优势；decode 的 4→32 扩展倍率从中心化的 9.83× 降到去中心化 critical path 的 1.82×。</div>
+    <div class="callout warn"><strong>结果不支持“去中心化端到端一定更快”或“去中心化总 CPU 更少”。</strong>32-node 是单机上的独立 LocalScheduler replica 模型；Router、transport、receipt、barrier、Ray/RDMA 和 GPU 均不在主指标中。去中心化 aggregate CPU 更高，完整控制面诊断也明显高于主 critical path。</div>
+  </article>
+
+  <article class="card">
+    <h2>延迟路径为什么变短</h2>
+    <div class="arch">
+      <div class="arch-side central">
+        <div class="arch-title"><span class="dot"></span>中心化</div>
+        <div class="flow">
+          <div class="node">全局请求集 N</div><span class="arrow">→</span><div class="node">单个 Scheduler</div>
+        </div>
+        <p class="footnote">主 critical path 随全局请求规模增长；32-node 模型中一个 Scheduler 处理 8× 请求。</p>
+      </div>
+      <div class="versus">VS</div>
+      <div class="arch-side decentral">
+        <div class="arch-title"><span class="dot"></span>去中心化</div>
+        <div class="flow">
+          <div class="node">Router<br><small>主指标外</small></div><span class="arrow">→</span>
+          <div class="mini-nodes"><span>L0</span><span>L1</span><span>…</span><span>Ln</span></div>
+        </div>
+        <p class="footnote">主延迟取 <code>max(local)</code>；总 CPU 取 <code>sum(local)</code>。收益来自可并行分片。</p>
+      </div>
+    </div>
+  </article>
+
+  <div class="grid two">
+    <article class="card">
+      <h2>可以主张的结论</h2>
+      <ul class="plain-list">
+        <li><strong>4-node CPU 模型：</strong>decode mean 稳定改善 2.16–2.79×；admission 没有一致优势。</li>
+        <li><strong>32-node replica 模型：</strong>admission critical path 改善 4.67–8.80×，decode mean 改善 11.96–15.82×。</li>
+        <li><strong>尾部：</strong>32-node decode P99 在全部点改善 1.97–3.17×，但收益小于 mean，说明 <code>max(local)</code> 仍受局部抖动影响。</li>
+        <li><strong>正确性：</strong>40/40 架构×阶段结果格通过，请求数、SP1/SP8 分布和 live decode 状态均满足 gate。</li>
+      </ul>
+    </article>
+    <article class="card">
+      <h2>不能直接主张的结论</h2>
+      <ul class="plain-list">
+        <li>不能把 32-node 模型写成真实 256-GPU 分布式 wall-clock。</li>
+        <li>不能从 scheduler slice 推导端到端 TPOT、吞吐或用户延迟。</li>
+        <li>不能忽略 Router/receipt/transport/consensus 后声称完整控制面已获得同等加速。</li>
+        <li>不能把单 seed、10 次 admission 样本用于稳定 P99 或跨 workload 单调性结论。</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<section id="admission" class="tab">
+  <div class="grid two">
+    <article class="card">
+      <div class="chart-title"><h2>4 logical nodes · Admission Mean</h2><div class="legend"><span class="lc">中心化</span><span class="ld">去中心化</span></div></div>
+      <div id="admission-chart-4" class="bar-chart"></div>
+    </article>
+    <article class="card">
+      <div class="chart-title"><h2>32 logical nodes · Admission Mean</h2><div class="legend"><span class="lc">中心化</span><span class="ld">去中心化</span></div></div>
+      <div id="admission-chart-32" class="bar-chart"></div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>逐点对比</h2>
+    <p class="footnote">加速比 = 中心化 mean / 去中心化 critical-path mean；大于 1 表示去中心化更快。Pending SP8 是从固定 seed=0 的 workload 生成器重算出的本轮新入队长请求数。</p>
+    <div class="table-wrap"><table id="admission-table"></table></div>
+  </article>
+
+  <div class="grid two">
+    <article class="card">
+      <h2>4-node：Admission 结论不稳定</h2>
+      <p>去中心化只在 2/5 点胜出；几何平均加速 1.11×，但中位加速仅 0.95×。这不足以形成“4-node admission 普遍更快”的结论。</p>
+      <div class="callout warn"><strong>主要混杂因素是新 cohort 的 SP8 构成。</strong><code>issue5_r50</code> 的 80 个新请求中没有 SP8 请求，因此中心化 admission 只有 0.946 ms；<code>r40/r45</code> 分别含 5/7 个新 SP8 请求，中心化耗时跃升到 40.736/24.408 ms。跨点非单调主要反映 workload composition，而非 rate 单变量响应。</div>
+      <p class="footnote">同一 case 内中心化和去中心化使用相同请求集合，因此逐 case A/B 仍有效；不同 Fig9 点之间不应直接做趋势拟合。</p>
+    </article>
+    <article class="card">
+      <h2>32-node：Critical path 一致改善</h2>
+      <p>五个点全部胜出，去中心化 mean 为 13.588–27.299 ms，中心化为 74.046–144.805 ms；逐点加速 4.67–8.80×，几何平均 5.87×。</p>
+      <div class="callout good"><strong>这是一条明确的算法扩展性信号：</strong>把 admission commit 分到 32 个独立 LocalScheduler 后，最慢 local commit 仍显著小于单个全局 Scheduler 的调度时间。</div>
+      <p>但这不是完整控制面延迟：Router load/plan、receipt、transport 和 local commit 的真实并发没有进入主值。</p>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>Admission 的“关键路径”与“总工作”</h2>
+    <div class="table-wrap"><table id="admission-capacity-table"></table></div>
+    <div class="callout warn"><strong>32-node aggregate local commit CPU 是中心化的 1.47–1.61×（几何平均 1.51×）。</strong>完整控制面诊断为中心化主值的 1.92–4.57×，但其中 local commit 是串行求和，不能当成真实并行 wall-clock。部署收益依赖真正并行提交以及 Router/receipt 路径优化或 overlap。</div>
+  </article>
+</section>
+
+<section id="decode" class="tab">
+  <div class="grid two">
+    <article class="card">
+      <div class="chart-title"><h2>4 logical nodes · Decode Mean</h2><div class="legend"><span class="lc">中心化</span><span class="ld">去中心化</span></div></div>
+      <div id="decode-chart-4" class="bar-chart"></div>
+    </article>
+    <article class="card">
+      <div class="chart-title"><h2>32 logical nodes · Decode Mean</h2><div class="legend"><span class="lc">中心化</span><span class="ld">去中心化</span></div></div>
+      <div id="decode-chart-32" class="bar-chart"></div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>Decode Mean / P99 对比</h2>
+    <div class="table-wrap"><table id="decode-table"></table></div>
+  </article>
+
+  <div class="grid two">
+    <article class="card">
+      <h2>Mean：最稳定的收益</h2>
+      <ul class="plain-list">
+        <li>4-node 五个点全部改善，范围 2.16–2.79×，几何平均 2.45×。</li>
+        <li>32-node 五个点全部改善，范围 11.96–15.82×，几何平均 13.27×。</li>
+        <li>最大 32-node mean 从中心化 23.595 ms/quantum 降至 1.802 ms/quantum；除以 <code>loop_count=16</code> 后是 1.475 vs 0.113 ms/step。</li>
+      </ul>
+      <div class="callout good">以 100 ms target TPOT 仅作量纲参照，最重 workload 的 mean scheduler slice 约占 1.48%（中心化）与 0.11%（去中心化）。这不是端到端 TPOT 占比测量。</div>
+    </article>
+    <article class="card">
+      <h2>P99：仍有 local straggler</h2>
+      <p>32-node P99 全部改善，但几何平均只有 2.49×，明显低于 mean 的 13.27×。因为每个 quantum 取 32 个 local scheduler 的最大值，任一 local 抖动都会进入 critical path。</p>
+      <div class="callout warn">4-node 的 <code>issue5_r45/r50</code> 中，去中心化 P95 仍分别快 2.75×/2.68×，但 P99 被孤立尖峰拉到 6.219/5.462 ms，反而比中心化 P99 慢 13%/19%。100 个样本下 P99 接近最慢一两个样本，需重复运行确认。</div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>尾延迟分位数</h2>
+    <p class="footnote">下表突出 P50/P95 与 P99 的分离，帮助区分常态性能和极少数尖峰。</p>
+    <div class="table-wrap"><table id="tail-table"></table></div>
+  </article>
+</section>
+
+<section id="scaling" class="tab">
+  <div class="grid kpis">
+    <article class="kpi central"><div class="label">中心化 decode · 4→32</div><strong>9.83×</strong><small>几何平均耗时扩展倍率；workload 请求数为 8×。</small></article>
+    <article class="kpi decentral"><div class="label">去中心化 decode critical · 4→32</div><strong>1.82×</strong><small><code>max(local)</code> 几何平均扩展倍率。</small></article>
+    <article class="kpi warn"><div class="label">去中心化 decode aggregate · 4→32</div><strong>9.48×</strong><small><code>sum(local CPU)</code> 仍近似随全局请求规模增长。</small></article>
+    <article class="kpi"><div class="label">32-node decode P99</div><strong>2.49×</strong><small>去中心化几何平均加速；尾部收益小于 mean。</small></article>
+  </div>
+
+  <article class="card">
+    <h2>同一 Fig9 点从 4 扩到 32 logical nodes</h2>
+    <p class="footnote">倍率 = 32-node latency / 4-node latency。全局 decode/admission 请求数均扩大 8×，每 GPU workload 保持不变。</p>
+    <div class="table-wrap"><table id="scaling-table"></table></div>
+  </article>
+
+  <div class="grid two">
+    <article class="card">
+      <h2>Critical path 与 aggregate work 分离</h2>
+      <div class="metric-def"><strong>去中心化 critical</strong><span>每个 quantum 取最慢 LocalScheduler：<code>max(local)</code>。这是主延迟指标。</span></div>
+      <div class="metric-def"><strong>去中心化 aggregate</strong><span>把所有 LocalScheduler CPU 相加：<code>sum(local)</code>。这是容量成本，不是延迟。</span></div>
+      <div class="metric-def"><strong>观察</strong><span>32-node decode critical 只扩 1.82×，aggregate 却扩 9.48×；延迟收益来自并行化，不来自减少总 scheduler work。</span></div>
+    </article>
+    <article class="card">
+      <h2>容量成本</h2>
+      <p>相对单个中心化 Scheduler，去中心化 aggregate decode CPU：</p>
+      <ul class="plain-list">
+        <li>4-node：高 17.1–30.1%，几何平均高 25.2%。</li>
+        <li>32-node：高 15.4–29.9%，几何平均高 20.8%。</li>
+      </ul>
+      <div class="callout">这是一项可接受性取决于部署目标的 trade-off：用更多并行 CPU 容量换取更短 critical path，并消除全局 Scheduler 随规模增长的串行瓶颈。</div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>建议的下一步验证</h2>
+    <ol class="plain-list">
+      <li>对 4-node admission 使用多个 seed 重跑，按“pending SP8 数/每 local 分布”分层报告，而不是只按 rate 排序。</li>
+      <li>在真实 4 节点部署中记录统一 barrier 下的 Router start/end、每个 LocalScheduler start/end、receipt 与 coordination wait。</li>
+      <li>将 scheduler critical、aggregate CPU、完整控制面 wall-clock 和端到端 TPOT 四个口径并列，确认并行收益没有被 transport/coordination 吞掉。</li>
+      <li>对 decode 尖峰追加至少 5 次独立重复或更多样本，报告 run-level P95/P99 区间，定位 local straggler 来源。</li>
+    </ol>
+  </article>
+</section>
+
+<section id="method" class="tab">
+  <div class="grid two">
+    <article class="card">
+      <h2>实验矩阵</h2>
+      <div class="metric-def"><strong>拓扑</strong><span>4 logical nodes（32 logical GPUs）与 32 logical nodes（256 logical GPUs）。一个 logical node = 8 GPUs。</span></div>
+      <div class="metric-def"><strong>Fig9 issue1</strong><span>Dynamic SP8 1%；BS/GPU 135@80 req/s、173@90 req/s。</span></div>
+      <div class="metric-def"><strong>Fig9 issue5</strong><span>Dynamic SP8 5%；BS/GPU 56@40 req/s、58@45 req/s、59@50 req/s。</span></div>
+      <div class="metric-def"><strong>Admission cohort</strong><span><code>rate_32gpu / 32 × 1.6 s</code> per GPU；4→32 nodes 时全局 rate 与 cohort 扩大 8×。</span></div>
+      <div class="metric-def"><strong>采样</strong><span>warmup=10；admission=10 fresh-state samples；decode=100 quantum samples；loop_count=16。</span></div>
+    </article>
+    <article class="card">
+      <h2>主指标计时边界</h2>
+      <div class="metric-def"><strong>中心化 admission</strong><span>running baseline 存在时的一次 native <code>Scheduler.schedule()</code>；pending queue insertion 不计。</span></div>
+      <div class="metric-def"><strong>去中心化 admission</strong><span>各 LocalScheduler planned commit 的最大值；Router planning、receipt 和 stage 不计。</span></div>
+      <div class="metric-def"><strong>中心化 decode</strong><span>一次 native <code>Scheduler.schedule()</code>。</span></div>
+      <div class="metric-def"><strong>去中心化 decode</strong><span>各 LocalScheduler native schedule 的 <code>max(local)</code>；另存 <code>sum(local CPU)</code>。</span></div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>解释限制</h2>
+    <div class="grid three">
+      <div class="callout warn"><strong>逻辑 32-node 不是部署结果。</strong><br>Harness 在一台 CPU host 上串行执行独立 replica，再建模并行 critical path；没有真实网络并发和 host 抖动。</div>
+      <div class="callout warn"><strong>Admission n=10。</strong><br>均值可用于本轮 A/B，但不足以稳定估计 P99；本报告不把 admission P99 作为结论。</div>
+      <div class="callout warn"><strong>单 seed。</strong><br>Dynamic SP 长请求落入新 cohort 的数量随点变化，尤其影响 4-node admission；需 multi-seed 解耦 composition。</div>
+      <div class="callout"><strong>主边界不是完整控制面。</strong><br>Router、receipt、transport、Ray/RDMA/ZMQ、consensus 和 barrier 被排除或只作串行诊断。</div>
+      <div class="callout"><strong>没有 GPU/model execution。</strong><br>结果不能直接换算吞吐、TPOT、TTFT 或真实请求完成时间。</div>
+      <div class="callout"><strong>P99 对尖峰敏感。</strong><br>Decode 每 case 100 个样本；<code>max(local)</code> 还会放大多 replica 中任一局部抖动。</div>
+    </div>
+  </article>
+
+  <article class="card">
+    <h2>正确性与环境</h2>
+    <div class="metric-def"><strong>结果 gate</strong><span>10/10 case 通过；中心化和去中心化均得到预期请求总数、SP1/SP8 数，decode 保持 live 且无 reject/preemption/abort/finish。</span></div>
+    <div class="metric-def"><strong>执行主机</strong><span><code>gpu-lg-cmc-h-h200-2999.host.h.pjlab.org.cn</code>，192 logical CPUs，Linux 5.15，Python 3.12.13。</span></div>
+    <div class="metric-def"><strong>生成时间</strong><span>原始结果：2026-08-31 04:20:08 UTC；本报告分析日期：2026-08-31 UTC。</span></div>
+    <div class="metric-def"><strong>GPU 使用</strong><span><code>CUDA_VISIBLE_DEVICES=</code>；CPU-only，不含 CUDA kernel。</span></div>
+  </article>
+
+  <article class="card">
+    <h2>原始材料</h2>
+    <div class="source-list">
+      <a href="../../bench_logs/scheduler_overhead/r3_fig9_dpsk_full/mixed_admission_decode.json"><strong>完整 JSON</strong> · raw samples、统计分位数、诊断字段与 metadata</a>
+      <a href="../../bench_logs/scheduler_overhead/r3_fig9_dpsk_full/mixed_admission_decode.csv"><strong>对比 CSV</strong> · 10 个 workload case 的扁平主表</a>
+      <a href="../../bench_logs/scheduler_overhead/r3_fig9_dpsk_full/report.html"><strong>自动生成报告</strong> · profiler 原始 side-by-side 表</a>
+      <a href="../../bench_logs/scheduler_overhead/r3_fig9_dpsk_full/console.log"><strong>执行日志</strong> · 10/10 case 实时输出</a>
+      <a href="../../scripts/scheduler_overhead/profile_bs128_mixed_admission_decode.py"><strong>实验实现</strong> · case 构造、计时边界、正确性 gate</a>
+      <a href="../2026-08-30/Fig9DpskFullSamplingFollowup.md"><strong>启动记录</strong> · full-sampling 参数与预期产物</a>
+    </div>
+  </article>
+</section>
+
+<footer>本报告中的“加速”均指相同 case 内的 scheduler-only 指标；除非明确标注，否则不代表分布式 wall-clock 或端到端性能。</footer>
+</main>
+
+<script>
+const DATA = [
+  {nodes:4, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", bs:135, rate:80, decodeReq:4320, admitReq:128, pendingSp8:1, ca:4.365183, da:4.584770, daSum:11.789258, daFull:18.026975, cd:1.863106, dd:0.767635, c99:4.482153, d99:3.625116, c50:1.614103, d50:0.541565, c95:2.450179, d95:0.946620, ddAgg:2.423030},
+  {nodes:4, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", bs:173, rate:90, decodeReq:5536, admitReq:144, pendingSp8:1, ca:5.031204, da:5.489482, daSum:14.773593, daFull:22.593958, cd:2.361499, dd:0.865612, c99:3.228317, d99:1.318026, c50:2.019943, d50:0.651607, c95:3.115102, d95:1.115514, ddAgg:2.933303},
+  {nodes:4, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", bs:56, rate:40, decodeReq:1792, admitReq:64, pendingSp8:5, ca:40.736477, da:22.035670, daSum:60.761777, daFull:63.885483, cd:0.704680, dd:0.252949, c99:0.988616, d99:0.369521, c50:0.628297, d50:0.224716, c95:0.934158, d95:0.358495, ddAgg:0.913580},
+  {nodes:4, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", bs:58, rate:45, decodeReq:1856, admitReq:72, pendingSp8:7, ca:24.408420, da:17.987236, daSum:36.752944, daFull:40.110185, cd:0.978512, dd:0.453095, c99:5.509590, d99:6.219006, c50:0.745497, d50:0.228005, c95:1.129147, d95:0.410971, ddAgg:1.145723},
+  {nodes:4, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", bs:59, rate:50, decodeReq:1888, admitReq:80, pendingSp8:0, ca:0.946368, da:1.242926, daSum:4.706321, daFull:8.107437, cd:0.829798, dd:0.371524, c99:4.582418, d99:5.462288, c50:0.675517, d50:0.232052, c95:1.043366, d95:0.388744, ddAgg:1.039675},
+  {nodes:32, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", bs:135, rate:80, decodeReq:34560, admitReq:1024, pendingSp8:8, ca:79.581005, da:14.361786, daSum:120.716487, daFull:363.682054, cd:16.362092, dd:1.364475, c99:30.878437, d99:13.492008, c50:14.429503, d50:0.632682, c95:24.748808, d95:3.809361, ddAgg:21.249001},
+  {nodes:32, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", bs:173, rate:90, decodeReq:44288, admitReq:1152, pendingSp8:15, ca:119.525147, da:13.588429, daSum:177.808933, daFull:376.772322, cd:23.595110, dd:1.802197, c99:54.367968, d99:18.407300, c50:19.650998, d50:0.910711, c95:41.576795, d95:5.214967, ddAgg:29.015945},
+  {nodes:32, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", bs:56, rate:40, decodeReq:14336, admitReq:512, pendingSp8:27, ca:144.804944, da:27.298692, daSum:212.376321, daFull:277.926895, cd:8.156569, dd:0.515433, c99:20.269467, d99:10.300613, c50:7.291631, d50:0.282273, c95:10.323059, d95:0.452536, ddAgg:9.411669},
+  {nodes:32, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", bs:58, rate:45, decodeReq:14848, admitReq:576, pendingSp8:29, ca:109.340971, da:18.997688, daSum:163.038054, daFull:235.217794, cd:8.410873, dd:0.703475, c99:23.247982, d99:10.182475, c50:7.338720, d50:0.325665, c95:10.716096, d95:0.761322, ddAgg:10.013780},
+  {nodes:32, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", bs:59, rate:50, decodeReq:15104, admitReq:640, pendingSp8:19, ca:74.045650, da:15.870990, daSum:119.033336, daFull:194.394587, cd:8.705126, dd:0.628488, c99:30.863989, d99:9.736434, c50:7.600308, d50:0.301972, c95:10.476289, d95:0.485961, ddAgg:10.200239}
+];
+
+const fmt = (v, digits=3) => Number(v).toFixed(digits);
+const speed = (c, d) => c / d;
+const speedClass = value => value >= 1 ? "good-text" : "bad-text";
+const speedPill = value => `<span class="pill ${value >= 1 ? "good" : "bad"}">${fmt(value, 2)}×</span>`;
+
+function renderBarChart(id, nodes, centralKey, decentralKey) {
+  const rows = DATA.filter(row => row.nodes === nodes);
+  const maximum = Math.max(...rows.flatMap(row => [row[centralKey], row[decentralKey]]));
+  document.getElementById(id).innerHTML = rows.map(row => `
+    <div class="bar-group">
+      <div class="bar-label">${row.point}<small>BS ${row.bs} · ${row.scenario}</small></div>
+      <div class="bar-lines">
+        <div class="bar-line"><div class="track"><div class="fill central" style="width:${row[centralKey] / maximum * 100}%"></div></div><div class="bar-value">${fmt(row[centralKey])} ms</div></div>
+        <div class="bar-line"><div class="track"><div class="fill decentral" style="width:${row[decentralKey] / maximum * 100}%"></div></div><div class="bar-value">${fmt(row[decentralKey])} ms</div></div>
+      </div>
+    </div>`).join("");
+}
+
+function tableHead(columns) {
+  return `<thead><tr>${columns.map(value => `<th>${value}</th>`).join("")}</tr></thead>`;
+}
+
+function renderAdmissionTable() {
+  const body = DATA.map(row => {
+    const s = speed(row.ca, row.da);
+    return `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${row.bs}</td><td>${row.admitReq}</td><td>${row.pendingSp8}</td><td>${fmt(row.ca)}</td><td>${fmt(row.da)}</td><td>${speedPill(s)}</td></tr>`;
+  }).join("");
+  document.getElementById("admission-table").innerHTML = tableHead(["Nodes", "Point", "BS/GPU", "New req", "Pending SP8", "中心 ms", "去中心 ms", "加速比"]) + `<tbody>${body}</tbody>`;
+}
+
+function renderAdmissionCapacityTable() {
+  const body = DATA.map(row => `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${fmt(row.ca)}</td><td>${fmt(row.da)}</td><td>${fmt(row.daSum)}</td><td>${fmt(row.daSum / row.ca, 2)}×</td><td>${fmt(row.daFull)}</td><td>${fmt(row.daFull / row.ca, 2)}×</td></tr>`).join("");
+  document.getElementById("admission-capacity-table").innerHTML = tableHead(["Nodes", "Point", "中心 critical", "去中心 critical", "去中心 sum(local)", "sum / 中心", "完整 CP 诊断", "CP / 中心"]) + `<tbody>${body}</tbody>`;
+}
+
+function renderDecodeTable() {
+  const body = DATA.map(row => {
+    const meanSpeed = speed(row.cd, row.dd);
+    const p99Speed = speed(row.c99, row.d99);
+    return `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${fmt(row.cd)}</td><td>${fmt(row.dd)}</td><td>${speedPill(meanSpeed)}</td><td>${fmt(row.c99)}</td><td>${fmt(row.d99)}</td><td>${speedPill(p99Speed)}</td></tr>`;
+  }).join("");
+  document.getElementById("decode-table").innerHTML = tableHead(["Nodes", "Point", "Mean 中心", "Mean 去中心", "Mean 加速", "P99 中心", "P99 去中心", "P99 加速"]) + `<tbody>${body}</tbody>`;
+}
+
+function renderTailTable() {
+  const body = DATA.map(row => `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${fmt(row.c50)} / ${fmt(row.d50)}</td><td>${fmt(row.c95)} / ${fmt(row.d95)}</td><td>${fmt(row.c99)} / ${fmt(row.d99)}</td><td class="${speedClass(speed(row.c99, row.d99))}">${fmt(speed(row.c99, row.d99), 2)}×</td></tr>`).join("");
+  document.getElementById("tail-table").innerHTML = tableHead(["Nodes", "Point", "P50 中/去", "P95 中/去", "P99 中/去", "P99 加速"]) + `<tbody>${body}</tbody>`;
+}
+
+function renderScalingTable() {
+  const four = new Map(DATA.filter(row => row.nodes === 4).map(row => [row.key, row]));
+  const body = DATA.filter(row => row.nodes === 32).map(row => {
+    const base = four.get(row.key);
+    return `<tr><td>${row.point}</td><td>${fmt(row.ca / base.ca, 2)}×</td><td>${fmt(row.da / base.da, 2)}×</td><td>${fmt(row.cd / base.cd, 2)}×</td><td>${fmt(row.dd / base.dd, 2)}×</td><td>${fmt(row.ddAgg / base.ddAgg, 2)}×</td></tr>`;
+  }).join("");
+  document.getElementById("scaling-table").innerHTML = tableHead(["Point", "Admission 中心", "Admission 去中心 critical", "Decode 中心", "Decode 去中心 critical", "Decode 去中心 aggregate"]) + `<tbody>${body}</tbody>`;
+}
+
+document.querySelectorAll(".tabs button").forEach(button => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach(item => item.classList.toggle("active", item === button));
+    document.querySelectorAll(".tab").forEach(tab => tab.classList.toggle("active", tab.id === button.dataset.tab));
+  });
+});
+
+renderBarChart("admission-chart-4", 4, "ca", "da");
+renderBarChart("admission-chart-32", 32, "ca", "da");
+renderBarChart("decode-chart-4", 4, "cd", "dd");
+renderBarChart("decode-chart-32", 32, "cd", "dd");
+renderAdmissionTable();
+renderAdmissionCapacityTable();
+renderDecodeTable();
+renderTailTable();
+renderScalingTable();
+</script>
+</body>
+</html>
