@@ -206,6 +206,7 @@ tbody tr:hover { background: #f8fbfc; }
 .neutral-text { color: var(--warn); font-weight: 800; }
 .pill { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #edf3f6; font-size: 11px; font-weight: 800; }
 .pill.good { background: var(--decentral-soft); color: var(--decentral); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
 .pill.bad { background: var(--danger-soft); color: var(--danger); }
 .metric-def {
   display: grid;
@@ -347,15 +348,43 @@ footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: cen
 
   <article class="card">
     <h2>逐点对比</h2>
-    <p class="footnote">加速比 = 中心化 mean / 去中心化 critical-path mean；大于 1 表示去中心化更快。Pending SP8 是从固定 seed=0 的 workload 生成器重算出的本轮新入队长请求数。</p>
+    <p class="footnote">加速比 = 中心化 mean / 去中心化 critical-path mean；大于 1 表示去中心化更快。“新长/短”只统计本轮 admission cohort；长请求使用 428,033-token context 并走 SP8，短请求使用 1,024-token context 并走 SP1。</p>
     <div class="table-wrap"><table id="admission-table"></table></div>
   </article>
+
+  <article class="card">
+    <h2>每个 Admission 场景实际有多少长、多少短</h2>
+    <p>“当前长/短”是本轮 <code>seed=0</code> 已测数据的真实构成；“固定建议”是后续论文重跑时应预先锁定的构成。两者分开列出，避免把随机抽样结果误当成 rate 本身的效果。</p>
+    <div class="table-wrap"><table id="admission-composition-table"></table></div>
+    <p class="footnote">长数偏差 = 当前长请求数 − 固定建议长请求数。论文用途只评价 workload composition 是否适合跨 rate / 跨规模比较；相同 case 内中心化与去中心化仍使用完全相同的请求集合，因此所有点都可作为该 case 自身的 A/B 测量。</p>
+  </article>
+
+  <div class="grid two">
+    <article class="card">
+      <h2>这些数量是怎样确定的</h2>
+      <div class="metric-def"><strong>Admission 总数</strong><span>先在每个 8-GPU LocalScheduler 边界计算 <code>round((rate_32gpu / 32) × 8 × 1.6 s)</code>，五个点依次得到 32、36、16、18、20；再乘 logical node 数，所以 4-node 为 128/144/64/72/80，32-node 为 1024/1152/512/576/640。</span></div>
+      <div class="metric-def"><strong>长短定义</strong><span>Issue1 的目标长请求占比 <code>p=1%</code>，Issue5 为 <code>p=5%</code>。短请求 context=1,024 tokens、映射 SP1；长请求 context=428,033 tokens、映射 SP8。</span></div>
+      <div class="metric-def"><strong>当前生成规则</strong><span>先固定整个 <code>decode + admission</code> 合集的长请求总数 <code>round((N_decode + N_admit) × p)</code>，再用 <code>random.Random(0).sample(...)</code> 从全集抽位置。Admission 是请求 ID 尾段，因此它自己的长请求数没有被约束，只是随机交集。</span></div>
+      <div class="metric-def"><strong>论文固定规则</strong><span>对 admission cohort 独立固定 <code>N_long = round(N_admit × p)</code>，并令 <code>N_short = N_admit − N_long</code>；随机数只决定长请求位置，不再决定长请求数量。去中心化重跑还应把长请求在 LocalScheduler 间确定性均衡，且中心化/去中心化共享同一 manifest。</span></div>
+    </article>
+    <article class="card">
+      <h2>论文选点建议</h2>
+      <div class="callout good"><strong>现有数据若必须选一个跨规模代表点：首选 I1/R80。</strong>4-node 为 1 长 + 127 短，32-node 为 8 长 + 1016 短，两边实际长占比都恰为 0.781%；composition 随规模严格保持一致。</div>
+      <ul class="plain-list">
+        <li><strong>4-node rate 对比：</strong>I1/R80 与 I1/R90 可用；两者的长请求数都等于独立取整目标 1，分别是 1+127 与 1+143。</li>
+        <li><strong>32-node rate 对比：</strong>I5/R40 与 I5/R45 可用；实际长占比为 5.27% 与 5.03%，长请求数相对固定建议只差 +1 与 0。</li>
+        <li><strong>不要用于 rate 趋势：</strong>4-node 的全部 I5 点，特别是 I5/R50 的 0+80；以及 32-node I5/R50 的 19+621（2.97%，而目标为 5%）。</li>
+        <li><strong>仅作同 case A/B：</strong>32-node I1/R90 当前为 15+1137（1.30%），与 I1/R80 的 0.78% 不同，不适合作为干净的 I1 rate 曲线。</li>
+      </ul>
+      <div class="callout warn"><strong>更稳妥的论文方案仍是按固定建议构成重跑全部点，而不是从随机结果中挑最快点。</strong>现有 admission 每 case 只有 10 个样本；即使长短数量接近目标，也不应据此宣称严格的 rate 单调性。</div>
+    </article>
+  </div>
 
   <div class="grid two">
     <article class="card">
       <h2>4-node：Admission 结论不稳定</h2>
       <p>去中心化只在 2/5 点胜出；几何平均加速 1.11×，但中位加速仅 0.95×。这不足以形成“4-node admission 普遍更快”的结论。</p>
-      <div class="callout warn"><strong>主要混杂因素是新 cohort 的 SP8 构成。</strong><code>issue5_r50</code> 的 80 个新请求中没有 SP8 请求，因此中心化 admission 只有 0.946 ms；<code>r40/r45</code> 分别含 5/7 个新 SP8 请求，中心化耗时跃升到 40.736/24.408 ms。跨点非单调主要反映 workload composition，而非 rate 单变量响应。</div>
+      <div class="callout warn"><strong>主要混杂因素是新 cohort 的 SP8 构成。</strong><code>issue5_r50</code> 的 80 个新请求是 0 长 + 80 短，因此中心化 admission 只有 0.946 ms；<code>r40/r45</code> 分别是 5 长 + 59 短、7 长 + 65 短，中心化耗时跃升到 40.736/24.408 ms。跨点非单调主要反映 workload composition，而非 rate 单变量响应。</div>
       <p class="footnote">同一 case 内中心化和去中心化使用相同请求集合，因此逐 case A/B 仍有效；不同 Fig9 点之间不应直接做趋势拟合。</p>
     </article>
     <article class="card">
@@ -449,7 +478,7 @@ footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: cen
   <article class="card">
     <h2>建议的下一步验证</h2>
     <ol class="plain-list">
-      <li>对 4-node admission 使用多个 seed 重跑，按“pending SP8 数/每 local 分布”分层报告，而不是只按 rate 排序。</li>
+      <li>先按 <code>round(N_admit × p)</code> 固定每个 admission cohort 的长/短数量并确定性均衡到各 local，再使用多个 seed 改变位置、重复测量；不要只按 rate 排序随机 cohort。</li>
       <li>在真实 4 节点部署中记录统一 barrier 下的 Router start/end、每个 LocalScheduler start/end、receipt 与 coordination wait。</li>
       <li>将 scheduler critical、aggregate CPU、完整控制面 wall-clock 和端到端 TPOT 四个口径并列，确认并行收益没有被 transport/coordination 吞掉。</li>
       <li>对 decode 尖峰追加至少 5 次独立重复或更多样本，报告 run-level P95/P99 区间，定位 local straggler 来源。</li>
@@ -465,6 +494,8 @@ footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: cen
       <div class="metric-def"><strong>Fig9 issue1</strong><span>Dynamic SP8 1%；BS/GPU 135@80 req/s、173@90 req/s。</span></div>
       <div class="metric-def"><strong>Fig9 issue5</strong><span>Dynamic SP8 5%；BS/GPU 56@40 req/s、58@45 req/s、59@50 req/s。</span></div>
       <div class="metric-def"><strong>Admission cohort</strong><span><code>rate_32gpu / 32 × 1.6 s</code> per GPU；4→32 nodes 时全局 rate 与 cohort 扩大 8×。</span></div>
+      <div class="metric-def"><strong>请求长度</strong><span>短请求 context=1,024 tokens（SP1）；长请求 context=428,033 tokens（SP8）。</span></div>
+      <div class="metric-def"><strong>长请求抽样</strong><span>本轮先按完整 decode+admission 合集固定 1%/5% 总量，再以 seed=0 随机抽位置；没有单独固定 admission cohort 的长请求数。</span></div>
       <div class="metric-def"><strong>采样</strong><span>warmup=10；admission=10 fresh-state samples；decode=100 quantum samples；loop_count=16。</span></div>
     </article>
     <article class="card">
@@ -481,7 +512,7 @@ footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: cen
     <div class="grid three">
       <div class="callout warn"><strong>逻辑 32-node 不是部署结果。</strong><br>Harness 在一台 CPU host 上串行执行独立 replica，再建模并行 critical path；没有真实网络并发和 host 抖动。</div>
       <div class="callout warn"><strong>Admission n=10。</strong><br>均值可用于本轮 A/B，但不足以稳定估计 P99；本报告不把 admission P99 作为结论。</div>
-      <div class="callout warn"><strong>单 seed。</strong><br>Dynamic SP 长请求落入新 cohort 的数量随点变化，尤其影响 4-node admission；需 multi-seed 解耦 composition。</div>
+      <div class="callout warn"><strong>单 seed 且 cohort 数量未固定。</strong><br>Dynamic SP 长请求落入新 cohort 的数量随点变化，尤其影响 4-node admission。仅增加 seed 会估计随机波动，但不能消除 composition 混杂；论文主实验应先固定 cohort 长/短数量，再用多 seed 改变位置或报告重复区间。</div>
       <div class="callout"><strong>主边界不是完整控制面。</strong><br>Router、receipt、transport、Ray/RDMA/ZMQ、consensus 和 barrier 被排除或只作串行诊断。</div>
       <div class="callout"><strong>没有 GPU/model execution。</strong><br>结果不能直接换算吞吐、TPOT、TTFT 或真实请求完成时间。</div>
       <div class="callout"><strong>P99 对尖峰敏感。</strong><br>Decode 每 case 100 个样本；<code>max(local)</code> 还会放大多 replica 中任一局部抖动。</div>
@@ -514,16 +545,16 @@ footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: cen
 
 <script>
 const DATA = [
-  {nodes:4, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", bs:135, rate:80, decodeReq:4320, admitReq:128, pendingSp8:1, ca:4.365183, da:4.584770, daSum:11.789258, daFull:18.026975, cd:1.863106, dd:0.767635, c99:4.482153, d99:3.625116, c50:1.614103, d50:0.541565, c95:2.450179, d95:0.946620, ddAgg:2.423030},
-  {nodes:4, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", bs:173, rate:90, decodeReq:5536, admitReq:144, pendingSp8:1, ca:5.031204, da:5.489482, daSum:14.773593, daFull:22.593958, cd:2.361499, dd:0.865612, c99:3.228317, d99:1.318026, c50:2.019943, d50:0.651607, c95:3.115102, d95:1.115514, ddAgg:2.933303},
-  {nodes:4, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", bs:56, rate:40, decodeReq:1792, admitReq:64, pendingSp8:5, ca:40.736477, da:22.035670, daSum:60.761777, daFull:63.885483, cd:0.704680, dd:0.252949, c99:0.988616, d99:0.369521, c50:0.628297, d50:0.224716, c95:0.934158, d95:0.358495, ddAgg:0.913580},
-  {nodes:4, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", bs:58, rate:45, decodeReq:1856, admitReq:72, pendingSp8:7, ca:24.408420, da:17.987236, daSum:36.752944, daFull:40.110185, cd:0.978512, dd:0.453095, c99:5.509590, d99:6.219006, c50:0.745497, d50:0.228005, c95:1.129147, d95:0.410971, ddAgg:1.145723},
-  {nodes:4, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", bs:59, rate:50, decodeReq:1888, admitReq:80, pendingSp8:0, ca:0.946368, da:1.242926, daSum:4.706321, daFull:8.107437, cd:0.829798, dd:0.371524, c99:4.582418, d99:5.462288, c50:0.675517, d50:0.232052, c95:1.043366, d95:0.388744, ddAgg:1.039675},
-  {nodes:32, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", bs:135, rate:80, decodeReq:34560, admitReq:1024, pendingSp8:8, ca:79.581005, da:14.361786, daSum:120.716487, daFull:363.682054, cd:16.362092, dd:1.364475, c99:30.878437, d99:13.492008, c50:14.429503, d50:0.632682, c95:24.748808, d95:3.809361, ddAgg:21.249001},
-  {nodes:32, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", bs:173, rate:90, decodeReq:44288, admitReq:1152, pendingSp8:15, ca:119.525147, da:13.588429, daSum:177.808933, daFull:376.772322, cd:23.595110, dd:1.802197, c99:54.367968, d99:18.407300, c50:19.650998, d50:0.910711, c95:41.576795, d95:5.214967, ddAgg:29.015945},
-  {nodes:32, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", bs:56, rate:40, decodeReq:14336, admitReq:512, pendingSp8:27, ca:144.804944, da:27.298692, daSum:212.376321, daFull:277.926895, cd:8.156569, dd:0.515433, c99:20.269467, d99:10.300613, c50:7.291631, d50:0.282273, c95:10.323059, d95:0.452536, ddAgg:9.411669},
-  {nodes:32, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", bs:58, rate:45, decodeReq:14848, admitReq:576, pendingSp8:29, ca:109.340971, da:18.997688, daSum:163.038054, daFull:235.217794, cd:8.410873, dd:0.703475, c99:23.247982, d99:10.182475, c50:7.338720, d50:0.325665, c95:10.716096, d95:0.761322, ddAgg:10.013780},
-  {nodes:32, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", bs:59, rate:50, decodeReq:15104, admitReq:640, pendingSp8:19, ca:74.045650, da:15.870990, daSum:119.033336, daFull:194.394587, cd:8.705126, dd:0.628488, c99:30.863989, d99:9.736434, c50:7.600308, d50:0.301972, c95:10.476289, d95:0.485961, ddAgg:10.200239}
+  {nodes:4, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", longRatio:0.01, bs:135, rate:80, decodeReq:4320, admitReq:128, admitLong:1, targetLong:1, paperUse:"首选：跨规模 / 4-node rate", paperTone:"good", ca:4.365183, da:4.584770, daSum:11.789258, daFull:18.026975, cd:1.863106, dd:0.767635, c99:4.482153, d99:3.625116, c50:1.614103, d50:0.541565, c95:2.450179, d95:0.946620, ddAgg:2.423030},
+  {nodes:4, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", longRatio:0.01, bs:173, rate:90, decodeReq:5536, admitReq:144, admitLong:1, targetLong:1, paperUse:"可用：4-node I1 rate", paperTone:"good", ca:5.031204, da:5.489482, daSum:14.773593, daFull:22.593958, cd:2.361499, dd:0.865612, c99:3.228317, d99:1.318026, c50:2.019943, d50:0.651607, c95:3.115102, d95:1.115514, ddAgg:2.933303},
+  {nodes:4, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", longRatio:0.05, bs:56, rate:40, decodeReq:1792, admitReq:64, admitLong:5, targetLong:3, paperUse:"仅同 case A/B", paperTone:"warn", ca:40.736477, da:22.035670, daSum:60.761777, daFull:63.885483, cd:0.704680, dd:0.252949, c99:0.988616, d99:0.369521, c50:0.628297, d50:0.224716, c95:0.934158, d95:0.358495, ddAgg:0.913580},
+  {nodes:4, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", longRatio:0.05, bs:58, rate:45, decodeReq:1856, admitReq:72, admitLong:7, targetLong:4, paperUse:"仅同 case A/B", paperTone:"warn", ca:24.408420, da:17.987236, daSum:36.752944, daFull:40.110185, cd:0.978512, dd:0.453095, c99:5.509590, d99:6.219006, c50:0.745497, d50:0.228005, c95:1.129147, d95:0.410971, ddAgg:1.145723},
+  {nodes:4, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", longRatio:0.05, bs:59, rate:50, decodeReq:1888, admitReq:80, admitLong:0, targetLong:4, paperUse:"排除 rate 趋势", paperTone:"bad", ca:0.946368, da:1.242926, daSum:4.706321, daFull:8.107437, cd:0.829798, dd:0.371524, c99:4.582418, d99:5.462288, c50:0.675517, d50:0.232052, c95:1.043366, d95:0.388744, ddAgg:1.039675},
+  {nodes:32, point:"I1 / R80", key:"fig9_issue1_r80", scenario:"SP8 1%", longRatio:0.01, bs:135, rate:80, decodeReq:34560, admitReq:1024, admitLong:8, targetLong:10, paperUse:"首选：跨规模", paperTone:"good", ca:79.581005, da:14.361786, daSum:120.716487, daFull:363.682054, cd:16.362092, dd:1.364475, c99:30.878437, d99:13.492008, c50:14.429503, d50:0.632682, c95:24.748808, d95:3.809361, ddAgg:21.249001},
+  {nodes:32, point:"I1 / R90", key:"fig9_issue1_r90", scenario:"SP8 1%", longRatio:0.01, bs:173, rate:90, decodeReq:44288, admitReq:1152, admitLong:15, targetLong:12, paperUse:"仅同 case A/B", paperTone:"warn", ca:119.525147, da:13.588429, daSum:177.808933, daFull:376.772322, cd:23.595110, dd:1.802197, c99:54.367968, d99:18.407300, c50:19.650998, d50:0.910711, c95:41.576795, d95:5.214967, ddAgg:29.015945},
+  {nodes:32, point:"I5 / R40", key:"fig9_issue5_r40", scenario:"SP8 5%", longRatio:0.05, bs:56, rate:40, decodeReq:14336, admitReq:512, admitLong:27, targetLong:26, paperUse:"可用：32-node I5 rate", paperTone:"good", ca:144.804944, da:27.298692, daSum:212.376321, daFull:277.926895, cd:8.156569, dd:0.515433, c99:20.269467, d99:10.300613, c50:7.291631, d50:0.282273, c95:10.323059, d95:0.452536, ddAgg:9.411669},
+  {nodes:32, point:"I5 / R45", key:"fig9_issue5_r45", scenario:"SP8 5%", longRatio:0.05, bs:58, rate:45, decodeReq:14848, admitReq:576, admitLong:29, targetLong:29, paperUse:"可用：32-node I5 rate", paperTone:"good", ca:109.340971, da:18.997688, daSum:163.038054, daFull:235.217794, cd:8.410873, dd:0.703475, c99:23.247982, d99:10.182475, c50:7.338720, d50:0.325665, c95:10.716096, d95:0.761322, ddAgg:10.013780},
+  {nodes:32, point:"I5 / R50", key:"fig9_issue5_r50", scenario:"SP8 5%", longRatio:0.05, bs:59, rate:50, decodeReq:15104, admitReq:640, admitLong:19, targetLong:32, paperUse:"排除 rate 趋势", paperTone:"bad", ca:74.045650, da:15.870990, daSum:119.033336, daFull:194.394587, cd:8.705126, dd:0.628488, c99:30.863989, d99:9.736434, c50:7.600308, d50:0.301972, c95:10.476289, d95:0.485961, ddAgg:10.200239}
 ];
 
 const fmt = (v, digits=3) => Number(v).toFixed(digits);
@@ -551,9 +582,20 @@ function tableHead(columns) {
 function renderAdmissionTable() {
   const body = DATA.map(row => {
     const s = speed(row.ca, row.da);
-    return `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${row.bs}</td><td>${row.admitReq}</td><td>${row.pendingSp8}</td><td>${fmt(row.ca)}</td><td>${fmt(row.da)}</td><td>${speedPill(s)}</td></tr>`;
+    return `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${row.bs}</td><td>${row.admitReq}</td><td>${row.admitLong} / ${row.admitReq - row.admitLong}</td><td>${fmt(row.ca)}</td><td>${fmt(row.da)}</td><td>${speedPill(s)}</td></tr>`;
   }).join("");
-  document.getElementById("admission-table").innerHTML = tableHead(["Nodes", "Point", "BS/GPU", "New req", "Pending SP8", "中心 ms", "去中心 ms", "加速比"]) + `<tbody>${body}</tbody>`;
+  document.getElementById("admission-table").innerHTML = tableHead(["Nodes", "Point", "BS/GPU", "New req", "新长 / 短", "中心 ms", "去中心 ms", "加速比"]) + `<tbody>${body}</tbody>`;
+}
+
+function renderAdmissionCompositionTable() {
+  const body = DATA.map(row => {
+    const actualShort = row.admitReq - row.admitLong;
+    const targetShort = row.admitReq - row.targetLong;
+    const delta = row.admitLong - row.targetLong;
+    const signedDelta = delta > 0 ? `+${delta}` : `${delta}`;
+    return `<tr><td>${row.nodes}</td><td>${row.point}</td><td>${row.admitReq}</td><td>${fmt(row.longRatio * 100, 0)}%</td><td><strong>${row.admitLong} / ${actualShort}</strong></td><td>${fmt(row.admitLong / row.admitReq * 100, 2)}%</td><td>${row.targetLong} / ${targetShort}</td><td class="${delta === 0 ? "good-text" : "neutral-text"}">${signedDelta}</td><td><span class="pill ${row.paperTone}">${row.paperUse}</span></td></tr>`;
+  }).join("");
+  document.getElementById("admission-composition-table").innerHTML = tableHead(["Nodes", "Point", "Admission", "目标长占比", "当前长 / 短", "当前长占比", "固定建议长 / 短", "长数偏差", "论文用途"]) + `<tbody>${body}</tbody>`;
 }
 
 function renderAdmissionCapacityTable() {
@@ -596,6 +638,7 @@ renderBarChart("admission-chart-32", 32, "ca", "da");
 renderBarChart("decode-chart-4", 4, "cd", "dd");
 renderBarChart("decode-chart-32", 32, "cd", "dd");
 renderAdmissionTable();
+renderAdmissionCompositionTable();
 renderAdmissionCapacityTable();
 renderDecodeTable();
 renderTailTable();
