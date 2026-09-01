@@ -61,7 +61,3 @@ def supports_tma():
 
     VALID_VERSION = version.parse("3.4.0")
     return TRITON_VERSION == VALID_VERSION
-
-
-if supports_tma():
-    from triton.tools.tensor_descriptor import TensorDescriptor  # noqa: F401
