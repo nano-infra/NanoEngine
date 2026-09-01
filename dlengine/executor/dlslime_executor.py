@@ -17,6 +17,22 @@ from dlengine.logging import get_logger
 logger = get_logger()
 
 
+def _select_driver_nic(available_nics):
+    if not available_nics:
+        raise RuntimeError("No available NICs found for DLSLime driver agent")
+
+    selected_nic = available_nics[0]
+    if len(available_nics) > 1 and not os.environ.get("SLIME_VISIBLE_DEVICES"):
+        logger.warning(
+            "SLIME_VISIBLE_DEVICES is not set; DLSLime detected %d RDMA NICs "
+            "and will use the first one (%s). Set SLIME_VISIBLE_DEVICES to "
+            "restrict driver NIC selection.",
+            len(available_nics),
+            selected_nic,
+        )
+    return selected_nic
+
+
 class DLSLimeExecutor(RayExecutor):
     """Ray-managed workers with DLSLime for hot-path run/migrate calls."""
 
@@ -54,14 +70,13 @@ class DLSLimeExecutor(RayExecutor):
 
     def _bootstrap_dlslime(self) -> None:
         available_nics = self._dlslime.available_nic()
-        if not available_nics:
-            raise RuntimeError("No available NICs found for DLSLime driver agent")
+        driver_nic = _select_driver_nic(available_nics)
 
         self._driver_alias = f"{self.config.engine_id}:driver:{uuid.uuid4().hex[:8]}"
         self._driver_agent = self._dlslime.start_peer_agent(
             ctrl_url=self.config.ctrl_address,
             alias=self._driver_alias,
-            device=available_nics[0],
+            device=driver_nic,
             scope=self.config.ctrl_scope,
         )
         driver_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
@@ -78,11 +93,36 @@ class DLSLimeExecutor(RayExecutor):
         ]
         for conn in pending_conns:
             conn.wait(timeout=60)
-        self._proxies = [
-            self._proxy_factory(self._driver_agent, alias, ModelRunnerRpcService)
-            for alias in worker_aliases
-        ]
+        self._proxies = self._create_proxies(worker_aliases)
         logger.info(f"DLSLime transport ready for {len(self._worker_aliases)} workers")
+
+    def _create_proxies(self, worker_aliases):
+        try:
+            return [
+                self._proxy_factory(self._driver_agent, alias, ModelRunnerRpcService)
+                for alias in worker_aliases
+            ]
+        except Exception as exc:
+            message = str(exc)
+            if not any(
+                marker in message
+                for marker in (
+                    "CUDA error: initialization error",
+                    "cudaErrorInitializationError",
+                )
+            ):
+                raise
+
+            visible_nics = os.environ.get("SLIME_VISIBLE_DEVICES", "<unset>")
+            raise RuntimeError(
+                "DLSLime driver failed to allocate pinned RPC buffers because "
+                "CUDA could not be initialized in the engine backend process. "
+                "This commonly means the process was created with "
+                "multiprocessing 'fork' after CUDA initialization. This failed "
+                "before RDMA memory-region registration. "
+                f"SLIME_VISIBLE_DEVICES={visible_nics!r} only filters RDMA NIC "
+                "selection and does not control CUDA device visibility."
+            ) from exc
 
     def _probe_totals(self) -> tuple[int, int, int, int]:
         """Sum the transport RpcSession timing probes across all DP-shard proxies.
