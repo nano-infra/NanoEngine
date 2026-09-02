@@ -430,6 +430,14 @@ async fn health() -> &'static str {
     "OK"
 }
 
+async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let manager = state.engine_manager.lock().await;
+    let (hybrid, prefill, decode) = manager.total_http_role_counts();
+    Json(
+        serde_json::json!({"status":"ok", "engines":{"prefill":prefill,"decode":decode,"hybrid":hybrid,"encoder":0}, "models":manager.routable_model_keys()}),
+    )
+}
+
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -466,6 +474,7 @@ pub async fn start_server(
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
