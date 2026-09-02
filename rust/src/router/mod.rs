@@ -2,21 +2,40 @@ pub mod engine_manager;
 pub mod http_server;
 
 use clap::Parser;
+use std::fs;
+use std::process::{Command, Stdio};
 use pyo3::prelude::*;
 use tracing::{debug, error, info};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value_t = 3001)]
+    #[command(subcommand)]
+    command: Option<CommandKind>,
+    #[arg(short, long, global = true, default_value_t = 3001)]
     port: u16,
 
-    #[arg(long, default_value = "http://127.0.0.1:4479")]
+    #[arg(long, global = true, default_value = "http://127.0.0.1:4479")]
     ctrl_address: String,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     ctrl_scope: Option<String>,
+
+    /// Run in background (accepts true/yes/1).
+    #[arg(long, global = true, value_name = "BOOL", default_value = "false", action = clap::ArgAction::Set)]
+    daemonize: String,
 }
+
+#[derive(clap::Subcommand, Debug)]
+#[derive(Clone)]
+enum CommandKind { Start, Status, Stop }
+
+fn runtime_dir() -> std::path::PathBuf { std::env::var_os("DLENGINE_ROUTER_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/tmp/dlengine-router")) }
+fn pid_file() -> std::path::PathBuf { runtime_dir().join("dlengine-router.pid") }
+fn read_pid() -> Option<u32> { fs::read_to_string(pid_file()).ok()?.trim().parse().ok() }
+fn running(pid: u32) -> bool { Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) }
+fn daemonize(args: &Args) -> anyhow::Result<()> { fs::create_dir_all(runtime_dir())?; if let Some(pid)=read_pid() { if running(pid) { println!("dlengine-router is already running (pid={pid})"); return Ok(()) } } let exe=std::env::var_os("DLENGINE_ROUTER_EXECUTABLE").map(std::path::PathBuf::from).unwrap_or_else(|| { let e=std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("dlengine-router")); if e.file_name().and_then(|n| n.to_str()).map(|n| n.contains("python")).unwrap_or(false) { std::path::PathBuf::from("dlengine-router") } else { e } }); let mut a=vec!["--port".into(),args.port.to_string(),"--ctrl-address".into(),args.ctrl_address.clone()]; if let Some(s)=&args.ctrl_scope { a.extend(["--ctrl-scope".into(),s.clone()]); } let c=Command::new(exe).args(a).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?; fs::write(pid_file(),c.id().to_string())?; println!("dlengine-router started (pid={})",c.id()); Ok(()) }
+fn ops(args: &Args, c: CommandKind) -> anyhow::Result<()> { match c { CommandKind::Start=>daemonize(args), CommandKind::Status=>{if let Some(p)=read_pid(){if running(p){println!("dlengine-router is running (pid={p})"); let url=format!("http://127.0.0.1:{}/status",args.port); if let Ok(out)=Command::new("curl").args(["-fsS",&url]).output(){if out.status.success(){println!("{}",String::from_utf8_lossy(&out.stdout));}else{println!("health: unavailable");}} return Ok(())}} println!("dlengine-router is not running");Ok(())}, CommandKind::Stop=>{if let Some(p)=read_pid(){if running(p){Command::new("kill").args(["-TERM",&p.to_string()]).status()?;println!("dlengine-router stopped (pid={p})");} let _=fs::remove_file(pid_file());} else {println!("dlengine-router is not running");} Ok(())}} }
 
 fn normalize_ctrl_address(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
@@ -92,6 +111,8 @@ where
         .try_init();
 
     let args = Args::parse_from(args);
+    if let Some(command) = args.command.as_ref() { return ops(&args, command.clone()); }
+    if matches!(args.daemonize.as_str(), "true" | "yes" | "1") { return daemonize(&args); }
     tokio::runtime::Runtime::new()?.block_on(run(args))
 }
 
