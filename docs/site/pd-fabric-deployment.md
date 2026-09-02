@@ -129,6 +129,15 @@ RUST_LOG=info dlengine-router \
   --port 3001 \
   --ctrl-address "${CTRL_ADDRESS}" \
   --ctrl-scope "${CTRL_SCOPE}"
+
+For background operation, add `--daemonize yes`. The lifecycle/status commands use the same default port and runtime directory:
+
+```bash
+dlengine-router --daemonize yes --port 3001 \
+  --ctrl-address "${CTRL_ADDRESS}" --ctrl-scope "${CTRL_SCOPE}"
+dlengine-router status
+dlengine-router stop
+```
 ```
 
 ## Verify the deployment

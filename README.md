@@ -23,6 +23,8 @@ Use the prebuilt CUDA development image for the recommended setup. DeepSeek-fami
 
 DLEngine production serving combines Ray-managed GPU resources, the dlslime-ctrl discovery/control plane, separate prefill and decode engines, and dlengine-router as the public OpenAI/Anthropic gateway. Follow the complete [Production Serving guide](./docs/site/online-serving.md), including the Claude Code and OpenCode workflows and operational checks.
 
+The router supports foreground and managed background operation. Use `dlengine-router --daemonize yes` to start it in the background, `dlengine-router status` to inspect process health and discovered prefill/decode/hybrid engines, and `dlengine-router stop` for a graceful shutdown. The detailed deployment workflow is documented in the [Production Serving guide](./docs/site/online-serving.md).
+
 For checkpoint validation, debugging, and batch jobs without a public HTTP gateway, use the [Offline Inference guide](./docs/site/offline-inference.md).
 
 ______________________________________________________________________

@@ -180,15 +180,38 @@ The registry response should contain one `prefill` and one `decode` endpoint for
 The router watches dlslime-ctrl for engine registration and heartbeat changes. It may start before or after the engines; discovery is refreshed dynamically.
 
 ```bash
+Start the router in the foreground while developing or troubleshooting:
+
+```bash
 RUST_LOG=info dlengine-router \
   --port 3001 \
   --ctrl-address "${CTRL_ADDRESS}"
+```
+
+For a long-running deployment, use the lifecycle commands:
+
+```bash
+RUST_LOG=info dlengine-router --daemonize yes \
+  --port 3001 \
+  --ctrl-address "${CTRL_ADDRESS}"
+
+dlengine-router status
+```
+
+`status` reports the managed PID and, when the HTTP endpoint is reachable, the discovered `prefill`, `decode`, and `hybrid` engine counts and routable models. Stop the managed instance gracefully with:
+
+```bash
+dlengine-router stop
+```
+
+The PID file is stored under `/tmp/dlengine-router` by default. Set `DLENGINE_ROUTER_RUNTIME_DIR` to use another runtime directory.
 ```
 
 Verify the public gateway:
 
 ```bash
 curl -sS http://127.0.0.1:3001/health
+curl -sS http://127.0.0.1:3001/status
 curl -sS http://127.0.0.1:3001/v1/models
 ```
 
