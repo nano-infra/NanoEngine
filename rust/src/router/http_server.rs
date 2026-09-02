@@ -433,7 +433,9 @@ async fn health() -> &'static str {
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let manager = state.engine_manager.lock().await;
     let (hybrid, prefill, decode) = manager.total_http_role_counts();
-    Json(serde_json::json!({"status":"ok", "engines":{"prefill":prefill,"decode":decode,"hybrid":hybrid,"encoder":0}, "models":manager.routable_model_keys()}))
+    Json(
+        serde_json::json!({"status":"ok", "engines":{"prefill":prefill,"decode":decode,"hybrid":hybrid,"encoder":0}, "models":manager.routable_model_keys()}),
+    )
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
