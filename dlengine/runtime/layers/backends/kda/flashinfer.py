@@ -62,7 +62,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             )
         self.num_k_heads = self.num_v_heads = total_heads // tp
         self.head_k_dim = int(linear["head_dim"])
-        self.head_v_dim = int(config.v_head_dim)
+        self.head_v_dim = int(linear.get("value_head_dim", linear.get("head_dim", config.v_head_dim)))
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.kv_ratio = 1
@@ -170,6 +170,11 @@ class FlashInferKDA(GenericGatedDeltaNet):
         self.fused_a_beta_weight = weight
         self.f_a_proj.weight.data = weight[: self.head_k_dim]
         self.b_proj.weight.data = weight[self.head_k_dim : width]
+
+    def process_weights_after_loading(self) -> None:
+        """Pack KDA decode projections after checkpoint loading."""
+        if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
+            self.prepare_fused_decode_projections()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_batch_context()

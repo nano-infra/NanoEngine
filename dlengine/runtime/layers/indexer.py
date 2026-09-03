@@ -392,6 +392,15 @@ class Indexer(nn.Module):
         self.layer_id = layer_id
         self.softmax_scale = index_head_dim**-0.5
         self.indexer_rope_interleave = indexer_rope_interleave
+        # GLM-5.3 pool-indexer parameters.  The pool path compresses groups of
+        # four index keys before top-k; keeping these tensors in the Indexer
+        # makes checkpoint loading independent of the selected kernel path.
+        self.index_kpool_compress_ape = nn.Parameter(
+            torch.empty(4, index_head_dim, dtype=torch.bfloat16)
+        )
+        self.index_kpool_compress_gate = nn.Parameter(
+            torch.empty(index_head_dim, hidden_size, dtype=torch.bfloat16)
+        )
 
         # Linear projections
         self.wq_b: ReplicatedLinearBase = get_backend().get_replicated_linear(

@@ -1283,7 +1283,9 @@ class ModelRunner:
         elif local_layer_types is not None and any(
             lt == "linear_attention" for lt in local_layer_types
         ):
-            num_kv_layers = sum(1 for lt in local_layer_types if lt == "full_attention")
+            # Qwen uses full_attention; GLM-5.3 calls its paged MLA layers
+            # deepseek_sparse_attention.  Both are the non-linear cache side.
+            num_kv_layers = sum(1 for lt in local_layer_types if lt != "linear_attention")
         else:
             # With pipeline parallelism each stage owns only a contiguous slice
             # of the decoder layers, so it allocates KV cache for just those
