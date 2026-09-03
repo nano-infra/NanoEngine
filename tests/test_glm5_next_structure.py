@@ -34,6 +34,11 @@ def test_mhc_projector_matches_reference_formula():
     assert torch.allclose(y, ref_y, atol=2e-2, rtol=2e-2)
     assert post.shape == (tokens, mult)
     assert comb.shape == (tokens, mult, mult)
+    y_ref4, post4, comb4 = p(x.view(1, tokens, mult, h))
+    assert y_ref4.shape == (1, tokens, h)
+    assert torch.allclose(y_ref4, y.view(1, tokens, h), atol=2e-2, rtol=2e-2)
+    assert post4.shape == (1, tokens, mult)
+    assert comb4.shape == (1, tokens, mult, mult)
 
 
 def test_mhc_post_uses_transposed_combination_like_reference():

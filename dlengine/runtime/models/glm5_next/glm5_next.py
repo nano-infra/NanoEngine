@@ -36,20 +36,35 @@ class Glm5NextHCProjector(nn.Module):
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        shape, dtype = x.shape, x.dtype
-        flat = x.flatten(1).float()
+        if x.ndim == 3:
+            # NanoDeploy's flattened token layout: [tokens, streams, hidden].
+            flat = x.flatten(1).float()
+            stream_dim = 1
+        elif x.ndim == 4:
+            # Transformers reference layout: [batch, sequence, streams, hidden].
+            flat = x.flatten(start_dim=2).float()
+            stream_dim = 2
+        else:
+            raise ValueError(
+                "GLM-5.3 mHC expects [tokens, streams, hidden] or "
+                f"[batch, sequence, streams, hidden], got {tuple(x.shape)}"
+            )
+        dtype = x.dtype
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.eps)
         mixes = F.linear(flat, self.fn) * rsqrt
         h = self.hc_mult
-        pre = torch.sigmoid(mixes[:, :h] * self.scale[0] + self.base[:h]) + self.eps
-        post = 2 * torch.sigmoid(mixes[:, h:2*h] * self.scale[1] + self.base[h:2*h])
-        comb = mixes[:, 2*h:].view(-1, h, h) * self.scale[2] + self.base[2*h:].view(h, h)
+        pre = torch.sigmoid(mixes[..., :h] * self.scale[0] + self.base[:h]) + self.eps
+        post = 2 * torch.sigmoid(
+            mixes[..., h : 2 * h] * self.scale[1] + self.base[h : 2 * h]
+        )
+        comb = mixes[..., 2 * h :].view(*mixes.shape[:-1], h, h) * self.scale[2]
+        comb = comb + self.base[2 * h :].view(h, h)
         comb = comb.softmax(-1) + self.eps
         comb = comb / (comb.sum(-2, keepdim=True) + self.eps)
         for _ in range(max(0, self.sinkhorn_iters - 1)):
             comb = comb / (comb.sum(-1, keepdim=True) + self.eps)
             comb = comb / (comb.sum(-2, keepdim=True) + self.eps)
-        y = torch.sum(pre.unsqueeze(-1) * x.flatten(1).view(shape), dim=1)
+        y = torch.sum(pre.unsqueeze(-1) * x, dim=stream_dim)
         return y.to(dtype), post.to(dtype), comb.to(dtype)
 
 
