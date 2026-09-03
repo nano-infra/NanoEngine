@@ -294,7 +294,7 @@ class Config(BaseModel):
                 raise
             with config_path.open() as f:
                 config_dict = json.load(f)
-            if config_dict.get("model_type") in ("qwen3_5", "kimi_k3"):
+            if config_dict.get("model_type") in ("qwen3_5", "kimi_k3", "glm5_next"):
                 text_config = config_dict.get("text_config")
                 self.hf_config = PretrainedConfig(**config_dict)
                 if isinstance(text_config, dict):
@@ -365,6 +365,7 @@ class Config(BaseModel):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ):
             if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
                 assert self.attention_sp == 1
@@ -452,7 +453,7 @@ class Config(BaseModel):
             if self.attention_tp != 1:
                 raise ValueError("enable_hisparse requires attention_tp == 1")
             if self.num_speculative_tokens != 0:
-                if arch != "GlmMoeDsaForCausalLM":
+                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
                     raise ValueError(
                         "enable_hisparse with MTP currently requires "
                         "GlmMoeDsaForCausalLM"
@@ -558,7 +559,7 @@ class Config(BaseModel):
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
             if self.num_speculative_tokens > 1:
-                if arch != "GlmMoeDsaForCausalLM":
+                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
                     raise ValueError(
                         "num_speculative_tokens > 1 is currently supported only "
                         "for GlmMoeDsaForCausalLM"
@@ -581,6 +582,7 @@ class Config(BaseModel):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):
