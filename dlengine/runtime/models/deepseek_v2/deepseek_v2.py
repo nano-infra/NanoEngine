@@ -1173,7 +1173,12 @@ class DeepseekV2Attention(nn.Module):
             config.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.softmax_scale,
             num_kv_heads=num_key_value_heads,
-            v_head_dim=config.kv_lora_rank,
+            # MLA's value width is model-configured.  GLM-5.3 uses a 256-wide
+            # value head while its compressed KV rank is 512; using the rank
+            # here silently creates a 512-wide backend and rejects the model
+            # on Blackwell.  DeepSeek V2/V3 configs retain their existing
+            # value width through ``config.v_head_dim``.
+            v_head_dim=self.v_head_dim,
             attention_type="MLA",
             nsa_index_topk=getattr(config, "index_topk", 0),
             mla_qk_nope_head_dim=config.qk_nope_head_dim,
@@ -1206,6 +1211,10 @@ class DeepseekV2Attention(nn.Module):
                 indexer_norm_eps=float(getattr(config, "indexer_norm_eps", 1e-6)),
                 indexer_rope_interleave=bool(
                     getattr(config, "indexer_rope_interleave", False)
+                ),
+                index_kpool=int(getattr(config, "index_kpool", 1) or 1),
+                index_kpool_always_select_tail=bool(
+                    getattr(config, "index_kpool_always_select_tail", False)
                 ),
             )
         else:

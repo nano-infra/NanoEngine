@@ -37,6 +37,7 @@ import os
 import deep_gemm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dlengine.logging import get_logger
 from dlengine.runtime.kernel.jit.sgl import fused_kernels_enabled
@@ -159,6 +160,191 @@ def _weighted_relu_mqa_scores(
         head_scores.mul_(weights_f[:, h_start:h_end, None])
         scores.add_(head_scores.sum(dim=1))
     return scores
+
+
+def pool_indexer_states(
+    packed_states: torch.Tensor,
+    index_kpool: int,
+    index_kpool_compress_ape: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build GLM-5.3 compressed key pools from cached indexer states.
+
+    ``packed_states`` follows the reference layout ``[key, gate_scores, valid]``
+    with shape ``[batch, kv_len, 2 * index_head_dim + 1]``.  Pool boundaries
+    start at the first valid token (rather than physical cache slot zero), which
+    is essential for paged caches whose first page can contain padding.  The
+    returned ``pool_indices`` retain raw logical token indices so the attention
+    backend can expand selected pools back into token/page indices.
+    """
+    if packed_states.ndim != 3:
+        raise ValueError(
+            "packed_states must have shape [batch, kv_len, 2*head_dim+1], got "
+            f"{tuple(packed_states.shape)}"
+        )
+    if index_kpool < 1:
+        raise ValueError(f"index_kpool must be positive, got {index_kpool}")
+    batch_size, seq_len, packed_width = packed_states.shape
+    if seq_len == 0:
+        raise ValueError("packed_states must contain at least one key")
+    if packed_width < 3 or (packed_width - 1) % 2:
+        raise ValueError(
+            "packed_states last dimension must be 2*head_dim+1, got "
+            f"{packed_width}"
+        )
+    head_dim = (packed_width - 1) // 2
+    ape = index_kpool_compress_ape
+    if tuple(ape.shape) != (index_kpool, head_dim):
+        raise ValueError(
+            "index_kpool_compress_ape shape mismatch: expected "
+            f"{(index_kpool, head_dim)}, got {tuple(ape.shape)}"
+        )
+
+    keys, gate_scores, valid = torch.split(
+        packed_states, [head_dim, head_dim, 1], dim=-1
+    )
+    valid = valid.bool().squeeze(-1)
+    num_pools = (seq_len + index_kpool - 1) // index_kpool
+    device = packed_states.device
+    first_key = torch.where(
+        valid.any(-1),
+        valid.long().argmax(-1),
+        torch.full((batch_size,), seq_len, dtype=torch.long, device=device),
+    )
+    offsets = torch.arange(
+        num_pools * index_kpool, device=device, dtype=torch.long
+    ).view(1, num_pools, index_kpool)
+    pool_indices = first_key[:, None, None] + offsets
+    batch_idx = torch.arange(batch_size, device=device)[:, None, None]
+    safe_indices = pool_indices.clamp(0, seq_len - 1)
+    grouped_keys = keys[batch_idx, safe_indices]
+    grouped_gate_scores = gate_scores[batch_idx, safe_indices]
+    grouped_valid = valid[batch_idx, safe_indices] & (pool_indices < seq_len)
+    pool_valid = grouped_valid.all(-1)
+    pool_indices = pool_indices.masked_fill(~grouped_valid, -1)
+
+    logits = grouped_gate_scores.float() + ape.float()[None, None]
+    logits = logits.masked_fill(~grouped_valid[..., None], float("-inf"))
+    probabilities = torch.nan_to_num(logits.softmax(dim=2)).to(grouped_keys.dtype)
+    pool_keys = (probabilities * grouped_keys).sum(dim=2)
+
+    # Static cache pages can extend beyond the actual sequence. Keep a pool
+    # column if it is valid for at least one batch row, just as the reference
+    # implementation does; per-query masking below handles other rows.
+    keep = pool_valid.any(0)
+    return pool_keys[:, keep], pool_indices[:, keep], pool_valid[:, keep]
+
+
+def append_pool_tail(
+    topk_indices: torch.Tensor,
+    token_visible: torch.Tensor,
+    key_valid: torch.Tensor,
+    index_kpool: int,
+) -> torch.Tensor:
+    """Append the incomplete visible pool as raw token indices.
+
+    GLM-5.3 always selects this tail by default. For ``index_kpool=4`` a
+    visible sequence ``A..F`` therefore contributes full pool ``A..D`` plus
+    raw tail ``E,F``.
+    """
+    if index_kpool < 1:
+        raise ValueError(f"index_kpool must be positive, got {index_kpool}")
+    max_tail_width = index_kpool - 1
+    if max_tail_width == 0:
+        return topk_indices
+    if token_visible.ndim != 3 or key_valid.ndim != 2:
+        raise ValueError("token_visible=[B,S,L] and key_valid=[B,L] are required")
+    batch_size, _, kv_length = token_visible.shape
+    if key_valid.shape != (batch_size, kv_length):
+        raise ValueError(
+            f"key_valid shape {tuple(key_valid.shape)} does not match "
+            f"token_visible {(batch_size, kv_length)}"
+        )
+    device = token_visible.device
+    first_key = torch.where(
+        key_valid.any(-1),
+        key_valid.long().argmax(-1),
+        torch.full((batch_size,), kv_length, dtype=torch.long, device=device),
+    )
+    visible_count = token_visible.long().sum(-1)
+    tail_count = visible_count.remainder(index_kpool)
+    offsets = torch.arange(max_tail_width, device=device)
+    tail_start = first_key[:, None] + visible_count - tail_count
+    tail_indices = tail_start[..., None] + offsets
+    tail_valid = (offsets[None, None, :] < tail_count[..., None]) & tail_indices.lt(kv_length)
+    safe_indices = tail_indices.clamp(0, max(kv_length - 1, 0))
+    tail_visible = token_visible.gather(-1, safe_indices)
+    tail_indices = tail_indices.masked_fill(~(tail_valid & tail_visible), -1)
+    return torch.cat([topk_indices, tail_indices], dim=-1)
+
+
+def pool_indexer_topk(
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    packed_states: torch.Tensor,
+    token_visible: torch.Tensor,
+    index_topk: int,
+    index_kpool: int,
+    index_kpool_compress_ape: torch.Tensor,
+    *,
+    always_select_tail: bool = True,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Reference GLM-5.3 pool-indexer scoring and token expansion.
+
+    This eager implementation is intentionally separate from the FP8 paged
+    DeepGEMM path. It is used for correctness tests and CPU/reference prefill;
+    the CUDA path can replace only the score/TopK kernel while preserving this
+    exact pool contract.
+    """
+    if query.ndim != 4:
+        raise ValueError(f"query must be [B,S,H,D], got {tuple(query.shape)}")
+    if weights.shape != query.shape[:3]:
+        raise ValueError(
+            f"weights must have shape {tuple(query.shape[:3])}, got {tuple(weights.shape)}"
+        )
+    if token_visible.ndim != 3 or token_visible.shape[:2] != query.shape[:2]:
+        raise ValueError("token_visible must have shape [B,S,kv_len]")
+    if index_topk < 1 or index_topk % index_kpool:
+        raise ValueError("index_topk must be positive and divisible by index_kpool")
+    pool_keys, pool_indices, pool_valid = pool_indexer_states(
+        packed_states, index_kpool, index_kpool_compress_ape
+    )
+    batch_size, seq_len, num_heads, head_dim = query.shape
+    kv_len = packed_states.shape[1]
+    if packed_states.shape[0] != batch_size or packed_states.shape[2] != 2 * head_dim + 1:
+        raise ValueError("query and packed_states dimensions are incompatible")
+    scale = head_dim ** -0.5 if softmax_scale is None else softmax_scale
+    scores = torch.matmul(
+        query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1)
+    )
+    scores = F.relu(scores * scale)
+    index_scores = torch.matmul(
+        weights.float().unsqueeze(-2), scores
+    ).squeeze(-2) * (num_heads ** -0.5)
+    pool_end = pool_indices[..., -1].clamp(0, kv_len - 1)
+    visible = token_visible.bool()
+    pool_visible = visible.gather(
+        -1, pool_end[:, None, :].expand(batch_size, seq_len, -1)
+    )
+    valid_candidates = pool_visible & pool_valid[:, None]
+    index_scores = index_scores.masked_fill(
+        ~valid_candidates, torch.finfo(index_scores.dtype).min
+    )
+    select_k = min(index_topk // index_kpool, index_scores.shape[-1])
+    selected = index_scores.topk(select_k, dim=-1).indices
+    batch_idx = torch.arange(batch_size, device=query.device)[:, None, None]
+    selected_valid = valid_candidates.gather(-1, selected)
+    selected_indices = pool_indices[batch_idx, selected]
+    topk = selected_indices.flatten(-2).masked_fill(
+        ~selected_valid[..., None].expand_as(selected_indices).flatten(-2), -1
+    )
+    output_width = index_topk
+    if always_select_tail:
+        topk = append_pool_tail(topk, visible, packed_states[..., -1].bool(), index_kpool)
+        output_width += index_kpool - 1
+    topk = F.pad(topk, (0, max(0, output_width - topk.shape[-1])), value=-1)
+    query_valid = visible.any(-1)
+    return topk[..., :output_width].masked_fill(~query_valid[..., None], -1)
 
 
 def _expand_decode_context_lens(
@@ -381,6 +567,8 @@ class Indexer(nn.Module):
         layer_id: int,
         indexer_norm_eps: float = 1e-6,
         indexer_rope_interleave: bool = False,
+        index_kpool: int = 1,
+        index_kpool_always_select_tail: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -392,11 +580,15 @@ class Indexer(nn.Module):
         self.layer_id = layer_id
         self.softmax_scale = index_head_dim**-0.5
         self.indexer_rope_interleave = indexer_rope_interleave
-        # GLM-5.3 pool-indexer parameters.  The pool path compresses groups of
-        # four index keys before top-k; keeping these tensors in the Indexer
-        # makes checkpoint loading independent of the selected kernel path.
+        self.index_kpool = int(index_kpool)
+        self.index_kpool_always_select_tail = bool(index_kpool_always_select_tail)
+        if self.index_kpool < 1:
+            raise ValueError(f"index_kpool must be positive, got {self.index_kpool}")
+        # GLM-5.3 pool-indexer parameters.  The checkpoint uses index_kpool=4
+        # (the HF config class default is 16), so this must come from the loaded
+        # model config rather than being hard-coded.
         self.index_kpool_compress_ape = nn.Parameter(
-            torch.empty(4, index_head_dim, dtype=torch.bfloat16)
+            torch.empty(self.index_kpool, index_head_dim, dtype=torch.bfloat16)
         )
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(index_head_dim, hidden_size, dtype=torch.bfloat16)
@@ -442,6 +634,36 @@ class Indexer(nn.Module):
 
         # Indexer cache reference (set externally after cache allocation)
         self.indexer_cache: IndexerCache | None = None
+
+    def pool_topk(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        packed_states: torch.Tensor,
+        token_visible: torch.Tensor,
+        *,
+        always_select_tail: bool | None = None,
+    ) -> torch.Tensor:
+        """Run the reference pool-indexer path with this layer's parameters.
+
+        ``weights`` is the unscaled ``weights_proj(hidden_states)`` output;
+        the helper applies the reference ``1/sqrt(num_heads)`` factor.
+        """
+        return pool_indexer_topk(
+            query,
+            weights,
+            packed_states,
+            token_visible,
+            self.index_topk,
+            self.index_kpool,
+            self.index_kpool_compress_ape,
+            always_select_tail=(
+                self.index_kpool_always_select_tail
+                if always_select_tail is None
+                else always_select_tail
+            ),
+            softmax_scale=self.softmax_scale,
+        )
 
     def build_schedule_metadata(self, context_lens: torch.Tensor) -> torch.Tensor:
         """Build the per-step DeepGEMM schedule shared by all Indexer layers."""
