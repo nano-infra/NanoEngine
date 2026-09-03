@@ -359,6 +359,43 @@ class Config(BaseModel):
         ):
             setattr(self.hf_config, attr, getattr(self, attr, None))
 
+        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+        if arch == "Glm5NextForConditionalGeneration":
+            # GLM-5.3's first implementation is the text-only hybrid topology
+            # exercised by the reference model: attention DP feeds a matching
+            # expert-parallel FFN group, with no TP/SP/PP split.
+            if self.attention_tp != 1 or self.attention_sp != 1:
+                raise ValueError(
+                    "GLM-5.3 requires attention_tp=attention_sp=1; "
+                    f"got tp={self.attention_tp}, sp={self.attention_sp}"
+                )
+            if self.ffn_dp != 1 or self.ffn_tp != 1:
+                raise ValueError(
+                    "GLM-5.3 requires ffn_dp=ffn_tp=1; "
+                    f"got ffn_dp={self.ffn_dp}, ffn_tp={self.ffn_tp}"
+                )
+            if self.attention_dp != self.ffn_ep:
+                raise ValueError(
+                    "GLM-5.3 attention_dp must equal ffn_ep so each attention "
+                    "DP rank maps to one expert-parallel group; got "
+                    f"attention_dp={self.attention_dp}, ffn_ep={self.ffn_ep}"
+                )
+            n_experts = int(getattr(self.hf_config, "n_routed_experts", 0) or 0)
+            if n_experts and n_experts % self.ffn_ep:
+                raise ValueError(
+                    f"GLM-5.3 n_routed_experts={n_experts} must be divisible "
+                    f"by ffn_ep={self.ffn_ep}"
+                )
+            index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
+            index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
+            if index_kpool < 1 or (index_topk and index_topk % index_kpool):
+                raise ValueError(
+                    "GLM-5.3 index_topk must be divisible by positive index_kpool; "
+                    f"got index_topk={index_topk}, index_kpool={index_kpool}"
+                )
+            if self.pp != 1:
+                raise ValueError("GLM-5.3 does not support pipeline parallel decode")
+
         if self.hf_config.architectures[0] in (
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
@@ -546,8 +583,12 @@ class Config(BaseModel):
         # MTP validation
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+        if arch == "Glm5NextForConditionalGeneration" and self.num_speculative_tokens > 5:
+            raise ValueError(
+                "GLM-5.3 supports at most 5 recurrent NextN speculative tokens"
+            )
         if self.num_speculative_tokens > 0:
-            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
             has_mtp = (
                 getattr(self.hf_config, "num_nextn_predict_layers", 0) > 0
                 or getattr(self.hf_config, "mtp_num_hidden_layers", 0) > 0

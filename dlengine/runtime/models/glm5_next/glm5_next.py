@@ -6,16 +6,16 @@ through the decoder and is contracted before the LM head.
 """
 from __future__ import annotations
 import re
-from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from dlengine.runtime.context.distributed import get_dist_context
-from dlengine.runtime.context.cache.plan import kimi_k3_cache_plan
+from dlengine.runtime.context.cache.plan import glm5_next_cache_plan
 from dlengine.runtime.layers import get_backend
 from dlengine.runtime.layers.backends.kda import FlashInferKDA
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from dlengine.runtime.layers.activation import SiluAndMul
 from dlengine.runtime.layers.layernorm import RMSNorm
 from dlengine.runtime.layers.parallelism_transition import AttnToFfnTransition, FfnToAttnTransition
 from dlengine.runtime.models.deepseek_v2.deepseek_v2 import DeepseekV2Attention, DeepseekV2MLP, DeepseekV2MoE
@@ -53,6 +53,29 @@ class Glm5NextHCProjector(nn.Module):
         return y.to(dtype), post.to(dtype), comb.to(dtype)
 
 
+class Glm5NextHyperHead(nn.Module):
+    """Reference GLM-5.3 final mHC stream contraction.
+
+    GLM-5.3 deliberately uses an *unweighted mean* at the output boundary.
+    This is different from DeepSeek-V4's learned hyper-head and is important
+    for keeping the hidden-state scale (and therefore the logits) aligned with
+    the checkpoint.
+    """
+
+    def forward(self, hidden_streams: torch.Tensor) -> torch.Tensor:
+        if hidden_streams.ndim == 3:
+            # NanoDeploy flattens [batch, sequence] into the leading token
+            # dimension, so the stream axis is dim=1 ([tokens, hc_mult, H]).
+            return hidden_streams.mean(dim=1)
+        if hidden_streams.ndim >= 4:
+            # Transformers reference layout is [batch, sequence, hc_mult, H].
+            return hidden_streams.mean(dim=2)
+        raise ValueError(
+            "GLM-5.3 hyper-head expects [tokens, streams, hidden] or "
+            f"[batch, sequence, streams, hidden], got {tuple(hidden_streams.shape)}"
+        )
+
+
 def _hc_post(x, residual, post, comb):
     return post.unsqueeze(-1) * x.unsqueeze(1) + torch.einsum("tij,tjd->tid", comb.transpose(1, 2), residual)
 
@@ -65,8 +88,23 @@ class Glm5NextDecoderLayer(nn.Module):
                           DeepseekV2Attention(config, quantization_config, layer_idx, cache_idx))
         dense = (getattr(config, "mlp_layer_types", ["sparse"] * config.num_hidden_layers)[layer_idx] == "dense")
         self.mlp = (DeepseekV2MLP(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
-                                  hidden_act=config.hidden_act, config=config, quantization_config=quantization_config)
+                                  hidden_act=config.hidden_act, config=config, quantization_config=quantization_config,
+                                  swiglu_limit=float(getattr(config, "swiglu_limit", 10.0)))
                     if dense else DeepseekV2MoE(config, quantization_config))
+        if not dense:
+            # DeepseekV2MoE is shared with models whose SwiGLU is unclamped.
+            # GLM-5.3 clamps both routed and shared experts at 10.0, matching
+            # Glm5NextTextExperts/Glm5NextTextMLP in the reference model.
+            routed = getattr(self.mlp, "routed_experts", None)
+            if routed is not None and hasattr(routed, "_swiglu_limit_runtime"):
+                routed._swiglu_limit_runtime = float(
+                    getattr(config, "swiglu_limit", 10.0)
+                )
+            shared = getattr(self.mlp, "shared_experts", None)
+            if shared is not None:
+                shared.act_fn = SiluAndMul(
+                    swiglu_limit=float(getattr(config, "swiglu_limit", 10.0))
+                )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_attn = Glm5NextHCProjector(config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps)
@@ -102,6 +140,7 @@ class Glm5NextModel(nn.Module):
             sum(t == "linear_attention" for t in config.layer_types[:i]),
             sum(t != "linear_attention" for t in config.layer_types[:i])))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.is_last_pp_stage else None
+        self.hc_head = Glm5NextHyperHead() if self.is_last_pp_stage else None
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         if self.is_first_pp_stage:
@@ -113,7 +152,10 @@ class Glm5NextModel(nn.Module):
         for i in range(self.start_layer, self.end_layer): hidden, residual = self.layers[i](hidden, positions, residual)
         if not self.is_last_pp_stage:
             pp_send_hidden(hidden); return hidden
-        hidden = hidden.sum(dim=1)
+        # Decoder layers carry [tokens, hc_mult, hidden].  The reference
+        # hyper-head contracts that stream axis with a mean immediately before
+        # the final RMSNorm (not a sum).
+        hidden = self.hc_head(hidden)
         return self.norm(hidden)
 
 
@@ -125,7 +167,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size) if get_dist_context().is_last_pp_stage else None
     def forward(self, input_ids, positions, inputs_embeds=None): return self.model(input_ids, positions, inputs_embeds)
     def compute_logits(self, hidden_states): return self.lm_head(hidden_states)
-    def get_cache_plan(self): return kimi_k3_cache_plan()
+    def get_cache_plan(self): return glm5_next_cache_plan()
     def load_weights(self, weights):
         from dlengine.runtime.models.deepseek_v2.deepseek_v2_loader import load_weights
         load_weights(self, _normalize_glm5_weights(weights))
@@ -139,6 +181,13 @@ def _normalize_glm5_weights(weights):
     """
     conv, gates = {}, {}
     for name, raw, tensor in weights:
+        # ``iterate_weights`` already strips VLM prefixes, but keeping the
+        # normalizer self-contained also makes direct checkpoint/meta-device
+        # tests and alternative loaders behave identically.
+        if name.startswith("model.language_model."):
+            name = "model." + name[len("model.language_model.") :]
+        elif name.startswith("language_model."):
+            name = "model." + name[len("language_model.") :]
         m = re.search(r"model\.layers\.(\d+)\.self_attn\.([qkv])_conv1d\.weight$", name)
         if m:
             conv.setdefault(int(m.group(1)), {})[m.group(2)] = tensor

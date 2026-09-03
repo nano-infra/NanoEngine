@@ -1,11 +1,16 @@
+import json
 import types
+
+import pytest
 import torch
 
 from dlengine.runtime.models.glm5_next.glm5_next import (
     Glm5NextHCProjector,
+    Glm5NextHyperHead,
     _hc_post,
     _normalize_glm5_weights,
 )
+from dlengine.runtime.context.cache.plan import glm5_next_cache_plan
 
 
 def test_glm5_layer_schedule_from_checkpoint_config():
@@ -48,15 +53,89 @@ def test_glm_kda_weight_normalization_is_streaming_and_shape_correct():
     ga = torch.randn(2, 3)
     gb = torch.randn(8, 2)
     src = [
-        ("model.layers.0.self_attn.q_conv1d.weight", "", q),
-        ("model.layers.0.self_attn.k_conv1d.weight", "", k),
-        ("model.layers.0.self_attn.v_conv1d.weight", "", v),
-        ("model.layers.0.self_attn.g_a_proj.weight", "", ga),
-        ("model.layers.0.self_attn.g_b_proj.weight", "", gb),
-        ("model.layers.0.hc_attn_fn", "", torch.empty(24, 12)),
+        ("model.language_model.layers.0.self_attn.q_conv1d.weight", "", q),
+        ("model.language_model.layers.0.self_attn.k_conv1d.weight", "", k),
+        ("model.language_model.layers.0.self_attn.v_conv1d.weight", "", v),
+        ("model.language_model.layers.0.self_attn.g_a_proj.weight", "", ga),
+        ("model.language_model.layers.0.self_attn.g_b_proj.weight", "", gb),
+        ("model.language_model.layers.0.hc_attn_fn", "", torch.empty(24, 12)),
     ]
     out = list(_normalize_glm5_weights(iter(src)))
     names = {name: tensor for name, _, tensor in out}
     assert names["model.layers.0.self_attn.conv1d.weight"].shape == (24, 2, 3)
     assert torch.allclose(names["model.layers.0.self_attn.g_proj.weight"], gb @ ga)
     assert "model.layers.0.hc_attn.fn" in names
+
+
+def test_glm_final_hyper_head_is_unweighted_mean():
+    head = Glm5NextHyperHead()
+    streams = torch.arange(2 * 3 * 4 * 1, dtype=torch.float32).view(2, 3, 4, 1)
+    out = head(streams)
+    assert out.shape == (2, 3, 1)
+    assert torch.equal(out, streams.mean(dim=2))
+    flat_streams = streams.view(6, 4, 1)
+    assert torch.equal(head(flat_streams), flat_streams.mean(dim=1))
+
+
+def test_glm_cache_plan_includes_mla_gdn_and_indexer():
+    plan = glm5_next_cache_plan()
+    assert plan.has_mla()
+    assert plan.has_gdn()
+    assert plan.has_indexer()
+
+
+def _write_minimal_glm_config(tmp_path):
+    config = {
+        "model_type": "glm5_next",
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "hidden_size": 8, "num_hidden_layers": 1,
+        "num_attention_heads": 1, "num_key_value_heads": 1,
+        "vocab_size": 32, "max_position_embeddings": 16,
+        "layer_types": ["linear_attention"],
+        "mlp_layer_types": ["dense"],
+        "index_head_dim": 2, "index_n_heads": 1,
+        "index_topk": 4, "index_kpool": 2,
+        "n_routed_experts": 8, "num_experts_per_tok": 1,
+        "num_nextn_predict_layers": 1,
+        "kv_lora_rank": 2, "qk_rope_head_dim": 0,
+        "qk_nope_head_dim": 2, "v_head_dim": 2, "q_lora_rank": 2,
+        "n_shared_experts": 1, "moe_intermediate_size": 4,
+        "intermediate_size": 4, "hidden_act": "silu",
+        "rms_norm_eps": 1e-6, "attention_bias": False,
+        "linear_attn_config": {"num_heads": 1, "head_dim": 2, "short_conv_kernel_size": 2},
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    return tmp_path
+
+
+def test_glm_config_accepts_target_dp_ep_and_mtp_range(tmp_path, monkeypatch):
+    from dlengine import config as config_module
+
+    monkeypatch.setattr(
+        config_module.AutoConfig, "from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unknown model")),
+    )
+    path = _write_minimal_glm_config(tmp_path)
+    for steps in range(0, 6):
+        cfg = config_module.Config(
+            model=str(path), attention_dp=4, ffn_ep=4,
+            num_speculative_tokens=steps, max_num_seqs=1,
+        )
+        assert cfg.kvcache_block_size == 64
+
+
+def test_glm_config_rejects_mismatched_dp_ep_and_mtp_overflow(tmp_path, monkeypatch):
+    from dlengine import config as config_module
+
+    monkeypatch.setattr(
+        config_module.AutoConfig, "from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unknown model")),
+    )
+    path = _write_minimal_glm_config(tmp_path)
+    with pytest.raises(Exception, match="attention_dp must equal ffn_ep"):
+        config_module.Config(model=str(path), attention_dp=2, ffn_ep=4)
+    with pytest.raises(Exception, match="at most 5"):
+        config_module.Config(
+            model=str(path), attention_dp=4, ffn_ep=4, num_speculative_tokens=6
+        )
