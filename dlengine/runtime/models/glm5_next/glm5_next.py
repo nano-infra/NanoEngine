@@ -128,22 +128,34 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def get_cache_plan(self): return kimi_k3_cache_plan()
     def load_weights(self, weights):
         from dlengine.runtime.models.deepseek_v2.deepseek_v2_loader import load_weights
-        conv, gates = {}, {}
-        def normalized():
-            for name, raw, tensor in weights:
-                m = re.search(r"model\.layers\.(\d+)\.self_attn\.([qkv])_conv1d\.weight$", name)
-                if m: conv.setdefault(int(m.group(1)), {})[m.group(2)] = tensor; continue
-                m = re.search(r"model\.layers\.(\d+)\.self_attn\.g_([ab])_proj\.weight$", name)
-                if m: gates.setdefault(int(m.group(1)), {})[m.group(2)] = tensor; continue
-                name = re.sub(r"(layers\.\d+)\.(hc_attn|hc_ffn)_(fn|base|scale)$", r"\1.\2.\3", name)
-                yield name, raw, tensor
-            for layer, vals in conv.items():
-                if set(vals) == {"q", "k", "v"}:
-                    yield f"model.layers.{layer}.self_attn.conv1d.weight", "", torch.cat((vals["q"], vals["k"], vals["v"]), 0)
-            for layer, vals in gates.items():
-                if set(vals) == {"a", "b"}:
-                    yield f"model.layers.{layer}.self_attn.g_proj.weight", "", vals["b"] @ vals["a"]
-        load_weights(self, normalized())
+        load_weights(self, _normalize_glm5_weights(weights))
+
+
+def _normalize_glm5_weights(weights):
+    """Normalize split GLM KDA tensors into NanoDeploy parameter names.
+
+    This is intentionally a streaming generator: a GLM checkpoint is too large
+    to materialize in memory merely to combine the three depthwise-conv shards.
+    """
+    conv, gates = {}, {}
+    for name, raw, tensor in weights:
+        m = re.search(r"model\.layers\.(\d+)\.self_attn\.([qkv])_conv1d\.weight$", name)
+        if m:
+            conv.setdefault(int(m.group(1)), {})[m.group(2)] = tensor
+            continue
+        m = re.search(r"model\.layers\.(\d+)\.self_attn\.g_([ab])_proj\.weight$", name)
+        if m:
+            gates.setdefault(int(m.group(1)), {})[m.group(2)] = tensor
+            continue
+        name = re.sub(r"(layers\.\d+)\.(hc_attn|hc_ffn)_(fn|base|scale)$", r"\1.\2.\3", name)
+        yield name, raw, tensor
+    for layer, vals in conv.items():
+        if set(vals) == {"q", "k", "v"}:
+            yield f"model.layers.{layer}.self_attn.conv1d.weight", "", torch.cat((vals["q"], vals["k"], vals["v"]), 0)
+    for layer, vals in gates.items():
+        if set(vals) == {"a", "b"}:
+            yield f"model.layers.{layer}.self_attn.g_proj.weight", "", vals["b"] @ vals["a"]
+
 
 
 class Glm5NextForConditionalGenerationNextN(DeepSeekMTP):
