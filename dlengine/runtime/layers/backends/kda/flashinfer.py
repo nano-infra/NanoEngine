@@ -205,7 +205,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             # Tiny GEMM does not support the padded GLM-5.3 KDA layout on all Blackwell builds.
             fused_a_beta = F.linear(hidden_states, self.fused_a_beta_weight)
             beta = fused_a_beta[:, self.head_k_dim : self.head_k_dim + self.num_v_heads]
-            forget = F.linear(fused_a_beta[:, : self.head_k_dim], self.f_b_proj.weight)
+            forget = F.linear(fused_a_beta[:, : self.head_k_dim], self.f_b_proj.weight.to(torch.bfloat16))
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
