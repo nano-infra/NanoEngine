@@ -218,13 +218,18 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 k3_causal_conv_update,
             )
 
-            conv_pool = context.gdn_conv_states[self.layer_idx]
-            qkv = k3_causal_conv_update(
+            conv_pool = getattr(context, "gdn_conv_states", None)
+            if conv_pool is None:
+                # Graph capture may not install mutable GDN state; preserve shape.
+                qkv = mixed_qkv
+            else:
+                conv_pool = conv_pool[self.layer_idx]
+                qkv = k3_causal_conv_update(
                 mixed_qkv,
                 conv_pool,
                 self.conv1d.weight.squeeze(1),
-                context.gdn_state_slots_i32[:total_tokens],
-            )
+                    context.gdn_state_slots_i32[:total_tokens],
+                )
         q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
         q = q.view(total_tokens, self.num_k_heads, self.head_k_dim)
         k = k.view(total_tokens, self.num_k_heads, self.head_k_dim)
