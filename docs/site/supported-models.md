@@ -14,6 +14,7 @@ DLEngine is designed primarily for large-model inference on multi-GPU and multi-
 | DeepSeek-V3.2                  | `DeepseekV32ForCausalLM`                                | MLA + MoE + NSA                  | Indexer cache, sparse attention, HiSparse decode          |
 | DeepSeek-V4                    | `DeepseekV4ForCausalLM`                                 | MLA/DSA/SWA + MoE                | Compressed cache, Hyper-Connection, mega-MoE paths        |
 | GLM-5 family                   | `GlmMoeDsaForCausalLM`                                  | MLA + MoE + DSA/NSA              | GLM Indexer, long context, recurrent N=5/K=6 MTP          |
+| GLM-5.3-Flash                  | `Glm5NextForConditionalGeneration`                      | KDA + MLA/DSA + mHC + MoE        | Single-node hybrid PD; DP4/EP4; MTP pending              |
 | Gemma4 text                    | `Gemma4ForCausalLM` or `Gemma4ForConditionalGeneration` | Sliding-window + global GQA      | HiSparse ring buffer and graph-safe decode                |
 | Kimi-K2 compatible checkpoints | compatible `DeepseekV3ForCausalLM` config               | MLA + MoE                        | Uses the DeepSeek-V3-compatible model path                |
 
