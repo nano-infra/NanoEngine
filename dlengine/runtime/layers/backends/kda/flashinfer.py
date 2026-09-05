@@ -160,14 +160,14 @@ class FlashInferKDA(GenericGatedDeltaNet):
         ):
             proj.weight.data = qkvg[offset : offset + size]
             offset += size
-        self.fused_qkvg_weight = qkvg
+        self.fused_qkvg_weight = qkvg.to(torch.bfloat16)
 
         width = self.head_k_dim + self.num_v_heads
         padded = (width + 15) // 16 * 16
         weight = self.f_a_proj.weight.new_zeros((padded, self.hidden_size))
         weight[: self.head_k_dim].copy_(self.f_a_proj.weight)
         weight[self.head_k_dim : width].copy_(self.b_proj.weight)
-        self.fused_a_beta_weight = weight
+        self.fused_a_beta_weight = weight.to(torch.bfloat16)
         self.f_a_proj.weight.data = weight[: self.head_k_dim]
         self.b_proj.weight.data = weight[self.head_k_dim : width]
 
