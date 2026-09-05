@@ -202,15 +202,10 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 (self.key_dim, self.key_dim, self.value_dim, self.key_dim), dim=-1
             )
             mixed_qkv = qkvg[:, : self.conv_dim]
-            fused_a_beta = tiny_n_gemm_bf16(
-                hidden_states, self.fused_a_beta_weight, max_m=8
-            )
+            # Tiny GEMM does not support the padded GLM-5.3 KDA layout on all Blackwell builds.
+            fused_a_beta = F.linear(hidden_states, self.fused_a_beta_weight)
             beta = fused_a_beta[:, self.head_k_dim : self.head_k_dim + self.num_v_heads]
-            forget = tiny_k_gemm_bf16(
-                fused_a_beta[:, : self.head_k_dim],
-                self.f_b_proj.weight,
-                max_m=8,
-            )
+            forget = F.linear(fused_a_beta[:, : self.head_k_dim], self.f_b_proj.weight)
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
