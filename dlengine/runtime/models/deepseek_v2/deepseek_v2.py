@@ -1182,6 +1182,7 @@ class DeepseekV2Attention(nn.Module):
             attention_type="MLA",
             nsa_index_topk=getattr(config, "index_topk", 0),
             mla_qk_nope_head_dim=config.qk_nope_head_dim,
+            mla_kv_lora_rank=config.kv_lora_rank,
         )
 
         self.vc = DeepseekV2BMM(self.num_heads, config.kv_lora_rank, self.v_head_dim)
@@ -1197,11 +1198,14 @@ class DeepseekV2Attention(nn.Module):
         if self.is_v32 and not self.skip_topk:
             from dlengine.runtime.layers.indexer import Indexer
 
+            indexer_rope_dim = int(
+                getattr(config, "indexer_rope_head_dim", config.qk_rope_head_dim)
+            )
             self.indexer = Indexer(
                 hidden_size=config.hidden_size,
                 index_n_heads=config.index_n_heads,
                 index_head_dim=config.index_head_dim,
-                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_rope_head_dim=indexer_rope_dim,
                 q_lora_rank=config.q_lora_rank,
                 index_topk=config.index_topk,
                 max_position_embeddings=config.max_position_embeddings,

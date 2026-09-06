@@ -634,7 +634,11 @@ def _sdpa_fixed_decode(
 class _FA2AttentionImpl:
     """GQA attention impl using FlashAttention-2."""
 
-    def __init__(self, num_heads, head_dim, scale, num_kv_heads, sliding_window=None):
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads, sliding_window=None,
+                 nsa_index_topk=None, nsa_index_head_dim=None, **kwargs):
+        # NSA/DSA-specific arguments are accepted for the correctness-first
+        # generic fallback.  Generic attention does not use the indexer, but
+        # the shared DeepSeek/GLM constructor passes these fields uniformly.
         if not _HAS_FA2:
             raise RuntimeError(
                 "FlashAttention-2 is required for the generic attention "
@@ -883,6 +887,9 @@ class GenericAttention(AttentionBase):
         v_head_dim: int,
         attention_type: str = "GQA",
         sliding_window: int | None = None,
+        nsa_index_topk: int | None = None,
+        nsa_index_head_dim: int | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.num_heads = num_heads

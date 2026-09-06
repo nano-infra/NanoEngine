@@ -359,8 +359,25 @@ class Config(BaseModel):
         ):
             setattr(self.hf_config, attr, getattr(self, attr, None))
 
-        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+        # Some released GLM-5.3 checkpoints rely on ``model_type`` and omit
+        # the optional architectures list.  Infer the canonical runtime
+        # class so topology validation and model registry selection still
+        # work with those configs.
+        architectures = getattr(self.hf_config, "architectures", None)
+        if not architectures and getattr(self.hf_config, "model_type", None) == "glm5_next":
+            architectures = ["Glm5NextForConditionalGeneration"]
+            try:
+                self.hf_config.architectures = architectures
+            except Exception:
+                pass
+        arch = (architectures or [""])[0]
         if arch == "Glm5NextForConditionalGeneration":
+            # KDA layers need one recurrent state slot per live sequence;
+            # unlike MLA pages this state cannot be inferred from KV blocks.
+            # Keep the default usable for GLM-5.3 instead of failing during
+            # the first warmup when the generic default is zero.
+            if self.gdn_state_cache_slots <= 0:
+                self.gdn_state_cache_slots = max(1, self.max_num_seqs)
             # GLM-5.3's first implementation is the text-only hybrid topology
             # exercised by the reference model: attention DP feeds a matching
             # expert-parallel FFN group, with no TP/SP/PP split.
@@ -396,7 +413,8 @@ class Config(BaseModel):
             if self.pp != 1:
                 raise ValueError("GLM-5.3 does not support pipeline parallel decode")
 
-        if self.hf_config.architectures[0] in (
+        hf_architectures = getattr(self.hf_config, "architectures", None) or architectures or [""]
+        if hf_architectures[0] in (
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -404,7 +422,7 @@ class Config(BaseModel):
             "GlmMoeDsaForCausalLM",
             "Glm5NextForConditionalGeneration",
         ):
-            if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
+            if hf_architectures[0] == "DeepseekV4ForCausalLM":
                 assert self.attention_sp == 1
                 assert self.ffn_tp == 1
                 n_experts = getattr(self.hf_config, "n_routed_experts", None)

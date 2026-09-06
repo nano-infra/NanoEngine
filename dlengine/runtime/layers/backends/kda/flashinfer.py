@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import os
 import torch.nn.functional as F
 from torch import nn
 
@@ -50,6 +51,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             ) from exc
         self._chunk_kda = chunk_kda
         self.config = config
+        self._is_glm5_next = getattr(config, "model_type", "") == "glm5_next"
         self.layer_idx = state_layer_idx
         self.model_layer_idx = layer_idx
         self.hidden_size = int(config.hidden_size)
@@ -120,6 +122,12 @@ class FlashInferKDA(GenericGatedDeltaNet):
             bias=False,
             tp_group=tp_group,
         )
+        # GLM-5.3 KDA projection shards are BF16 in the checkpoint. Keep them
+        # BF16 even when the global model quantization config is FP8; the
+        # correctness fallback below must not reinterpret BF16 bytes as FP8.
+        if self._is_glm5_next:
+            for _proj in (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.b_proj, self.f_a_proj, self.f_b_proj, self.o_proj):
+                _proj.weight.data = _proj.weight.data.to(torch.bfloat16)
 
         self.conv1d = nn.Conv1d(
             self.conv_dim,
@@ -179,13 +187,14 @@ class FlashInferKDA(GenericGatedDeltaNet):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_batch_context()
         total_tokens = hidden_states.shape[0]
+        linear = lambda layer, x: F.linear(x, layer.weight.to(x.dtype), getattr(layer, "bias", None)) if (self._is_glm5_next and os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {"1", "true", "yes"}) else layer(x)
         if context.is_prefill:
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
-            gate = self.g_proj(hidden_states)
-            beta = self.b_proj(hidden_states)
-            forget = self.f_b_proj(self.f_a_proj(hidden_states))
+            q = linear(self.q_proj, hidden_states)
+            k = linear(self.k_proj, hidden_states)
+            v = linear(self.v_proj, hidden_states)
+            gate = linear(self.g_proj, hidden_states)
+            beta = linear(self.b_proj, hidden_states)
+            forget = linear(self.f_b_proj, linear(self.f_a_proj, hidden_states))
         else:
             if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
                 raise RuntimeError(
@@ -297,4 +306,5 @@ class FlashInferKDA(GenericGatedDeltaNet):
         out = out.reshape(total_tokens, self.num_v_heads, self.head_v_dim)
         gate = gate.view(total_tokens, self.num_v_heads, self.head_k_dim)
         out = self.o_norm(out, gate).reshape(total_tokens, self.value_dim)
-        return self.o_proj(out)
+        result = linear(self.o_proj, out)
+        return result

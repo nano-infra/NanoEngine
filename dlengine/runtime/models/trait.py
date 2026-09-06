@@ -51,6 +51,45 @@ def has_layer_type(hf_config: Any, layer_type: str) -> bool:
 
 def apply_hf_config_compatibility_fixes(hf_config: Any, raw_config: dict) -> None:
     """Repair model dimensions clobbered by Hugging Face config aliases."""
+    if raw_config.get("model_type") == "glm5_next":
+        # GLM-5.3 keeps the KDA dimensions in the nested text config.  The
+        # cache allocator and the generic GDN helpers use the flattened
+        # compatibility names below, while FlashInferKDA reads the original
+        # ``linear_attn_config`` directly.  Populate both objects so state
+        # buffers are allocated before the first warmup forward.
+        raw_text = raw_config.get("text_config") or {}
+        text = getattr(hf_config, "text_config", hf_config)
+        linear = raw_text.get("linear_attn_config") or {}
+        num_heads = int(linear.get("num_heads", 0))
+        head_dim = int(linear.get("head_dim", 0))
+        layer_types = raw_text.get("layer_types")
+        if not layer_types:
+            num_layers = int(raw_text.get("num_hidden_layers", 0))
+            kda_layers = set(linear.get("kda_layers") or [])
+            full_layers = set(linear.get("full_attn_layers") or [])
+            layer_types = [
+                "deepseek_sparse_attention"
+                if i in full_layers or i not in kda_layers
+                else "linear_attention"
+                for i in range(num_layers)
+            ]
+        compatibility = {
+            "layer_types": list(layer_types),
+            "linear_num_key_heads": num_heads,
+            "linear_num_value_heads": num_heads,
+            "linear_key_head_dim": head_dim,
+            "linear_value_head_dim": int(linear.get("value_head_dim", head_dim)),
+            "linear_conv_kernel_dim": int(linear.get("short_conv_kernel_size", 4)),
+            # GLM-5.3 has no RoPE in main MLA Q/K, but its pool indexer
+            # uses the reference 64-dimensional interleaved RoPE.
+            "indexer_rope_head_dim": int(raw_text.get("indexer_rope_head_dim", 64)),
+        }
+        for name, value in compatibility.items():
+            setattr(text, name, value)
+            if text is not hf_config:
+                setattr(hf_config, name, value)
+        return
+
     if raw_config.get("model_type") == "kimi_k3":
         raw_text = raw_config.get("text_config") or {}
         text = getattr(hf_config, "text_config", hf_config)

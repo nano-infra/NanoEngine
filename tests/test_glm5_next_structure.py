@@ -99,6 +99,7 @@ def _write_minimal_glm_config(tmp_path):
         "layer_types": ["linear_attention"],
         "mlp_layer_types": ["dense"],
         "index_head_dim": 2, "index_n_heads": 1,
+        "indexer_rope_interleave": True,
         "index_topk": 4, "index_kpool": 2,
         "n_routed_experts": 8, "num_experts_per_tok": 1,
         "num_nextn_predict_layers": 1,
@@ -128,6 +129,7 @@ def test_glm_config_accepts_target_dp_ep_and_mtp_range(tmp_path, monkeypatch):
             num_speculative_tokens=steps, max_num_seqs=1,
         )
         assert cfg.kvcache_block_size == 64
+    assert cfg.hf_config.indexer_rope_head_dim == 64
 
 
 def test_glm_config_rejects_mismatched_dp_ep_and_mtp_overflow(tmp_path, monkeypatch):

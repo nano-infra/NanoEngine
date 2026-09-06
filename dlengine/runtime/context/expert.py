@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Optional
 
 import torch
@@ -24,6 +25,12 @@ def _require_deep_ep():
 
 def _is_mnnvl_fabric_supported() -> bool:
     """Return whether the current CUDA device belongs to an MNNVL fabric."""
+    # Some Blackwell containers expose the fabric query but do not have a
+    # usable IBGDA/NVSHMEM channel.  DeepEP then aborts during construction
+    # before a model can even warm up.  Keep a correctness-first escape hatch
+    # that selects the ordinary NVLink path for single-node DP/EP runs.
+    if os.environ.get("NANO_DISABLE_MNNVL", "").lower() in {"1", "true", "yes"}:
+        return False
     try:
         from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
@@ -156,12 +163,29 @@ class ExpertContext(BaseContext):
             buffer_kwargs.get("use_fabric", False),
         )
 
-        self.buffer = deep_ep.Buffer(
-            ep_group,
-            num_nvl_bytes=num_nvl_bytes,
-            num_rdma_bytes=num_rdma_bytes,
-            **buffer_kwargs,
-        )
+        try:
+            self.buffer = deep_ep.Buffer(
+                ep_group,
+                num_nvl_bytes=num_nvl_bytes,
+                num_rdma_bytes=num_rdma_bytes,
+                **buffer_kwargs,
+            )
+        except RuntimeError as exc:
+            # A container can report MNNVL support while its IBGDA transport
+            # is unavailable. Retry with the ordinary intranode NVLink path;
+            # this preserves EP correctness and avoids an opaque worker crash.
+            if not buffer_kwargs.get("allow_mnnvl"):
+                raise
+            logger.warning("DeepEP fabric init failed (%s); retrying without MNNVL", exc)
+            fallback_kwargs = dict(buffer_kwargs)
+            fallback_kwargs.pop("use_fabric", None)
+            fallback_kwargs["allow_mnnvl"] = False
+            self.buffer = deep_ep.Buffer(
+                ep_group,
+                num_nvl_bytes=num_nvl_bytes,
+                num_rdma_bytes=num_rdma_bytes,
+                **fallback_kwargs,
+            )
         self.buffer.set_num_sms(self.num_sms)
 
         self.warmup_called = True
