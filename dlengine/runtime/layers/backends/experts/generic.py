@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.runtime.layers.base_backend import DistributedRoutedExpertsBase
-from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
+from dlengine.runtime.layers.backends.experts.local_dispatch import LocalPaddedDispatcher
 
 
 class GenericExperts(DistributedRoutedExpertsBase):
