@@ -284,6 +284,7 @@ class BlackwellMLAAttention(HopperAttention):
         attention_type: str = "MLA",
         nsa_index_topk: int = 0,
         mla_qk_nope_head_dim: int | None = None,
+        mla_kv_lora_rank: int | None = None,
         **kwargs,
     ) -> None:
         del kwargs
@@ -301,7 +302,8 @@ class BlackwellMLAAttention(HopperAttention):
             raise RuntimeError(message)
         if num_kv_heads != 1:
             raise ValueError(f"MLA requires one compressed KV head, got {num_kv_heads}")
-        if head_dim <= v_head_dim:
+        kv_lora_rank = v_head_dim if mla_kv_lora_rank is None else mla_kv_lora_rank
+        if head_dim < kv_lora_rank:
             raise ValueError(
                 f"Invalid MLA dimensions: cache head_dim={head_dim}, "
                 f"kv_lora_rank={v_head_dim}"
@@ -314,7 +316,8 @@ class BlackwellMLAAttention(HopperAttention):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.v_head_dim = v_head_dim
-        self.qk_rope_head_dim = head_dim - v_head_dim
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = head_dim - kv_lora_rank
         if mla_qk_nope_head_dim is None:
             raise ValueError("Blackwell MLA requires mla_qk_nope_head_dim")
         self.qk_nope_head_dim = mla_qk_nope_head_dim
@@ -404,7 +407,7 @@ class BlackwellMLAAttention(HopperAttention):
             kv_cache=kv_cache,
             workspace_buffer=_get_trtllm_workspace(query.device),
             qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.v_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,

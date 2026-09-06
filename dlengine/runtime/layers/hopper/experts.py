@@ -8,6 +8,7 @@ It supports:
 """
 
 from typing import Any, Dict, Optional
+import os
 
 import torch
 from torch import nn
@@ -385,6 +386,17 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             return self._compute_local(
                 hidden_states, topk_ids, topk_weights, is_prefill
             )
+
+        # The low-latency decode path is intrinsically tied to DeepGEMM's
+        # masked grouped FP8 kernel.  In correctness mode use the normal EP
+        # dispatcher instead; fused_moe_v3 contains the per-expert BF16
+        # dequantization fallback and preserves the same gather semantics.
+        if os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return self._compute_prefill_ep(hidden_states, topk_ids, topk_weights)
 
         # use_low_latency_ep: force decode (low-latency) EP path even during
         # prefill.  Used by MTP which needs prefill attention mode but must

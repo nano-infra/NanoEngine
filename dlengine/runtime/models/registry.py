@@ -61,6 +61,14 @@ def _qwen3_5_mtp_cls():
     return Qwen3_5MTP
 
 
+def _glm5_next_cls():
+    from dlengine.runtime.models.glm5_next import Glm5NextForConditionalGeneration
+    return Glm5NextForConditionalGeneration
+
+def _glm5_next_mtp_cls():
+    from dlengine.runtime.models.glm5_next import Glm5NextForConditionalGenerationNextN
+    return Glm5NextForConditionalGenerationNextN
+
 def _kimi_k3_cls():
     from dlengine.runtime.models.kimi_k3 import KimiK3ForConditionalGeneration
 
@@ -80,6 +88,7 @@ architecture_loaders = {
     "Gemma4ForCausalLM": _gemma4_cls,
     "Gemma4ForConditionalGeneration": _gemma4_cls,
     "KimiK3ForConditionalGeneration": _kimi_k3_cls,
+    "Glm5NextForConditionalGeneration": _glm5_next_cls,
 }
 
 architecture_mtp_loaders = {
@@ -87,6 +96,7 @@ architecture_mtp_loaders = {
     "DeepseekV32ForCausalLM": _deepseek_mtp_cls,
     "GlmMoeDsaForCausalLM": _deepseek_mtp_cls,
     "Qwen3_5MoeForConditionalGeneration": _qwen3_5_mtp_cls,
+    "Glm5NextForConditionalGeneration": _glm5_next_mtp_cls,
 }
 
 

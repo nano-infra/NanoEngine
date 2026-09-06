@@ -30,6 +30,13 @@ def kimi_k3_cache_plan() -> CachePlan:
     return cache_plan(flags=(CachePlanFlag.Mla, CachePlanFlag.Gdn))
 
 
+def glm5_next_cache_plan() -> CachePlan:
+    """GLM-5.3 hybrid cache: MLA pages + KDA state + DSA indexer pages."""
+    return cache_plan(
+        flags=(CachePlanFlag.Mla, CachePlanFlag.Gdn, CachePlanFlag.Indexer)
+    )
+
+
 def deepseek_mla_cache_plan(
     *, use_indexer: bool = False, use_hisparse: bool = False
 ) -> CachePlan:
@@ -59,5 +66,6 @@ __all__ = [
     "gqa_hisparse_cache_plan",
     "hca_csa_cache_plan",
     "kimi_k3_cache_plan",
+    "glm5_next_cache_plan",
     "qwen35_cache_plan",
 ]

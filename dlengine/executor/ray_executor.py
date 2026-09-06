@@ -71,6 +71,16 @@ def _collect_dsv4_debug_env() -> dict[str, str] | None:
         "MCCL_DEBUG_SUBSYS",
         "TORCH_NCCL_BLOCKING_WAIT",
         "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+        # GLM-5.3/Blackwell correctness fallback: a container may report MNNVL
+        # support while IBGDA is unavailable.  Forward this opt-in switch to
+        # every Ray ModelRunner, since actor environments are isolated from
+        # the driver process.
+        "NANO_DISABLE_MNNVL",
+        "NANO_DISABLE_DEEP_GEMM",
+        "NANO_BACKEND",
+        # Force the slow non-absorbed MLA path for GLM-5.3's 256/256 shape;
+        # FlashInfer TRTLLM-GEN only accepts the standard DeepSeek shapes.
+        "DLENGINE_FORCE_MLA_REFERENCE",
     )
     debug_env = {
         key: value

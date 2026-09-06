@@ -1085,10 +1085,18 @@ class ModelRunner:
         # first real prefill doesn't JIT-compile inside the forward (which
         # stalls this rank while peers time out in the DeepEP combine
         # collective). Best-effort: never fatal.
-        try:
-            self._warmup_deep_gemm_moe(max_num_batched_tokens)
-        except Exception as e:  # pragma: no cover - warmup must never crash boot
-            logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
+        # GLM-5.3 uses a padded expert layout that the installed Blackwell
+        # DeepGEMM build rejects during its synthetic warmup.  Its runtime
+        # expert path already has a correctness fallback, so avoid launching
+        # the incompatible probe (a CUDA launch failure poisons the context).
+        arch = (getattr(self.config.hf_config, "architectures", None) or [""])[0]
+        if arch != "Glm5NextForConditionalGeneration":
+            try:
+                self._warmup_deep_gemm_moe(max_num_batched_tokens)
+            except Exception as e:  # pragma: no cover - warmup must never crash boot
+                logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
+        else:
+            logger.info("[startup] GLM-5.3 DeepGEMM MoE warmup disabled; using runtime fallback")
         # Empty warmup batch, built without exposing Sequence serializers.
         warmup_data = RunnerIn.dummy("", 0, True).to_bytes()
         self.run_from_bytes(warmup_data, True)
@@ -1283,7 +1291,9 @@ class ModelRunner:
         elif local_layer_types is not None and any(
             lt == "linear_attention" for lt in local_layer_types
         ):
-            num_kv_layers = sum(1 for lt in local_layer_types if lt == "full_attention")
+            # Qwen uses full_attention; GLM-5.3 calls its paged MLA layers
+            # deepseek_sparse_attention.  Both are the non-linear cache side.
+            num_kv_layers = sum(1 for lt in local_layer_types if lt != "linear_attention")
         else:
             # With pipeline parallelism each stage owns only a contiguous slice
             # of the decoder layers, so it allocates KV cache for just those
@@ -1315,7 +1325,10 @@ class ModelRunner:
         # packed cache, so disabling FP8 cache for unsupported shapes is opt-in.
         index_head_dim = getattr(hf_config, "index_head_dim", 0)
         mla_head_dim = kv_lora_rank + qk_rope_head_dim
-        flash_mla_supported = mla_head_dim in (512, 576)
+        flash_mla_supported = (
+            mla_head_dim in (512, 576)
+            and os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") != "1"
+        )
         enable_mla_reference_fallback = getattr(
             config, "enable_mla_reference_fallback", False
         )

@@ -294,7 +294,7 @@ class Config(BaseModel):
                 raise
             with config_path.open() as f:
                 config_dict = json.load(f)
-            if config_dict.get("model_type") in ("qwen3_5", "kimi_k3"):
+            if config_dict.get("model_type") in ("qwen3_5", "kimi_k3", "glm5_next"):
                 text_config = config_dict.get("text_config")
                 self.hf_config = PretrainedConfig(**config_dict)
                 if isinstance(text_config, dict):
@@ -359,14 +359,70 @@ class Config(BaseModel):
         ):
             setattr(self.hf_config, attr, getattr(self, attr, None))
 
-        if self.hf_config.architectures[0] in (
+        # Some released GLM-5.3 checkpoints rely on ``model_type`` and omit
+        # the optional architectures list.  Infer the canonical runtime
+        # class so topology validation and model registry selection still
+        # work with those configs.
+        architectures = getattr(self.hf_config, "architectures", None)
+        if not architectures and getattr(self.hf_config, "model_type", None) == "glm5_next":
+            architectures = ["Glm5NextForConditionalGeneration"]
+            try:
+                self.hf_config.architectures = architectures
+            except Exception:
+                pass
+        arch = (architectures or [""])[0]
+        if arch == "Glm5NextForConditionalGeneration":
+            # KDA layers need one recurrent state slot per live sequence;
+            # unlike MLA pages this state cannot be inferred from KV blocks.
+            # Keep the default usable for GLM-5.3 instead of failing during
+            # the first warmup when the generic default is zero.
+            if self.gdn_state_cache_slots <= 0:
+                self.gdn_state_cache_slots = max(1, self.max_num_seqs)
+            # GLM-5.3's first implementation is the text-only hybrid topology
+            # exercised by the reference model: attention DP feeds a matching
+            # expert-parallel FFN group, with no TP/SP/PP split.
+            if self.attention_tp != 1 or self.attention_sp != 1:
+                raise ValueError(
+                    "GLM-5.3 requires attention_tp=attention_sp=1; "
+                    f"got tp={self.attention_tp}, sp={self.attention_sp}"
+                )
+            if self.ffn_dp != 1 or self.ffn_tp != 1:
+                raise ValueError(
+                    "GLM-5.3 requires ffn_dp=ffn_tp=1; "
+                    f"got ffn_dp={self.ffn_dp}, ffn_tp={self.ffn_tp}"
+                )
+            if self.attention_dp != self.ffn_ep:
+                raise ValueError(
+                    "GLM-5.3 attention_dp must equal ffn_ep so each attention "
+                    "DP rank maps to one expert-parallel group; got "
+                    f"attention_dp={self.attention_dp}, ffn_ep={self.ffn_ep}"
+                )
+            n_experts = int(getattr(self.hf_config, "n_routed_experts", 0) or 0)
+            if n_experts and n_experts % self.ffn_ep:
+                raise ValueError(
+                    f"GLM-5.3 n_routed_experts={n_experts} must be divisible "
+                    f"by ffn_ep={self.ffn_ep}"
+                )
+            index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
+            index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
+            if index_kpool < 1 or (index_topk and index_topk % index_kpool):
+                raise ValueError(
+                    "GLM-5.3 index_topk must be divisible by positive index_kpool; "
+                    f"got index_topk={index_topk}, index_kpool={index_kpool}"
+                )
+            if self.pp != 1:
+                raise ValueError("GLM-5.3 does not support pipeline parallel decode")
+
+        hf_architectures = getattr(self.hf_config, "architectures", None) or architectures or [""]
+        if hf_architectures[0] in (
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ):
-            if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
+            if hf_architectures[0] == "DeepseekV4ForCausalLM":
                 assert self.attention_sp == 1
                 assert self.ffn_tp == 1
                 n_experts = getattr(self.hf_config, "n_routed_experts", None)
@@ -452,7 +508,7 @@ class Config(BaseModel):
             if self.attention_tp != 1:
                 raise ValueError("enable_hisparse requires attention_tp == 1")
             if self.num_speculative_tokens != 0:
-                if arch != "GlmMoeDsaForCausalLM":
+                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
                     raise ValueError(
                         "enable_hisparse with MTP currently requires "
                         "GlmMoeDsaForCausalLM"
@@ -545,8 +601,12 @@ class Config(BaseModel):
         # MTP validation
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+        if arch == "Glm5NextForConditionalGeneration" and self.num_speculative_tokens > 5:
+            raise ValueError(
+                "GLM-5.3 supports at most 5 recurrent NextN speculative tokens"
+            )
         if self.num_speculative_tokens > 0:
-            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
             has_mtp = (
                 getattr(self.hf_config, "num_nextn_predict_layers", 0) > 0
                 or getattr(self.hf_config, "mtp_num_hidden_layers", 0) > 0
@@ -558,7 +618,7 @@ class Config(BaseModel):
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
             if self.num_speculative_tokens > 1:
-                if arch != "GlmMoeDsaForCausalLM":
+                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
                     raise ValueError(
                         "num_speculative_tokens > 1 is currently supported only "
                         "for GlmMoeDsaForCausalLM"
@@ -581,6 +641,7 @@ class Config(BaseModel):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):

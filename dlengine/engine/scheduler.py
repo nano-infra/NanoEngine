@@ -100,9 +100,15 @@ def _build_cache_plan_with_reason(config: Config) -> tuple[CachePlan, str]:
         _configure_hca_csa_cache_plan(plan, config)
         return plan, "hf_config.compress_ratios declares HCA/CSA compressed cache"
 
-    if arch == "KimiK3ForConditionalGeneration":
-        from dlengine.runtime.context.cache.plan import kimi_k3_cache_plan
+    if arch in ("KimiK3ForConditionalGeneration", "Glm5NextForConditionalGeneration"):
+        # GLM-5.3 combines MLA/DSA pages with KDA recurrent state.
+        from dlengine.runtime.context.cache.plan import (
+            glm5_next_cache_plan,
+            kimi_k3_cache_plan,
+        )
 
+        if arch == "Glm5NextForConditionalGeneration":
+            return glm5_next_cache_plan(), "GLM-5.3 combines MLA, KDA, and DSA indexer state"
         return kimi_k3_cache_plan(), "K3 combines MLA with KDA linear state"
 
     if has_gdn_component(hf_config):
