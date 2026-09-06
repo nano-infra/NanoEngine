@@ -13,7 +13,7 @@ keys in ``TIER_POLICIES``.
 
 from __future__ import annotations
 
-from dlengine.runtime.layers.backend_policy import TIER_POLICIES, TierPolicy
+from dlengine.runtime.layers.policy import TIER_POLICIES, TierPolicy
 from dlengine.runtime.layers.base_backend import (
     AttentionBase,
     BackendFactory,

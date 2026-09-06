@@ -5,10 +5,11 @@ implementation family is preferred, what fallback is permitted, whether a
 correctness-first reference implementation may be substituted, and the
 capability constraints that gate those choices.
 
-This module only defines the schema. Selection logic
-(``backend_selection.py`` and ``backends/selector.py``) consumes it. Keeping the
-schema separate from the selectors lets policy (which implementation, and when
-to fall back) evolve independently from implementation code.
+This module only defines the schema/data. Selection logic
+(``backend_selection.py`` and ``backends/selector.py``) consumes it, and
+``factory.PolicyBackendFactory`` reads it to construct layers. Keeping the
+schema separate from the factory lets policy (which implementation, and when to
+fall back) evolve independently from implementation code.
 """
 
 from __future__ import annotations
