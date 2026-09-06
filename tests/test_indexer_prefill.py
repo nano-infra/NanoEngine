@@ -18,7 +18,7 @@ class _FixedWeights(nn.Module):
 
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
-    import dlengine.runtime.layers.indexer as indexer_module
+    import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
     from dlengine.runtime.layers.indexer import _interleaved_to_half, Indexer
 
     class CaptureRope(nn.Module):
@@ -241,7 +241,7 @@ def test_prefill_mqa_chunk_rows_respects_available_memory(monkeypatch):
 def test_ragged_prefill_topk_uses_multi_seq_causal_ranges_and_large_chunks(
     monkeypatch,
 ):
-    import dlengine.runtime.layers.indexer as indexer_module
+    import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
     from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
@@ -339,7 +339,7 @@ def test_ragged_prefill_topk_uses_multi_seq_causal_ranges_and_large_chunks(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_ragged_prefill_long_context_uses_fused_radix_topk(monkeypatch):
     """Production Top-2048 uses the fused ragged selector beyond 64K."""
-    import dlengine.runtime.layers.indexer as indexer_module
+    import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
     from dlengine.runtime.layers.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
