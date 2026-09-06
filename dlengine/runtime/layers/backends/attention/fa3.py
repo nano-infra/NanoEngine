@@ -1,11 +1,6 @@
 import torch
 
 try:
-    import flash_mla
-except ImportError:
-    flash_mla = None
-
-try:
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
     _FA_KVCACHE_TABLE_ARG = "page_table"
@@ -21,14 +16,11 @@ except ImportError:
 
 from dlengine.logging import get_logger
 from dlengine.runtime.context.batch import get_batch_context
-from dlengine.runtime.context.cache.hca import get_hca_context
 from dlengine.runtime.context.cache.hisparse import get_hisparse_context
-from dlengine.runtime.context.cache.mla import get_mla_context
-from dlengine.runtime.kernel.triton.generic.kv_store import store_kcache, store_kvcache
+from dlengine.runtime.kernel.triton.generic.kv_store import store_kvcache
 from dlengine.runtime.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
 )
-from dlengine.runtime.kernel.triton.hopper.fp8_utils import store_kcache_fp8
 from dlengine.runtime.layers.base_backend import AttentionBase
 from dlengine.runtime.layers.backends.attention.mla_utils import (
     _compute_cached_split,
@@ -364,149 +356,12 @@ class Fa3AttentionImpl:
         return o
 
 
-class FlashMlaAttentionImpl:
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float = None,
-        num_kv_heads: int = None,
-        v_head_size: int = None,
-        causal: bool = True,
-        nsa_index_topk: int = 0,
-    ):
-        import flash_mla
-
-        if scale is None:
-            scale = 1.0 / (head_size**0.5)
-        if num_kv_heads is None:
-            num_kv_heads = num_heads
-        if v_head_size is None:
-            v_head_size = head_size
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads
-        self.v_head_size = v_head_size
-        self.causal = causal
-        self.nsa_index_topk = nsa_index_topk
-
-        assert num_kv_heads == 1, "MLA requires num kv heads equal to 1"
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        sparse_indices: torch.Tensor | None = None,
-        write_kv_cache: bool = True,
-    ):
-
-        context = get_batch_context()
-        if k_cache.numel() and not get_batch_context().is_dummy:
-            slot_mapping = (
-                context.hisparse_slot_mapping
-                if context.hisparse_slot_mapping is not None
-                else context.slot_mapping
-            )
-            if k_cache.dtype == torch.float8_e4m3fn:
-                store_kcache_fp8(k, k_cache, slot_mapping)
-            else:
-                store_kcache(k, k_cache, slot_mapping)
-
-        if context.is_prefill:
-            # NOTE: MLA prefill is handled directly in DeepseekV2Attention.forward
-            # using the non-absorbed approach (expanded K/V). This path should not
-            # be reached for MLA models.
-            raise RuntimeError(
-                "FlashMlaAttentionImpl.forward should not be called during prefill. "
-                "MLA prefill is handled in DeepseekV2Attention.forward."
-            )
-
-        else:  # decode
-            ntps = context.num_tokens_per_seq
-            total_tokens, num_head, head_dim = q.shape
-            bs = total_tokens // ntps
-            q = q[: bs * ntps]
-            context_lens = context.context_lens[0, :bs]
-            block_tables = context.block_tables[0, :bs]
-
-            # FP8 KV cache REQUIRES sparse decode — dense_decode_fwd
-            # does not support FP8.  When sparse_indices is None (e.g.
-            # during CUDA graph capture warmup), synthesise dummy all-invalid
-            # indices so the sparse kernel is still used.
-            if (
-                k_cache.dtype == torch.float8_e4m3fn
-                and sparse_indices is None
-                and self.nsa_index_topk > 0
-            ):
-                sparse_indices = torch.full(
-                    (bs * ntps, self.nsa_index_topk),
-                    -1,
-                    dtype=torch.int32,
-                    device=q.device,
-                )
-
-            if sparse_indices is not None and k_cache.dtype == torch.float8_e4m3fn:
-                # === Sparse decode (NSA V3.2) ===
-                # sparse_indices: (bs * ntps, topk) — physical slot indices
-                # Reshape to (bs, ntps, topk) for flash_mla_with_kvcache
-                topk = sparse_indices.shape[-1]
-                indices_3d = sparse_indices.view(bs, ntps, topk)
-
-                # Use context-managed sparse sched meta (CUDA graph compatible)
-                mla_context = get_mla_context()
-                sparse_meta = mla_context.sparse_tile_scheduler_metadata
-                if sparse_meta is None:
-                    sparse_meta, _ = flash_mla.get_mla_metadata()
-
-                o, lse = flash_mla.flash_mla_with_kvcache(
-                    q.reshape(bs, ntps, num_head, head_dim),
-                    k_cache,
-                    None,  # block_table (not needed for sparse)
-                    None,  # cache_seqlens (not needed for sparse)
-                    self.v_head_size,
-                    sparse_meta,
-                    None,  # num_splits
-                    self.scale,
-                    False,  # causal must be False for sparse
-                    is_fp8_kvcache=True,  # sparse requires FP8
-                    indices=indices_3d,
-                )
-                # Write back so graph runner can track it
-                mla_context.sparse_tile_scheduler_metadata = sparse_meta
-            else:
-                # === Dense decode (default) ===
-                hca_context = get_hca_context()
-                if hca_context.tile_scheduler_metadata is not None:
-                    # Use precomputed metadata from prepare_decode (CUDA graph compatible)
-                    tile_scheduler_metadata = hca_context.tile_scheduler_metadata
-                else:
-                    # Fallback: create fresh FlashMLASchedMeta (will be initialized on first kernel call)
-                    tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
-
-                o, lse = flash_mla.flash_mla_with_kvcache(
-                    q.reshape(bs, ntps, num_head, head_dim),
-                    k_cache,
-                    block_tables,
-                    context_lens,
-                    self.v_head_size,
-                    tile_scheduler_metadata,
-                    None,  # num_splits (managed internally by FlashMLASchedMeta)
-                    self.scale,
-                    ntps > 1,  # causal=True when lazy verify
-                    is_fp8_kvcache=k_cache.dtype == torch.float8_e4m3fn,
-                )
-
-            # o: (bs, ntps, H, v_head_dim) → (q_len, H, v_head_dim)
-            o = o.reshape(bs * ntps, o.shape[2], o.shape[3])
-
-        return o
-
-
 class Fa3Attention(AttentionBase):
+    """FlashAttention-3 GQA attention (SM90).
+
+    Dense MLA now lives in ``backends/mla/`` (``FlashMlaAttention``); this class
+    is GQA-only.
+    """
 
     def __init__(
         self,
@@ -515,11 +370,16 @@ class Fa3Attention(AttentionBase):
         scale,
         num_kv_heads,
         v_head_dim,
-        attention_type: str = "MLA",
+        attention_type: str = "GQA",
         nsa_index_topk: int = 0,
         sliding_window: int | None = None,
     ):
         super().__init__()
+        if attention_type != "GQA":
+            raise ValueError(
+                f"Fa3Attention is GQA-only, got {attention_type!r}. Dense MLA "
+                "uses backends/mla/FlashMlaAttention."
+            )
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
@@ -527,26 +387,13 @@ class Fa3Attention(AttentionBase):
         self.k_cache = self.v_cache = torch.tensor([])
         self.hisparse_k_cache = self.hisparse_v_cache = torch.tensor([])
         self.forward_method = None
-
-        if attention_type == "MLA":
-            self.impl = FlashMlaAttentionImpl(
-                num_heads,
-                head_dim,
-                scale,
-                num_kv_heads,
-                v_head_dim,
-                nsa_index_topk=nsa_index_topk,
-            )
-        elif attention_type == "GQA":
-            self.impl = Fa3AttentionImpl(
-                num_heads,
-                head_dim,
-                scale,
-                num_kv_heads,
-                sliding_window=sliding_window,
-            )
-        else:
-            raise ValueError(f"Unknown attention type: {attention_type}")
+        self.impl = Fa3AttentionImpl(
+            num_heads,
+            head_dim,
+            scale,
+            num_kv_heads,
+            sliding_window=sliding_window,
+        )
 
     def forward(
         self,
@@ -557,23 +404,14 @@ class Fa3Attention(AttentionBase):
         write_kv_cache: bool = True,
     ):
         """forward."""
-        kwargs = {
-            "sparse_indices": sparse_indices,
-            "write_kv_cache": write_kv_cache,
-        }
-        # Hot GQA caches are a FlashAttention/HiSparse detail. Passing them to
-        # FlashMlaAttentionImpl breaks MLA graph capture because its forward signature
-        # intentionally has no hot-cache arguments.
-        if isinstance(self.impl, Fa3AttentionImpl):
-            kwargs.update(
-                hot_k_cache=self.hisparse_k_cache,
-                hot_v_cache=self.hisparse_v_cache,
-            )
         return self.impl.forward(
             q,
             k,
             v,
             self.k_cache,
             self.v_cache,
-            **kwargs,
+            sparse_indices=sparse_indices,
+            write_kv_cache=write_kv_cache,
+            hot_k_cache=self.hisparse_k_cache,
+            hot_v_cache=self.hisparse_v_cache,
         )

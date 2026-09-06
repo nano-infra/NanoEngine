@@ -7,8 +7,10 @@ from .selector import (
     create_experts,
     create_gdn,
     create_linear,
+    create_mla,
     GDNBackendPlan,
     resolve_backend_plan,
+    resolve_mla_plan,
 )
 
 __all__ = [
@@ -19,5 +21,7 @@ __all__ = [
     "create_experts",
     "create_gdn",
     "create_linear",
+    "create_mla",
     "resolve_backend_plan",
+    "resolve_mla_plan",
 ]
