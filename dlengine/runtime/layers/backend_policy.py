@@ -56,4 +56,71 @@ class BackendPolicy:
         )
 
 
-__all__ = ["BackendPolicy"]
+@dataclass(frozen=True)
+class TierPolicy:
+    """Per-capability-tier selection policy.
+
+    A tier (``gpu_generic``, ``hopper``, ``blackwell``) is described entirely by
+    data: which implementation family to use for each layer family, whether the
+    tier supports FP8, and whether experts selection consults the quantization
+    config (Blackwell picks NVFP4/MXFP4 experts based on the checkpoint format).
+
+    This replaces the previous pattern where hardware-tier factories carried
+    per-family construction logic and Blackwell subclassed Hopper only to
+    override two methods.
+
+    Attributes
+    ----------
+    hardware:
+        Tier name, matching ``BackendSelection.hardware``.
+    linear:
+        Linear implementation family (``"generic"`` or ``"deepseek"``).
+    experts:
+        Default routed-experts family (``"generic"`` or ``"deepseek"``).
+    attention / gdn:
+        Requested attention/GDN backend for the tier. ``"auto"`` lets the
+        capability-aware selector decide.
+    supports_fp8:
+        Whether the tier supports FP8 execution.
+    experts_quant_override:
+        When ``True``, experts selection first inspects the quantization config
+        and may pick a quant-specific family (NVFP4 or MXFP4) before falling
+        back to ``experts``.
+    """
+
+    hardware: str
+    linear: str
+    experts: str
+    attention: str = "auto"
+    gdn: str = "auto"
+    supports_fp8: bool = False
+    experts_quant_override: bool = False
+
+
+# Static policy table. The linear/experts families match what the previous
+# hardware-tier factories hardcoded (generic tier -> generic/BF16; hopper and
+# blackwell tiers -> deepseek/FP8), so default selection is unchanged.
+TIER_POLICIES = {
+    "gpu_generic": TierPolicy(
+        hardware="gpu_generic",
+        linear="generic",
+        experts="generic",
+        supports_fp8=False,
+    ),
+    "hopper": TierPolicy(
+        hardware="hopper",
+        linear="deepseek",
+        experts="deepseek",
+        supports_fp8=True,
+    ),
+    "blackwell": TierPolicy(
+        hardware="blackwell",
+        linear="deepseek",
+        experts="deepseek",
+        supports_fp8=True,
+        experts_quant_override=True,
+    ),
+}
+
+
+__all__ = ["BackendPolicy", "TierPolicy", "TIER_POLICIES"]
