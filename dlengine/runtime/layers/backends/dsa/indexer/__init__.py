@@ -1,12 +1,13 @@
-"""Compatibility shim for the NSA Lightning-Indexer.
+"""NSA Lightning-Indexer for the DSA sparse-attention family.
 
-The indexer now lives in ``dlengine.runtime.layers.backends.dsa.indexer``. This
-module re-exports its public API so existing importers (MTP/graph runners,
-model loaders, tests) keep working during the DSA migration. It will be removed
-once all consumers import from ``backends.dsa.indexer``.
+The indexer scores keys and returns per-query top-k logical (and optionally
+physical) indices that the sparse MLA kernel then attends. It is consumed both
+by ``DsaAttention`` and directly by MTP / graph-capture runners for state
+seeding and reuse, so its public API is re-exported here (and, during
+migration, from the compatibility shim ``dlengine.runtime.layers.indexer``).
 """
 
-from dlengine.runtime.layers.backends.dsa.indexer import (  # noqa: F401
+from dlengine.runtime.layers.backends.dsa.indexer.lightning import (
     INDEXER_QUANT_BLOCK_SIZE,
     Indexer,
     IndexerCache,

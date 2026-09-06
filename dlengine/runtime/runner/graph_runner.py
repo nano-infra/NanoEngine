@@ -775,7 +775,7 @@ class CachedMTPChainGraphRunner:
             self._flash_mla = flash_mla
 
     def _install_context(self, bs: int, cache_ctx, mtp_model):
-        from dlengine.runtime.models.deepseek_v2.deepseek_v2 import _IndexerTopKState
+        from dlengine.runtime.layers.backends.dsa.state import _IndexerTopKState
 
         if get_hisparse_context().num_real_reqs is not None:
             get_hisparse_context().num_real_reqs.fill_(bs)

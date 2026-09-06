@@ -15,10 +15,8 @@ import torch.nn as nn
 
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.runtime.layers.layernorm import RMSNorm
-from dlengine.runtime.models.deepseek_v2.deepseek_v2 import (
-    _IndexerTopKState,
-    DeepseekV2DecoderLayer,
-)
+from dlengine.runtime.layers.backends.dsa.state import _IndexerTopKState
+from dlengine.runtime.models.deepseek_v2.deepseek_v2 import DeepseekV2DecoderLayer
 from dlengine.runtime.models.quant_config import QuantizationConfig
 from dlengine.runtime.models.pp_utils import get_pp_layer_range
 

@@ -17,7 +17,7 @@ from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.context.expert import set_expert_context
 from dlengine.runtime.context.graph import PagedAttentionStrategy
 from dlengine.runtime.layers.sampler import Sampler
-from dlengine.runtime.models.deepseek_v2.deepseek_v2 import _IndexerTopKState
+from dlengine.runtime.layers.backends.dsa.state import _IndexerTopKState
 from dlengine.runtime.runner.graph_runner import (
     CachedMTPChainGraphRunner,
     LazyVerifyGraphRunner,
