@@ -18,6 +18,14 @@ class BackendSelection:
     gdn: str
     hardware_source: Literal["config", "environment", "auto"]
     hardware_reason: str
+    # When True, the selector may degrade a preferred/native implementation to a
+    # generic/reference implementation when the native path cannot serve the
+    # requested shape or capability. Defaults to False to preserve deterministic
+    # behavior. See dlengine/config.py:ref_fallback_allowed and docs/
+    # backend-interface-refactor.md.
+    ref_fallback_allowed: bool = False
+    # Human-readable explanation of the fallback decision, for observability.
+    fallback_reason: str = "ref fallback disabled"
 
 
 def resolve_backend_selection(
@@ -27,6 +35,7 @@ def resolve_backend_selection(
     requested_gdn: str = "auto",
     cuda_capability: tuple[int, int] | None,
     legacy_hardware_backend: str | None = None,
+    ref_fallback_allowed: bool = False,
 ) -> BackendSelection:
     """Resolve backend names without reading environment or touching CUDA."""
     valid_hardware = {"auto", "blackwell", "hopper", "gpu_generic"}
@@ -36,6 +45,12 @@ def resolve_backend_selection(
             f"Valid values: {', '.join(sorted(valid_hardware))}."
         )
 
+    fallback_reason = (
+        "ref fallback allowed by config"
+        if ref_fallback_allowed
+        else "ref fallback disabled"
+    )
+
     if requested_hardware != "auto":
         return BackendSelection(
             hardware=requested_hardware,
@@ -43,6 +58,8 @@ def resolve_backend_selection(
             gdn=requested_gdn,
             hardware_source="config",
             hardware_reason=f"explicit hardware_backend={requested_hardware}",
+            ref_fallback_allowed=ref_fallback_allowed,
+            fallback_reason=fallback_reason,
         )
 
     if legacy_hardware_backend:
@@ -57,6 +74,8 @@ def resolve_backend_selection(
             gdn=requested_gdn,
             hardware_source="environment",
             hardware_reason=f"NANO_BACKEND={legacy_hardware_backend}",
+            ref_fallback_allowed=ref_fallback_allowed,
+            fallback_reason=fallback_reason,
         )
 
     if cuda_capability is None:
@@ -78,6 +97,8 @@ def resolve_backend_selection(
         gdn=requested_gdn,
         hardware_source="auto",
         hardware_reason=reason,
+        ref_fallback_allowed=ref_fallback_allowed,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -103,6 +124,7 @@ def create_backend(
 
     backend.attention_backend = selection.attention
     backend.gdn_backend = selection.gdn
+    backend.ref_fallback_allowed = selection.ref_fallback_allowed
     return backend
 
 

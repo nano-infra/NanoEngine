@@ -92,6 +92,14 @@ class Config(BaseModel):
         "auto"
     )
     gdn_backend: Literal["auto", "flashinfer", "fla", "torch"] = "auto"
+    # Allow the backend selector to degrade a preferred/native implementation to
+    # a generic/reference implementation when the native path cannot serve the
+    # requested shape or capability (e.g. an MLA head-dim FlashMLA does not
+    # instantiate, or a FlashInfer/FLA GDN kernel is unavailable). When False,
+    # an unsupported shape or missing kernel raises instead of silently falling
+    # back, preserving deterministic performance expectations. Applies uniformly
+    # to attention and GDN; expert fallback is a future goal (see #332).
+    ref_fallback_allowed: bool = False
     use_flashinfer_decode: bool = Field(
         default_factory=lambda: os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1")
         == "1"

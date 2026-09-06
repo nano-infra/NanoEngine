@@ -25,6 +25,7 @@ class GenericBackendFactory(BackendFactory):
         self.hardware_backend = "gpu_generic"
         self.attention_backend = "auto"
         self.gdn_backend = "auto"
+        self.ref_fallback_allowed = False
 
     # ------------------------------------------------------------------
     # Linear layers

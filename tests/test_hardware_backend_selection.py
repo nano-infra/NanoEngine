@@ -56,3 +56,32 @@ def test_invalid_legacy_environment_fails_at_selection_boundary():
             cuda_capability=(9, 0),
             legacy_hardware_backend="typo",
         )
+
+
+def test_ref_fallback_defaults_to_disabled():
+    selection = resolve_backend_selection(cuda_capability=(9, 0))
+
+    assert selection.ref_fallback_allowed is False
+    assert selection.fallback_reason == "ref fallback disabled"
+
+
+@pytest.mark.parametrize(
+    ("requested_hardware", "cuda_capability", "legacy"),
+    [
+        ("auto", (9, 0), None),  # auto path
+        ("hopper", (10, 0), None),  # explicit-config path
+        ("auto", (10, 0), "hopper"),  # legacy-environment path
+    ],
+)
+def test_ref_fallback_recorded_across_selection_paths(
+    requested_hardware, cuda_capability, legacy
+):
+    selection = resolve_backend_selection(
+        requested_hardware=requested_hardware,
+        cuda_capability=cuda_capability,
+        legacy_hardware_backend=legacy,
+        ref_fallback_allowed=True,
+    )
+
+    assert selection.ref_fallback_allowed is True
+    assert selection.fallback_reason == "ref fallback allowed by config"
