@@ -14,7 +14,6 @@ from dlengine.runtime.context.cache.plan import kimi_k3_cache_plan
 from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.layers import get_backend
 from dlengine.runtime.layers.activation import SituAndMul
-from dlengine.runtime.layers.backends.kda import FlashInferKDA
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.runtime.layers.layernorm import RMSNorm
 from dlengine.runtime.layers.parallelism_transition import (
@@ -271,7 +270,7 @@ class KimiDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.is_kda = config.layer_types[layer_idx] == "linear_attention"
         self.self_attn = (
-            FlashInferKDA(layer_idx, state_idx, config)
+            get_backend().get_kimi_delta_attention(layer_idx, state_idx, config)
             if self.is_kda
             else KimiMLAAttention(config, layer_idx, cache_idx)
         )

@@ -13,7 +13,6 @@ from torch import nn
 from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.context.cache.plan import glm5_next_cache_plan
 from dlengine.runtime.layers import get_backend
-from dlengine.runtime.layers.backends.kda import FlashInferKDA
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.runtime.layers.activation import SiluAndMul
 from dlengine.runtime.layers.layernorm import RMSNorm
@@ -99,7 +98,7 @@ class Glm5NextDecoderLayer(nn.Module):
     def __init__(self, config, quantization_config, layer_idx: int, state_idx: int, cache_idx: int):
         super().__init__(); self.config = config; self.layer_idx = layer_idx
         self.is_kda = config.layer_types[layer_idx] == "linear_attention"
-        self.self_attn = (FlashInferKDA(layer_idx, state_idx, config) if self.is_kda else
+        self.self_attn = (get_backend().get_kimi_delta_attention(layer_idx, state_idx, config) if self.is_kda else
                           DeepseekV2Attention(config, quantization_config, layer_idx, cache_idx))
         dense = (getattr(config, "mlp_layer_types", ["sparse"] * config.num_hidden_layers)[layer_idx] == "dense")
         self.mlp = (DeepseekV2MLP(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,

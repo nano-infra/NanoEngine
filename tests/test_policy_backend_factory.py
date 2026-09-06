@@ -40,3 +40,30 @@ def test_blackwell_is_not_a_hopper_subclass():
     # The BlackwellBackendFactory(HopperBackendFactory) inheritance-for-config
     # pattern is gone; both are thin siblings over PolicyBackendFactory.
     assert not issubclass(BlackwellBackendFactory, HopperBackendFactory)
+
+
+def test_factory_exposes_kimi_delta_attention_contract():
+    # KDA is reached through the factory contract, not a direct model import.
+    from dlengine.runtime.layers.base_backend import BackendFactory
+
+    assert hasattr(BackendFactory, "get_kimi_delta_attention")
+    factory = GenericBackendFactory(QuantizationConfig())
+    assert callable(factory.get_kimi_delta_attention)
+
+
+def test_models_do_not_import_kda_implementation_directly():
+    # Topologies must depend on the abstract contract, not FlashInferKDA.
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "dlengine" / "runtime"
+    offenders = []
+    for path in (root / "models").rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.endswith("backends.kda") or "backends.kda" in node.module:
+                    offenders.append(str(path))
+            if isinstance(node, ast.alias) and node.name == "FlashInferKDA":
+                offenders.append(str(path))
+    assert offenders == [], f"model files import KDA impl directly: {offenders}"
