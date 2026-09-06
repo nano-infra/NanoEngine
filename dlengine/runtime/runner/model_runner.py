@@ -431,6 +431,7 @@ class ModelRunner:
             requested_gdn=getattr(config, "gdn_backend", "auto"),
             cuda_capability=cuda_capability,
             legacy_hardware_backend=os.environ.get("NANO_BACKEND"),
+            ref_fallback_allowed=getattr(config, "ref_fallback_allowed", False),
         )
         self.backend = create_backend(
             backend_selection,
@@ -439,12 +440,14 @@ class ModelRunner:
         set_backend(self.backend)
         logger.info(
             "Selected runtime backend: hardware=%s attention=%s gdn=%s "
-            "source=%s reason=%s",
+            "source=%s reason=%s ref_fallback=%s (%s)",
             backend_selection.hardware,
             backend_selection.attention,
             backend_selection.gdn,
             backend_selection.hardware_source,
             backend_selection.hardware_reason,
+            backend_selection.ref_fallback_allowed,
+            backend_selection.fallback_reason,
         )
 
         model_architecture = hf_config.architectures[0]

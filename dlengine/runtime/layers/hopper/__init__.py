@@ -24,6 +24,7 @@ class HopperBackendFactory(BackendFactory):
         self.hardware_backend = "hopper"
         self.attention_backend = "auto"
         self.gdn_backend = "auto"
+        self.ref_fallback_allowed = False
 
     # ------------------------------------------------------------------
     # Linear layers
