@@ -10,7 +10,7 @@ from torch import nn
 from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.layers import get_backend
-from dlengine.runtime.layers.generic.gated_delta_net import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
 
 
 class SigmoidRMSNormGated(nn.Module):

@@ -1,6 +1,6 @@
 """Torch/BF16 linear layers."""
 
-from dlengine.runtime.layers.generic.linear import (
+from dlengine.runtime.layers.backends.generic.linear import (
     GenericColumnParallelLinear,
     GenericColumnParallelLinear as ColumnParallelLinear,
     GenericMergedColumnParallelLinear,
