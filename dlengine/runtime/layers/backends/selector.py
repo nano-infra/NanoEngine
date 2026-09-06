@@ -32,6 +32,9 @@ class BackendPlan:
 def resolve_attention_plan(requested="auto", capability=None):
     capability = capability or torch.cuda.get_device_capability()
     major = capability[0]
+    # ``torch`` is a deprecated alias for the pure-SDPA ``generic`` backend.
+    if requested == "torch":
+        requested = "generic"
     if requested == "auto":
         if major >= 10:
             return AttentionBackendPlan("fa4", "flashinfer")
@@ -46,7 +49,7 @@ def resolve_attention_plan(requested="auto", capability=None):
         if major < 9:
             raise RuntimeError("FA3 attention requires a Hopper-class GPU (SM90+).")
         return AttentionBackendPlan("fa3", "fa3")
-    if requested in ("fa2", "flashinfer", "torch"):
+    if requested in ("fa2", "flashinfer", "generic"):
         return AttentionBackendPlan(requested, requested)
     raise ValueError(f"Unknown attention backend: {requested!r}")
 
@@ -227,9 +230,9 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
         from .attention.flashinfer import FlashInferAttention
 
         return FlashInferAttention(**kwargs)
-    from .attention.torch import TorchAttention
+    from .attention.generic import GenericAttention
 
-    return TorchAttention(**kwargs)
+    return GenericAttention(**kwargs)
 
 
 def create_gdn(*, requested="auto", **kwargs):

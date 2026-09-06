@@ -6,7 +6,7 @@ from dlengine.runtime.context.cache.hisparse import (
     reset_hisparse_context,
 )
 from dlengine.runtime.kernel.jit.sgl.hisparse import build_ring_slot_mapping
-from dlengine.runtime.layers.backends.attention.generic import (
+from dlengine.runtime.layers.backends.attention.base import (
     _hisparse_prefill_fresh_slot_mapping,
 )
 

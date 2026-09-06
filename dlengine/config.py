@@ -88,9 +88,10 @@ class Config(BaseModel):
     # runner config
     enforce_eager: bool = False
     hardware_backend: Literal["auto", "blackwell", "hopper", "gpu_generic"] = "auto"
-    attention_backend: Literal["auto", "fa2", "fa3", "fa4", "flashinfer", "torch"] = (
-        "auto"
-    )
+    # ``torch`` is a deprecated alias for ``generic`` (pure-SDPA GQA backend).
+    attention_backend: Literal[
+        "auto", "fa2", "fa3", "fa4", "flashinfer", "generic", "torch"
+    ] = "auto"
     gdn_backend: Literal["auto", "flashinfer", "fla", "torch"] = "auto"
     # Allow the backend selector to degrade a preferred/native implementation to
     # a generic/reference implementation when the native path cannot serve the
