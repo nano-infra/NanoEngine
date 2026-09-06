@@ -1,7 +1,7 @@
 import pytest
 import torch
 from dlengine.runtime.layers.backends.experts.mega_moe import MegaMoEExperts
-from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
+from dlengine.runtime.layers.factory import PolicyBackendFactory
 from dlengine.runtime.models.quant_config import QuantizationConfig
 
 

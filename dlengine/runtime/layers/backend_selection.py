@@ -112,8 +112,8 @@ def create_backend(
     key* into ``TIER_POLICIES``; a single ``PolicyBackendFactory`` implements
     every tier, so there are no per-tier factory classes.
     """
-    from dlengine.runtime.layers.backend_policy import TIER_POLICIES
-    from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
+    from dlengine.runtime.layers.policy import TIER_POLICIES
+    from dlengine.runtime.layers.factory import PolicyBackendFactory
 
     if selection.hardware not in TIER_POLICIES:
         raise AssertionError(f"Unhandled hardware backend: {selection.hardware}")

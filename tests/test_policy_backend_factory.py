@@ -7,8 +7,8 @@ pre-refactor per-tier hardcoding). There are no per-tier factory classes.
 """
 
 import pytest
-from dlengine.runtime.layers.backend_policy import TIER_POLICIES
-from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
+from dlengine.runtime.layers.policy import TIER_POLICIES
+from dlengine.runtime.layers.factory import PolicyBackendFactory
 from dlengine.runtime.models.quant_config import QuantizationConfig
 
 
