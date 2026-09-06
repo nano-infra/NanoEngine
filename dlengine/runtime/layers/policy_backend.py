@@ -265,5 +265,21 @@ class PolicyBackendFactory(BackendFactory):
             **kwargs,
         )
 
+    def get_kimi_delta_attention(
+        self,
+        layer_idx: int,
+        state_layer_idx: int,
+        config,
+        **kwargs,
+    ):
+        from dlengine.runtime.layers.backends.selector import create_kda
+
+        return create_kda(
+            layer_idx=layer_idx,
+            state_layer_idx=state_layer_idx,
+            config=config,
+            **kwargs,
+        )
+
 
 __all__ = ["PolicyBackendFactory"]

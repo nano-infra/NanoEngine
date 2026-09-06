@@ -75,6 +75,10 @@ class GatedDeltaNetBase(nn.Module, ABC):
     """Abstract base class for GatedDeltaNet linear attention layer."""
 
 
+class KimiDeltaAttentionBase(nn.Module, ABC):
+    """Abstract base class for Kimi Delta Attention (KDA) linear attention."""
+
+
 class AttentionBase(nn.Module, ABC):
     """Abstract base for Attention layer."""
 
@@ -196,3 +200,12 @@ class BackendFactory(ABC):
         nsa_index_topk: int = 0,
         **kwargs,
     ) -> AttentionBase: ...
+
+    @abstractmethod
+    def get_kimi_delta_attention(
+        self,
+        layer_idx: int,
+        state_layer_idx: int,
+        config,
+        **kwargs,
+    ) -> KimiDeltaAttentionBase: ...

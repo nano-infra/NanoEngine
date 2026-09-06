@@ -219,3 +219,15 @@ def create_gdn(*, requested="auto", **kwargs):
     from .torch.gdn import TorchGatedDeltaNet
 
     return TorchGatedDeltaNet(**kwargs)
+
+
+def create_kda(*, layer_idx, state_layer_idx, config, **kwargs):
+    """Instantiate the Kimi Delta Attention (KDA) linear-attention layer.
+
+    KDA has a single FlashInfer-backed implementation with no GDN/torch
+    fallback; it is routed through the selector so model topologies depend only
+    on the factory contract rather than importing the implementation directly.
+    """
+    from .kda import FlashInferKDA
+
+    return FlashInferKDA(layer_idx, state_layer_idx, config)
