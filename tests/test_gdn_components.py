@@ -27,11 +27,8 @@ def _bare_layer(num_v_heads=2, head_v_dim=4, head_k_dim=3):
     layer.head_v_dim = head_v_dim
     layer.A_log = nn.Parameter(torch.zeros(num_v_heads))
     layer.dt_bias = nn.Parameter(torch.zeros(num_v_heads))
-    # Force the naive reference path in both prefill and decode.
-    layer._has_flashinfer_prefill = False
-    layer._has_flashinfer_pretranspose = False
-    layer._has_flashinfer_nontranspose = False
-    layer._has_fla = False
+    # GenericGatedDeltaNet is the naive reference backend (NaiveRecurrenceMixin),
+    # so prefill/decode already use the pure-PyTorch scan; no flags to set.
     return layer
 
 

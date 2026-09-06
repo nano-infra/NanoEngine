@@ -56,10 +56,13 @@ def resolve_attention_plan(requested="auto", capability=None):
 
 def resolve_gdn_plan(requested="auto", capability=None):
     capability = capability or torch.cuda.get_device_capability()
+    # ``torch`` is a deprecated alias for the pure-naive ``generic`` GDN backend.
+    if requested == "torch":
+        requested = "generic"
     if requested == "auto":
         name = "flashinfer" if capability[0] >= 9 else "fla"
         return GDNBackendPlan(name, name)
-    if requested in ("flashinfer", "fla", "torch"):
+    if requested in ("flashinfer", "fla", "generic"):
         return GDNBackendPlan(requested, requested)
     raise ValueError(f"Unknown GDN backend: {requested!r}")
 
@@ -265,9 +268,9 @@ def create_gdn(*, requested="auto", **kwargs):
         from .delta_net.fla import FlaGatedDeltaNet
 
         return FlaGatedDeltaNet(**kwargs)
-    from .delta_net.torch import TorchGatedDeltaNet
+    from .delta_net.generic import GenericGatedDeltaNet
 
-    return TorchGatedDeltaNet(**kwargs)
+    return GenericGatedDeltaNet(**kwargs)
 
 
 def create_kda(*, layer_idx, state_layer_idx, config, **kwargs):
