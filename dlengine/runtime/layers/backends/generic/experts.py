@@ -1,8 +1,9 @@
 """Generic GPU (BF16) distributed routed experts.
 
-This is a minimal MoE implementation for non-Hopper GPUs.
-Expert parallelism (ep_size > 1) is not supported — raise NotImplementedError
-if attempted.  Single-rank BF16 MoE (SwiGLU) is fully functional.
+A portable BF16 MoE implementation for non-Hopper GPUs. Single-rank BF16 MoE
+(SwiGLU) is fully functional; expert parallelism (``ep_size > 1``) uses a
+correctness-first all-gather/all-reduce path (no performance claims — it is the
+reference fallback, not the optimized DeepEP path).
 """
 
 from typing import Optional
@@ -18,8 +19,8 @@ from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
 class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
     """BF16-only MoE experts for generic GPUs.
 
-    Supports ep_size=1 (local compute) with optional TP all-reduce.
-    Raises ``NotImplementedError`` when ep_size > 1.
+    Supports ep_size=1 (local compute) with optional TP all-reduce, and
+    ep_size>1 via a correctness-first all-gather reference path.
     """
 
     def __init__(
@@ -100,11 +101,87 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
         is_prefill: bool = True,
     ) -> torch.Tensor:
         if self.ep_size > 1:
-            raise NotImplementedError(
-                "Expert parallelism (ep_size > 1) requires the Hopper backend. "
-                "Use NANO_BACKEND=hopper or run on an H100/H200 GPU."
-            )
+            return self._compute_ep(hidden_states, topk_ids, topk_weights)
         return self._compute_local(hidden_states, topk_ids, topk_weights, is_prefill)
+
+    def _compute_ep(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Correctness-first expert-parallel path.
+
+        Reference implementation, not the optimized DeepEP dispatcher: gather
+        every rank's tokens, compute the contribution of this rank's local
+        experts for all of them (``_compute_local_prefill`` already masks to
+        the local expert range and returns zeros elsewhere), all-reduce the
+        per-token sums across the EP group, then slice out this rank's tokens.
+        """
+        ep_group = self.ep_group
+        num_tokens = hidden_states.shape[0]
+
+        # Gather variable per-rank token counts so we can un-pad after compute.
+        counts = torch.empty(self.ep_size, dtype=torch.long, device=hidden_states.device)
+        local_count = torch.tensor(
+            [num_tokens], dtype=torch.long, device=hidden_states.device
+        )
+        torch.distributed.all_gather_into_tensor(counts, local_count, group=ep_group)
+        counts_list = counts.tolist()
+        max_count = max(counts_list)
+
+        # Pad to a uniform length for fixed-shape all-gather.
+        def _pad(t, fill=0):
+            if t.shape[0] == max_count:
+                return t
+            pad = t.new_full((max_count - t.shape[0], *t.shape[1:]), fill)
+            return torch.cat([t, pad], dim=0)
+
+        gathered_hidden = torch.empty(
+            self.ep_size * max_count,
+            self.hidden_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        gathered_ids = torch.empty(
+            self.ep_size * max_count,
+            topk_ids.shape[1],
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        gathered_weights = torch.empty(
+            self.ep_size * max_count,
+            topk_weights.shape[1],
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_hidden, _pad(hidden_states), group=ep_group
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_ids, _pad(topk_ids, fill=-1), group=ep_group
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_weights, _pad(topk_weights), group=ep_group
+        )
+
+        # Local experts contribute to all gathered tokens; others yield zeros.
+        # tp all-reduce is intentionally skipped here (handled by the EP reduce).
+        saved_tp_size = self.tp_size
+        self.tp_size = 1
+        try:
+            partial = self._compute_local_prefill(
+                gathered_hidden, gathered_ids, gathered_weights
+            )
+        finally:
+            self.tp_size = saved_tp_size
+
+        torch.distributed.all_reduce(partial, group=ep_group)
+        if self.tp_size > 1 and self.tp_group is not None:
+            torch.distributed.all_reduce(partial, group=self.tp_group)
+
+        start = self.ep_rank * max_count
+        return partial[start : start + num_tokens]
 
     def _get_or_create_local_dispatcher(self) -> LocalPaddedDispatcher:
         if self._local_dispatcher is None:

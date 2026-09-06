@@ -51,6 +51,36 @@ def test_factory_exposes_kimi_delta_attention_contract():
     assert callable(factory.get_kimi_delta_attention)
 
 
+def test_experts_ref_fallback_when_deepseek_unavailable(monkeypatch):
+    # With ref_fallback_allowed, a failing deepseek experts import degrades to
+    # the generic experts instead of raising.
+    from dlengine.runtime.layers.backends import selector
+
+    sentinel = object()
+
+    def _boom(**_):
+        raise RuntimeError("deepseek experts unavailable in this build")
+
+    def _generic(**_):
+        return sentinel
+
+    # Force the deepseek path to fail and capture the generic fallback.
+    import dlengine.runtime.layers.backends.deepseek.experts as ds
+
+    monkeypatch.setattr(ds, "HopperDistributedRoutedExperts", _boom)
+    monkeypatch.setattr(selector, "_create_generic_experts", _generic)
+
+    with pytest.raises(RuntimeError):
+        selector.create_experts(
+            family="deepseek", ref_fallback_allowed=False, hidden_size=8
+        )
+
+    got = selector.create_experts(
+        family="deepseek", ref_fallback_allowed=True, hidden_size=8
+    )
+    assert got is sentinel
+
+
 def test_models_do_not_import_kda_implementation_directly():
     # Topologies must depend on the abstract contract, not FlashInferKDA.
     import ast

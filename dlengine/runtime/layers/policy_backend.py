@@ -204,6 +204,7 @@ class PolicyBackendFactory(BackendFactory):
             family=self.policy.experts,
             quantization_config=quantization_config,
             experts_quant_override=self.policy.experts_quant_override,
+            ref_fallback_allowed=self.ref_fallback_allowed,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
