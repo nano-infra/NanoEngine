@@ -189,6 +189,37 @@ def create_experts(
     raise ValueError(f"Unknown experts backend family: {family!r}")
 
 
+def resolve_mla_plan(hardware_backend="gpu_generic", capability=None):
+    """Select the dense-MLA decode backend for the hardware tier.
+
+    Blackwell -> TRTLLM-GEN, Hopper -> FlashMLA. Other tiers have no MLA kernel
+    (a reference path is added with the DSA family).
+    """
+    if hardware_backend == "blackwell":
+        return "trtllm"
+    if hardware_backend == "hopper":
+        return "flash_mla"
+    return "reference"
+
+
+def create_mla(*, hardware_backend="gpu_generic", **kwargs):
+    plan = resolve_mla_plan(hardware_backend)
+    if plan == "trtllm":
+        from .mla.trtllm import TrtllmMlaAttention
+
+        return TrtllmMlaAttention(**kwargs)
+    if plan == "flash_mla":
+        from .mla.flash_mla import FlashMlaAttention
+
+        kwargs.pop("mla_qk_nope_head_dim", None)
+        kwargs.pop("mla_kv_lora_rank", None)
+        return FlashMlaAttention(**kwargs)
+    raise RuntimeError(
+        "Dense MLA has no kernel for this hardware tier and no reference MLA "
+        "backend is available yet (added with the DSA family)."
+    )
+
+
 def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwargs):
     attention_type = kwargs.get("attention_type", "MLA")
     if attention_type != "GQA":
@@ -197,18 +228,7 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
                 f"Explicit attention backend {requested!r} only supports GQA; "
                 f"{attention_type} uses its dedicated implementation."
             )
-        if hardware_backend == "blackwell":
-            from .attention.fa4 import Fa4MlaAttention
-
-            return Fa4MlaAttention(**kwargs)
-        if hardware_backend == "hopper":
-            from .attention.fa3 import Fa3Attention
-
-            kwargs.pop("mla_qk_nope_head_dim", None)
-            return Fa3Attention(**kwargs)
-        from .attention.generic import GenericAttention
-
-        return GenericAttention(**kwargs)
+        return create_mla(hardware_backend=hardware_backend, **kwargs)
 
     plan = resolve_attention_plan(requested or "auto")
     if plan.prefill == "fa4":

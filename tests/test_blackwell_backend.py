@@ -2,6 +2,7 @@ import dlengine.runtime.layers as layers
 import torch
 from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
 from dlengine.runtime.layers.backends.attention import fa4 as attention
+from dlengine.runtime.layers.backends.mla import trtllm as mla_trtllm
 from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
 
 
@@ -9,6 +10,7 @@ def teardown_function():
     reset_batch_context()
     layers.reset_backend()
     attention._trtllm_workspace = None
+    mla_trtllm._trtllm_workspace = None
 
 
 def test_blackwell_auto_selects_blackwell_backend(monkeypatch):
@@ -129,13 +131,13 @@ def _make_blackwell_mla(monkeypatch, calls):
         kwargs["out"].fill_(1)
         return kwargs["out"]
 
-    monkeypatch.setattr(attention, "_trtllm_mla_decode_func", fake_decode)
+    monkeypatch.setattr(mla_trtllm, "_trtllm_mla_decode_func", fake_decode)
     monkeypatch.setattr(
-        attention,
+        mla_trtllm,
         "_get_trtllm_workspace",
         lambda device: torch.zeros(1, dtype=torch.uint8, device=device),
     )
-    impl = attention.Fa4MlaAttention(
+    impl = mla_trtllm.TrtllmMlaAttention(
         num_heads=8,
         head_dim=576,
         scale=0.125,

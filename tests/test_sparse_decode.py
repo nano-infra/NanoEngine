@@ -3,7 +3,7 @@
 Tests:
   - topk_indices_to_physical: logical → physical index conversion
   - Indexer.store_prefill_keys: prefill key storage to IndexerCache
-  - FlashMlaAttentionImpl sparse decode path (shape/dispatch validation)
+  - FlashMlaAttention sparse decode path (shape/dispatch validation)
 """
 
 import pytest
