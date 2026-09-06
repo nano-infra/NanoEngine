@@ -91,7 +91,7 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
 
             kwargs.pop("mla_qk_nope_head_dim", None)
             return HopperAttention(**kwargs)
-        from dlengine.runtime.layers.generic.attention import GenericAttention
+        from dlengine.runtime.layers.backends.generic.attention import GenericAttention
 
         return GenericAttention(**kwargs)
 

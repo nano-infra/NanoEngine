@@ -43,7 +43,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> RowParallelLinearBase:
-        from dlengine.runtime.layers.backends.torch.linear import (
+        from dlengine.runtime.layers.backends.generic.linear import (
             GenericRowParallelLinear,
         )
 
@@ -69,7 +69,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> ColumnParallelLinearBase:
-        from dlengine.runtime.layers.backends.torch.linear import (
+        from dlengine.runtime.layers.backends.generic.linear import (
             GenericColumnParallelLinear,
         )
 
@@ -95,7 +95,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase:
-        from dlengine.runtime.layers.backends.torch.linear import (
+        from dlengine.runtime.layers.backends.generic.linear import (
             GenericMergedColumnParallelLinear,
         )
 
@@ -123,7 +123,7 @@ class GenericBackendFactory(BackendFactory):
         tp_group=None,
         **kwargs,
     ) -> QKVParallelLinearBase:
-        from dlengine.runtime.layers.backends.torch.linear import (
+        from dlengine.runtime.layers.backends.generic.linear import (
             GenericQKVParallelLinear,
         )
 
@@ -150,7 +150,7 @@ class GenericBackendFactory(BackendFactory):
         scale_tensor=None,
         **kwargs,
     ) -> ReplicatedLinearBase:
-        from dlengine.runtime.layers.backends.torch.linear import (
+        from dlengine.runtime.layers.backends.generic.linear import (
             GenericReplicatedLinear,
         )
 
@@ -173,7 +173,7 @@ class GenericBackendFactory(BackendFactory):
         tp_size,
         **kwargs,
     ) -> DistributedRoutedExpertsBase:
-        from dlengine.runtime.layers.backends.torch.experts import (
+        from dlengine.runtime.layers.backends.generic.experts import (
             GenericDistributedRoutedExperts,
         )
 

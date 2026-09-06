@@ -1,6 +1,6 @@
 """FlashAttention-2 backend for Ampere/Ada and compatible GPUs."""
 
-from dlengine.runtime.layers.generic.attention import GenericAttention
+from dlengine.runtime.layers.backends.generic.attention import GenericAttention
 
 
 class FA2Attention(GenericAttention):

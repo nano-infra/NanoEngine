@@ -1,6 +1,6 @@
 """Explicit correctness/debug Torch GatedDeltaNet backend."""
 
-from dlengine.runtime.layers.generic.gated_delta_net import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
 
 
 class TorchGatedDeltaNet(GenericGatedDeltaNet):

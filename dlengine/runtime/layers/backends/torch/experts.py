@@ -1,6 +1,6 @@
 """Torch/BF16 routed experts."""
 
-from dlengine.runtime.layers.generic.experts import (
+from dlengine.runtime.layers.backends.generic.experts import (
     GenericDistributedRoutedExperts,
     GenericDistributedRoutedExperts as DistributedRoutedExperts,
 )
