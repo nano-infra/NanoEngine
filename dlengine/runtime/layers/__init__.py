@@ -59,9 +59,8 @@ def init_backend(
 
     selection = resolve_backend_selection(
         requested_hardware=backend_type or "auto",
-        requested_attention=attention_backend
-        or os.environ.get("DLENGINE_ATTENTION_BACKEND", "auto"),
-        requested_gdn=gdn_backend or os.environ.get("DLENGINE_GDN_BACKEND", "auto"),
+        requested_attention=attention_backend or "auto",
+        requested_gdn=gdn_backend or "auto",
         cuda_capability=capability,
         legacy_hardware_backend=os.environ.get("NANO_BACKEND"),
     )

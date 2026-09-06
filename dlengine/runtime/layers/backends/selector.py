@@ -4,6 +4,10 @@ from dataclasses import dataclass
 
 import torch
 
+from dlengine.logging import get_logger
+
+logger = get_logger()
+
 
 @dataclass(frozen=True)
 class AttentionBackendPlan:
@@ -120,14 +124,33 @@ def create_linear(
     return classes[kind](**kwargs)
 
 
+def _create_generic_experts(**kwargs):
+    from dlengine.runtime.layers.backends.generic.experts import (
+        GenericDistributedRoutedExperts,
+    )
+
+    kwargs.pop("quantization_config", None)
+    return GenericDistributedRoutedExperts(**kwargs)
+
+
 def create_experts(
-    *, family, quantization_config=None, experts_quant_override=False, **kwargs
+    *,
+    family,
+    quantization_config=None,
+    experts_quant_override=False,
+    ref_fallback_allowed=False,
+    **kwargs,
 ):
     """Instantiate routed experts from the given implementation family.
 
     When ``experts_quant_override`` is set (Blackwell tier), the checkpoint's
     quantization format takes precedence: NVFP4 -> ModelOptNvFp4Experts,
     MXFP4 -> MegaMoEExperts, otherwise the base ``family`` is used.
+
+    When ``ref_fallback_allowed`` is set and the preferred family fails to
+    construct (e.g. the DeepGEMM/DeepEP path is unavailable in this build), the
+    portable generic experts are used instead. When it is not set, the failure
+    propagates so performance expectations stay deterministic.
     """
     if experts_quant_override:
         if bool(getattr(quantization_config, "is_modelopt_nvfp4", False)):
@@ -142,19 +165,24 @@ def create_experts(
             return MegaMoEExperts(quantization_config=quantization_config, **kwargs)
 
     if family == "deepseek":
-        from dlengine.runtime.layers.backends.deepseek.experts import (
-            HopperDistributedRoutedExperts,
-        )
+        try:
+            from dlengine.runtime.layers.backends.deepseek.experts import (
+                HopperDistributedRoutedExperts,
+            )
 
-        return HopperDistributedRoutedExperts(
-            quantization_config=quantization_config, **kwargs
-        )
+            return HopperDistributedRoutedExperts(
+                quantization_config=quantization_config, **kwargs
+            )
+        except Exception:
+            if not ref_fallback_allowed:
+                raise
+            logger.warning(
+                "deepseek experts unavailable; falling back to generic experts "
+                "(ref_fallback_allowed=True)."
+            )
+            return _create_generic_experts(**kwargs)
     if family == "generic":
-        from dlengine.runtime.layers.backends.generic.experts import (
-            GenericDistributedRoutedExperts,
-        )
-
-        return GenericDistributedRoutedExperts(**kwargs)
+        return _create_generic_experts(quantization_config=quantization_config, **kwargs)
     raise ValueError(f"Unknown experts backend family: {family!r}")
 
 
