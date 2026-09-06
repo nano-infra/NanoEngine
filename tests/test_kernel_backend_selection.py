@@ -40,8 +40,13 @@ def test_gdn_auto_plan(capability, expected):
 
 
 def test_explicit_debug_backends_are_never_selected_by_auto():
+    # ``torch`` attention is a deprecated alias for the pure-SDPA ``generic``
+    # backend; ``generic`` is the canonical debug/reference name.
+    assert resolve_attention_plan("generic", (10, 3)) == AttentionBackendPlan(
+        "generic", "generic"
+    )
     assert resolve_attention_plan("torch", (10, 3)) == AttentionBackendPlan(
-        "torch", "torch"
+        "generic", "generic"
     )
     assert resolve_gdn_plan("torch", (10, 3)) == GDNBackendPlan("torch", "torch")
 
