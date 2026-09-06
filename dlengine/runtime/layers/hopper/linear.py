@@ -5,6 +5,7 @@ and support both FP8 (Hopper-native) and BF16 (fallback) computation paths.
 """
 
 from typing import Optional
+import os
 
 import torch
 import torch.distributed as dist
@@ -121,10 +122,23 @@ class _HopperLinearMixin:
         this, the trivial-looking FP32 scale variant accumulates ~2.5%
         relative drift per FP8 GEMM and flips greedy top-1.
         """
-        if isinstance(x, PrequantizedActivation):
+        is_prequantized = isinstance(x, PrequantizedActivation) or (
+            isinstance(x, tuple)
+            and len(x) == 3
+            and torch.is_tensor(x[0])
+            and torch.is_tensor(x[1])
+        )
+        if is_prequantized:
             # Activation already quantised by a fused norm+quant kernel.
             input_quant, input_scale, num_tokens = x
             out_dtype = torch.bfloat16
+            fallback_x = input_quant.float()
+            if input_scale.ndim == 2 and input_scale.shape != input_quant.shape:
+                # Fused quantization stores one scale per K block. Expand it
+                # before using the correctness-first BF16 path below.
+                fallback_x = fallback_x * input_scale.float().repeat_interleave(
+                    self.quantization_config.block_size[1], dim=1
+                )[:, : input_quant.shape[1]]
         else:
             round_ue8m0 = (
                 getattr(self.quantization_config, "scale_fmt", None) == "ue8m0"
@@ -137,6 +151,22 @@ class _HopperLinearMixin:
             )
             num_tokens = x.size(0)
             out_dtype = x.dtype
+            fallback_x = x
+        # DeepGEMM's FP8 kernel currently rejects GLM-5.3's Blackwell layout.
+        # Provide a slow BF16 dequantized path for correctness validation.
+        if os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {"1", "true", "yes"}:
+            w = self.weight.float()
+            s = self.weight_scale_inv.float()
+            nb, kb = self.quantization_config.block_size
+            if s.ndim == 2 and (s.shape != w.shape):
+                s = s.repeat_interleave(nb, 0).repeat_interleave(kb, 1)
+                s = s[: w.shape[0], : w.shape[1]]
+            out = F.linear(
+                fallback_x.float(),
+                w * s,
+                self.bias.float() if self.bias is not None else None,
+            )
+            return out[:num_tokens].to(out_dtype)
         out = deep_gemm_fp8(
             input_quant,
             input_scale,

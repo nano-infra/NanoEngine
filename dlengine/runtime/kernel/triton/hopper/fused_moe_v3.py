@@ -1,4 +1,5 @@
 import functools
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -623,6 +624,53 @@ def fused_moe_v3(
         m_indices,
         output_index,
     )
+
+    # Correctness fallback for checkpoints whose FP8 block scales have not
+    # been packed into DeepGEMM's Blackwell layout yet.  Keep the dispatch and
+    # gather semantics identical, but dequantize one expert at a time and use
+    # PyTorch BF16/FP32 GEMMs.  This avoids materializing all 288 experts in
+    # BF16 simultaneously.
+    if os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {"1", "true", "yes"}:
+        import torch.nn.functional as F
+
+        down_output = torch.empty(
+            (all_tokens, K), device=gather_out.device, dtype=torch.bfloat16
+        )
+
+        def _dequant(weight, scale):
+            weight = weight.float()
+            scale = scale.float()
+            if scale.ndim == 2 and scale.shape != weight.shape:
+                scale = scale.repeat_interleave(scale_block_size, -2)
+                scale = scale.repeat_interleave(scale_block_size, -1)
+                scale = scale[: weight.shape[-2], : weight.shape[-1]]
+            return weight * scale
+
+        offset = 0
+        for expert, count in enumerate(num_recv_tokens_per_expert):
+            if count <= 0:
+                continue
+            end = offset + count
+            x_e = input_tensor[offset:end].float()
+            x_e = x_e * input_tensor_scale[offset:end].float().repeat_interleave(
+                scale_block_size, dim=1
+            )[:, :K]
+            gateup = F.linear(
+                x_e,
+                _dequant(w13_weight_fp8[0][expert], w13_weight_fp8[1][expert]),
+            )
+            gate, up = gateup.chunk(2, dim=-1)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+            gate = gate.clamp(max=swiglu_limit)
+            down_input = F.silu(gate) * up
+            down = F.linear(
+                down_input,
+                _dequant(w2_weight_fp8[0][expert], w2_weight_fp8[1][expert]),
+            )
+            down_output[offset:end] = down.to(down_output.dtype)
+            offset = end
+        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+        return gather_out
 
     del hidden_states_fp8
     gateup_output = torch.empty(

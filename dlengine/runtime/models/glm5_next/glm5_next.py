@@ -164,7 +164,8 @@ class Glm5NextModel(nn.Module):
         else:
             hidden = pp_recv_hidden(positions.numel(), self.hc_mult * self.hidden_size, self.hidden_dtype).view(-1, self.hc_mult, self.hidden_size)
         residual = None
-        for i in range(self.start_layer, self.end_layer): hidden, residual = self.layers[i](hidden, positions, residual)
+        for i in range(self.start_layer, self.end_layer):
+            hidden, residual = self.layers[i](hidden, positions, residual)
         if not self.is_last_pp_stage:
             pp_send_hidden(hidden); return hidden
         # Decoder layers carry [tokens, hc_mult, hidden].  The reference

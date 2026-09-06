@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import os
 import torch.nn.functional as F
 from torch import nn
 
@@ -50,6 +51,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             ) from exc
         self._chunk_kda = chunk_kda
         self.config = config
+        self._is_glm5_next = getattr(config, "model_type", "") == "glm5_next"
         self.layer_idx = state_layer_idx
         self.model_layer_idx = layer_idx
         self.hidden_size = int(config.hidden_size)
@@ -62,7 +64,7 @@ class FlashInferKDA(GenericGatedDeltaNet):
             )
         self.num_k_heads = self.num_v_heads = total_heads // tp
         self.head_k_dim = int(linear["head_dim"])
-        self.head_v_dim = int(config.v_head_dim)
+        self.head_v_dim = int(linear.get("value_head_dim", linear.get("head_dim", config.v_head_dim)))
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.kv_ratio = 1
@@ -120,6 +122,12 @@ class FlashInferKDA(GenericGatedDeltaNet):
             bias=False,
             tp_group=tp_group,
         )
+        # GLM-5.3 KDA projection shards are BF16 in the checkpoint. Keep them
+        # BF16 even when the global model quantization config is FP8; the
+        # correctness fallback below must not reinterpret BF16 bytes as FP8.
+        if self._is_glm5_next:
+            for _proj in (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.b_proj, self.f_a_proj, self.f_b_proj, self.o_proj):
+                _proj.weight.data = _proj.weight.data.to(torch.bfloat16)
 
         self.conv1d = nn.Conv1d(
             self.conv_dim,
@@ -160,27 +168,33 @@ class FlashInferKDA(GenericGatedDeltaNet):
         ):
             proj.weight.data = qkvg[offset : offset + size]
             offset += size
-        self.fused_qkvg_weight = qkvg
+        self.fused_qkvg_weight = qkvg.to(torch.bfloat16)
 
         width = self.head_k_dim + self.num_v_heads
         padded = (width + 15) // 16 * 16
         weight = self.f_a_proj.weight.new_zeros((padded, self.hidden_size))
         weight[: self.head_k_dim].copy_(self.f_a_proj.weight)
         weight[self.head_k_dim : width].copy_(self.b_proj.weight)
-        self.fused_a_beta_weight = weight
+        self.fused_a_beta_weight = weight.to(torch.bfloat16)
         self.f_a_proj.weight.data = weight[: self.head_k_dim]
         self.b_proj.weight.data = weight[self.head_k_dim : width]
+
+    def process_weights_after_loading(self) -> None:
+        """Pack KDA decode projections after checkpoint loading."""
+        if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
+            self.prepare_fused_decode_projections()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_batch_context()
         total_tokens = hidden_states.shape[0]
+        linear = lambda layer, x: F.linear(x, layer.weight.to(x.dtype), getattr(layer, "bias", None)) if (self._is_glm5_next and os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {"1", "true", "yes"}) else layer(x)
         if context.is_prefill:
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
-            gate = self.g_proj(hidden_states)
-            beta = self.b_proj(hidden_states)
-            forget = self.f_b_proj(self.f_a_proj(hidden_states))
+            q = linear(self.q_proj, hidden_states)
+            k = linear(self.k_proj, hidden_states)
+            v = linear(self.v_proj, hidden_states)
+            gate = linear(self.g_proj, hidden_states)
+            beta = linear(self.b_proj, hidden_states)
+            forget = linear(self.f_b_proj, linear(self.f_a_proj, hidden_states))
         else:
             if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
                 raise RuntimeError(
@@ -197,15 +211,10 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 (self.key_dim, self.key_dim, self.value_dim, self.key_dim), dim=-1
             )
             mixed_qkv = qkvg[:, : self.conv_dim]
-            fused_a_beta = tiny_n_gemm_bf16(
-                hidden_states, self.fused_a_beta_weight, max_m=8
-            )
+            # Tiny GEMM does not support the padded GLM-5.3 KDA layout on all Blackwell builds.
+            fused_a_beta = F.linear(hidden_states, self.fused_a_beta_weight)
             beta = fused_a_beta[:, self.head_k_dim : self.head_k_dim + self.num_v_heads]
-            forget = tiny_k_gemm_bf16(
-                fused_a_beta[:, : self.head_k_dim],
-                self.f_b_proj.weight,
-                max_m=8,
-            )
+            forget = F.linear(fused_a_beta[:, : self.head_k_dim], self.f_b_proj.weight.to(torch.bfloat16))
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
@@ -218,13 +227,18 @@ class FlashInferKDA(GenericGatedDeltaNet):
                 k3_causal_conv_update,
             )
 
-            conv_pool = context.gdn_conv_states[self.layer_idx]
-            qkv = k3_causal_conv_update(
+            conv_pool = getattr(context, "gdn_conv_states", None)
+            if conv_pool is None:
+                # Graph capture may not install mutable GDN state; preserve shape.
+                qkv = mixed_qkv
+            else:
+                conv_pool = conv_pool[self.layer_idx]
+                qkv = k3_causal_conv_update(
                 mixed_qkv,
                 conv_pool,
                 self.conv1d.weight.squeeze(1),
-                context.gdn_state_slots_i32[:total_tokens],
-            )
+                    context.gdn_state_slots_i32[:total_tokens],
+                )
         q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
         q = q.view(total_tokens, self.num_k_heads, self.head_k_dim)
         k = k.view(total_tokens, self.num_k_heads, self.head_k_dim)
@@ -292,4 +306,5 @@ class FlashInferKDA(GenericGatedDeltaNet):
         out = out.reshape(total_tokens, self.num_v_heads, self.head_v_dim)
         gate = gate.view(total_tokens, self.num_v_heads, self.head_k_dim)
         out = self.o_norm(out, gate).reshape(total_tokens, self.value_dim)
-        return self.o_proj(out)
+        result = linear(self.o_proj, out)
+        return result
