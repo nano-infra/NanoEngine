@@ -1,9 +1,9 @@
 """Flash Linear Attention GatedDeltaNet backend."""
 
-from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.delta_net.generic import GenericGatedDeltaNet
 
 
-class FLAGatedDeltaNet(GenericGatedDeltaNet):
+class FlaGatedDeltaNet(GenericGatedDeltaNet):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self._has_fla:
@@ -15,4 +15,4 @@ class FLAGatedDeltaNet(GenericGatedDeltaNet):
         self._has_flashinfer_nontranspose = False
 
 
-__all__ = ["FLAGatedDeltaNet"]
+__all__ = ["FlaGatedDeltaNet"]

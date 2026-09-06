@@ -48,7 +48,7 @@ def _init_backend():
 
 @pytest.fixture()
 def indexer_cache():
-    from dlengine.runtime.layers.indexer import IndexerCache
+    from dlengine.runtime.layers.backends.dsa.indexer import IndexerCache
 
     num_layers = 2
     num_pages = 16
@@ -64,7 +64,7 @@ def indexer_cache():
 @pytest.fixture()
 def indexer(indexer_cache):
     """Create an Indexer with random weights and attached cache."""
-    from dlengine.runtime.layers.indexer import Indexer
+    from dlengine.runtime.layers.backends.dsa.indexer import Indexer
 
     prev_device = torch.get_default_device()
     prev_dtype = torch.get_default_dtype()
@@ -271,7 +271,7 @@ class TestIndexerCacheAllocation:
         from types import SimpleNamespace
 
         from dlengine.runtime.context.cache import CacheContext
-        from dlengine.runtime.layers.indexer import IndexerCache
+        from dlengine.runtime.layers.backends.dsa.indexer import IndexerCache
 
         hf_config = SimpleNamespace(index_head_dim=128)
 

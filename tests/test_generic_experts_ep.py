@@ -19,13 +19,13 @@ def _worker(rank, world, port, q):
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group("gloo", rank=rank, world_size=world)
-        from dlengine.runtime.layers.backends.generic.experts import (
-            GenericDistributedRoutedExperts,
+        from dlengine.runtime.layers.backends.experts.generic import (
+            GenericExperts,
         )
 
         H, I, E, K = 8, 8, 4, 2
         ep_group = dist.group.WORLD
-        exp = GenericDistributedRoutedExperts(
+        exp = GenericExperts(
             hidden_size=H,
             intermediate_size=I,
             num_experts=E,
@@ -47,7 +47,7 @@ def _worker(rank, world, port, q):
         w = torch.rand(x.shape[0], K)
         out = exp(x, ids, w, is_prefill=True)
 
-        ref = GenericDistributedRoutedExperts(
+        ref = GenericExperts(
             hidden_size=H,
             intermediate_size=I,
             num_experts=E,

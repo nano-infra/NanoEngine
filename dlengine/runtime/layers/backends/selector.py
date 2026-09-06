@@ -98,19 +98,19 @@ def create_linear(
     QKV/merged variants) are passed through ``kwargs`` verbatim.
     """
     if family == "deepseek":
-        from dlengine.runtime.layers.backends.deepseek import linear as _mod
+        from dlengine.runtime.layers.backends.linear import deep_gemm as _mod
 
         classes = {
-            "row": _mod.HopperRowParallelLinear,
-            "column": _mod.HopperColumnParallelLinear,
-            "merged": _mod.HopperMergedColumnParallelLinear,
-            "qkv": _mod.HopperQKVParallelLinear,
-            "replicated": _mod.HopperReplicatedLinear,
+            "row": _mod.DeepGemmRowParallelLinear,
+            "column": _mod.DeepGemmColumnParallelLinear,
+            "merged": _mod.DeepGemmMergedColumnParallelLinear,
+            "qkv": _mod.DeepGemmQKVParallelLinear,
+            "replicated": _mod.DeepGemmReplicatedLinear,
         }
         kwargs["quantization_config"] = quantization_config
         kwargs["scale_tensor"] = scale_tensor
     elif family == "generic":
-        from dlengine.runtime.layers.backends.generic import linear as _mod
+        from dlengine.runtime.layers.backends.linear import generic as _mod
 
         classes = {
             "row": _mod.GenericRowParallelLinear,
@@ -128,12 +128,10 @@ def create_linear(
 
 
 def _create_generic_experts(**kwargs):
-    from dlengine.runtime.layers.backends.generic.experts import (
-        GenericDistributedRoutedExperts,
-    )
+    from dlengine.runtime.layers.backends.experts.generic import GenericExperts
 
     kwargs.pop("quantization_config", None)
-    return GenericDistributedRoutedExperts(**kwargs)
+    return GenericExperts(**kwargs)
 
 
 def create_experts(
@@ -157,23 +155,25 @@ def create_experts(
     """
     if experts_quant_override:
         if bool(getattr(quantization_config, "is_modelopt_nvfp4", False)):
-            from dlengine.runtime.layers.backends.nvfp4 import ModelOptNvFp4Experts
+            from dlengine.runtime.layers.backends.experts.nvfp4 import (
+                ModelOptNvFp4Experts,
+            )
 
             return ModelOptNvFp4Experts(
                 quantization_config=quantization_config, **kwargs
             )
         if bool(getattr(quantization_config, "is_mxfp4", False)):
-            from dlengine.runtime.layers.backends.megamoe import MegaMoEExperts
+            from dlengine.runtime.layers.backends.experts.mega_moe import MegaMoEExperts
 
             return MegaMoEExperts(quantization_config=quantization_config, **kwargs)
 
     if family == "deepseek":
         try:
-            from dlengine.runtime.layers.backends.deepseek.experts import (
-                HopperDistributedRoutedExperts,
+            from dlengine.runtime.layers.backends.experts.deep_gemm import (
+                DeepGemmExperts,
             )
 
-            return HopperDistributedRoutedExperts(
+            return DeepGemmExperts(
                 quantization_config=quantization_config, **kwargs
             )
         except Exception:
@@ -258,14 +258,14 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
 def create_gdn(*, requested="auto", **kwargs):
     plan = resolve_gdn_plan(requested or "auto")
     if plan.prefill == "flashinfer":
-        from .flashinfer.gdn import FlashInferGatedDeltaNet
+        from .delta_net.flashinfer import FlashInferGatedDeltaNet
 
         return FlashInferGatedDeltaNet(**kwargs)
     if plan.prefill == "fla":
-        from .fla.gdn import FLAGatedDeltaNet
+        from .delta_net.fla import FlaGatedDeltaNet
 
-        return FLAGatedDeltaNet(**kwargs)
-    from .torch.gdn import TorchGatedDeltaNet
+        return FlaGatedDeltaNet(**kwargs)
+    from .delta_net.torch import TorchGatedDeltaNet
 
     return TorchGatedDeltaNet(**kwargs)
 
@@ -277,6 +277,6 @@ def create_kda(*, layer_idx, state_layer_idx, config, **kwargs):
     fallback; it is routed through the selector so model topologies depend only
     on the factory contract rather than importing the implementation directly.
     """
-    from .kda import FlashInferKDA
+    from .delta_net.kda import FlashInferKda
 
-    return FlashInferKDA(layer_idx, state_layer_idx, config)
+    return FlashInferKda(layer_idx, state_layer_idx, config)

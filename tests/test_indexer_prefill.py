@@ -19,7 +19,7 @@ class _FixedWeights(nn.Module):
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
     import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
-    from dlengine.runtime.layers.indexer import _interleaved_to_half, Indexer
+    from dlengine.runtime.layers.backends.dsa.indexer import _interleaved_to_half, Indexer
 
     class CaptureRope(nn.Module):
         def __init__(self):
@@ -51,7 +51,7 @@ def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_relu_mqa_scores_matches_dense_reference():
-    from dlengine.runtime.layers.indexer import _weighted_relu_mqa_scores
+    from dlengine.runtime.layers.backends.dsa.indexer import _weighted_relu_mqa_scores
 
     torch.manual_seed(17)
     query = torch.randn(7, 6, 128, device="cuda", dtype=torch.bfloat16)
@@ -67,7 +67,7 @@ def test_weighted_relu_mqa_scores_matches_dense_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_relu_cannot_be_replaced_by_folded_query():
-    from dlengine.runtime.layers.indexer import _weighted_relu_mqa_scores
+    from dlengine.runtime.layers.backends.dsa.indexer import _weighted_relu_mqa_scores
 
     query = torch.tensor([[[2.0], [-1.0]]], device="cuda")
     weights = torch.tensor([[1.0, 3.0]], device="cuda")
@@ -82,7 +82,7 @@ def test_weighted_relu_cannot_be_replaced_by_folded_query():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
-    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
+    from dlengine.runtime.layers.backends.dsa.indexer import Indexer, IndexerCache
 
     torch.manual_seed(23)
     device = torch.device("cuda")
@@ -226,7 +226,7 @@ def test_indexer_cache_gather_handles_fragmented_partial_pages():
 
 
 def test_prefill_mqa_chunk_rows_respects_available_memory(monkeypatch):
-    from dlengine.runtime.layers.indexer import _prefill_mqa_chunk_rows
+    from dlengine.runtime.layers.backends.dsa.indexer import _prefill_mqa_chunk_rows
 
     monkeypatch.setattr(
         torch.cuda, "mem_get_info", lambda _device: (1_000_000, 10_000_000)
@@ -242,7 +242,7 @@ def test_ragged_prefill_topk_uses_multi_seq_causal_ranges_and_large_chunks(
     monkeypatch,
 ):
     import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
-    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
+    from dlengine.runtime.layers.backends.dsa.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
     indexer = Indexer.__new__(Indexer)
@@ -340,7 +340,7 @@ def test_ragged_prefill_topk_uses_multi_seq_causal_ranges_and_large_chunks(
 def test_ragged_prefill_long_context_uses_fused_radix_topk(monkeypatch):
     """Production Top-2048 uses the fused ragged selector beyond 64K."""
     import dlengine.runtime.layers.backends.dsa.indexer.lightning as indexer_module
-    from dlengine.runtime.layers.indexer import Indexer, IndexerCache
+    from dlengine.runtime.layers.backends.dsa.indexer import Indexer, IndexerCache
 
     device = torch.device("cuda")
     indexer = Indexer.__new__(Indexer)

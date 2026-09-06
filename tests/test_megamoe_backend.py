@@ -1,8 +1,12 @@
 import pytest
 import torch
-from dlengine.runtime.layers.backends.megamoe import MegaMoEExperts
-from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
+from dlengine.runtime.layers.backends.experts.mega_moe import MegaMoEExperts
+from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
 from dlengine.runtime.models.quant_config import QuantizationConfig
+
+
+def BlackwellBackendFactory(quant_config):
+    return PolicyBackendFactory(quant_config, tier="blackwell")
 
 
 def mxfp4_config():

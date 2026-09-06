@@ -6,7 +6,7 @@ import torch
 from dlengine.runtime.context.cache._allocator import allocate_device_tensor
 from dlengine.runtime.context.peer import normalize_peer_placements, PeerContext
 from dlengine.runtime.disagg.p2p.cache_transfer import _validate_named_region_ops
-from dlengine.runtime.layers.indexer import IndexerCache
+from dlengine.runtime.layers.backends.dsa.indexer import IndexerCache
 
 
 def _peer_context(agent):

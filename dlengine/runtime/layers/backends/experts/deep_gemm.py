@@ -1,8 +1,6 @@
 """DeepGEMM/DeepEP distributed routed experts (FP8).
 
-This is the full-featured MoE implementation for FP8-capable GPUs (SM90+). The
-class name retains the ``Hopper`` prefix during the ownership-inversion
-migration and will be renamed in a follow-up.
+This is the full-featured MoE implementation for FP8-capable GPUs (SM90+).
 It supports:
   - FP8 block-wise quantization via DeepGEMM
   - Expert parallelism via DeepEP (normal and low-latency dispatchers)
@@ -69,7 +67,7 @@ def compute_topk_ids(topk_ids, ranks, num_experts):
     return topk_ids
 
 
-class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
+class DeepGemmExperts(DistributedRoutedExpertsBase):
     """
     Unified MoE Layer handling both Expert Parallel (EP) and Tensor Parallel (TP).
     Uses DeepEP for cross-node/cross-GPU expert routing when ep_size > 1.

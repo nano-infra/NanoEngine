@@ -106,22 +106,19 @@ def create_backend(
     selection: BackendSelection,
     quant_config,
 ) -> BackendFactory:
-    """Construct the selected hardware factory without changing global state."""
-    if selection.hardware == "blackwell":
-        from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
+    """Construct the policy-driven backend factory without changing global state.
 
-        backend = BlackwellBackendFactory(quant_config)
-    elif selection.hardware == "hopper":
-        from dlengine.runtime.layers.hopper import HopperBackendFactory
+    The hardware tier (``blackwell``/``hopper``/``gpu_generic``) is a *policy
+    key* into ``TIER_POLICIES``; a single ``PolicyBackendFactory`` implements
+    every tier, so there are no per-tier factory classes.
+    """
+    from dlengine.runtime.layers.backend_policy import TIER_POLICIES
+    from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
 
-        backend = HopperBackendFactory(quant_config)
-    elif selection.hardware == "gpu_generic":
-        from dlengine.runtime.layers.generic import GenericBackendFactory
-
-        backend = GenericBackendFactory(quant_config)
-    else:
+    if selection.hardware not in TIER_POLICIES:
         raise AssertionError(f"Unhandled hardware backend: {selection.hardware}")
 
+    backend = PolicyBackendFactory(quant_config, tier=selection.hardware)
     backend.attention_backend = selection.attention
     backend.gdn_backend = selection.gdn
     backend.ref_fallback_allowed = selection.ref_fallback_allowed

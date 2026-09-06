@@ -10,7 +10,7 @@ from torch import nn
 from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.context.distributed import get_dist_context
 from dlengine.runtime.layers import get_backend
-from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.delta_net.generic import GenericGatedDeltaNet
 
 
 class SigmoidRMSNormGated(nn.Module):
@@ -25,7 +25,7 @@ class SigmoidRMSNormGated(nn.Module):
         return k3_output_norm(x, gate, self.weight, self.eps)
 
 
-class FlashInferKDA(GenericGatedDeltaNet):
+class FlashInferKda(GenericGatedDeltaNet):
     """K3 KDA with attention-TP sharding and the shared linear-state pool.
 
     The inherited methods implement only causal depthwise convolution and

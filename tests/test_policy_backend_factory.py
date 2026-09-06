@@ -1,30 +1,27 @@
 """Policy-provider factory tests.
 
-Assert that hardware tiers are pure policy providers: the tier maps to a static
-TierPolicy that drives which implementation family linear/experts resolve to,
-matching the pre-refactor per-tier hardcoding.
+Assert that hardware tiers are pure policy providers: a single
+``PolicyBackendFactory`` is parameterised by a tier key into ``TIER_POLICIES``,
+which drives the linear/experts implementation families (matching the
+pre-refactor per-tier hardcoding). There are no per-tier factory classes.
 """
 
 import pytest
 from dlengine.runtime.layers.backend_policy import TIER_POLICIES
-from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
-from dlengine.runtime.layers.generic import GenericBackendFactory
-from dlengine.runtime.layers.hopper import HopperBackendFactory
+from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
 from dlengine.runtime.models.quant_config import QuantizationConfig
 
 
 @pytest.mark.parametrize(
-    ("factory_cls", "hardware", "linear", "experts", "quant_override", "fp8"),
+    ("hardware", "linear", "experts", "quant_override", "fp8"),
     [
-        (GenericBackendFactory, "gpu_generic", "generic", "generic", False, False),
-        (HopperBackendFactory, "hopper", "deepseek", "deepseek", False, True),
-        (BlackwellBackendFactory, "blackwell", "deepseek", "deepseek", True, True),
+        ("gpu_generic", "generic", "generic", False, False),
+        ("hopper", "deepseek", "deepseek", False, True),
+        ("blackwell", "deepseek", "deepseek", True, True),
     ],
 )
-def test_factory_pins_tier_policy(
-    factory_cls, hardware, linear, experts, quant_override, fp8
-):
-    factory = factory_cls(QuantizationConfig())
+def test_factory_pins_tier_policy(hardware, linear, experts, quant_override, fp8):
+    factory = PolicyBackendFactory(QuantizationConfig(), tier=hardware)
 
     assert factory.hardware_backend == hardware
     assert factory.policy is TIER_POLICIES[hardware]
@@ -36,18 +33,12 @@ def test_factory_pins_tier_policy(
     assert factory.ref_fallback_allowed is False
 
 
-def test_blackwell_is_not_a_hopper_subclass():
-    # The BlackwellBackendFactory(HopperBackendFactory) inheritance-for-config
-    # pattern is gone; both are thin siblings over PolicyBackendFactory.
-    assert not issubclass(BlackwellBackendFactory, HopperBackendFactory)
-
-
 def test_factory_exposes_kimi_delta_attention_contract():
     # KDA is reached through the factory contract, not a direct model import.
     from dlengine.runtime.layers.base_backend import BackendFactory
 
     assert hasattr(BackendFactory, "get_kimi_delta_attention")
-    factory = GenericBackendFactory(QuantizationConfig())
+    factory = PolicyBackendFactory(QuantizationConfig(), tier="gpu_generic")
     assert callable(factory.get_kimi_delta_attention)
 
 
@@ -65,9 +56,9 @@ def test_experts_ref_fallback_when_deepseek_unavailable(monkeypatch):
         return sentinel
 
     # Force the deepseek path to fail and capture the generic fallback.
-    import dlengine.runtime.layers.backends.deepseek.experts as ds
+    import dlengine.runtime.layers.backends.experts.deep_gemm as ds
 
-    monkeypatch.setattr(ds, "HopperDistributedRoutedExperts", _boom)
+    monkeypatch.setattr(ds, "DeepGemmExperts", _boom)
     monkeypatch.setattr(selector, "_create_generic_experts", _generic)
 
     with pytest.raises(RuntimeError):
@@ -82,7 +73,7 @@ def test_experts_ref_fallback_when_deepseek_unavailable(monkeypatch):
 
 
 def test_models_do_not_import_kda_implementation_directly():
-    # Topologies must depend on the abstract contract, not FlashInferKDA.
+    # Topologies must depend on the abstract contract, not the KDA impl.
     import ast
     import pathlib
 
@@ -92,8 +83,11 @@ def test_models_do_not_import_kda_implementation_directly():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
-                if node.module.endswith("backends.kda") or "backends.kda" in node.module:
+                if "delta_net.kda" in node.module:
                     offenders.append(str(path))
-            if isinstance(node, ast.alias) and node.name == "FlashInferKDA":
+            if isinstance(node, ast.alias) and node.name in (
+                "FlashInferKDA",
+                "FlashInferKda",
+            ):
                 offenders.append(str(path))
     assert offenders == [], f"model files import KDA impl directly: {offenders}"

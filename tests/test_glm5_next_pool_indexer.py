@@ -1,6 +1,6 @@
 import torch
 
-from dlengine.runtime.layers.indexer import (
+from dlengine.runtime.layers.backends.dsa.indexer import (
     append_pool_tail,
     pool_indexer_states,
     pool_indexer_topk,

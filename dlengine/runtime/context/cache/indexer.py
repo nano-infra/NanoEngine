@@ -50,7 +50,7 @@ def get_indexer_block_bytes(context) -> int:
 
 def allocate_indexer_cache(context, hf_config) -> None:
     """Allocate NSA indexer FP8 cache for DeepSeek V3.2."""
-    from dlengine.runtime.layers.indexer import IndexerCache
+    from dlengine.runtime.layers.backends.dsa.indexer import IndexerCache
 
     index_head_dim = getattr(hf_config, "index_head_dim", 0)
     if index_head_dim == 0:

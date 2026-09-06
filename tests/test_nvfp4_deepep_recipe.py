@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
-from dlengine.runtime.layers.backends.nvfp4.experts import ModelOptNvFp4Experts
+from dlengine.runtime.layers.backends.experts.nvfp4 import ModelOptNvFp4Experts
 from dlengine.runtime.layers.token_dispatcher import DeepEPTokenDispatcherLowLatency
 
 
