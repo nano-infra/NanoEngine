@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from dlengine.runtime.layers.indexer import (
+from dlengine.runtime.layers.backends.dsa.indexer import (
     _expand_decode_context_lens,
     _uses_linear_mtp_indexer_path,
 )

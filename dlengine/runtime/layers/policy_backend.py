@@ -5,9 +5,10 @@ A single factory implementation whose behavior is fully determined by a
 tier had its own factory with hardcoded per-family construction logic, and
 Blackwell subclassed Hopper only to override two methods.
 
-The per-tier named factories (``GenericBackendFactory``, ``HopperBackendFactory``,
-``BlackwellBackendFactory``) are thin subclasses that only select which
-``TierPolicy`` to use; they carry no implementation logic.
+There are no per-tier factory classes: ``create_backend`` constructs a
+``PolicyBackendFactory`` with the tier key from ``BackendSelection.hardware``.
+The tier names (``gpu_generic``/``hopper``/``blackwell``) survive only as policy
+keys in ``TIER_POLICIES``.
 """
 
 from __future__ import annotations

@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
-from dlengine.runtime.layers.backends.generic.gdn.output import RMSNormGated
-from dlengine.runtime.layers.backends.generic.gdn.state import StateMixin
+from dlengine.runtime.layers.backends.delta_net.generic import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.delta_net.components.output import RMSNormGated
+from dlengine.runtime.layers.backends.delta_net.components.state import StateMixin
 
 
 def _bare_layer(num_v_heads=2, head_v_dim=4, head_k_dim=3):

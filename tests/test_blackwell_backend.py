@@ -3,7 +3,6 @@ import torch
 from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
 from dlengine.runtime.layers.backends.attention import fa4 as attention
 from dlengine.runtime.layers.backends.mla import trtllm as mla_trtllm
-from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
 
 
 def teardown_function():
@@ -19,7 +18,7 @@ def test_blackwell_auto_selects_blackwell_backend(monkeypatch):
 
     layers.init_backend(quant_config=object())
 
-    assert isinstance(layers.get_backend(), BlackwellBackendFactory)
+    assert layers.get_backend().hardware_backend == "blackwell"
 
 
 def test_blackwell_decode_uses_trtllm_paged_kv(monkeypatch):

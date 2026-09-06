@@ -22,12 +22,12 @@ from dlengine.runtime.layers.base_backend import GatedDeltaNetBase, ReplicatedLi
 from dlengine.runtime.models.quant_config import QuantizationConfig
 from dlengine.utils.cuda import get_cuda_compute_capability
 
-from . import gdn
-from .gdn import kernels
-from .gdn.conv import CausalConvMixin
-from .gdn.output import OutputTransformMixin, RMSNormGated
-from .gdn.recurrence import RecurrenceMixin
-from .gdn.state import StateMixin
+from . import components as gdn
+from .components import kernels
+from .components.conv import CausalConvMixin
+from .components.output import OutputTransformMixin, RMSNormGated
+from .components.recurrence import RecurrenceMixin
+from .components.state import StateMixin
 
 # Triton head-repeat helpers (used only in the prefill projection path here).
 try:

@@ -1,9 +1,8 @@
 """DeepGEMM (FP8) linear layer implementations.
 
 These are the vendor implementations backed by DeepGEMM/DeepEP. They require an
-FP8-capable GPU (SM90+); the class names retain the ``Hopper`` prefix during the
-ownership-inversion migration and will be renamed in a follow-up. All classes
-extend the abstract base types from ``layers.base_backend`` and support both FP8
+FP8-capable GPU (SM90+). All classes extend the abstract base types from
+``layers.base_backend`` and support both FP8
 and BF16 (fallback) computation paths.
 """
 
@@ -48,7 +47,7 @@ def _divide(numerator, denominator):
 # ---------------------------------------------------------------------------
 
 
-class _HopperLinearMixin:
+class _DeepGemmLinearMixin:
     """Mixin that allocates weights and implements the FP8/BF16 forward.
 
     Subclasses must call ``_init_weights(input_size, output_size, bias,
@@ -184,11 +183,11 @@ class _HopperLinearMixin:
 
 
 # ---------------------------------------------------------------------------
-# HopperReplicatedLinear
+# DeepGemmReplicatedLinear
 # ---------------------------------------------------------------------------
 
 
-class HopperReplicatedLinear(_HopperLinearMixin, ReplicatedLinearBase):
+class DeepGemmReplicatedLinear(_DeepGemmLinearMixin, ReplicatedLinearBase):
 
     def __init__(
         self,
@@ -231,11 +230,11 @@ class HopperReplicatedLinear(_HopperLinearMixin, ReplicatedLinearBase):
 
 
 # ---------------------------------------------------------------------------
-# HopperColumnParallelLinear
+# DeepGemmColumnParallelLinear
 # ---------------------------------------------------------------------------
 
 
-class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
+class DeepGemmColumnParallelLinear(_DeepGemmLinearMixin, ColumnParallelLinearBase):
 
     def __init__(
         self,
@@ -287,12 +286,12 @@ class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
 
 
 # ---------------------------------------------------------------------------
-# HopperMergedColumnParallelLinear
+# DeepGemmMergedColumnParallelLinear
 # ---------------------------------------------------------------------------
 
 
-class HopperMergedColumnParallelLinear(
-    _HopperLinearMixin, MergedColumnParallelLinearBase
+class DeepGemmMergedColumnParallelLinear(
+    _DeepGemmLinearMixin, MergedColumnParallelLinearBase
 ):
 
     def __init__(
@@ -359,11 +358,11 @@ class HopperMergedColumnParallelLinear(
 
 
 # ---------------------------------------------------------------------------
-# HopperQKVParallelLinear
+# DeepGemmQKVParallelLinear
 # ---------------------------------------------------------------------------
 
 
-class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
+class DeepGemmQKVParallelLinear(_DeepGemmLinearMixin, QKVParallelLinearBase):
 
     def __init__(
         self,
@@ -441,11 +440,11 @@ class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
 
 
 # ---------------------------------------------------------------------------
-# HopperRowParallelLinear
+# DeepGemmRowParallelLinear
 # ---------------------------------------------------------------------------
 
 
-class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
+class DeepGemmRowParallelLinear(_DeepGemmLinearMixin, RowParallelLinearBase):
 
     def __init__(
         self,

@@ -1150,7 +1150,7 @@ class ModelRunner:
         # MegaMoE uses its own packed-MXFP4 DeepGEMM kernels and is already
         # compiled by graph/model warmup. The legacy BF16/FP8 grouped-GEMM
         # warmup below is incompatible with its packed weights.
-        from dlengine.runtime.layers.backends.megamoe import MegaMoEExperts
+        from dlengine.runtime.layers.backends.experts.mega_moe import MegaMoEExperts
 
         if isinstance(experts, MegaMoEExperts):
             return

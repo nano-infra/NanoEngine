@@ -804,7 +804,7 @@ class DeepseekV2Model(nn.Module):
                 None,
             )
             if indexer is not None:
-                from dlengine.runtime.layers.indexer import _expand_decode_context_lens
+                from dlengine.runtime.layers.backends.dsa.indexer import _expand_decode_context_lens
 
                 sp_rank = get_dist_context().attn_sp_rank
                 nominal_bs = input_ids.numel() // context.num_tokens_per_seq
@@ -1107,7 +1107,7 @@ class DeepseekV2Attention(nn.Module):
 
         # NSA Indexer (V3.2 only)
         if self.is_v32 and not self.skip_topk:
-            from dlengine.runtime.layers.indexer import Indexer
+            from dlengine.runtime.layers.backends.dsa.indexer import Indexer
 
             indexer_rope_dim = int(
                 getattr(config, "indexer_rope_head_dim", config.qk_rope_head_dim)

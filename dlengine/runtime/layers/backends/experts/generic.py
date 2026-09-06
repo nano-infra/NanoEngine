@@ -16,7 +16,7 @@ from dlengine.runtime.layers.base_backend import DistributedRoutedExpertsBase
 from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
 
 
-class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
+class GenericExperts(DistributedRoutedExpertsBase):
     """BF16-only MoE experts for generic GPUs.
 
     Supports ep_size=1 (local compute) with optional TP all-reduce, and
