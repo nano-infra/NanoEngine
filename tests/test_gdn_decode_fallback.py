@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-import dlengine.runtime.layers.backends.generic.gated_delta_net as gdn_module
+import dlengine.runtime.layers.backends.generic.gdn.kernels as gdn_module
 import torch
 from dlengine.runtime.layers.backends.generic.gated_delta_net import GenericGatedDeltaNet
 from torch import nn

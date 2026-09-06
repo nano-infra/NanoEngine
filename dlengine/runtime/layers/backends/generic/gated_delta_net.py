@@ -1,63 +1,35 @@
 """Generic GatedDeltaNet (Linear Attention) layer implementation.
 
 Provides the linear attention mechanism used in Qwen3.5 MoE.
-"""
 
-from typing import Optional
+The operation is decomposed into independently-testable components under
+``gdn/``: projection setup lives here, causal convolution in ``gdn/conv.py``,
+recurrent-state hygiene in ``gdn/state.py``, the delta-rule recurrence in
+``gdn/recurrence.py``, and the gated output transform in ``gdn/output.py``.
+``GenericGatedDeltaNet`` composes these mixins; kernel-specific backends
+(FlashInfer/FLA/Torch/KDA) reuse the same components and only toggle the
+capability flags or override the recurrence.
+"""
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from dlengine.logging import get_logger
-from dlengine.runtime.compile_utils import maybe_compile
 from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.layers import get_backend
 from dlengine.runtime.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.runtime.models.quant_config import QuantizationConfig
 from dlengine.utils.cuda import get_cuda_compute_capability
 
-logger = get_logger()
+from . import gdn
+from .gdn import kernels
+from .gdn.conv import CausalConvMixin
+from .gdn.output import OutputTransformMixin, RMSNormGated
+from .gdn.recurrence import RecurrenceMixin
+from .gdn.state import StateMixin
 
-
-# Module-level lazily-compiled L2 norm. Compiling at module-import time
-# (e.g. via @torch.compile on a class method) attaches ConfigModuleInstance
-# refs to the class object, which breaks cloudpickle in Ray actors on
-# torch >= 2.10. Using a module-level function + lazy compile keeps the
-# wrapper out of any class dict and out of module globals at import time.
-def _l2norm_impl(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x * inv_norm
-
-
-_l2norm_compiled_fn = None
-
-
-def _l2norm_compiled(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    global _l2norm_compiled_fn
-    if _l2norm_compiled_fn is None:
-        _l2norm_compiled_fn = maybe_compile(_l2norm_impl)
-    return _l2norm_compiled_fn(x, dim, eps)
-
-
-try:
-    from dlengine.runtime.kernel.triton.generic.rmsnorm_gated import (
-        can_use_rms_norm_gated_kernel,
-        rms_norm_gated_triton,
-    )
-except ImportError:
-    can_use_rms_norm_gated_kernel = None
-    rms_norm_gated_triton = None
-
-try:
-    from dlengine.runtime.kernel.triton.generic.repeat_interleave import (
-        can_use_repeat_interleave_from_prefix_triton,
-        repeat_interleave_from_prefix_triton,
-    )
-except ImportError:
-    can_use_repeat_interleave_from_prefix_triton = None
-    repeat_interleave_from_prefix_triton = None
-
+# Triton head-repeat helpers (used only in the prefill projection path here).
 try:
     from dlengine.runtime.kernel.triton.generic.repeat_heads import (
         can_use_repeat_heads_triton,
@@ -67,108 +39,25 @@ except ImportError:
     can_use_repeat_heads_triton = None
     repeat_heads_triton = None
 
-try:
-    from dlengine.runtime.kernel.triton.generic.ragged_layout import (
-        can_use_ragged_to_padded_triton,
-        ragged_to_padded_triton,
-    )
-except ImportError:
-    can_use_ragged_to_padded_triton = None
-    ragged_to_padded_triton = None
+logger = get_logger()
 
-# Try to import flashinfer GDN kernels (preferred, SM90 native). Some
-# FlashInfer builds expose the Python API while omitting one of the optional
-# compiled decode backends, so probe the actual backend callables separately.
-try:
-    from flashinfer import chunk_gated_delta_rule
-
-    _HAS_FLASHINFER_GDN_PREFILL = callable(chunk_gated_delta_rule)
-except ImportError:
-    chunk_gated_delta_rule = None
-    _HAS_FLASHINFER_GDN_PREFILL = False
-    logger.warning(
-        "flashinfer GDN kernels not available. GatedDeltaNet will use naive fallback."
-    )
-
-try:
-    from flashinfer.gdn_decode import (
-        gated_delta_rule_decode_pretranspose,
-        run_pretranspose_decode as _run_pretranspose_decode,
-    )
-
-    _HAS_FLASHINFER_GDN_PRETRANSPOSE = callable(
-        gated_delta_rule_decode_pretranspose
-    ) and callable(_run_pretranspose_decode)
-except ImportError:
-    gated_delta_rule_decode_pretranspose = None
-    _HAS_FLASHINFER_GDN_PRETRANSPOSE = False
-
-try:
-    from flashinfer.gdn_decode import (
-        gated_delta_rule_decode,
-        run_nontranspose_decode as _run_nontranspose_decode,
-    )
-
-    _HAS_FLASHINFER_GDN_NONTRANSPOSE = callable(gated_delta_rule_decode) and callable(
-        _run_nontranspose_decode
-    )
-except ImportError:
-    gated_delta_rule_decode = None
-    _HAS_FLASHINFER_GDN_NONTRANSPOSE = False
-
-# Try to import flash-linear-attention GDN kernels (preferred for non-Hopper).
-try:
-    from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-        fused_recurrent_gated_delta_rule as fla_fused_recurrent_gated_delta_rule,
-    )
-
-    _HAS_FLA_GDN = True
-except ImportError:
-    _HAS_FLA_GDN = False
-
-# Try to import causal_conv1d for optimized depthwise conv
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
-
-    _HAS_CAUSAL_CONV1D = True
-except ImportError:
-    _HAS_CAUSAL_CONV1D = False
+# Backwards-compatible module-level capability aliases. Historically these
+# ``_HAS_*`` names lived in this module; they now come from ``gdn.kernels`` but
+# are re-exported so existing imports/monkeypatch targets keep working.
+_HAS_FLASHINFER_GDN_PREFILL = kernels.HAS_FLASHINFER_GDN_PREFILL
+_HAS_FLASHINFER_GDN_PRETRANSPOSE = kernels.HAS_FLASHINFER_GDN_PRETRANSPOSE
+_HAS_FLASHINFER_GDN_NONTRANSPOSE = kernels.HAS_FLASHINFER_GDN_NONTRANSPOSE
+_HAS_FLA_GDN = kernels.HAS_FLA_GDN
+_HAS_CAUSAL_CONV1D = kernels.HAS_CAUSAL_CONV1D
 
 
-class RMSNormGated(nn.Module):
-    """RMSNorm followed by SiLU-gated multiplication.
-
-    Applied per-head: weight has shape [head_v_dim].
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [..., hidden_size] — the value to normalize
-            gate: [..., hidden_size] — gating signal (SiLU applied)
-        """
-        if can_use_rms_norm_gated_kernel is not None and can_use_rms_norm_gated_kernel(
-            x, gate, self.weight
-        ):
-            return rms_norm_gated_triton(x, gate, self.weight, self.eps)
-
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        x = self.weight * x.to(input_dtype)
-        x = x * F.silu(gate.to(torch.float32)).to(input_dtype)
-        return x
-
-
-class GenericGatedDeltaNet(GatedDeltaNetBase):
+class GenericGatedDeltaNet(
+    CausalConvMixin,
+    StateMixin,
+    RecurrenceMixin,
+    OutputTransformMixin,
+    GatedDeltaNetBase,
+):
     """GatedDeltaNet linear attention.
 
     Uses FlashInfer SM90 kernels when their compiled backends are available:
@@ -176,6 +65,11 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
     - Decode: pretranspose fused kernel, with nontranspose/FLA/naive fallbacks
 
     State layout is K-last: [N, H, V, K].
+
+    Composed from the ``gdn/`` components: convolution (CausalConvMixin), state
+    hygiene (StateMixin), recurrence (RecurrenceMixin), and output transform
+    (OutputTransformMixin). This class owns projection setup and the top-level
+    forward/decode orchestration.
     """
 
     def __init__(
@@ -250,16 +144,18 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         sm_major = capability[0] if capability is not None else 0
         # FlashInfer 0.6.11 supports GDN prefill on SM90 and SM100+. SM100
         # prefill computes recurrent state in fp32; decode uses the bf16 pool.
-        self._has_flashinfer_prefill = _HAS_FLASHINFER_GDN_PREFILL and sm_major >= 9
+        self._has_flashinfer_prefill = (
+            kernels.HAS_FLASHINFER_GDN_PREFILL and sm_major >= 9
+        )
         self._has_flashinfer_pretranspose = (
-            _HAS_FLASHINFER_GDN_PRETRANSPOSE and sm_major >= 9
+            kernels.HAS_FLASHINFER_GDN_PRETRANSPOSE and sm_major >= 9
         )
         self._has_flashinfer_nontranspose = (
-            _HAS_FLASHINFER_GDN_NONTRANSPOSE and sm_major == 9
+            kernels.HAS_FLASHINFER_GDN_NONTRANSPOSE and sm_major == 9
         )
         # FLA is also a valid fallback on Hopper when a FlashInfer build omits
         # its optional decode kernels.
-        self._has_fla = _HAS_FLA_GDN
+        self._has_fla = kernels.HAS_FLA_GDN
         self._conv1d_prefill_padded_ws: torch.Tensor | None = None
 
     def _get_conv1d_prefill_padded_workspace(
@@ -288,9 +184,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 dtype=dtype,
             )
 
-        padded = self._conv1d_prefill_padded_ws[:num_seqs, :dim, :max_seqlen]
-        padded.zero_()
-        return padded
+        return self._conv1d_prefill_padded_ws[:num_seqs, :dim, :max_seqlen]
 
     def forward(
         self,
@@ -431,18 +325,6 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         # ---------- 6. Gated RMSNorm + output projection ----------
         return self._apply_output_transform(core_out, z_all, total_tokens)
 
-    def _apply_output_transform(
-        self, core_attn_out: torch.Tensor, z: torch.Tensor, total_tokens: int
-    ) -> torch.Tensor:
-        """Gated RMSNorm + output projection (shared by forward & lazy verify)."""
-        z = z.view(total_tokens, self.num_v_heads, self.head_v_dim)
-        out = core_attn_out.reshape(-1, self.head_v_dim)
-        z_flat = z.reshape(-1, self.head_v_dim)
-        out = self.norm(out, z_flat)
-        out = out.view(total_tokens, self.num_v_heads, self.head_v_dim)
-        out = out.reshape(total_tokens, self.value_dim)
-        return self.out_proj(out)
-
     def _decode_one_step(
         self,
         qkv: torch.Tensor,
@@ -463,638 +345,5 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             k = k.repeat_interleave(self.kv_ratio, dim=1)
         return self._gdn_decode(q, k, v, a, b, scale, context)
 
-    def _apply_conv1d(self, qkv: torch.Tensor, context) -> torch.Tensor:
-        """Apply causal conv1d to concatenated QKV.
 
-        Args:
-            qkv: [total_tokens, conv_dim]
-        """
-        if context.is_prefill:
-            if _HAS_CAUSAL_CONV1D:
-                return self._conv1d_prefill_fast(qkv, context)
-            else:
-                return self._conv1d_prefill_naive(qkv, context)
-        else:
-            return self._conv1d_decode(qkv, context)
-
-    def _conv1d_prefill_fast(self, qkv: torch.Tensor, context) -> torch.Tensor:
-        """Prefill conv1d using causal_conv1d_fn with seq_idx (single batched kernel)."""
-        cu_seqlens = context.cu_seqlens_q
-        num_seqs = cu_seqlens.shape[0] - 1
-        conv_weight = self.conv1d.weight.squeeze(1)
-
-        gdn_conv_states = getattr(context, "gdn_conv_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-
-        has_prev_state = (
-            context.block_tables is not None and gdn_conv_states is not None
-        )
-
-        if has_prev_state:
-            # Chunked prefill (chunks 2+): pad variable-length sequences into
-            # a fixed batch so we can call causal_conv1d_fn once with
-            # initial_states, avoiding per-seq Python loops and D2H syncs.
-            total_tokens = qkv.shape[0]
-            max_seqlen = context.max_seqlen_q
-            dim = qkv.shape[1]
-            cu_seqlens_long = cu_seqlens.to(torch.int64)
-            batch_values = torch.arange(num_seqs, device=qkv.device, dtype=torch.int64)
-            offset_values = cu_seqlens_long[:-1].contiguous()
-
-            if (
-                repeat_interleave_from_prefix_triton is not None
-                and can_use_repeat_interleave_from_prefix_triton is not None
-                and can_use_repeat_interleave_from_prefix_triton(
-                    batch_values, cu_seqlens_long
-                )
-            ):
-                batch_idx = repeat_interleave_from_prefix_triton(
-                    batch_values,
-                    cu_seqlens_long,
-                    total_tokens,
-                    max_repeat_hint=max_seqlen,
-                )
-                offsets = repeat_interleave_from_prefix_triton(
-                    offset_values,
-                    cu_seqlens_long,
-                    total_tokens,
-                    max_repeat_hint=max_seqlen,
-                )
-            else:
-                # print("no torch_interleave")
-
-                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
-                batch_idx = torch.repeat_interleave(
-                    torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
-                    seq_lens,
-                    output_size=total_tokens,
-                )
-                offsets = torch.repeat_interleave(
-                    cu_seqlens_long[:-1],
-                    seq_lens,
-                    output_size=total_tokens,
-                )
-            pos_in_seq = (
-                torch.arange(
-                    total_tokens,
-                    device=qkv.device,
-                    dtype=torch.long,
-                )
-                - offsets
-            )
-
-            padded = self._get_conv1d_prefill_padded_workspace(
-                num_seqs,
-                dim,
-                max_seqlen,
-                qkv.device,
-                qkv.dtype,
-            )
-            if (
-                ragged_to_padded_triton is not None
-                and can_use_ragged_to_padded_triton is not None
-                and can_use_ragged_to_padded_triton(qkv, cu_seqlens_long, padded)
-            ):
-                ragged_to_padded_triton(qkv, cu_seqlens_long, max_seqlen, out=padded)
-            else:
-                padded[batch_idx, :, pos_in_seq] = qkv
-
-            if gdn_state_slots is not None:
-                init_states = gdn_conv_states[
-                    self.layer_idx, gdn_state_slots[:num_seqs], :, 1:
-                ]
-            else:
-                init_states = gdn_conv_states[self.layer_idx, :num_seqs, :, 1:]
-            # Force fresh (first-chunk) sequences to start from a zero conv
-            # state (see _continuation_keep_mask); guards against stale state in
-            # a reused slot when a fresh seq is batched with a continuation.
-            keep = self._continuation_keep_mask(context, num_seqs, init_states.dtype)
-            if keep is not None:
-                init_states = init_states * keep.view(-1, 1, 1)
-            if not init_states.is_contiguous():
-                init_states = init_states.contiguous()
-
-            padded_out = causal_conv1d_fn(
-                x=padded,
-                weight=conv_weight,
-                initial_states=init_states,
-                activation=self.activation,
-            )
-
-            qkv_out = padded_out[batch_idx, :, pos_in_seq]
-        else:
-            # First chunk or single-chunk: batched with seq_idx
-            cu_seqlens_long = cu_seqlens.to(torch.int64)
-            seq_values = torch.arange(num_seqs, dtype=torch.int32, device=qkv.device)
-            if (
-                repeat_interleave_from_prefix_triton is not None
-                and can_use_repeat_interleave_from_prefix_triton is not None
-                and can_use_repeat_interleave_from_prefix_triton(
-                    seq_values, cu_seqlens_long
-                )
-            ):
-
-                seq_idx = repeat_interleave_from_prefix_triton(
-                    seq_values,
-                    cu_seqlens_long,
-                    qkv.shape[0],
-                    max_repeat_hint=context.max_seqlen_q,
-                ).unsqueeze(0)
-            else:
-                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
-                    seq_lens,
-                ).unsqueeze(0)
-
-            qkv_out = (
-                causal_conv1d_fn(
-                    x=qkv.T.unsqueeze(0),
-                    weight=conv_weight,
-                    bias=None,
-                    seq_idx=seq_idx,
-                    activation=self.activation,
-                )
-                .squeeze(0)
-                .T
-            )
-
-        # Store conv states for future chunks/decode — batched extraction
-        if gdn_conv_states is not None:
-            states = causal_conv1d_varlen_states(
-                qkv, cu_seqlens, self.conv_kernel_size - 1
-            )
-            if gdn_state_slots is not None:
-                target_states = gdn_conv_states[
-                    self.layer_idx, gdn_state_slots[:num_seqs]
-                ]
-            else:
-                target_states = gdn_conv_states[self.layer_idx, :num_seqs]
-            target_states.zero_()
-            target_states[:, :, 1:].copy_(states)
-
-        return qkv_out
-
-    def _conv1d_prefill_naive(self, qkv: torch.Tensor, context) -> torch.Tensor:
-        """Prefill conv1d using PyTorch (per-sequence, fallback)."""
-        cu_seqlens = context.cu_seqlens_q
-        num_seqs = cu_seqlens.shape[0] - 1
-        qkv_out = torch.empty_like(qkv)
-
-        gdn_conv_states = getattr(context, "gdn_conv_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-        has_prev_state = (
-            context.block_tables is not None and gdn_conv_states is not None
-        )
-
-        conv_weight = self.conv1d.weight  # [conv_dim, 1, kernel_size]
-
-        for i in range(num_seqs):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            if end <= start:
-                continue
-            seq_qkv = qkv[start:end].unsqueeze(0).transpose(1, 2)  # [1, D, L]
-            conv_dtype = conv_weight.dtype
-            conv_input = seq_qkv.to(conv_dtype)
-
-            if has_prev_state:
-                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
-                prev = gdn_conv_states[self.layer_idx, slot, :, 1:].unsqueeze(
-                    0
-                )  # [1, D, k-1]
-                padded = torch.cat([prev.to(conv_dtype), conv_input], dim=2)
-                seq_out = F.silu(
-                    F.conv1d(padded, conv_weight, groups=self.conv_dim)
-                )  # [1, D, L]
-            else:
-                seq_out = F.silu(self.conv1d(conv_input)[:, :, : end - start])
-
-            qkv_out[start:end] = seq_out.to(qkv.dtype).squeeze(0).transpose(0, 1)
-
-        # Store conv state
-        if gdn_conv_states is not None:
-            for i in range(num_seqs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                if end <= start:
-                    continue
-                seq_len = end - start
-                pad_len = min(seq_len, self.conv_kernel_size - 1)
-                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
-                gdn_conv_states[self.layer_idx, slot, :, :] = 0
-                gdn_conv_states[self.layer_idx, slot, :, -pad_len:] = qkv[
-                    end - pad_len : end
-                ].T
-
-        return qkv_out
-
-    def _conv1d_decode(self, qkv: torch.Tensor, context) -> torch.Tensor:
-        """Decode conv1d: single token per sequence, update conv state."""
-        gdn_conv_states = getattr(context, "gdn_conv_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-        bs = qkv.shape[0]
-
-        if gdn_conv_states is not None and _HAS_CAUSAL_CONV1D:
-            conv_weight = self.conv1d.weight.squeeze(1)
-            if gdn_state_slots is not None:
-                slots = gdn_state_slots[:bs]
-                conv_state = gdn_conv_states[self.layer_idx, slots]
-            else:
-                conv_state = gdn_conv_states[self.layer_idx, :bs]
-            qkv_out = causal_conv1d_update(
-                qkv,
-                conv_state,
-                conv_weight,
-                bias=None,
-                activation=self.activation,
-            )
-            if gdn_state_slots is not None:
-                gdn_conv_states[self.layer_idx, slots] = conv_state
-            return qkv_out
-        elif gdn_conv_states is not None:
-            if gdn_state_slots is not None:
-                slots = gdn_state_slots[:bs]
-                conv_state = gdn_conv_states[self.layer_idx, slots].clone()
-            else:
-                conv_state = gdn_conv_states[self.layer_idx, :bs]
-            conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
-            conv_state[:, :, -1] = qkv
-            conv_weight = self.conv1d.weight.squeeze(1)
-            qkv_out = F.silu(
-                (conv_state.to(conv_weight.dtype) * conv_weight.unsqueeze(0)).sum(-1)
-            ).to(qkv.dtype)
-            if gdn_state_slots is not None:
-                gdn_conv_states[self.layer_idx, slots] = conv_state
-            return qkv_out
-        else:
-            return F.silu(qkv)
-
-    def _gdn_prefill(self, q, k, v, g, alpha, beta, scale, context) -> torch.Tensor:
-        """Prefill: chunk mode. State layout is K-last [N, H, V, K].
-
-        Args:
-            g: log-space decay, used by naive fallback (negative values)
-            alpha: linear decay factor = exp(g), used by flashinfer kernel (in [0, 1])
-        """
-        cu_seqlens = context.cu_seqlens_q.long()
-        num_seqs = cu_seqlens.shape[0] - 1
-
-        gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-        initial_state = None
-        if gdn_recurrent_states is not None:
-            if context.block_tables is not None:
-                if gdn_state_slots is not None:
-                    initial_state = gdn_recurrent_states[
-                        self.layer_idx, gdn_state_slots[:num_seqs]
-                    ]
-                else:
-                    initial_state = gdn_recurrent_states[self.layer_idx, :num_seqs]
-                # Force fresh (first-chunk) sequences to start from zero state;
-                # block_tables is batch-global so a fresh seq batched with a
-                # continuation would otherwise inherit a stale reused slot.
-                keep = self._continuation_keep_mask(
-                    context, num_seqs, initial_state.dtype
-                )
-                if keep is not None:
-                    initial_state = initial_state * keep.view(-1, 1, 1, 1)
-            else:
-                initial_state = gdn_recurrent_states.new_zeros(
-                    num_seqs, self.num_v_heads, self.head_v_dim, self.head_k_dim
-                )
-
-        if self._has_flashinfer_prefill:
-            q_normed = self._l2norm(q.float(), dim=-1).to(q.dtype)
-            k_normed = self._l2norm(k.float(), dim=-1).to(k.dtype)
-            if initial_state is not None:
-                initial_state = initial_state.float()
-            o, final_state = chunk_gated_delta_rule(
-                q_normed,
-                k_normed,
-                v,
-                g=alpha,
-                beta=beta,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-            )
-        elif self._has_fla:
-            o, final_state = fla_chunk_gated_delta_rule(
-                q.unsqueeze(0),
-                k.unsqueeze(0),
-                v.unsqueeze(0),
-                g.unsqueeze(0),
-                beta.unsqueeze(0),
-                scale=scale,
-                initial_state=(
-                    initial_state.to(q.dtype) if initial_state is not None else None
-                ),
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                state_v_first=True,
-                cu_seqlens=cu_seqlens,
-            )
-            o = o.squeeze(0)
-        else:
-            o, final_state = self._naive_gdn_prefill(
-                q, k, v, g, beta, scale, cu_seqlens, initial_state
-            )
-
-        if gdn_recurrent_states is not None and final_state is not None:
-            final_state = final_state.to(gdn_recurrent_states.dtype)
-            if gdn_state_slots is not None:
-                gdn_recurrent_states[self.layer_idx, gdn_state_slots[:num_seqs]] = (
-                    final_state
-                )
-            else:
-                gdn_recurrent_states[self.layer_idx, :num_seqs] = final_state
-
-        return o
-
-    def _gdn_decode(self, q, k, v, a, b, scale, context) -> torch.Tensor:
-        """Decode with FlashInfer, FLA, or a naive recurrent fallback.
-
-        The preferred FlashInfer pretranspose kernel takes raw A_log, a,
-        dt_bias, b and supports direct pool indexing. Builds without that
-        optional backend use the nontranspose kernel with gather/scatter.
-        State layout is K-last [pool_size, H, V, K].
-        """
-        bs = q.shape[0]
-
-        gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-
-        if self._has_flashinfer_pretranspose and gdn_recurrent_states is not None:
-            state_pool = gdn_recurrent_states[self.layer_idx]
-            if gdn_state_slots is not None:
-                indices = gdn_state_slots[:bs].to(torch.int32)
-            else:
-                indices = torch.arange(bs, device=q.device, dtype=torch.int32)
-
-            o, _ = gated_delta_rule_decode_pretranspose(
-                q=q.unsqueeze(1),
-                k=k.unsqueeze(1),
-                v=v.unsqueeze(1),
-                state=None,
-                A_log=self.A_log.detach().float(),
-                a=a.unsqueeze(1),
-                dt_bias=self.dt_bias.detach(),
-                b=b.unsqueeze(1),
-                scale=scale,
-                use_qk_l2norm=True,
-                initial_state=state_pool,
-                initial_state_indices=indices,
-            )
-            o = o.squeeze(1)
-        elif self._has_flashinfer_nontranspose and gdn_recurrent_states is not None:
-            if gdn_state_slots is not None:
-                slots = gdn_state_slots[:bs]
-                initial_state = gdn_recurrent_states[self.layer_idx, slots]
-            else:
-                slots = None
-                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
-
-            # The shared state pool is V-major/K-last. FlashInfer's alternate
-            # decode backend expects K-major/V-last, so gather a contiguous
-            # batch view, transpose it for the call, then scatter it back.
-            nontranspose_state = initial_state.transpose(-1, -2).contiguous()
-            o, updated_state = gated_delta_rule_decode(
-                q=q.unsqueeze(1),
-                k=k.unsqueeze(1),
-                v=v.unsqueeze(1),
-                state=nontranspose_state,
-                A_log=self.A_log.detach().float(),
-                a=a.unsqueeze(1),
-                dt_bias=self.dt_bias.detach(),
-                b=b.unsqueeze(1),
-                scale=scale,
-                use_qk_l2norm=True,
-            )
-            o = o.squeeze(1)
-            updated_state = updated_state.transpose(-1, -2)
-            updated_state = updated_state.to(gdn_recurrent_states.dtype)
-            if slots is not None:
-                gdn_recurrent_states[self.layer_idx, slots] = updated_state
-            else:
-                gdn_recurrent_states[self.layer_idx, :bs] = updated_state
-        elif self._has_fla and gdn_recurrent_states is not None:
-            if gdn_state_slots is not None:
-                initial_state = gdn_recurrent_states[
-                    self.layer_idx, gdn_state_slots[:bs]
-                ]
-            else:
-                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
-            beta = b.sigmoid()
-            A_exp = -self.A_log.float().exp()
-            g = A_exp * F.softplus(a.float() + self.dt_bias)
-            o, updated_state = fla_fused_recurrent_gated_delta_rule(
-                q.unsqueeze(1),
-                k.unsqueeze(1),
-                v.unsqueeze(1),
-                g=g.unsqueeze(1),
-                beta=beta.unsqueeze(1),
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                state_v_first=True,
-            )
-            o = o.squeeze(1)
-            updated_state = updated_state.to(gdn_recurrent_states.dtype)
-            if gdn_state_slots is not None:
-                gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
-                    updated_state
-                )
-            else:
-                gdn_recurrent_states[self.layer_idx, :bs] = updated_state
-        else:
-            beta = b.sigmoid()
-            A_exp = -self.A_log.float().exp()
-            g = A_exp * F.softplus(a.float() + self.dt_bias)
-
-            if gdn_recurrent_states is not None:
-                if gdn_state_slots is not None:
-                    initial_state = gdn_recurrent_states[
-                        self.layer_idx, gdn_state_slots[:bs]
-                    ]
-                else:
-                    initial_state = gdn_recurrent_states[self.layer_idx, :bs]
-            else:
-                initial_state = q.new_zeros(
-                    bs, self.num_v_heads, self.head_v_dim, self.head_k_dim
-                )
-
-            o, updated_state = self._naive_gdn_decode(
-                q, k, v, g, beta, scale, initial_state
-            )
-            if gdn_recurrent_states is not None:
-                if gdn_state_slots is not None:
-                    gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
-                        updated_state
-                    )
-                else:
-                    gdn_recurrent_states[self.layer_idx, :bs] = updated_state
-
-        return o
-
-    @staticmethod
-    def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-        """L2 normalization matching FLA's l2norm."""
-        return _l2norm_compiled(x, dim, eps)
-
-    def _zero_fresh_slots(self, context) -> None:
-        """Zero the conv + recurrent state slots of fresh (first-chunk) seqs
-        before prefill reads them.
-
-        The GDN state pool is persistent across requests and is *not* cleared
-        when a slot is recycled, so a slot handed to a new sequence still holds
-        the previous occupant's final state. In a mixed prefill batch (a fresh
-        sequence batched with a chunked-prefill continuation) ``block_tables``
-        is set batch-globally, so several read paths — notably the naive conv1d
-        fallback (``_conv1d_prefill_naive``), which has no per-seq mask — would
-        otherwise pick up that stale state. Zeroing the fresh sequences' slots
-        in place here neutralises the leak for every downstream path
-        (fast/naive, conv/recurrent) in a single sync-free scatter-multiply;
-        continuation sequences (keep == 1) retain their state untouched.
-
-        Only needed when ``block_tables`` is set: when it is ``None`` no
-        sequence in the batch has cached tokens, so every prefill path already
-        starts from a freshly-allocated zero state.
-        """
-        if context.block_tables is None:
-            return
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
-        if gdn_state_slots is None:
-            return
-        cu_q = getattr(context, "cu_seqlens_q", None)
-        if cu_q is None:
-            return
-        num_seqs = cu_q.shape[0] - 1
-        if num_seqs <= 0:
-            return
-        keep = self._continuation_keep_mask(context, num_seqs, torch.float32)
-        if keep is None:
-            return
-        slots = gdn_state_slots[:num_seqs].long()
-
-        gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
-        if gdn_recurrent_states is not None:
-            keep_r = keep.view(-1, 1, 1, 1).to(gdn_recurrent_states.dtype)
-            gdn_recurrent_states[self.layer_idx, slots] = (
-                gdn_recurrent_states[self.layer_idx, slots] * keep_r
-            )
-
-        gdn_conv_states = getattr(context, "gdn_conv_states", None)
-        if gdn_conv_states is not None:
-            keep_c = keep.view(-1, 1, 1).to(gdn_conv_states.dtype)
-            gdn_conv_states[self.layer_idx, slots] = (
-                gdn_conv_states[self.layer_idx, slots] * keep_c
-            )
-
-    @staticmethod
-    def _continuation_keep_mask(context, num_seqs: int, dtype: torch.dtype):
-        """Per-seq multiplier: 1.0 for sequences that continue from a cached
-        recurrent state (chunked-prefill chunk 2+), 0.0 for fresh first-chunk
-        sequences.
-
-        ``block_tables is not None`` is a *batch-global* flag, so a fresh
-        sequence (no cached tokens) batched together with a chunked-prefill
-        continuation would otherwise read stale conv/recurrent state left in
-        its reused slot by a previous sequence. Multiplying the gathered
-        initial state by this mask forces fresh sequences to start from zero
-        without leaking across requests. Computed from cu_seqlens (cached =
-        seqlen_k - seqlen_q) so it stays sync-free (no ``.item()``/``bool()``).
-        """
-        cu_q = getattr(context, "cu_seqlens_q", None)
-        cu_k = getattr(context, "cu_seqlens_k", None)
-        if cu_q is None or cu_k is None:
-            return None
-        cu_q = cu_q.long()
-        cu_k = cu_k.long()
-        seqlen_q = cu_q[1 : num_seqs + 1] - cu_q[:num_seqs]
-        seqlen_k = cu_k[1 : num_seqs + 1] - cu_k[:num_seqs]
-        # cached tokens = seqlen_k - seqlen_q; > 0 only for continuations.
-        return (seqlen_k > seqlen_q).to(dtype)
-
-    def _naive_gdn_prefill(
-        self, q, k, v, g, beta, scale, cu_seqlens, initial_state=None
-    ):
-        """Naive sequential scan for prefill. State is K-last [H, V, K]."""
-        num_seqs = cu_seqlens.shape[0] - 1
-        outputs = []
-        final_states = []
-
-        q = self._l2norm(q.float(), dim=-1)
-        k = self._l2norm(k.float(), dim=-1)
-        q = q * scale
-
-        for i in range(num_seqs):
-            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-
-            if initial_state is not None:
-                S = initial_state[i].float().clone()  # [H, V, K]
-            else:
-                S = torch.zeros(
-                    self.num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-
-            if end <= start:
-                final_states.append(S)
-                continue
-            qi, ki, vi = q[start:end], k[start:end], v[start:end]
-            gi, bi = g[start:end], beta[start:end]
-
-            out_seq = []
-            for t in range(end - start):
-                qt = qi[t]
-                kt = ki[t]
-                vt = vi[t].float()
-                bt = bi[t].float()
-                gt = gi[t].float()
-
-                decay = gt.exp().unsqueeze(-1).unsqueeze(-1)
-                S = decay * S  # [H, V, K]
-
-                vk = torch.einsum("hv,hk->hvk", vt, kt)
-                Sk = torch.einsum("hvk,hk->hv", S, kt)
-                correction = torch.einsum("hv,hk->hvk", Sk, kt)
-                S = S + bt.unsqueeze(-1).unsqueeze(-1) * (vk - correction)
-
-                out_t = torch.einsum("hk,hvk->hv", qt, S)
-                out_seq.append(out_t)
-
-            out_seq = torch.stack(out_seq, dim=0).to(v.dtype)
-            outputs.append(out_seq)
-            final_states.append(S)
-
-        if outputs:
-            output = torch.cat(outputs, dim=0)
-        else:
-            output = v.new_zeros(0, self.num_v_heads, self.head_v_dim)
-
-        final_state = torch.stack(final_states, dim=0)
-        return output, final_state
-
-    def _naive_gdn_decode(self, q, k, v, g, beta, scale, state):
-        """Naive recurrent step for decode. State is K-last [B, H, V, K]."""
-        q = self._l2norm(q.float(), dim=-1) * scale
-        k = self._l2norm(k.float(), dim=-1)
-        state_f32 = state.float()  # [B, H, V, K]
-
-        decay = g.float().exp().unsqueeze(-1).unsqueeze(-1)
-        state_f32.mul_(decay)
-
-        vk = torch.einsum("bhv,bhk->bhvk", v.float(), k)
-        Sk = torch.einsum("bhvk,bhk->bhv", state_f32, k)
-        correction = torch.einsum("bhv,bhk->bhvk", Sk, k)
-        state_f32.add_(beta.float().unsqueeze(-1).unsqueeze(-1) * (vk - correction))
-
-        out = torch.einsum("bhk,bhvk->bhv", q, state_f32)
-
-        return out.to(v.dtype), state_f32
+__all__ = ["GenericGatedDeltaNet", "RMSNormGated"]
