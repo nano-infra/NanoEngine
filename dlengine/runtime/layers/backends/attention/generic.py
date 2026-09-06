@@ -35,6 +35,9 @@ from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.context.cache.hisparse import get_hisparse_context
 from dlengine.runtime.context.graph import get_graph_context
 from dlengine.runtime.kernel.triton.generic.kv_store import store_kvcache
+from dlengine.runtime.layers.backends.attention.mla_utils import (
+    _gather_kv_cached_concat,
+)
 from dlengine.runtime.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
 )
@@ -457,99 +460,6 @@ def _hisparse_store_swa_fresh(
         store_kvcache(k, v, hot_k_cache, hot_v_cache, slot_mapping)
 
 
-# ---------------------------------------------------------------------------
-# Helpers — mirror the hopper backend (intentional code dup; kept local so
-# the generic backend stays standalone).
-# ---------------------------------------------------------------------------
-
-
-def _compute_cached_split(
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
-    seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).long()
-    cached_lens = seqlens_k - seqlens_q
-    cu_cached = torch.zeros_like(cu_seqlens_k)
-    cu_cached[1:] = cached_lens.cumsum(0)
-    return cached_lens, cu_cached
-
-
-def _interleave_cached_fresh(
-    cached: torch.Tensor,
-    fresh: torch.Tensor,
-    cached_lens: torch.Tensor,
-    cu_cached: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-) -> torch.Tensor:
-    # Fully vectorized interleave: per-row destination indices are computed
-    # on-device and scattered, avoiding the former Python per-sequence loop with
-    # its many ``.item()`` host syncs (one set per sequence, per layer).
-    # total_k == total_cached + total_fresh; both are host-known tensor shapes,
-    # so the output is allocated without a device->host sync.
-    total_cached = cached.shape[0]
-    total_fresh = fresh.shape[0]
-    ref = cached if cached.numel() > 0 else fresh
-    out = ref.new_empty(total_cached + total_fresh, *ref.shape[1:])
-
-    device = cu_seqlens_k.device
-    cu_k = cu_seqlens_k.to(torch.int64)
-    cu_q = cu_seqlens_q.to(torch.int64)
-    cu_c = cu_cached.to(torch.int64)
-    clens = cached_lens.to(torch.int64)
-
-    # Cached rows land at cu_k[s] + (j - cu_c[s]) (prefix occupies the head).
-    if total_cached > 0:
-        idx_c = torch.arange(total_cached, device=device, dtype=torch.int64)
-        seq_c = torch.searchsorted(cu_c, idx_c, right=True) - 1
-        dest_c = cu_k[seq_c] + (idx_c - cu_c[seq_c])
-        out[dest_c] = cached
-
-    # Fresh rows land at cu_k[s] + cached_lens[s] + (j - cu_q[s]) (after prefix).
-    if total_fresh > 0:
-        idx_f = torch.arange(total_fresh, device=device, dtype=torch.int64)
-        seq_f = torch.searchsorted(cu_q, idx_f, right=True) - 1
-        dest_f = cu_k[seq_f] + clens[seq_f] + (idx_f - cu_q[seq_f])
-        out[dest_f] = fresh
-
-    return out
-
-
-def _gather_kv_cached_concat(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    k_fresh: torch.Tensor,
-    v_fresh: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cached_lens, cu_cached = _compute_cached_split(cu_seqlens_q, cu_seqlens_k)
-    total_cached = int(cu_cached[-1].item())
-
-    if total_cached == 0:
-        return k_fresh, v_fresh
-
-    cached_indices = _build_paged_gather_indices(
-        block_table, cu_cached, block_size, total_k=total_cached
-    )
-    _, _, num_kv_heads, head_dim = k_cache.shape
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
-    k_cached = k_flat[cached_indices]
-    v_cached = v_flat[cached_indices]
-
-    k_out = _interleave_cached_fresh(
-        k_cached, k_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
-    )
-    v_out = _interleave_cached_fresh(
-        v_cached, v_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
-    )
-    return k_out, v_out
-
-
 def _sdpa_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -631,7 +541,7 @@ def _sdpa_fixed_decode(
 # ---------------------------------------------------------------------------
 
 
-class _FA2AttentionImpl:
+class _GenericAttentionImpl:
     """GQA attention impl using FlashAttention-2."""
 
     def __init__(self, num_heads, head_dim, scale, num_kv_heads, sliding_window=None,
@@ -902,7 +812,7 @@ class GenericAttention(AttentionBase):
         self.hisparse_k_cache = self.hisparse_v_cache = torch.tensor([])
 
         if attention_type == "GQA":
-            self.impl = _FA2AttentionImpl(
+            self.impl = _GenericAttentionImpl(
                 num_heads, head_dim, scale, num_kv_heads, sliding_window=sliding_window
             )
         elif attention_type == "MLA":

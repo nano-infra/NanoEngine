@@ -1,7 +1,8 @@
 import dlengine.runtime.layers as layers
 import torch
 from dlengine.runtime.context.batch import reset_batch_context, set_batch_context
-from dlengine.runtime.layers.blackwell import attention, BlackwellBackendFactory
+from dlengine.runtime.layers.backends.attention import fa4 as attention
+from dlengine.runtime.layers.blackwell import BlackwellBackendFactory
 
 
 def teardown_function():
@@ -29,7 +30,7 @@ def test_blackwell_decode_uses_trtllm_paged_kv(monkeypatch):
 
     monkeypatch.setattr(attention, "_trtllm_decode_func", fake_decode)
     attention._trtllm_workspace = torch.zeros(1, dtype=torch.uint8)
-    impl = attention.BlackwellAttentionImpl(8, 128, 0.125, 2)
+    impl = attention.Fa4AttentionImpl(8, 128, 0.125, 2)
     q = torch.zeros(2, 8, 128)
     k = torch.empty(2, 2, 128)
     v = torch.empty_like(k)
@@ -64,7 +65,7 @@ def test_blackwell_trtllm_missing_fails_without_fallback(monkeypatch):
     monkeypatch.setattr(attention, "_TRTLLM_IMPORT_ERROR", import_error)
 
     try:
-        attention.BlackwellAttentionImpl(8, 128, 0.125, 2)
+        attention.Fa4AttentionImpl(8, 128, 0.125, 2)
     except RuntimeError as error:
         assert "No naive or SDPA fallback" in str(error)
         assert error.__cause__ is import_error
@@ -78,7 +79,7 @@ def test_blackwell_fa4_missing_fails_without_fallback(monkeypatch):
     monkeypatch.setattr(attention, "_FA4_IMPORT_ERROR", import_error)
 
     try:
-        attention.BlackwellAttentionImpl(8, 128, 0.125, 2)
+        attention.Fa4AttentionImpl(8, 128, 0.125, 2)
     except RuntimeError as error:
         assert "No naive or SDPA fallback" in str(error)
         assert error.__cause__ is import_error
@@ -94,7 +95,7 @@ def test_blackwell_prefill_packs_strided_qkv_views(monkeypatch):
         return torch.zeros_like(q)
 
     monkeypatch.setattr(attention, "_fa4_varlen_func", fake_fa4)
-    impl = attention.BlackwellAttentionImpl(8, 128, 0.125, 2)
+    impl = attention.Fa4AttentionImpl(8, 128, 0.125, 2)
     q = torch.empty(3, 8, 129)[..., :128]
     k = torch.empty(3, 2, 129)[..., :128]
     v = torch.empty(3, 2, 129)[..., :128]
@@ -134,7 +135,7 @@ def _make_blackwell_mla(monkeypatch, calls):
         "_get_trtllm_workspace",
         lambda device: torch.zeros(1, dtype=torch.uint8, device=device),
     )
-    impl = attention.BlackwellMLAAttention(
+    impl = attention.Fa4MlaAttention(
         num_heads=8,
         head_dim=576,
         scale=0.125,

@@ -30,145 +30,15 @@ from dlengine.runtime.kernel.triton.generic.paged_gather import (
 )
 from dlengine.runtime.kernel.triton.hopper.fp8_utils import store_kcache_fp8
 from dlengine.runtime.layers.base_backend import AttentionBase
+from dlengine.runtime.layers.backends.attention.mla_utils import (
+    _compute_cached_split,
+    _gather_cache_cached_only,
+    _gather_kv_cached_concat,
+    _interleave_cached_fresh,
+    topk_indices_to_physical,
+)
 
 logger = get_logger()
-
-
-def _compute_cached_split(
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-sequence cached/fresh split for chunked prefill.
-
-    Returns:
-        cached_lens:  [num_seqs] — number of previously-cached tokens per sequence
-        cu_cached:    [num_seqs + 1] — cumulative cached lengths
-    """
-    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
-    seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).long()
-    cached_lens = seqlens_k - seqlens_q
-    cu_cached = torch.zeros_like(cu_seqlens_k)
-    cu_cached[1:] = cached_lens.cumsum(0)
-    return cached_lens, cu_cached
-
-
-def _interleave_cached_fresh(
-    cached: torch.Tensor,
-    fresh: torch.Tensor,
-    cached_lens: torch.Tensor,
-    cu_cached: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-) -> torch.Tensor:
-    """Interleave cached and fresh tensors into ragged K layout.
-
-    Per sequence i the output is [cached_tokens_i, fresh_tokens_i] contiguously.
-
-    Fully vectorized: per-row destination indices are computed on-device and the
-    rows are scattered in two ``index_put`` ops. This replaces the former Python
-    per-sequence loop, which issued ~5 ``.item()`` host syncs per sequence (×2
-    for K and V, ×num_layers) and serialized the GPU during chunked prefill.
-    """
-    # total_k == total_cached + total_fresh, and both are host-known tensor
-    # shapes, so the output is allocated without a device->host sync.
-    total_cached = cached.shape[0]
-    total_fresh = fresh.shape[0]
-    ref = cached if cached.numel() > 0 else fresh
-    out = ref.new_empty(total_cached + total_fresh, *ref.shape[1:])
-
-    device = cu_seqlens_k.device
-    cu_k = cu_seqlens_k.to(torch.int64)
-    cu_q = cu_seqlens_q.to(torch.int64)
-    cu_c = cu_cached.to(torch.int64)
-    clens = cached_lens.to(torch.int64)
-
-    # Cached rows: row j of `cached` belongs to seq s where cu_c[s] <= j <
-    # cu_c[s+1]; it lands at cu_k[s] + (j - cu_c[s]) (prefix occupies the head).
-    if total_cached > 0:
-        idx_c = torch.arange(total_cached, device=device, dtype=torch.int64)
-        seq_c = torch.searchsorted(cu_c, idx_c, right=True) - 1
-        dest_c = cu_k[seq_c] + (idx_c - cu_c[seq_c])
-        out[dest_c] = cached
-
-    # Fresh rows: row j of `fresh` belongs to seq s where cu_q[s] <= j <
-    # cu_q[s+1]; it lands at cu_k[s] + cached_lens[s] + (j - cu_q[s]) (after the
-    # cached prefix for that sequence).
-    if total_fresh > 0:
-        idx_f = torch.arange(total_fresh, device=device, dtype=torch.int64)
-        seq_f = torch.searchsorted(cu_q, idx_f, right=True) - 1
-        dest_f = cu_k[seq_f] + clens[seq_f] + (idx_f - cu_q[seq_f])
-        out[dest_f] = fresh
-
-    return out
-
-
-def _gather_kv_cached_concat(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    k_fresh: torch.Tensor,
-    v_fresh: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather only previously-cached K/V from paged cache, concat with fresh K/V.
-
-    Avoids redundantly re-reading fresh tokens that were just written to cache.
-    Falls back to full gather when there are no cached tokens.
-    """
-    cached_lens, cu_cached = _compute_cached_split(cu_seqlens_q, cu_seqlens_k)
-    total_cached = int(cu_cached[-1].item())
-
-    if total_cached == 0:
-        return k_fresh, v_fresh
-
-    cached_indices = _build_paged_gather_indices(
-        block_table, cu_cached, block_size, total_k=total_cached
-    )
-    _, _, num_kv_heads, head_dim = k_cache.shape
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
-    k_cached = k_flat[cached_indices]
-    v_cached = v_flat[cached_indices]
-
-    k_out = _interleave_cached_fresh(
-        k_cached, k_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
-    )
-    v_out = _interleave_cached_fresh(
-        v_cached, v_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
-    )
-    return k_out, v_out
-
-
-def _gather_cache_cached_only(
-    cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather only previously-cached tokens from a single paged cache.
-
-    Returns:
-        gathered:    [total_cached, ...] — cached tokens from paged cache
-        cached_lens: [num_seqs] — per-sequence cached counts
-        cu_cached:   [num_seqs + 1] — cumulative cached lengths
-    """
-    cached_lens, cu_cached = _compute_cached_split(cu_seqlens_q, cu_seqlens_k)
-    total_cached = int(cu_cached[-1].item())
-
-    if total_cached == 0:
-        trailing = cache.shape[2:]
-        gathered = cache.new_empty(0, *trailing)
-        return gathered, cached_lens, cu_cached
-
-    cached_indices = _build_paged_gather_indices(
-        block_table, cu_cached, block_size, total_k=total_cached
-    )
-    trailing = cache.shape[2:]
-    flat = cache.reshape(-1, *trailing)
-    return flat[cached_indices], cached_lens, cu_cached
 
 
 def _hisparse_swa_decode(
@@ -337,7 +207,7 @@ def _hisparse_store_swa_fresh(
         store_kvcache(k, v, hot_k_cache, hot_v_cache, slot_mapping)
 
 
-class FlashAttentionImpl:
+class Fa3AttentionImpl:
 
     def __init__(
         self,
@@ -494,45 +364,7 @@ class FlashAttentionImpl:
         return o
 
 
-def topk_indices_to_physical(
-    topk_indices: torch.Tensor,
-    block_table: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Convert logical token indices to physical paged KV cache indices.
-
-    Args:
-        topk_indices: (batch, topk) int32 — logical token positions (0..ctx_len-1)
-                      May contain -1 for padding.
-        block_table:  (batch, max_num_blocks) int32 — page table
-        block_size:   int — tokens per page (64 for MLA)
-
-    Returns:
-        physical_indices: (batch, topk) int32 — physical slot indices
-                          (physical_block * block_size + offset)
-                          Padding entries (-1 in input) remain -1.
-    """
-    # Clamp negative indices to 0 so gather doesn't fail; result will be masked later
-    valid_mask = topk_indices >= 0
-    safe_indices = topk_indices.clamp(min=0)
-
-    logical_block = safe_indices // block_size  # (batch, topk)
-    offset_in_block = safe_indices % block_size  # (batch, topk)
-
-    # Gather physical block IDs from block_table: (batch, topk)
-    physical_block = torch.gather(block_table, dim=1, index=logical_block.long()).to(
-        torch.int32
-    )
-
-    physical_indices = physical_block * block_size + offset_in_block
-    # Invalid entries (-1 in input) must remain -1 so that sparse_decode_fwd
-    # correctly skips them.  Using 0 would cause the kernel to attend to
-    # physical slot 0 for every invalid index, corrupting the output.
-    physical_indices = torch.where(valid_mask, physical_indices, -1)
-    return physical_indices
-
-
-class FlashMLAImpl:
+class FlashMlaAttentionImpl:
     def __init__(
         self,
         num_heads: int,
@@ -589,7 +421,7 @@ class FlashMLAImpl:
             # using the non-absorbed approach (expanded K/V). This path should not
             # be reached for MLA models.
             raise RuntimeError(
-                "FlashMLAImpl.forward should not be called during prefill. "
+                "FlashMlaAttentionImpl.forward should not be called during prefill. "
                 "MLA prefill is handled in DeepseekV2Attention.forward."
             )
 
@@ -674,7 +506,7 @@ class FlashMLAImpl:
         return o
 
 
-class HopperAttention(AttentionBase):
+class Fa3Attention(AttentionBase):
 
     def __init__(
         self,
@@ -697,7 +529,7 @@ class HopperAttention(AttentionBase):
         self.forward_method = None
 
         if attention_type == "MLA":
-            self.impl = FlashMLAImpl(
+            self.impl = FlashMlaAttentionImpl(
                 num_heads,
                 head_dim,
                 scale,
@@ -706,7 +538,7 @@ class HopperAttention(AttentionBase):
                 nsa_index_topk=nsa_index_topk,
             )
         elif attention_type == "GQA":
-            self.impl = FlashAttentionImpl(
+            self.impl = Fa3AttentionImpl(
                 num_heads,
                 head_dim,
                 scale,
@@ -730,9 +562,9 @@ class HopperAttention(AttentionBase):
             "write_kv_cache": write_kv_cache,
         }
         # Hot GQA caches are a FlashAttention/HiSparse detail. Passing them to
-        # FlashMLAImpl breaks MLA graph capture because its forward signature
+        # FlashMlaAttentionImpl breaks MLA graph capture because its forward signature
         # intentionally has no hot-cache arguments.
-        if isinstance(self.impl, FlashAttentionImpl):
+        if isinstance(self.impl, Fa3AttentionImpl):
             kwargs.update(
                 hot_k_cache=self.hisparse_k_cache,
                 hot_v_cache=self.hisparse_v_cache,

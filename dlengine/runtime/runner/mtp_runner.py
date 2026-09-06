@@ -410,7 +410,7 @@ class MTPRunner:
             return state
         selected = state.select_rows(rows)
         if selected.physical_indices is None:
-            from dlengine.runtime.layers.hopper.attention import (
+            from dlengine.runtime.layers.backends.attention.mla_utils import (
                 topk_indices_to_physical,
             )
 
