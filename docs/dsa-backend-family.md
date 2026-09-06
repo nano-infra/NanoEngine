@@ -62,12 +62,17 @@ dlengine/runtime/layers/backends/dsa/
         topk.py        # fused/non-fused topk + topk_indices_to_physical
     sparse/
         __init__.py
-        flash_mla.py   # FlashMLA sparse prefill + decode    <- hopper/attention.py
-        trtllm.py      # TRTLLM-GEN sparse MLA decode         <- blackwell/attention.py
-        reference.py   # reference/naive sparse attention     <- deepseek_v2 fallback
+        flash_mla.py   # FlashMLA sparse prefill + decode    <- backends/mla/flash_mla.py
+        trtllm.py      # TRTLLM-GEN sparse MLA decode         <- backends/mla/trtllm.py
+        reference.py   # reference/naive sparse attention     <- backends/mla/reference.py
     state.py           # _IndexerTopKState (+ PP/MTP transfer) <- deepseek_v2.py
     dsa_attention.py   # DsaAttention: composes indexer + sparse + state
 ```
+
+DSA sparse attention is **dense MLA plus an index mask**: the `sparse/` kernels are
+the `backends/mla/` kernels invoked with the indexer's selected keys. They build on
+the `mla/` family (added in the MLA stage) rather than re-deriving from the
+hardware-tier packages, so the MLA family lands before DSA.
 
 `DsaAttention` is the family entry point. It holds an indexer implementation, a
 sparse-kernel implementation, and the top-k state, and exposes the same
