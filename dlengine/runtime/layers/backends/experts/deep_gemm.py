@@ -15,7 +15,7 @@ from torch import nn
 
 from dlengine.runtime.context.expert import ExpertContext, get_expert_runtime_context
 from dlengine.runtime.layers.base_backend import DistributedRoutedExpertsBase
-from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
+from dlengine.runtime.layers.backends.experts.local_dispatch import LocalPaddedDispatcher
 from dlengine.runtime.runner.runner_config import get_runner_config
 
 # Resolved once on first use and cached — this runs in the MoE decode hot
@@ -363,7 +363,7 @@ class DeepGemmExperts(DistributedRoutedExpertsBase):
         topk_weights: torch.Tensor,
         is_prefill: bool = True,
     ) -> torch.Tensor:
-        from dlengine.runtime.layers.eplb import topk_ids_logical_to_physical
+        from dlengine.runtime.layers.backends.experts.eplb import topk_ids_logical_to_physical
         from dlengine.runtime.runner.runner_config import get_runner_config
 
         ctx = ExpertContext.get_instance()
@@ -376,7 +376,7 @@ class DeepGemmExperts(DistributedRoutedExpertsBase):
         # Use EPLB dispatch if layer_idx != -1
         runner_config = get_runner_config()
         if getattr(runner_config, "enable_eplb", False) and self.layer_idx != -1:
-            import dlengine.runtime.layers.eplb as eplb
+            import dlengine.runtime.layers.backends.experts.eplb as eplb
 
             info = eplb.EPLBDispatchInfo.init_new(
                 ep_rank=self.ep_rank, layer_idx=self.layer_idx
@@ -614,7 +614,7 @@ class DeepGemmExperts(DistributedRoutedExpertsBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        from dlengine.runtime.layers.token_dispatcher import DeepEPTokenDispatcherNormal
+        from dlengine.runtime.layers.backends.experts.token_dispatcher import DeepEPTokenDispatcherNormal
 
         ctx = ExpertContext.get_instance()
         ctx.transition_to_normal()
@@ -680,7 +680,7 @@ class DeepGemmExperts(DistributedRoutedExpertsBase):
     ):
         import deep_gemm
 
-        from dlengine.runtime.layers.token_dispatcher import (
+        from dlengine.runtime.layers.backends.experts.token_dispatcher import (
             DeepEPTokenDispatcherLowLatency,
         )
 

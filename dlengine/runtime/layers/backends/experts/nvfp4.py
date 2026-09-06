@@ -228,8 +228,8 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
     def _compute_prefill_ep(self, hidden_states, topk_ids, topk_weights):
         """Run prefill with DeepEP normal dispatch and padded local experts."""
         from dlengine.runtime.context.expert import ExpertContext
-        from dlengine.runtime.layers.local_dispatch import LocalPaddedDispatcher
-        from dlengine.runtime.layers.token_dispatcher import DeepEPTokenDispatcherNormal
+        from dlengine.runtime.layers.backends.experts.local_dispatch import LocalPaddedDispatcher
+        from dlengine.runtime.layers.backends.experts.token_dispatcher import DeepEPTokenDispatcherNormal
 
         ExpertContext.get_instance().transition_to_normal()
         dispatcher = DeepEPTokenDispatcherNormal(
@@ -276,7 +276,7 @@ class ModelOptNvFp4Experts(DistributedRoutedExpertsBase):
     def _compute_decode_ep(self, hidden_states, topk_ids, topk_weights):
         """Run decode with DeepEP low-latency native NVFP4 dispatch."""
         from dlengine.runtime.context.expert import ExpertContext
-        from dlengine.runtime.layers.token_dispatcher import (
+        from dlengine.runtime.layers.backends.experts.token_dispatcher import (
             DeepEPTokenDispatcherLowLatency,
         )
 

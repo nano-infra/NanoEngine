@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import torch
 from dlengine.runtime.layers.backends.experts.nvfp4 import ModelOptNvFp4Experts
-from dlengine.runtime.layers.token_dispatcher import DeepEPTokenDispatcherLowLatency
+from dlengine.runtime.layers.backends.experts.token_dispatcher import DeepEPTokenDispatcherLowLatency
 
 
 def _experts():
@@ -85,7 +85,7 @@ def test_low_latency_dispatch_keeps_legacy_kwargs_by_default():
 
 def test_decode_uses_low_latency_nvfp4_without_double_scaling(monkeypatch):
     import dlengine.runtime.context.expert as expert_context
-    import dlengine.runtime.layers.token_dispatcher as token_dispatcher
+    import dlengine.runtime.layers.backends.experts.token_dispatcher as token_dispatcher
 
     context = Mock()
     monkeypatch.setattr(
@@ -126,8 +126,8 @@ def test_decode_uses_low_latency_nvfp4_without_double_scaling(monkeypatch):
 
 def test_prefill_uses_normal_dispatch_and_local_padding(monkeypatch):
     import dlengine.runtime.context.expert as expert_context
-    import dlengine.runtime.layers.local_dispatch as local_dispatch
-    import dlengine.runtime.layers.token_dispatcher as token_dispatcher
+    import dlengine.runtime.layers.backends.experts.local_dispatch as local_dispatch
+    import dlengine.runtime.layers.backends.experts.token_dispatcher as token_dispatcher
 
     context = Mock()
     monkeypatch.setattr(
