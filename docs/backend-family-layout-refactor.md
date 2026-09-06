@@ -63,7 +63,8 @@ dlengine/runtime/layers/backends/
         flashinfer.py      # FlashInferAttention (paged FlashInfer decode)
         trtllm.py          # TrtllmAttention     (TRTLLM-GEN MHA/MLA decode)
         torch.py           # TorchAttention      (SDPA correctness/debug)
-        dsa.py             # DsaAttention        (DeepSeek/GLM sparse MLA + indexer)
+    dsa/                   # DeepSeek/GLM sparse attention (own family; see
+                           # docs/dsa-backend-family.md) — indexer + sparse MLA
     experts/
         __init__.py
         generic.py         # GenericExperts      (BF16 + EP reference)      <- backends/generic/experts
@@ -109,23 +110,15 @@ proposal.)
 ### The DSA/NSA sparse-attention family
 
 DeepSeek-V3.2 and GLM-5.3 use sparse MLA: an **indexer** selects top-k keys per query,
-then a sparse MLA decode kernel attends only those. Today this is spread across
-`deepseek_v2.py` (the `nsa_index_topk`/`index_topk` branches, `topk_indices_to_physical`,
-sparse page-table construction), `layers/indexer.py` (`Indexer`, `IndexerCache`,
-`pool_indexer_topk`), and the TRTLLM sparse-MLA call in `blackwell/attention.py`.
+then a sparse MLA kernel attends only those. Because this is a *compose of* an indexer
+(with paged-FP8/reference/pooled/fused-topk strategies) and a sparse kernel
+(FlashMLA/TRTLLM-GEN/reference), it is promoted to its **own top-level family**
+`backends/dsa/` rather than a single `attention/dsa.py` file.
 
-This plan gives it an explicit `attention/dsa.py` (`DsaAttention`) that composes:
-
-- the indexer (top-k selection) — kept in `layers/indexer.py` for now, consumed by the
-  DSA backend;
-- the sparse page-table construction (`topk_indices_to_physical` moves to
-  `attention/mla_utils.py`);
-- a sparse-MLA decode kernel (FlashMLA sparse or TRTLLM-GEN sparse), selected by policy.
-
-`DsaAttention` is selected when `attention_type == "MLA"` and `nsa_index_topk > 0`,
-replacing the current in-model branching. The reference/correctness sparse path
-(`enable_mla_reference_fallback`) becomes a fallback within this family, gated by
-`ref_fallback_allowed`.
+The full design — layout, the indexer × sparse-kernel selection matrix, the factory
+contract (`get_dsa_attention` / `resolve_dsa_plan` / `create_dsa`), and its own 6-stage
+migration — is specified in **`docs/dsa-backend-family.md`**. It supersedes the
+single-file framing here.
 
 ### Shared MLA helpers
 
