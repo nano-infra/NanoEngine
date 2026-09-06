@@ -1,14 +1,14 @@
-"""Generic GatedDeltaNet (Linear Attention) layer implementation.
+"""Generic (naive reference) GatedDeltaNet layer implementation.
 
-Provides the linear attention mechanism used in Qwen3.5 MoE.
+Provides the linear attention mechanism used in Qwen3.5 MoE. ``GenericGatedDeltaNet``
+is the pure-PyTorch **reference** backend (``NaiveRecurrenceMixin``); it owns the
+projection setup, causal convolution, state hygiene, output transform, and the
+forward/decode orchestration. The FlashInfer and FLA backends subclass it and
+swap only the recurrence strategy (by prepending their recurrence mixin), so the
+choice of kernel is expressed by composition rather than ``_has_*`` flags.
 
-The operation is decomposed into independently-testable components under
-``gdn/``: projection setup lives here, causal convolution in ``gdn/conv.py``,
-recurrent-state hygiene in ``gdn/state.py``, the delta-rule recurrence in
-``gdn/recurrence.py``, and the gated output transform in ``gdn/output.py``.
-``GenericGatedDeltaNet`` composes these mixins; kernel-specific backends
-(FlashInfer/FLA/Torch/KDA) reuse the same components and only toggle the
-capability flags or override the recurrence.
+Components live under ``components/``: convolution (``conv.py``), state hygiene
+(``state.py``), recurrence (``recurrence*.py``), gated output (``output.py``).
 """
 
 import torch
@@ -20,13 +20,12 @@ from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.layers import get_backend
 from dlengine.runtime.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.runtime.models.quant_config import QuantizationConfig
-from dlengine.utils.cuda import get_cuda_compute_capability
 
 from . import components as gdn
 from .components import kernels
 from .components.conv import CausalConvMixin
 from .components.output import OutputTransformMixin, RMSNormGated
-from .components.recurrence import RecurrenceMixin
+from .components.recurrence import NaiveRecurrenceMixin
 from .components.state import StateMixin
 
 # Triton head-repeat helpers (used only in the prefill projection path here).
@@ -54,22 +53,21 @@ _HAS_CAUSAL_CONV1D = kernels.HAS_CAUSAL_CONV1D
 class GenericGatedDeltaNet(
     CausalConvMixin,
     StateMixin,
-    RecurrenceMixin,
+    NaiveRecurrenceMixin,
     OutputTransformMixin,
     GatedDeltaNetBase,
 ):
-    """GatedDeltaNet linear attention.
+    """GatedDeltaNet linear attention — pure-PyTorch reference backend.
 
-    Uses FlashInfer SM90 kernels when their compiled backends are available:
-    - Prefill: chunk_gated_delta_rule
-    - Decode: pretranspose fused kernel, with nontranspose/FLA/naive fallbacks
+    Uses the naive delta-rule recurrence (``NaiveRecurrenceMixin``); it is the
+    portable/correctness backend and the ``ref_fallback_allowed`` target for
+    GDN. The FlashInfer / FLA backends subclass this and swap the recurrence
+    mixin. State layout is K-last: [N, H, V, K].
 
-    State layout is K-last: [N, H, V, K].
-
-    Composed from the ``gdn/`` components: convolution (CausalConvMixin), state
-    hygiene (StateMixin), recurrence (RecurrenceMixin), and output transform
-    (OutputTransformMixin). This class owns projection setup and the top-level
-    forward/decode orchestration.
+    Composed from the ``components/`` mixins: convolution (CausalConvMixin),
+    state hygiene (StateMixin), recurrence (NaiveRecurrenceMixin), and output
+    transform (OutputTransformMixin). This class owns projection setup and the
+    top-level forward/decode orchestration.
     """
 
     def __init__(
@@ -138,24 +136,6 @@ class GenericGatedDeltaNet(
 
         # Output normalization: RMSNorm with SiLU gating
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
-
-        # Kernel availability
-        capability = get_cuda_compute_capability()
-        sm_major = capability[0] if capability is not None else 0
-        # FlashInfer 0.6.11 supports GDN prefill on SM90 and SM100+. SM100
-        # prefill computes recurrent state in fp32; decode uses the bf16 pool.
-        self._has_flashinfer_prefill = (
-            kernels.HAS_FLASHINFER_GDN_PREFILL and sm_major >= 9
-        )
-        self._has_flashinfer_pretranspose = (
-            kernels.HAS_FLASHINFER_GDN_PRETRANSPOSE and sm_major >= 9
-        )
-        self._has_flashinfer_nontranspose = (
-            kernels.HAS_FLASHINFER_GDN_NONTRANSPOSE and sm_major == 9
-        )
-        # FLA is also a valid fallback on Hopper when a FlashInfer build omits
-        # its optional decode kernels.
-        self._has_fla = kernels.HAS_FLA_GDN
         self._conv1d_prefill_padded_ws: torch.Tensor | None = None
 
     def _get_conv1d_prefill_padded_workspace(

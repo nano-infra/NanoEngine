@@ -48,7 +48,13 @@ def test_explicit_debug_backends_are_never_selected_by_auto():
     assert resolve_attention_plan("torch", (10, 3)) == AttentionBackendPlan(
         "generic", "generic"
     )
-    assert resolve_gdn_plan("torch", (10, 3)) == GDNBackendPlan("torch", "torch")
+    # ``torch`` GDN is a deprecated alias for the pure-naive ``generic`` backend.
+    assert resolve_gdn_plan("generic", (10, 3)) == GDNBackendPlan(
+        "generic", "generic"
+    )
+    assert resolve_gdn_plan("torch", (10, 3)) == GDNBackendPlan(
+        "generic", "generic"
+    )
 
 
 @pytest.mark.parametrize(

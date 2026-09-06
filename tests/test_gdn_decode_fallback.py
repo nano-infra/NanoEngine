@@ -2,17 +2,21 @@ from types import SimpleNamespace
 
 import dlengine.runtime.layers.backends.delta_net.components.kernels as gdn_module
 import torch
-from dlengine.runtime.layers.backends.delta_net.generic import GenericGatedDeltaNet
+from dlengine.runtime.layers.backends.delta_net.components.recurrence_flashinfer import (
+    FlashInferRecurrenceMixin,
+)
 from torch import nn
 
 
+class _FlashInferRecurrence(FlashInferRecurrenceMixin):
+    """Bare host exposing only the FlashInfer nontranspose decode path."""
+
+
 def test_nontranspose_decode_fallback_updates_v_major_state_pool(monkeypatch):
-    layer = GenericGatedDeltaNet.__new__(GenericGatedDeltaNet)
-    nn.Module.__init__(layer)
+    layer = _FlashInferRecurrence()
     layer.layer_idx = 0
+    # No pretranspose kernel -> the nontranspose gather/transpose/scatter path.
     layer._has_flashinfer_pretranspose = False
-    layer._has_flashinfer_nontranspose = True
-    layer._has_fla = False
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(2))
 
