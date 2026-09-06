@@ -52,17 +52,20 @@ implementation is a file named after its **vendor/kernel** (never a hardware tie
 ```text
 dlengine/runtime/layers/backends/
     selector.py            # resolve_*_plan + create_* for every family
-    attention/
+    attention/             # dense GQA attention
         __init__.py
-        base.py            # AttentionBase re-export + shared impl scaffolding
+        base.py            # GqaAttentionBase + shared GQA cache/gather scaffolding
         mla_utils.py       # shared paged-cache gather/scatter + topk->physical
-        generic.py         # GenericAttention (QK·softmax·V; FA2/FlashInfer/SDPA dispatch)
-        fa3.py             # Fa3Attention        (Hopper FA3 + FlashMLA)   <- from hopper/
-        fa4.py             # Fa4Attention        (Blackwell FA4 + TRTLLM)  <- from blackwell/
-        flash_mla.py       # FlashMlaAttention   (FlashMLA decode impl)
+        generic.py         # GenericAttention (pure SDPA reference; no FA/FlashInfer)
+        fa2.py             # Fa2Attention        (FlashAttention-2)
+        fa3.py             # Fa3Attention        (FlashAttention-3, SM90)
         flashinfer.py      # FlashInferAttention (paged FlashInfer decode)
-        trtllm.py          # TrtllmAttention     (TRTLLM-GEN MHA/MLA decode)
-        torch.py           # TorchAttention      (SDPA correctness/debug)
+    mla/                   # dense MLA (compressed-KV, absorbed projection)
+        __init__.py
+        base.py            # MlaAttentionBase
+        flash_mla.py       # FlashMlaAttention   (Hopper FlashMLA prefill+decode)
+        trtllm.py          # TrtllmMlaAttention  (Blackwell TRTLLM-GEN decode)
+        reference.py       # RefMlaAttention     (varlen/decode reference fallback)
     dsa/                   # DeepSeek/GLM sparse attention (own family; see
                            # docs/dsa-backend-family.md) — indexer + sparse MLA
     experts/
@@ -88,24 +91,55 @@ dlengine/runtime/layers/backends/
 
 Naming convention for classes: **`<Vendor><Family>`**, no hardware tier words.
 
+Attention-family renames already landed (stage 2, PR #343):
+`HopperAttention→Fa3Attention`, `BlackwellAttention→Fa4Attention`,
+`BlackwellMLAAttention→Fa4MlaAttention`, `FlashAttentionImpl→Fa3AttentionImpl`,
+`FlashMLAImpl→FlashMlaAttentionImpl`, `BlackwellAttentionImpl→Fa4AttentionImpl`,
+`_FA2AttentionImpl→_GenericAttentionImpl`, `FA2Attention→Fa2Attention`.
+
+Remaining renames (later stages):
+
 | old name | new name | family |
 | --- | --- | --- |
-| `HopperAttention` | `Fa3Attention` | attention |
-| `BlackwellAttention` | `Fa4Attention` | attention |
-| `BlackwellMLAAttention` | `Fa4MlaAttention` (or `TrtllmMlaAttention`) | attention |
-| `FlashMLAImpl` | `FlashMlaAttentionImpl` | attention |
-| `FlashAttentionImpl` | `Fa3AttentionImpl` | attention |
-| `BlackwellAttentionImpl` | `Fa4AttentionImpl` | attention |
-| `_FA2AttentionImpl` | `_GenericAttentionImpl` | attention |
-| `GenericAttention` | `GenericAttention` (unchanged) | attention |
+| `FlashMlaAttentionImpl` (in `attention/fa3.py`) | `FlashMlaAttention` (in `mla/flash_mla.py`) | mla |
+| `Fa4MlaAttention` (in `attention/fa4.py`) | `TrtllmMlaAttention` (in `mla/trtllm.py`) | mla |
+| MLA reference (in `deepseek_v2`) | `RefMlaAttention` (in `mla/reference.py`) | mla |
 | `HopperDistributedRoutedExperts` | `DeepGemmExperts` | experts |
 | `GenericDistributedRoutedExperts` | `GenericExperts` | experts |
 | `Hopper*Linear` | `DeepGemm*Linear` | linear |
 | `Generic*Linear` | `Generic*Linear` (unchanged) | linear |
 | `FlashInferKDA` | `FlashInferKda` | delta_net |
 
-(Final names are reviewed in the attention PR before landing; the table is the
-proposal.)
+### `generic` attention must be pure SDPA (single responsibility)
+
+The attention-family migration relocated the files but left `GenericAttention`
+(`attention/generic.py`) as a **multi-strategy dispatcher**: its
+`_GenericAttentionImpl` carries `use_fa2` / `use_flashinfer_decode` /
+`use_flashinfer_prefill` flags and branches into FlashAttention-2, FlashInfer
+paged, and SDPA at runtime. `attention/fa2.py`, `attention/flashinfer.py`, and
+`attention/torch.py` are then all thin subclasses that just flip those flags on
+the *same* impl. That is a single class owning four backends — the opposite of
+the family/vendor split.
+
+Target:
+
+- **`generic.py`** owns only the **pure SDPA / naive** reference path (no
+  `flash_attn`, no `flashinfer`). It is the portable correctness backend and the
+  `ref_fallback_allowed` target for GQA.
+- **`fa2.py`** owns the FlashAttention-2 kernel path; **`flashinfer.py`** owns the
+  FlashInfer paged prefill/decode path. They no longer subclass `GenericAttention`
+  by toggling flags — they contain their own kernel calls.
+- **`torch.py` is deleted.** "Torch attention" was just `Fa2Attention` with all
+  accelerated flags turned off, i.e. the SDPA path — which is exactly what
+  `generic` now is. The debug/correctness backend is `generic`; a `torch`
+  attention backend is redundant.
+- Shared GQA plumbing (KV-cache store, paged gather, HiSparse SWA, FlashInfer
+  metadata/plan caching) moves to `attention/base.py` (`GqaAttentionBase`) so the
+  three kernel backends reuse it instead of duplicating or sharing one god-impl.
+
+The `attention_backend` config value `torch` is remapped to `generic` (kept as a
+deprecated alias for one release), and `resolve_attention_plan` drops the `torch`
+name.
 
 ### The DSA/NSA sparse-attention family
 
@@ -140,15 +174,16 @@ gains explicit vendor names and an MLA/DSA axis:
 
 ```text
 attention plan = (family, prefill_impl, decode_impl)
-  GQA  -> generic | fa2 | fa3 | fa4 | flashinfer | torch
-  MLA  -> fa3(+flash_mla) | fa4(+trtllm) | generic(ref)
-  DSA  -> dsa (indexer + sparse MLA decode), ref fallback when ref_fallback_allowed
+  GQA  -> generic(SDPA) | fa2 | fa3 | flashinfer
+  MLA  -> flash_mla (Hopper) | trtllm (Blackwell) | reference (ref_fallback_allowed)
+  DSA  -> dsa (indexer + sparse MLA), reference fallback when ref_fallback_allowed
 ```
 
 `create_attention` dispatches on `(attention_type, plan)` and instantiates the
-`attention/` implementation directly — no import from `hopper/` or `blackwell/`. The
-`hardware_backend` argument is replaced by the capability-derived plan, so the
-`hardware_backend == "blackwell"/"hopper"` branches in `create_attention` disappear.
+`attention/`, `mla/`, or `dsa/` implementation directly — no import from `hopper/` or
+`blackwell/`. The `hardware_backend` argument is replaced by the capability-derived
+plan, so the `hardware_backend == "blackwell"/"hopper"` branches in `create_attention`
+disappear. The GQA `torch` name is dropped (`generic` is the SDPA backend).
 
 ## Deleting the hardware-tier packages
 
@@ -163,24 +198,34 @@ as **policy keys** — the hardware concept survives as policy data, not as pack
 ## Migration plan (each stage is an independent, reviewable PR)
 
 1. **This doc PR.** Terminology, target tree, naming table, DSA family definition.
-2. **Attention migration.** Create `backends/attention/`; move
-   `hopper/attention.py` + `blackwell/attention.py` + `backends/generic/attention.py`
-   into it, split shared helpers into `mla_utils.py`, rename classes per the table, and
-   repoint `selector.create_attention` + `backends/fa/*` + external helper consumers
-   (`deepseek_v2`, `mtp_runner`, tests). Behavior-preserving.
-3. **DSA family.** Extract the sparse-MLA + indexer path from `deepseek_v2.py` into
-   `attention/dsa.py` (`DsaAttention`), selected by `nsa_index_topk > 0`. Fold
-   `enable_mla_reference_fallback` into `ref_fallback_allowed` for this family.
-4. **Family regrouping for the settled families.** Move `backends/deepseek/*` ->
-   `backends/{linear,experts}/deep_gemm.py`, `backends/generic/*` ->
+2. **Attention migration.** *(done — PR #343)* Moved `hopper/attention.py`,
+   `blackwell/attention.py`, `backends/generic/attention.py` into
+   `backends/attention/`, split `mla_utils.py`, renamed classes, repointed consumers.
+3. **`generic` SDPA split + drop `torch`.** Extract shared GQA plumbing into
+   `attention/base.py` (`GqaAttentionBase`); make `generic.py` a pure SDPA reference;
+   give `fa2.py` / `flashinfer.py` their own kernel calls instead of flag-toggling one
+   impl; delete `attention/torch.py` and remap the `torch` attention name to `generic`.
+4. **MLA family.** Extract MLA decode impls from `attention/fa3.py`
+   (`FlashMlaAttentionImpl`) and `attention/fa4.py` (`Fa4MlaAttention`) into
+   `backends/mla/{flash_mla,trtllm}.py` (`FlashMlaAttention` / `TrtllmMlaAttention`),
+   add `mla/reference.py`, and add `resolve_mla_plan` / `create_mla` to the selector.
+   (MLA prefill currently in `DeepseekV2Attention.forward` is pulled into the backend
+   in the DSA stage, since DSA reuses the MLA prefill/decode path.)
+5. **DSA family.** Per `docs/dsa-backend-family.md`: extract indexer + sparse kernels +
+   state into `backends/dsa/`, move sparse orchestration (and MLA prefill) out of
+   `DeepseekV2Attention.forward` into `DsaAttention`, wire `get_dsa_attention` /
+   `resolve_dsa_plan` / `create_dsa`, fold `enable_mla_reference_fallback` into
+   `ref_fallback_allowed`.
+6. **Family regrouping for the settled families.** Move `backends/deepseek/*` ->
+   `backends/{linear,experts}/deep_gemm.py`, `backends/generic/{linear,experts}` ->
    `backends/{linear,experts}/generic.py`, `backends/{megamoe,nvfp4}` ->
    `backends/experts/{mega_moe,nvfp4}.py`, and `backends/{generic/gdn,flashinfer/gdn,
    fla/gdn,torch/gdn,kda}` -> `backends/delta_net/*`. Apply the class renames. Update
    `selector.create_linear/experts/gdn/kda`. Keep temporary re-export shims.
-5. **Collapse factories and delete hardware-tier packages.** Route
+7. **Collapse factories and delete hardware-tier packages.** Route
    `create_backend()` through `PolicyBackendFactory`; delete `generic/`, `hopper/`,
    `blackwell/`; keep `TIER_POLICIES` keys.
-6. **Remove shims.** Delete the temporary re-export modules and old import paths after
+8. **Remove shims.** Delete the temporary re-export modules and old import paths after
    all consumers and focused tests use the new locations.
 
 Each stage preserves existing focused tests and adds a reference-vs-backend token or
