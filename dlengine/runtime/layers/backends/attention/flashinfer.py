@@ -1,9 +1,9 @@
 """FlashInfer paged attention backend."""
 
-from ..fa.fa2 import FA2Attention
+from dlengine.runtime.layers.backends.attention.fa2 import Fa2Attention
 
 
-class FlashInferAttention(FA2Attention):
+class FlashInferAttention(Fa2Attention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, force_flashinfer_decode=True, **kwargs)
         if not self.impl.has_flashinfer:

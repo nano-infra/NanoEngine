@@ -30,7 +30,7 @@ from dlengine.runtime.layers.base_backend import (
     RowParallelLinearBase,
 )
 from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from dlengine.runtime.layers.hopper.attention import (
+from dlengine.runtime.layers.backends.attention.mla_utils import (
     _gather_cache_cached_only,
     _interleave_cached_fresh,
 )
@@ -1936,7 +1936,7 @@ class DeepseekV2Attention(nn.Module):
                 and (has_full_indexer or reuse_topk)
                 and has_decode_pages
             ):
-                from dlengine.runtime.layers.hopper.attention import (
+                from dlengine.runtime.layers.backends.attention.mla_utils import (
                     topk_indices_to_physical,
                 )
 

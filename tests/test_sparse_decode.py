@@ -3,7 +3,7 @@
 Tests:
   - topk_indices_to_physical: logical → physical index conversion
   - Indexer.store_prefill_keys: prefill key storage to IndexerCache
-  - FlashMLAImpl sparse decode path (shape/dispatch validation)
+  - FlashMlaAttentionImpl sparse decode path (shape/dispatch validation)
 """
 
 import pytest
@@ -97,7 +97,7 @@ class TestTopkIndicesToPhysical:
 
     def test_basic_conversion(self):
         """Verify logical→physical mapping matches manual calculation."""
-        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.backends.attention.mla_utils import topk_indices_to_physical
 
         block_size = 64
         # block_table: batch=1, 4 blocks with physical IDs [5, 10, 2, 8]
@@ -126,7 +126,7 @@ class TestTopkIndicesToPhysical:
 
     def test_negative_padding(self):
         """Padding entries (-1) are preserved as -1."""
-        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.backends.attention.mla_utils import topk_indices_to_physical
 
         block_table = torch.tensor([[3, 7]], dtype=torch.int32, device="cuda")
         topk_indices = torch.tensor(
@@ -145,7 +145,7 @@ class TestTopkIndicesToPhysical:
 
     def test_multi_batch(self):
         """Multi-batch conversion works correctly."""
-        from dlengine.runtime.layers.hopper.attention import topk_indices_to_physical
+        from dlengine.runtime.layers.backends.attention.mla_utils import topk_indices_to_physical
 
         block_table = torch.tensor([[1, 2], [5, 6]], dtype=torch.int32, device="cuda")
         topk_indices = torch.tensor(

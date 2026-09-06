@@ -195,41 +195,39 @@ def create_attention(*, requested="auto", hardware_backend="gpu_generic", **kwar
                 f"{attention_type} uses its dedicated implementation."
             )
         if hardware_backend == "blackwell":
-            from dlengine.runtime.layers.blackwell.attention import (
-                BlackwellMLAAttention,
-            )
+            from .attention.fa4 import Fa4MlaAttention
 
-            return BlackwellMLAAttention(**kwargs)
+            return Fa4MlaAttention(**kwargs)
         if hardware_backend == "hopper":
-            from dlengine.runtime.layers.hopper.attention import HopperAttention
+            from .attention.fa3 import Fa3Attention
 
             kwargs.pop("mla_qk_nope_head_dim", None)
-            return HopperAttention(**kwargs)
-        from dlengine.runtime.layers.backends.generic.attention import GenericAttention
+            return Fa3Attention(**kwargs)
+        from .attention.generic import GenericAttention
 
         return GenericAttention(**kwargs)
 
     plan = resolve_attention_plan(requested or "auto")
     if plan.prefill == "fa4":
-        from .fa.fa4 import FA4Attention
+        from .attention.fa4 import Fa4Attention
 
-        return FA4Attention(**kwargs)
+        return Fa4Attention(**kwargs)
     if plan.prefill == "fa3":
-        from .fa.fa3 import FA3Attention
+        from .attention.fa3 import Fa3Attention
 
-        return FA3Attention(**kwargs)
+        return Fa3Attention(**kwargs)
     kwargs.pop("nsa_index_topk", None)
     if plan.prefill == "fa2":
-        from .fa.fa2 import FA2Attention
+        from .attention.fa2 import Fa2Attention
 
-        return FA2Attention(
+        return Fa2Attention(
             force_flashinfer_decode=plan.decode == "flashinfer", **kwargs
         )
     if plan.prefill == "flashinfer":
-        from .flashinfer.attention import FlashInferAttention
+        from .attention.flashinfer import FlashInferAttention
 
         return FlashInferAttention(**kwargs)
-    from .torch.attention import TorchAttention
+    from .attention.torch import TorchAttention
 
     return TorchAttention(**kwargs)
 

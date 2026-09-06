@@ -7,9 +7,9 @@ import torch
 from dlengine.logging import get_logger
 from dlengine.runtime.context.batch import get_batch_context
 from dlengine.runtime.kernel.triton.generic.kv_store import store_kvcache
-from dlengine.runtime.layers.hopper.attention import (
+from dlengine.runtime.layers.backends.attention.fa3 import Fa3Attention
+from dlengine.runtime.layers.backends.attention.mla_utils import (
     _gather_kv_cached_concat,
-    HopperAttention,
 )
 
 logger = get_logger()
@@ -93,7 +93,7 @@ def _get_trtllm_workspace(device: torch.device) -> torch.Tensor:
     return _trtllm_workspace
 
 
-class BlackwellAttentionImpl:
+class Fa4AttentionImpl:
     """FA4 prefill plus TRTLLM-GEN paged decode."""
 
     def __init__(self, num_heads, head_dim, scale, num_kv_heads, sliding_window=None):
@@ -271,7 +271,7 @@ class BlackwellAttentionImpl:
         )
 
 
-class BlackwellMLAAttention(HopperAttention):
+class Fa4MlaAttention(Fa3Attention):
     """FlashInfer TRTLLM-GEN decode for compressed MLA caches on Blackwell."""
 
     def __init__(
@@ -290,7 +290,7 @@ class BlackwellMLAAttention(HopperAttention):
         del kwargs
         if attention_type != "MLA":
             raise ValueError(
-                f"BlackwellMLAAttention requires MLA, got {attention_type}"
+                f"Fa4MlaAttention requires MLA, got {attention_type}"
             )
         if _trtllm_mla_decode_func is None:
             message = (
@@ -308,7 +308,7 @@ class BlackwellMLAAttention(HopperAttention):
                 f"Invalid MLA dimensions: cache head_dim={head_dim}, "
                 f"kv_lora_rank={v_head_dim}"
             )
-        # Do not call HopperAttention.__init__: that constructs the legacy
+        # Do not call Fa3Attention.__init__: that constructs the legacy
         # FlashMLA implementation. Cache tensors are injected by ModelRunner.
         torch.nn.Module.__init__(self)
         self.num_heads = num_heads
@@ -330,7 +330,7 @@ class BlackwellMLAAttention(HopperAttention):
         context = get_batch_context()
         if context.is_prefill:
             raise RuntimeError(
-                "BlackwellMLAAttention is decode-only; MLA prefill must use "
+                "Fa4MlaAttention is decode-only; MLA prefill must use "
                 "the non-absorbed FA4 path in DeepseekV2Attention."
             )
         fp8_cache = self.k_cache.dtype == torch.float8_e4m3fn
@@ -427,7 +427,7 @@ class BlackwellMLAAttention(HopperAttention):
         return result.reshape(-1, self.num_heads, self.v_head_dim)
 
 
-class BlackwellAttention(HopperAttention):
+class Fa4Attention(Fa3Attention):
     """Hopper cache plumbing with FA4 prefill and TRT-LLM decode."""
 
     def __init__(self, *args, attention_type: str = "MLA", **kwargs) -> None:
@@ -437,7 +437,7 @@ class BlackwellAttention(HopperAttention):
                 "no Hopper, naive, or SDPA fallback will be selected."
             )
         super().__init__(*args, attention_type=attention_type, **kwargs)
-        self.impl = BlackwellAttentionImpl(
+        self.impl = Fa4AttentionImpl(
             self.num_heads,
             self.head_dim,
             self.scale,
