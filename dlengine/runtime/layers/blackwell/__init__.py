@@ -1,89 +1,16 @@
-"""Blackwell hardware mapping for native layer backends."""
+"""Blackwell (NVIDIA SM100+) backend factory.
 
-from dlengine.runtime.layers.base_backend import (
-    AttentionBase,
-    DistributedRoutedExpertsBase,
-)
-from dlengine.runtime.layers.hopper import HopperBackendFactory
+Selects the ``blackwell`` tier policy. The policy's ``experts_quant_override``
+flag drives NVFP4/MXFP4 expert selection from the checkpoint format, so no
+per-method override is needed here. All construction logic lives in
+``PolicyBackendFactory``; this class only pins the tier.
+"""
+
+from dlengine.runtime.layers.policy_backend import PolicyBackendFactory
 
 
-class BlackwellBackendFactory(HopperBackendFactory):
-    """Map Blackwell checkpoint formats to their preferred kernel backends."""
+class BlackwellBackendFactory(PolicyBackendFactory):
+    """Factory that returns Blackwell-specific layer instances."""
 
     def __init__(self, quant_config):
-        super().__init__(quant_config)
-        self.hardware_backend = "blackwell"
-
-    def get_distributed_routed_experts(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
-        top_k: int,
-        ep_size: int,
-        tp_size: int,
-        **kwargs,
-    ) -> DistributedRoutedExpertsBase:
-        quantization_config = kwargs.pop("quantization_config", self.quant_config)
-        if bool(getattr(quantization_config, "is_modelopt_nvfp4", False)):
-            from dlengine.runtime.layers.backends.nvfp4 import ModelOptNvFp4Experts
-
-            return ModelOptNvFp4Experts(
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                num_experts=num_experts,
-                top_k=top_k,
-                ep_size=ep_size,
-                tp_size=tp_size,
-                quantization_config=quantization_config,
-                **kwargs,
-            )
-        if bool(getattr(quantization_config, "is_mxfp4", False)):
-            from dlengine.runtime.layers.backends.megamoe import MegaMoEExperts
-
-            return MegaMoEExperts(
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                num_experts=num_experts,
-                top_k=top_k,
-                ep_size=ep_size,
-                tp_size=tp_size,
-                quantization_config=quantization_config,
-                **kwargs,
-            )
-        return super().get_distributed_routed_experts(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            top_k=top_k,
-            ep_size=ep_size,
-            tp_size=tp_size,
-            quantization_config=quantization_config,
-            **kwargs,
-        )
-
-    def get_attention(
-        self,
-        num_heads: int,
-        head_dim: int,
-        scale: float,
-        num_kv_heads: int,
-        v_head_dim: int,
-        attention_type: str = "MLA",
-        nsa_index_topk: int = 0,
-        **kwargs,
-    ) -> AttentionBase:
-        from dlengine.runtime.layers.backends import create_attention
-
-        return create_attention(
-            requested=self.attention_backend,
-            hardware_backend=self.hardware_backend,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            scale=scale,
-            num_kv_heads=num_kv_heads,
-            v_head_dim=v_head_dim,
-            attention_type=attention_type,
-            nsa_index_topk=nsa_index_topk,
-            **kwargs,
-        )
+        super().__init__(quant_config, tier="blackwell")

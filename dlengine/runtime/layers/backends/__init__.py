@@ -4,7 +4,9 @@ from .selector import (
     AttentionBackendPlan,
     BackendPlan,
     create_attention,
+    create_experts,
     create_gdn,
+    create_linear,
     GDNBackendPlan,
     resolve_backend_plan,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "BackendPlan",
     "GDNBackendPlan",
     "create_attention",
+    "create_experts",
     "create_gdn",
+    "create_linear",
     "resolve_backend_plan",
 ]
