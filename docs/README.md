@@ -18,3 +18,7 @@ make build
 Site pages live under `docs/site/`. Internal design notes elsewhere under `docs/` are excluded by default. A long-form article under `docs/blogs/` participates in the site build only when it is linked from `docs/site/blogs/` and added to `mkdocs.yml` navigation.
 
 Every documentation workflow run uploads `dlengine-docs-<commit>` for 14 days. Only users with repository access can download Actions artifacts. GitHub Pages publishing is intentionally disabled because standard Pages would make a site from this private personal repository publicly accessible.
+
+## Design proposals
+
+- [DSpark support plan: Kimi-K3 (中文)](dspark-support-plan.zh.md) — draft integration, verification/state recovery, and staged validation based on SGLang and vLLM.
