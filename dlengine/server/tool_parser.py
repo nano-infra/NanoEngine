@@ -232,6 +232,33 @@ def _coerce_glm_value(
     return str(parsed_value)
 
 
+class StreamingContentFilter:
+    """Remove parser-owned framing while holding markers split across deltas."""
+
+    def __init__(self, markers: tuple[str, ...]):
+        self.markers = markers
+        self.pending = ""
+
+    def feed(self, delta: str) -> str:
+        text = self.pending + delta
+        for marker in self.markers:
+            text = text.replace(marker, "")
+        holdback = 0
+        for marker in self.markers:
+            for size in range(min(len(text), len(marker) - 1), holdback, -1):
+                if text.endswith(marker[:size]):
+                    holdback = size
+                    break
+        self.pending = text[-holdback:] if holdback else ""
+        return text[:-holdback] if holdback else text
+
+    def finish(self) -> str:
+        # A truncated XTML control marker is framing, not user content. A lone
+        # '<' can also be ordinary prose, so preserve that ambiguous character.
+        tail, self.pending = self.pending, ""
+        return "" if tail.startswith("<|") else tail
+
+
 class ToolParser:
     """Base class. Subclasses implement :meth:`parse_full`."""
 
@@ -239,6 +266,7 @@ class ToolParser:
     # into content deltas.
     open_markers: tuple[str, ...] = ()
     reasoning_close_marker = "</think>"
+    content_markers: tuple[str, ...] = ()
 
     def parse_full(
         self, text: str, tools: Optional[list[dict]] = None
@@ -371,6 +399,8 @@ class KimiK3ToolParser(ToolParser):
     TOOLS_OPEN = "<|open|>tools<|sep|>"
     TOOLS_CLOSE = "<|close|>tools<|sep|>"
     MESSAGE_CLOSE = "<|close|>message<|sep|>"
+    END_OF_MESSAGE = "<|end_of_msg|>"
+    content_markers = (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, END_OF_MESSAGE)
     reasoning_close_marker = THINK_CLOSE
     open_markers = (THINK_OPEN, TOOLS_OPEN)
     _CALL_RE = re.compile(
@@ -401,7 +431,7 @@ class KimiK3ToolParser(ToolParser):
             text = text[start:] if end < 0 else text[start:end]
         else:
             text = text.replace(cls.RESPONSE_CLOSE, "")
-        return text.replace(cls.MESSAGE_CLOSE, "")
+        return text.replace(cls.MESSAGE_CLOSE, "").replace(cls.END_OF_MESSAGE, "")
 
     def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
         reasoning = None

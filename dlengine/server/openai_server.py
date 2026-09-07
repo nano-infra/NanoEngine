@@ -565,6 +565,31 @@ class OpenAIServer:
         hold_markers: Optional[list[str]] = None,
         reasoning_open: bool = False,
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
+        """Stream parsed content without changing raw tokens or reasoning/tool state."""
+        from dlengine.server.tool_parser import StreamingContentFilter
+
+        content_filter = StreamingContentFilter(
+            getattr(self.tool_parser, "content_markers", ())
+        )
+        last_gen = None
+        async for delta, gen in self._stream_text_raw(
+            req, max_tokens, stop, hold_markers, reasoning_open
+        ):
+            last_gen = gen
+            yield delta if gen.in_reasoning else content_filter.feed(delta), gen
+        tail = content_filter.finish()
+        if tail and last_gen is not None:
+            last_gen.in_reasoning = False
+            yield tail, last_gen
+
+    async def _stream_text_raw(
+        self,
+        req: _Request,
+        max_tokens: int,
+        stop: Optional[list[str]] = None,
+        hold_markers: Optional[list[str]] = None,
+        reasoning_open: bool = False,
+    ) -> AsyncGenerator[tuple[str, _Generation], None]:
         """Yield ``(delta_text, generation)`` as tokens arrive.
 
         When ``stop`` sequences are given, generation is truncated at the
