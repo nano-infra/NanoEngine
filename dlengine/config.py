@@ -35,7 +35,11 @@ class Config(BaseModel):
     pp_prefill_scheduler_depth: int = 0
     max_num_seqs: int = 16
     max_num_recv_seqs: int = 32
-    max_model_len: int = 16384
+    max_model_len: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Maximum sequence length; defaults to the model text configuration.",
+    )
     gpu_memory_utilization: float = 0.9
     gpu_memory_limit_gb: Optional[float] = None
     # CPU KV spill tier for preempted decode requests. GiB budget per local
@@ -480,12 +484,40 @@ class Config(BaseModel):
         if self.attention_sp == 1:
             self.max_num_recv_seqs = 0
 
-        if hasattr(self.hf_config, "max_position_embeddings"):
-            self.hf_config.max_position_embeddings = max(
-                self.max_model_len, self.hf_config.max_position_embeddings
+        # The text model owns the context limit in multimodal checkpoints.
+        # Prefer it explicitly: flattening may retain a different outer value.
+        text_config = getattr(self.hf_config, "text_config", None)
+        model_context_len = (
+            text_config.get("max_position_embeddings")
+            if isinstance(text_config, dict)
+            else getattr(text_config, "max_position_embeddings", None)
+        )
+        if model_context_len is None:
+            model_context_len = getattr(self.hf_config, "max_position_embeddings", None)
+        if model_context_len is not None and (
+            isinstance(model_context_len, bool)
+            or not isinstance(model_context_len, int)
+            or model_context_len <= 0
+        ):
+            raise ValueError(
+                "model max_position_embeddings must be a positive integer; "
+                f"got {model_context_len!r}"
             )
-        else:
-            self.hf_config.max_position_embeddings = self.max_model_len
+        if self.max_model_len is None:
+            if model_context_len is None:
+                logger.warning(
+                    "Model config has no max_position_embeddings; "
+                    "defaulting max_model_len to 16384. Set max_model_len explicitly "
+                    "to override this fallback."
+                )
+                self.max_model_len = 16384
+            else:
+                self.max_model_len = model_context_len
+        # Preserve positional capacity when an explicit service limit is smaller,
+        # and retain support for explicit context extensions.
+        self.hf_config.max_position_embeddings = max(
+            self.max_model_len, model_context_len or 0
+        )
 
         dtype = getattr(self.hf_config, "dtype", None) or getattr(
             self.hf_config, "torch_dtype", None
