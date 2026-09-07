@@ -113,5 +113,34 @@ class TestStoreFP8Integration:
             assert torch.equal(rope[0], key[i, 0, D_NOPE:])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_raw_mla_fp8_store_saturates_and_preserves_unused_slots(slot_dtype):
+    from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
+        restore_mla_fp8_cache_rows,
+    )
+
+    # A strided source and slots spanning pages exercise the Blackwell raw ABI.
+    source = torch.randn(6, 1, 640, dtype=torch.bfloat16, device="cuda")
+    key = source[..., :576]
+    key[0, 0, 0] = 1000
+    key[1, 0, 0] = -1000
+    key[2].fill_(float("nan"))  # skipped token must not contaminate any page
+    slots = torch.tensor([63, 64, -1, 129, 0, 127], dtype=slot_dtype, device="cuda")
+    cache = torch.zeros(3, 64, 1, 576, dtype=torch.float8_e4m3fn, device="cuda")
+    store_kcache_fp8(key, cache, slots)
+    restored = restore_mla_fp8_cache_rows(cache.reshape(-1, 576))
+    assert torch.isfinite(restored).all()
+    assert restored[63, 0].item() == 448
+    assert restored[64, 0].item() == -448
+    valid = slots >= 0
+    expected = key[valid].clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16().squeeze(1)
+    torch.testing.assert_close(restored[slots[valid].long()], expected, rtol=0, atol=0)
+    written = torch.zeros(192, dtype=torch.bool, device="cuda")
+    written[slots[valid].long()] = True
+    assert torch.count_nonzero(restored[~written]).item() == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

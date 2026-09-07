@@ -344,3 +344,21 @@ def test_kimi_k3_mla_decode_matches_reference_and_cuda_graph(cache_dtype):
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mla_dummy_decode_has_positive_sequence_bound(monkeypatch, cache_dtype):
+    calls = []
+    impl = _make_blackwell_mla(monkeypatch, calls, v_head_dim=128, mla_kv_lora_rank=512)
+    impl.k_cache = impl.k_cache.to(cache_dtype)
+    set_batch_context(
+        is_prefill=False,
+        is_dummy=True,
+        context_lens=torch.ones(1, 1, dtype=torch.int32),
+        block_tables=torch.empty(1, 0, 0, dtype=torch.int32),
+    )
+    q = torch.zeros(1, 8, 576, dtype=torch.bfloat16)
+    output = impl(q, torch.empty(1, 1, 576), torch.empty(0))
+    assert output.shape == (1, 8, 512)
+    assert calls[0]["max_seq_len"] == 64
+    assert calls[0]["block_tables"].shape == (1, 2)

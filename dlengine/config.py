@@ -135,6 +135,14 @@ class Config(BaseModel):
     hf_config: Any = Field(default=None, repr=False)
     cache_plan: Any = Field(default=None, repr=False)
     eos: List[int] = []
+    kv_cache_dtype: Literal["auto", "bfloat16", "fp8_e4m3"] = Field(
+        default="auto",
+        description=(
+            "MLA KV cache storage dtype. auto preserves model/backend defaults; "
+            "fp8_e4m3 enables E4M3 cache for supported Blackwell dense MLA or Hopper "
+            "sparse MLA. Does not change model weights or linear-attention state."
+        ),
+    )
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
     num_host_kvcache_blocks: int = 0
@@ -378,7 +386,10 @@ class Config(BaseModel):
         # class so topology validation and model registry selection still
         # work with those configs.
         architectures = getattr(self.hf_config, "architectures", None)
-        if not architectures and getattr(self.hf_config, "model_type", None) == "glm5_next":
+        if (
+            not architectures
+            and getattr(self.hf_config, "model_type", None) == "glm5_next"
+        ):
             architectures = ["Glm5NextForConditionalGeneration"]
             try:
                 self.hf_config.architectures = architectures
@@ -427,7 +438,9 @@ class Config(BaseModel):
             if self.pp != 1:
                 raise ValueError("GLM-5.3 does not support pipeline parallel decode")
 
-        hf_architectures = getattr(self.hf_config, "architectures", None) or architectures or [""]
+        hf_architectures = (
+            getattr(self.hf_config, "architectures", None) or architectures or [""]
+        )
         if hf_architectures[0] in (
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
@@ -573,7 +586,10 @@ class Config(BaseModel):
             if self.attention_tp != 1:
                 raise ValueError("enable_hisparse requires attention_tp == 1")
             if self.num_speculative_tokens != 0:
-                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
+                if arch not in (
+                    "GlmMoeDsaForCausalLM",
+                    "Glm5NextForConditionalGeneration",
+                ):
                     raise ValueError(
                         "enable_hisparse with MTP currently requires "
                         "GlmMoeDsaForCausalLM"
@@ -667,7 +683,10 @@ class Config(BaseModel):
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
         arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-        if arch == "Glm5NextForConditionalGeneration" and self.num_speculative_tokens > 5:
+        if (
+            arch == "Glm5NextForConditionalGeneration"
+            and self.num_speculative_tokens > 5
+        ):
             raise ValueError(
                 "GLM-5.3 supports at most 5 recurrent NextN speculative tokens"
             )
@@ -683,7 +702,10 @@ class Config(BaseModel):
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
             if self.num_speculative_tokens > 1:
-                if arch not in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
+                if arch not in (
+                    "GlmMoeDsaForCausalLM",
+                    "Glm5NextForConditionalGeneration",
+                ):
                     raise ValueError(
                         "num_speculative_tokens > 1 is currently supported only "
                         "for GlmMoeDsaForCausalLM"
