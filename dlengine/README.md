@@ -54,3 +54,19 @@ these management endpoints to trusted networks in production.
 
 Profiling starts only through `/start_profiler` and continues until
 `/stop_profiler`; step-based automatic profiling is not supported.
+
+### Tensor Parallelism
+
+`attention_tp` and `ffn_tp` must be positive integers. There is no generic
+upper bound of 8: TP16 and larger values are accepted when the model's sharded
+head counts and the selected backend support them. For example, a compatible
+Kimi K3 topology can use `attention_tp=16, ffn_ep=16, ffn_tp=1`; a compatible
+GQA topology can use `attention_tp=16, ffn_tp=16`.
+
+Attention query heads must divide evenly across TP ranks. Qwen/Gemma GQA paths
+also require divisible KV-head counts; KV-head replication is not implemented.
+Kimi K3 MLA shares compressed KV across TP ranks, so its single compressed KV
+head does not limit TP to 1. Model-specific TP1 guards (including the configured
+DeepSeek/GLM paths and HiSparse), expert/quantization alignment requirements, and
+matching attention/FFN worker counts still apply. Configuration acceptance alone
+does not certify a model/backend topology for end-to-end serving.
