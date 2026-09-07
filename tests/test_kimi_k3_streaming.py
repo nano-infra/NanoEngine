@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from dlengine.server.openai_server import build_app, OpenAIServer
-from dlengine.server.tool_parser import get_tool_parser, StreamingContentFilter
+from dlengine.server.tool_parser import get_tool_parser
 from fastapi.testclient import TestClient
 
 PARSER = get_tool_parser("kimi_k3")
@@ -16,20 +16,32 @@ RESPONSE = (
 )
 
 
+def parse_chunks(chunks, *, reasoning_open=False):
+    parser = PARSER.create_stream_parser(reasoning_open=reasoning_open)
+    events = []
+    for chunk in chunks:
+        events.extend(parser.feed(chunk))
+    events.extend(parser.finish())
+    return (
+        "".join(event.content or "" for event in events),
+        "".join(event.reasoning or "" for event in events),
+        [call for event in events for call in event.tool_calls],
+    )
+
+
 @pytest.mark.parametrize("split", range(len(RESPONSE) + 1))
 def test_response_framing_split_at_every_character(split):
-    f = StreamingContentFilter(PARSER.content_markers)
-    assert (
-        f.feed(RESPONSE[:split]) + f.feed(RESPONSE[split:]) + f.finish()
-        == "答案 99 < 100"
+    assert parse_chunks([RESPONSE[:split], RESPONSE[split:]]) == (
+        "答案 99 < 100",
+        "",
+        [],
     )
 
 
 def test_character_deltas_and_truncated_control_marker():
-    f = StreamingContentFilter(PARSER.content_markers)
-    assert "".join(f.feed(c) for c in RESPONSE) + f.finish() == "答案 99 < 100"
-    assert f.feed(PARSER.RESPONSE_OPEN + "answer<|close|>res") + f.finish() == "answer"
-    assert f.feed("plain <") + f.finish() == "plain <"
+    assert parse_chunks(RESPONSE) == ("答案 99 < 100", "", [])
+    assert parse_chunks([PARSER.RESPONSE_OPEN + "answer<|close|>res"])[0] == "answer"
+    assert parse_chunks(["plain <"])[0] == "plain <"
 
 
 class Tokenizer:
@@ -44,7 +56,7 @@ class Tokenizer:
     def encode(self, text):
         return [1, 2, 3]
 
-    def decode(self, token_ids, skip_special_tokens=True):
+    def decode(self, token_ids, skip_special_tokens=True, **kwargs):
         return "".join(self.text[i] for i in token_ids)
 
 
@@ -202,3 +214,225 @@ def test_anthropic_stream_uses_same_clean_content_path():
     )
     assert answer == "答案 99 < 100"
     assert events[-1]["type"] == "message_stop"
+
+
+def xtml_call(name, arguments):
+    from html import escape
+
+    attrs = lambda value: escape(value, quote=True).replace("&#x27;", "'")
+    body = "".join(
+        '<|open|>argument key="'
+        + attrs(key)
+        + '" type="'
+        + kind
+        + '"<|sep|>'
+        + value
+        + "<|close|>argument<|sep|>"
+        for key, kind, value in arguments
+    )
+    return (
+        '<|open|>call tool="' + attrs(name) + '"<|sep|>' + body + "<|close|>call<|sep|>"
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 10000])
+def test_state_preserves_response_text_and_raw_string_arguments(chunk_size):
+    literal = "文档示例 " + PARSER.RESPONSE_OPEN + " 不应在当前 response 内被删除。"
+    argument = PARSER.MESSAGE_CLOSE + PARSER.TOOLS_OPEN + '\n<&quot;> "🙂"'
+    call = xtml_call(
+        'look"up&',
+        [('q&"', "string", argument), ("opts", "object", '{"a":[1,true,null]}')],
+    )
+    raw = (
+        PARSER.THINK_OPEN
+        + "reason"
+        + PARSER.THINK_CLOSE
+        + PARSER.RESPONSE_OPEN
+        + literal
+        + PARSER.RESPONSE_CLOSE
+        + PARSER.TOOLS_OPEN
+        + call
+        + PARSER.TOOLS_CLOSE
+        + PARSER.MESSAGE_CLOSE
+    )
+    content_text, reasoning, calls = parse_chunks(
+        [raw[i : i + chunk_size] for i in range(0, len(raw), chunk_size)]
+    )
+    assert content_text == literal
+    assert reasoning == "reason"
+    assert len(calls) == 1
+    assert calls[0].function.name == 'look"up&'
+    assert json.loads(calls[0].function.arguments) == {
+        'q&"': argument,
+        "opts": {"a": [1, True, None]},
+    }
+    full = PARSER.parse_full(raw)
+    assert full.content == content_text and full.reasoning == reasoning
+    assert full.tool_calls[0].function.arguments == calls[0].function.arguments
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
+def test_prefix_consumption_and_plain_response_are_chunk_invariant(chunk_size):
+    for text, expected, thinking in [
+        ("\n  body " + PARSER.RESPONSE_OPEN, "\n  body " + PARSER.RESPONSE_OPEN, False),
+        (PARSER.RESPONSE_CLOSE + PARSER.MESSAGE_CLOSE, "", False),
+        (
+            "reason"
+            + PARSER.THINK_CLOSE
+            + PARSER.RESPONSE_OPEN
+            + " answer "
+            + PARSER.RESPONSE_CLOSE,
+            " answer ",
+            True,
+        ),
+        (
+            PARSER.THINK_OPEN
+            + PARSER.THINK_OPEN
+            + "reason"
+            + PARSER.THINK_CLOSE
+            + PARSER.RESPONSE_OPEN
+            + "answer"
+            + PARSER.RESPONSE_CLOSE,
+            "answer",
+            True,
+        ),
+    ]:
+        parsed = parse_chunks(
+            [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)],
+            reasoning_open=thinking,
+        )
+        assert parsed[0] == expected
+        if thinking:
+            assert parsed[1] == "reason"
+
+
+def test_completed_calls_are_emitted_once_before_end_of_message():
+    parser = PARSER.create_stream_parser()
+    first = xtml_call("first", [("x", "integer", "1")])
+    second = xtml_call("second", [("flag", "boolean", "false")])
+    before = parser.feed(PARSER.TOOLS_OPEN + first[:-1])
+    assert not any(event.tool_calls for event in before)
+    events = parser.feed(first[-1:])
+    assert len(events) == 1 and events[0].tool_calls[0].function.name == "first"
+    first_id = events[0].tool_calls[0].id
+    assert parser.feed("") == []
+    events = parser.feed(second + PARSER.TOOLS_CLOSE + PARSER.MESSAGE_CLOSE)
+    assert len(events) == 1 and events[0].tool_calls[0].function.name == "second"
+    assert events[0].tool_calls[0].id != first_id
+    assert parser.finish() == []
+
+
+def test_incomplete_calls_are_not_emitted_as_tools_or_content():
+    first = xtml_call("complete", [("x", "integer", "1")])
+    incomplete = '<|open|>call tool="unfinished"<|sep|><|open|>argument key="q" type="string"<|sep|>secret tool argument'
+    text, reasoning, calls = parse_chunks([PARSER.TOOLS_OPEN + first + incomplete])
+    assert text == reasoning == ""
+    assert [c.function.name for c in calls] == ["complete"]
+
+
+def test_sse_multiple_calls_keep_indexes_and_ids_without_final_reparse():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in ["one", "two"]
+    ]
+    raw = (
+        PARSER.THINK_CLOSE
+        + PARSER.TOOLS_OPEN
+        + xtml_call("one", [])
+        + xtml_call("two", [])
+        + PARSER.TOOLS_CLOSE
+        + PARSER.MESSAGE_CLOSE
+    )
+    chunks, _ = request(raw, tools=tools)
+    calls = [
+        call
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        for call in choice.get("delta", {}).get("tool_calls", [])
+    ]
+    assert [call["index"] for call in calls] == [0, 1]
+    assert [call["function"]["name"] for call in calls] == ["one", "two"]
+    assert len({call["id"] for call in calls}) == 2
+    assert content(chunks) == ""
+    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_no_tools_and_tool_choice_none_do_not_expose_tool_protocol():
+    raw = (
+        PARSER.THINK_CLOSE
+        + PARSER.TOOLS_OPEN
+        + xtml_call("hidden", [])
+        + PARSER.TOOLS_CLOSE
+        + PARSER.MESSAGE_CLOSE
+    )
+    for extra in [
+        {},
+        {
+            "tools": [{"type": "function", "function": {"name": "hidden"}}],
+            "tool_choice": "none",
+        },
+    ]:
+        chunks, _ = request(raw, **extra)
+        assert content(chunks) == ""
+        assert not any(
+            "tool_calls" in choice.get("delta", {})
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+        assert chunks[-1]["usage"]["completion_tokens"] == len(raw)
+
+
+def test_non_streaming_reuses_structured_body_without_reinterpreting_literals():
+    body = "示例 " + PARSER.RESPONSE_OPEN + " 保留。"
+    raw = (
+        PARSER.THINK_CLOSE
+        + PARSER.RESPONSE_OPEN
+        + body
+        + PARSER.RESPONSE_CLOSE
+        + PARSER.MESSAGE_CLOSE
+    )
+    with TestClient(build_app(server_for(raw))) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-k3",
+                "messages": [{"role": "user", "content": "answer"}],
+                "stream": False,
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == body
+
+
+def test_server_exposes_completed_call_while_engine_queue_is_still_open():
+    import asyncio
+
+    first = PARSER.TOOLS_OPEN + xtml_call("ready", [("x", "integer", "42")])
+    raw = first + PARSER.TOOLS_CLOSE + PARSER.MESSAGE_CLOSE
+
+    async def check():
+        server = server_for(raw)
+        req = SimpleNamespace(aqueue=asyncio.Queue(), seq_id=1)
+        req.aqueue.put_nowait({"tokens": list(range(len(first)))})
+        stream = server.stream_text(req, max_tokens=4096)
+        try:
+            delta, gen = await asyncio.wait_for(anext(stream), timeout=1)
+            assert delta == "" and len(gen.tool_calls) == 1
+            assert gen.tool_calls[0].function.name == "ready"
+            assert json.loads(gen.tool_calls[0].function.arguments) == {"x": 42}
+            call_id = gen.tool_calls[0].id
+            # The engine has not sent the tool/message closers or EOS yet.
+            assert req.aqueue.empty() and len(gen.token_ids) == len(first)
+            req.aqueue.put_nowait({"tokens": list(range(len(first), len(raw)))})
+            req.aqueue.put_nowait(None)
+            async for _, gen in stream:
+                pass
+            assert [call.id for call in gen.tool_calls] == [call_id]
+            assert gen.finish_reason == "stop" and len(gen.token_ids) == len(raw)
+        finally:
+            await stream.aclose()
+
+    asyncio.run(check())
