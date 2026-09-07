@@ -224,3 +224,7 @@ scripts/.bin/
 docker/*.whl
 
 docs/generated/
+
+# Local documentation rendering runtimes (MkDocs uses pinned CDN versions)
+docs/site/assets/javascripts/mermaid.min.js
+docs/site/assets/javascripts/mathjax/
