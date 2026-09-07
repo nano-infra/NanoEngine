@@ -42,6 +42,62 @@ def reset_mla_context() -> None:
     _MLA_CONTEXT = MLAContext()
 
 
+def resolve_mla_cache_format(
+    config, cache_plan, hardware_backend: str, *, force_reference: bool = False
+) -> tuple[bool, bool]:
+    """Return (FP8 enabled, raw FP8 layout) without allocating any cache.
+
+    Dense Blackwell MLA supports raw E4M3 pages independently of the indexer.
+    Hopper FP8 decode requires the packed sparse layout. Automatic selection
+    retains the existing indexer-driven policy.
+    """
+    requested = getattr(config, "kv_cache_dtype", "auto")
+    if requested not in ("auto", "bfloat16", "fp8_e4m3"):
+        raise ValueError(f"Unsupported kv_cache_dtype={requested!r}")
+    if requested != "auto" and not cache_plan.has_mla():
+        raise ValueError("Explicit kv_cache_dtype is currently supported only for MLA")
+    hf = config.hf_config
+    sparse = (
+        cache_plan.has_indexer()
+        and getattr(hf, "index_head_dim", 0) > 0
+        and not getattr(config, "disable_nsa", False)
+    )
+    if requested == "bfloat16" and sparse:
+        raise ValueError(
+            "kv_cache_dtype=bfloat16 requires disable_nsa=True for sparse MLA; "
+            "the sparse decode path requires FP8 KV cache"
+        )
+    fp8 = requested == "fp8_e4m3" or (requested == "auto" and sparse)
+    rank = getattr(hf, "kv_lora_rank", 0)
+    rope = getattr(hf, "qk_rope_head_dim", 0)
+    reference_decode = force_reference or (
+        getattr(config, "enable_mla_reference_fallback", False)
+        and rank + rope not in (512, 576)
+    )
+    if reference_decode:
+        if requested == "fp8_e4m3":
+            raise ValueError(
+                "kv_cache_dtype=fp8_e4m3 is incompatible with MLA reference decode"
+            )
+        fp8 = False
+    if requested == "fp8_e4m3":
+        if (rank, rope) != (512, 64):
+            raise ValueError(
+                "Explicit FP8 MLA cache requires kv_lora_rank=512 and "
+                f"qk_rope_head_dim=64, got {rank} and {rope}"
+            )
+        if hardware_backend != "blackwell" and not (
+            hardware_backend == "hopper" and sparse
+        ):
+            raise ValueError(
+                "FP8 MLA cache requires Blackwell dense/sparse MLA or Hopper "
+                "sparse MLA; dense Hopper FP8 decode is not supported"
+            )
+    if cache_plan.has_hisparse() and cache_plan.has_mla() and not fp8:
+        raise ValueError("HiSparse requires FP8 MLA KV cache")
+    return bool(fp8), bool(fp8 and hardware_backend == "blackwell")
+
+
 def configure_mla_cache(context) -> None:
     assert context.block_size == 64, "MLA mode only support block_size=64"
     context.num_kv_heads = 1
@@ -160,4 +216,5 @@ __all__ = [
     "get_mla_block_bytes",
     "get_mla_context",
     "reset_mla_context",
+    "resolve_mla_cache_format",
 ]

@@ -35,6 +35,44 @@ DLEngine focuses on distributed inference for state-of-the-art large models. Thi
 | Million-token context    | Experimental | GLM-family long-context serving is supported, but capacity and latency depend strongly on topology, Indexer behavior, and HiSparse configuration. |
 | 3FS/L3 cache integration | Experimental | Extends cache capacity beyond local device and host memory for deployments configured with the optional storage path.                             |
 
+### Kimi-K3 MLA FP8 cache on Blackwell
+
+Append `--kv_cache_dtype fp8_e4m3` to the existing Kimi-K3 serving command to store
+its MLA KV pages as E4M3 FP8. `auto` (the default) retains the previous policy:
+K3 dense MLA uses the model dtype, while supported NSA/DSA models select FP8.
+`bfloat16` explicitly selects BF16 MLA storage; on sparse models this also
+requires `--disable_nsa true`, and HiSparse still requires FP8.
+
+The explicit FP8 option supports compressed rank 512 and a 64-wide positional
+component on Blackwell dense/sparse MLA, or the existing Hopper sparse MLA
+path. Unsupported hardware/shapes and reference decode fail before checkpoint
+weights are loaded. Explicit KV dtype selection currently applies only to MLA.
+
+For K3, an MLA token occupies **576 bytes in FP8 versus 1152 bytes in BF16**.
+This halves the MLA page storage. KDA recurrent/conv state and model weights
+retain their existing precision, so total process memory is not halved.
+Both chunked prefill cache reuse and CUDA Graph decode use the selected format.
+
+For large K3 prefill batches, also size `--mega_moe_max_tokens_per_rank` to
+cover the tokens each expert-parallel rank receives. Its default is 256; this
+independent MegaMoE capacity limit applies to both BF16 and FP8 KV caches.
+Startup validation of this limit is tracked in [#365](https://github.com/JimyMa/NanoDeploy/issues/365).
+
+Run the checkpoint-attention validator from an installed checkout:
+
+```bash
+python -m examples.kimi_k3_fp8_kv_validation \
+  --model /path/to/Kimi-K3 --layers all \
+  --prefill-tokens 257 --chunk-tokens 63 --decode-steps 8 \
+  --output k3-fp8-validation.json
+```
+
+It loads real K3 MLA weights one layer at a time and uses normalized synthetic
+activations to compare BF16/FP8 against causal BF16 prefill. It checks cache
+writes across noncontiguous pages, cached prefill, repeated decode, graph
+replay, and idle-DP cache preservation. This is attention-level validation;
+full-model generation quality and distributed serving require separate checks.
+
 ## Model execution
 
 | Feature                           | Status       | Description                                                                                                                   |

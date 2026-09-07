@@ -467,6 +467,15 @@ class ModelRunner:
             raise ValueError(f"Unsupported architecture {model_architecture}")
         self.model = model_loader()(hf_config)
         self.cache_plan = self._get_model_cache_plan()
+        from dlengine.runtime.context.cache.mla import resolve_mla_cache_format
+
+        # Validate explicit cache choices before loading checkpoint weights.
+        self._mla_cache_format = resolve_mla_cache_format(
+            config,
+            self.cache_plan,
+            self.backend.hardware_backend,
+            force_reference=os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") == "1",
+        )
 
         # Warmup ExpertContext for MoE models
         num_total_experts = getattr(hf_config, "num_experts", 0) or getattr(
@@ -1097,9 +1106,13 @@ class ModelRunner:
             try:
                 self._warmup_deep_gemm_moe(max_num_batched_tokens)
             except Exception as e:  # pragma: no cover - warmup must never crash boot
-                logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
+                logger.warning(
+                    f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}"
+                )
         else:
-            logger.info("[startup] GLM-5.3 DeepGEMM MoE warmup disabled; using runtime fallback")
+            logger.info(
+                "[startup] GLM-5.3 DeepGEMM MoE warmup disabled; using runtime fallback"
+            )
         # Empty warmup batch, built without exposing Sequence serializers.
         warmup_data = RunnerIn.dummy("", 0, True).to_bytes()
         self.run_from_bytes(warmup_data, True)
@@ -1296,7 +1309,9 @@ class ModelRunner:
         ):
             # Qwen uses full_attention; GLM-5.3 calls its paged MLA layers
             # deepseek_sparse_attention.  Both are the non-linear cache side.
-            num_kv_layers = sum(1 for lt in local_layer_types if lt != "linear_attention")
+            num_kv_layers = sum(
+                1 for lt in local_layer_types if lt != "linear_attention"
+            )
         else:
             # With pipeline parallelism each stage owns only a contiguous slice
             # of the decoder layers, so it allocates KV cache for just those
@@ -1323,36 +1338,25 @@ class ModelRunner:
                 config.ctrl_address, config.host, config.port
             )
 
-        # Enable FP8 KV cache for sparse attention (V3.2).
-        # The reference fallback is correctness-only and cannot read the FP8
-        # packed cache, so disabling FP8 cache for unsupported shapes is opt-in.
         index_head_dim = getattr(hf_config, "index_head_dim", 0)
-        mla_head_dim = kv_lora_rank + qk_rope_head_dim
-        flash_mla_supported = (
-            mla_head_dim in (512, 576)
-            and os.environ.get("DLENGINE_FORCE_MLA_REFERENCE", "0") != "1"
+        is_fp8_kvcache, raw_fp8_mla_layout = self._mla_cache_format
+        cache_dtype = (
+            torch.bfloat16
+            if getattr(config, "kv_cache_dtype", "auto") == "bfloat16"
+            else torch.get_default_dtype()
         )
-        enable_mla_reference_fallback = getattr(
-            config, "enable_mla_reference_fallback", False
-        )
-        is_fp8_kvcache = (
-            cache_plan.has_indexer() and index_head_dim > 0
-        ) and not getattr(config, "disable_nsa", False)
-        # The native MLA backend consumes the logical BF16 KV layout.
-        # Packed FP8 caches include scale metadata and are not ABI-compatible.
-        from dlengine.runtime.layers import get_backend
-
-        hardware_backend = getattr(get_backend(), "hardware_backend", "")
-        if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
-            logger.warning(
-                "Disabling FP8 MLA KV cache because MLA reference fallback is "
-                "enabled for unsupported FlashMLA head_dim=%s.",
-                mla_head_dim,
+        if cache_plan.has_mla():
+            logger.info(
+                "MLA KV cache: requested=%s storage=%s layout=%s layers=%d",
+                getattr(config, "kv_cache_dtype", "auto"),
+                "fp8_e4m3fn" if is_fp8_kvcache else str(cache_dtype),
+                (
+                    "raw"
+                    if raw_fp8_mla_layout
+                    else "packed" if is_fp8_kvcache else "native"
+                ),
+                num_kv_layers,
             )
-            is_fp8_kvcache = False
-        raw_fp8_mla_layout = is_fp8_kvcache and hardware_backend == "blackwell"
-        if cache_plan.has_hisparse() and cache_plan.has_mla() and not is_fp8_kvcache:
-            raise RuntimeError("HiSparse requires FP8 MLA KV cache")
 
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
@@ -1401,7 +1405,7 @@ class ModelRunner:
             is_fp8_kvcache=is_fp8_kvcache,
             raw_fp8_mla_layout=raw_fp8_mla_layout,
             device=torch.get_default_device(),
-            dtype=torch.get_default_dtype(),
+            dtype=cache_dtype,
             mode=mode,
             ctrl_address=config.ctrl_address,
             ctrl_scope=config.ctrl_scope,

@@ -179,7 +179,9 @@ class TrtllmMlaAttention(MlaAttentionBase):
             max_seq_len=(
                 int(seq_lens.max().item())
                 if sparse_mla_top_k and not torch.cuda.is_current_stream_capturing()
-                else context.block_tables.shape[-1] * self.k_cache.shape[1]
+                # An idle attention-DP rank still reads the synthetic page
+                # above; FlashInfer requires a positive scheduling bound.
+                else max(1, context.block_tables.shape[-1]) * self.k_cache.shape[1]
             ),
             sparse_mla_top_k=sparse_mla_top_k,
             out=out,
