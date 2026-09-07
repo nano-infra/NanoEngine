@@ -66,11 +66,11 @@ class Config(BaseModel):
     dump_requests_maxlen: int = 200000
 
     # parallel config
-    attention_tp: int = 1
+    attention_tp: int = Field(default=1, ge=1)
     attention_sp: int = 1
     attention_dp: int = 1
     ffn_ep: int = 1
-    ffn_tp: int = 1
+    ffn_tp: int = Field(default=1, ge=1)
     ffn_dp: int = 1
     # Pipeline parallelism. Splits the decoder layers into ``pp`` contiguous
     # stages. Each stage owns one full attn/ffn parallel group
@@ -451,7 +451,11 @@ class Config(BaseModel):
                     )
             else:
                 self.kvcache_block_size = 64
-            assert self.attention_tp == 1
+            if self.attention_tp != 1:
+                raise ValueError(
+                    f"{hf_architectures[0]} currently requires attention_tp=1; "
+                    f"got attention_tp={self.attention_tp}"
+                )
         else:
             assert self.kvcache_block_size % 64 == 0
             is_blackwell = (
@@ -475,7 +479,26 @@ class Config(BaseModel):
                     adjusted_block_size,
                 )
                 self.kvcache_block_size = adjusted_block_size
-            assert 1 <= self.attention_tp <= 8
+            if self.attention_tp > 1:
+                sharded_head_fields = ["num_attention_heads"]
+                if hf_architectures[0] in (
+                    "Qwen3ForCausalLM",
+                    "Qwen3MoeForCausalLM",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                    "Gemma4ForCausalLM",
+                    "Gemma4ForConditionalGeneration",
+                ):
+                    # These GQA implementations shard KV heads without replication.
+                    # MLA (including Kimi K3) shares its compressed KV across TP.
+                    sharded_head_fields.append("num_key_value_heads")
+                for field in sharded_head_fields:
+                    heads = getattr(self.hf_config, field, None)
+                    if heads is not None and (heads < 1 or heads % self.attention_tp):
+                        raise ValueError(
+                            f"{field}={heads} must be positive and divisible by "
+                            f"attention_tp={self.attention_tp}"
+                        )
 
         if self.attention_sp == 1:
             self.max_num_recv_seqs = 0
