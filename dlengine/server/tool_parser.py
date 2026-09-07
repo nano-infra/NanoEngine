@@ -77,6 +77,15 @@ class ParsedOutput:
     reasoning: Optional[str] = None
 
 
+@dataclass
+class ParsedDelta:
+    """Incremental protocol output; a complete call is emitted exactly once."""
+
+    content: Optional[str] = None
+    reasoning: Optional[str] = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+
 def _extract_reasoning(text: str) -> tuple[Optional[str], str]:
     """Split a leading <think>...</think> region off ``text``.
 
@@ -239,6 +248,11 @@ class ToolParser:
     # into content deltas.
     open_markers: tuple[str, ...] = ()
     reasoning_close_marker = "</think>"
+    requires_structural_tokens = False
+
+    def create_stream_parser(self, *, reasoning_open=False):
+        """Return per-request protocol state, or use the legacy serving path."""
+        return None
 
     def parse_full(
         self, text: str, tools: Optional[list[dict]] = None
@@ -371,18 +385,10 @@ class KimiK3ToolParser(ToolParser):
     TOOLS_OPEN = "<|open|>tools<|sep|>"
     TOOLS_CLOSE = "<|close|>tools<|sep|>"
     MESSAGE_CLOSE = "<|close|>message<|sep|>"
+    END_OF_MESSAGE = "<|end_of_msg|>"
+    requires_structural_tokens = True
     reasoning_close_marker = THINK_CLOSE
     open_markers = (THINK_OPEN, TOOLS_OPEN)
-    _CALL_RE = re.compile(
-        r"<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
-        r"(?P<body>.*?)<\|close\|>call<\|sep\|>",
-        re.DOTALL,
-    )
-    _ARG_RE = re.compile(
-        r"<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
-        r"(?P<val>.*?)<\|close\|>argument<\|sep\|>",
-        re.DOTALL,
-    )
     _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
 
     @classmethod
@@ -392,61 +398,28 @@ class KimiK3ToolParser(ToolParser):
             for m in cls._ATTR_RE.finditer(raw)
         }
 
-    @classmethod
-    def _unwrap_response(cls, text: str) -> str:
-        start = text.find(cls.RESPONSE_OPEN)
-        if start >= 0:
-            start += len(cls.RESPONSE_OPEN)
-            end = text.find(cls.RESPONSE_CLOSE, start)
-            text = text[start:] if end < 0 else text[start:end]
-        else:
-            text = text.replace(cls.RESPONSE_CLOSE, "")
-        return text.replace(cls.MESSAGE_CLOSE, "")
+    def create_stream_parser(self, *, reasoning_open=False):
+        from dlengine.server.kimi_k3_parser import KimiK3StreamParser
+
+        return KimiK3StreamParser(self, reasoning_open=reasoning_open)
 
     def parse_full(self, text: str, tools: Optional[list[dict]] = None) -> ParsedOutput:
-        reasoning = None
-        think_start = text.find(self.THINK_OPEN)
-        content_start = think_start + len(self.THINK_OPEN) if think_start >= 0 else 0
-        think_end = text.find(self.THINK_CLOSE, content_start)
-        if think_end >= 0:
-            reasoning = text[content_start:think_end].strip() or None
-            text = text[think_end + len(self.THINK_CLOSE) :]
-
-        tools_start = text.find(self.TOOLS_OPEN)
-        normal = text if tools_start < 0 else text[:tools_start]
-        section = "" if tools_start < 0 else text[tools_start + len(self.TOOLS_OPEN) :]
-        tools_end = section.find(self.TOOLS_CLOSE)
-        if tools_end >= 0:
-            section = section[:tools_end]
-        calls: list[ToolCall] = []
-        for match in self._CALL_RE.finditer(section):
-            name = self._attrs(match["attrs"]).get("tool")
-            if not name:
-                continue
-            arguments = {}
-            for arg in self._ARG_RE.finditer(match["body"]):
-                attrs = self._attrs(arg["attrs"])
-                key = attrs.get("key")
-                if not key:
-                    continue
-                raw = arg["val"]
-                if attrs.get("type", "string") == "string":
-                    arguments[key] = raw
-                else:
-                    try:
-                        arguments[key] = json.loads(raw)
-                    except json.JSONDecodeError:
-                        arguments[key] = raw
-            calls.append(
-                ToolCall(
-                    function=Function(
-                        name=name, arguments=json.dumps(arguments, ensure_ascii=False)
-                    )
-                )
-            )
-        content = self._unwrap_response(normal).strip()
+        # A generation prefix may already have opened the think channel.
+        close = text.find(self.THINK_CLOSE)
+        first_channel = min(
+            (
+                i
+                for tag in (self.THINK_OPEN, self.RESPONSE_OPEN, self.TOOLS_OPEN)
+                if (i := text.find(tag)) >= 0
+            ),
+            default=len(text),
+        )
+        parser = self.create_stream_parser(reasoning_open=0 <= close < first_channel)
+        events = parser.feed(text) + parser.finish()
         return ParsedOutput(
-            content=content or None, tool_calls=calls, reasoning=reasoning
+            content="".join(event.content or "" for event in events) or None,
+            reasoning="".join(event.reasoning or "" for event in events) or None,
+            tool_calls=[call for event in events for call in event.tool_calls],
         )
 
 

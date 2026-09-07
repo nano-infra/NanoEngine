@@ -104,6 +104,8 @@ class _Generation:
     prefix_offset: int = 0
     read_offset: int = 0
     tool_calls: list = field(default_factory=list)
+    parsed_output: bool = False
+    content_parts: list[str] = field(default_factory=list)
     reasoning: Optional[str] = None
     # True while the current streamed delta belongs to the model's reasoning
     # ("thinking") region rather than the user-visible answer. Consumers route
@@ -544,12 +546,16 @@ class OpenAIServer:
         the character completes, so we never emit a broken "\ufffd".
         """
         ids = gen.token_ids
+        decode_kwargs = {"skip_special_tokens": True}
+        if getattr(self.tool_parser, "requires_structural_tokens", False):
+            decode_kwargs = {
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+            }
         prefix_text = self.tokenizer.decode(
-            ids[gen.prefix_offset : gen.read_offset], skip_special_tokens=True
+            ids[gen.prefix_offset : gen.read_offset], **decode_kwargs
         )
-        new_text = self.tokenizer.decode(
-            ids[gen.prefix_offset :], skip_special_tokens=True
-        )
+        new_text = self.tokenizer.decode(ids[gen.prefix_offset :], **decode_kwargs)
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
             delta = new_text[len(prefix_text) :]
             gen.prefix_offset = gen.read_offset
@@ -557,7 +563,97 @@ class OpenAIServer:
             return delta
         return ""
 
+    def parse_generation(self, gen, text, tools=None):
+        """Reuse protocol output without parsing already-extracted content again."""
+        if getattr(gen, "parsed_output", False):
+            from dlengine.server.tool_parser import ParsedOutput
+
+            return ParsedOutput(
+                content="".join(gen.content_parts) or None,
+                reasoning=gen.reasoning,
+                tool_calls=gen.tool_calls,
+            )
+        return self.tool_parser.parse_full(text, tools=tools)
+
     async def stream_text(
+        self,
+        req: _Request,
+        max_tokens: int,
+        stop: Optional[list[str]] = None,
+        hold_markers: Optional[list[str]] = None,
+        reasoning_open: bool = False,
+    ) -> AsyncGenerator[tuple[str, _Generation], None]:
+        create_parser = getattr(self.tool_parser, "create_stream_parser", None)
+        parser = create_parser(reasoning_open=reasoning_open) if create_parser else None
+        if parser is None:
+            async for item in self._stream_text_raw(
+                req, max_tokens, stop, hold_markers, reasoning_open
+            ):
+                yield item
+        else:
+            async for item in self._stream_structured_text(
+                req, max_tokens, stop, parser
+            ):
+                yield item
+
+    @staticmethod
+    def _apply_parsed_delta(parsed, gen):
+        if parsed.reasoning is not None:
+            gen.in_reasoning = True
+            gen.reasoning = (gen.reasoning or "") + parsed.reasoning
+            yield parsed.reasoning, gen
+        if parsed.content is not None:
+            gen.in_reasoning = False
+            gen.content_parts.append(parsed.content)
+            yield parsed.content, gen
+        if parsed.tool_calls:
+            gen.in_reasoning = False
+            gen.tool_calls.extend(parsed.tool_calls)
+            yield "", gen
+
+    async def _stream_structured_text(self, req, max_tokens, stop, parser):
+        gen = _Generation(parsed_output=True)
+        pending = ""
+        stops = stop or []
+        stopped = False
+        while True:
+            item = await req.aqueue.get()
+            if item is None:
+                break
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            if "tokens" not in item:
+                continue
+            remaining = max_tokens - len(gen.token_ids)
+            if remaining <= 0:
+                continue
+            gen.token_ids.extend(item["tokens"][:remaining])
+            pending += self._incremental_detokenize(gen)
+            cut = _earliest_stop(pending, stops) if stops else None
+            safe = (
+                cut
+                if cut is not None
+                else len(pending) - _partial_stop_holdback(pending, stops)
+            )
+            for parsed in parser.feed(pending[:safe]):
+                for event in self._apply_parsed_delta(parsed, gen):
+                    yield event
+            pending = pending[safe:]
+            if cut is not None:
+                stopped = True
+                pending = ""
+                self._abort_request(req)
+                break
+        for parsed in parser.feed(pending) + parser.finish():
+            for event in self._apply_parsed_delta(parsed, gen):
+                yield event
+        gen.finish_reason = (
+            "stop" if stopped or len(gen.token_ids) < max_tokens else "length"
+        )
+        # Empty/control-only output must still expose token usage and finish state.
+        yield "", gen
+
+    async def _stream_text_raw(
         self,
         req: _Request,
         max_tokens: int,
@@ -1092,6 +1188,7 @@ def build_app(server: OpenAIServer):
                     list(server.tool_parser.open_markers) if use_tools else None
                 )
                 streamed_reasoning = False
+                streamed_call_count = 0
                 try:
                     async for delta, gen in server.stream_text(
                         req,
@@ -1100,15 +1197,25 @@ def build_app(server: OpenAIServer):
                         hold_markers=hold_markers,
                         reasoning_open=reasoning_open,
                     ):
-                        if not delta:
+                        delta_obj = {}
+                        if delta:
+                            if gen.in_reasoning:
+                                streamed_reasoning = True
+                                delta_obj["reasoning_content"] = delta
+                            else:
+                                delta_obj["content"] = delta
+                        if use_tools and getattr(gen, "parsed_output", False):
+                            new_calls = gen.tool_calls[streamed_call_count:]
+                            if new_calls:
+                                delta_obj["tool_calls"] = [
+                                    {"index": i, **call.to_dict()}
+                                    for i, call in enumerate(
+                                        new_calls, streamed_call_count
+                                    )
+                                ]
+                                streamed_call_count = len(gen.tool_calls)
+                        if not delta_obj:
                             continue
-                        # Reasoning ("thinking") tokens go to reasoning_content;
-                        # everything else is the user-visible answer.
-                        if gen.in_reasoning:
-                            streamed_reasoning = True
-                            delta_obj = {"reasoning_content": delta}
-                        else:
-                            delta_obj = {"content": delta}
                         chunk = {
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
@@ -1125,20 +1232,28 @@ def build_app(server: OpenAIServer):
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                     final_finish_reason = gen.finish_reason
                     if use_tools:
-                        full_text = server.tokenizer.decode(
-                            gen.token_ids, skip_special_tokens=True
+                        full_text = (
+                            ""
+                            if getattr(gen, "parsed_output", False)
+                            else server.tokenizer.decode(
+                                gen.token_ids, skip_special_tokens=True
+                            )
                         )
-                        parsed = server.tool_parser.parse_full(full_text, tools=tools)
+                        parsed = server.parse_generation(gen, full_text, tools=tools)
                         tool_delta: dict[str, Any] = {}
                         # Only attach reasoning here if it was not already
                         # streamed live (avoids duplicating the think region).
                         if parsed.reasoning is not None and not streamed_reasoning:
                             tool_delta["reasoning_content"] = parsed.reasoning
                         if parsed.tool_calls:
-                            tool_delta["tool_calls"] = [
-                                {"index": i, **tc.to_dict()}
-                                for i, tc in enumerate(parsed.tool_calls)
-                            ]
+                            remaining_calls = parsed.tool_calls[streamed_call_count:]
+                            if remaining_calls:
+                                tool_delta["tool_calls"] = [
+                                    {"index": i, **tc.to_dict()}
+                                    for i, tc in enumerate(
+                                        remaining_calls, streamed_call_count
+                                    )
+                                ]
                             final_finish_reason = "tool_calls"
                         if tool_delta:
                             tool_chunk = {
@@ -1222,7 +1337,7 @@ def build_app(server: OpenAIServer):
         # Always split off the reasoning region and any tool-call markup so the
         # think text never leaks into ``content`` (the template opens <think>
         # in the prompt, so the answer is preceded by reasoning + </think>).
-        parsed = server.tool_parser.parse_full(text, tools=tools if use_tools else None)
+        parsed = server.parse_generation(gen, text, tools=tools if use_tools else None)
         message: dict[str, Any] = {
             "role": "assistant",
             "content": parsed.content if parsed.content is not None else "",
