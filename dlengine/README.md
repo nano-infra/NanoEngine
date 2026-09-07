@@ -8,7 +8,7 @@
 | `mode`                   | str   | `"hybrid"`         | Engine mode: `prefill`, `decode`, `hybrid`                           |
 | `host`                   | str   | `"0.0.0.0"`        | Bind address                                                         |
 | `port`                   | int   | `0`                | Service port (`0` lets the OS allocate an available port)            |
-| `max_model_len`          | int   | `16384`            | Maximum sequence length                                              |
+| `max_model_len`          | int   | `None`             | Maximum sequence length; inferred from model config when omitted      |
 | `max_num_batched_tokens` | int   | `16384`            | Max tokens per batch                                                 |
 | `max_num_seqs`           | int   | `256`              | Max concurrent sequences                                             |
 | `kvcache_block_size`     | int   | `256`              | KV cache block size (64 for MLA models)                              |
@@ -24,6 +24,13 @@
 When `port` is left at `0`, DLEngine binds an OS-assigned port and logs the
 resulting bind and advertise endpoints. NanoCtrl registration uses the
 advertise endpoint, never the wildcard bind address.
+
+An omitted `max_model_len` (or `None` in Python) follows
+`text_config.max_position_embeddings` when present, then the top-level
+`max_position_embeddings`. An explicit positive value takes precedence. If neither
+model field is available, the engine warns and falls back to 16,384 tokens.
+The effective service limit may be reduced at startup to fit available KV cache;
+`max_num_batched_tokens` independently controls the per-forward token budget.
 
 ### Runtime Profiling
 
