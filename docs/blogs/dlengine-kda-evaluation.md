@@ -202,20 +202,278 @@ $$
 Activations are transient tensors created while a batch moves through one
 decoder layer. Unlike weights and persistent caches, most activation buffers
 can be reused after the layer completes, so capacity is determined by peak
-liveness rather than by summing all 93 layers. This chapter will separately
-model Prefill activation peaks as a function of active token count and Decode
-activation peaks as a function of batch size, then account for KDA/MLA
-projection buffers, MoE routing and dispatch buffers, collective communication,
-and backend workspaces.
+liveness rather than by summing all 93 layers. The primary experiment therefore
+measures the incremental peak GPU memory of one component and one complete
+decoder layer. Prefill is the main focus because many active tokens coexist in
+one forward pass; Decode is retained as a smaller batch-size comparison.
 
-## 6. Partitioning: Weights, Latent Cache, SSM Slots, and Activations
+### 5.1 Measurement Scope
 
-This chapter maps the capacity results onto a distributed deployment. It will
-show how TP, EP, and DP affect routed and non-routed weights, whether the MLA
-Latent Cache and KDA SSM Slots are sharded or replicated, and how much memory
-remains per rank for active requests. The result will be a per-rank capacity
-model that connects the static checkpoint footprint to feasible batch size and
-context length before the Prefill and Decode performance analysis.
+Let $B$ be the number of sequences, $L$ the active length per sequence, and
+$N_A=B\times L$ the number of active tokens in the measured forward pass. For
+Decode, $L=1$ and therefore $N_A=B$.
+
+The activation peak excludes weights, persistent caches, and input tensors that
+already exist before the measured region. For each target, report
+
+$$
+C_{\mathrm{activation}}^{\mathrm{peak}}
+=C_{\mathrm{peak\ allocated}}-C_{\mathrm{baseline}}.
+$$
+
+`allocated` memory is the primary metric. `reserved` memory is recorded
+separately to expose allocator behavior but is not treated as tensor capacity.
+All experiments use inference mode and exclude backward activations.
+
+The first measurement uses one NVIDIA B300 SXM6 GPU with BF16 activations. A
+synthetic **1,048,576-token resident context** is allocated before the baseline,
+and the largest Prefill chunk contains **16,384 active tokens**. KDA receives a
+synthetic BF16 convolution state and recurrent state. MLA receives a synthetic
+mixed FP8/BF16 latent cache with the layout from Chapter 4. These persistent
+tensors are deliberately excluded from the incremental activation peak.
+
+The component sweep includes a fresh-only MLA control in which the 16K queries
+attend the 16K fresh tokens. A separate cached-prefix experiment executes the
+target scenario: 1,032,192 cached prefix tokens plus 16,384 fresh tokens, for a
+total context of 1,048,576. The current MoE point uses the single-GPU BF16 reference
+expert implementation with K3's 896 experts, Top-16 routing, latent width 3584,
+and intermediate width 3072. It preserves the activation shapes but is not the
+production MXFP4 MegaMoE kernel; distributed MegaMoE is deferred to the
+partitioning analysis.
+
+### 5.2 Component-Level Experiments
+
+Measure the three dominant compute components independently before composing
+them into decoder layers.
+
+| Target | Measurement boundary | Main transient tensors to inspect |
+| --- | --- | --- |
+| KDA | KDA input to KDA output | Projections, causal-convolution intermediates, recurrence workspace, and output |
+| MLA | MLA input to MLA output | Query/KV projections, attention output, and attention-kernel workspace |
+| MoE | MoE input to merged output | Routing logits, Top-K metadata, token permutation, dispatched expert inputs, grouped-GEMM intermediates, and combine buffers |
+
+The first plot compares incremental peak memory against active-token count for
+KDA, MLA, and MoE. A second, normalized view reports bytes per active token to
+show whether each component has a stable linear slope or develops additional
+sequence-length-dependent workspace.
+
+![K3 Prefill component peak activation memory](../assets/prefill-component-peak-memory.png)
+
+At the 16K-token maximum, the measured operator-core peaks are:
+
+| Operator core | Incremental peak | Peak per active token |
+| --- | ---: | ---: |
+| KDA recurrence | 4.125 GiB | 264.00 KiB/token |
+| MLA Prefill attention | 0.375 GiB | 24.00 KiB/token |
+| Local BF16 routed experts | 15.176 GiB | 971.24 KiB/token |
+
+All three curves are approximately linear over the measured range. At a fixed
+16K active-token total, KDA and MLA produced the same peak for $1\times16384$,
+$4\times4096$, $16\times1024$, and $32\times512$. For these two operator cores
+on this backend, active-token count determined the observed allocation peak;
+the tested batch/sequence decomposition did not.
+
+!!! warning "These are operator-core peaks, not complete-component peaks"
+
+    Projection layers, normalization, residual buffers, KDA convolution, MLA
+    cache gathering, the MoE router and latent projections, and complete-layer
+    buffer reuse are not yet included in the plotted values. The chart is an
+    initial measurement of the dominant kernels, not yet the final decoder-layer
+    capacity model.
+
+#### 5.2.1 MLA With a 1M-Token Cached Prefix
+
+The cached-prefix run follows the allocation path used by K3's non-absorbed MLA
+Prefill implementation. It restores the packed mixed FP8/BF16 latent cache to
+BF16, expands the latent representation into 96-head K/V tensors, joins the
+cached and fresh tensors, and finally executes 16K queries against the complete
+1M-token history.
+
+![MLA cached-prefix 1M-context peak memory](../assets/mla-cached-1m-16k-peak.png)
+
+| Completed stage | Live incremental memory | Peak so far |
+| --- | ---: | ---: |
+| Restore cached latent rows | 1.107 GiB | 3.938 GiB |
+| Expand cached K/V | 83.803 GiB | 83.803 GiB |
+| Join cached and fresh K/V | 145.115 GiB | 145.115 GiB |
+| FlashAttention | 145.490 GiB | 145.490 GiB |
+
+The decisive cost is not the FlashAttention workspace. FlashAttention adds an
+output of approximately 0.375 GiB, while K/V expansion and concatenation create
+the 145.49 GiB peak. The implementation simultaneously retains the restored
+latent rows, expanded cached K/V, expanded fresh K/V, and joined attention
+inputs. Consequently, cached-prefix MLA—not KDA recurrence—is the dominant
+activation-capacity risk in this 1M-context, 16K-chunk setting.
+
+Keeping the fresh chunk fixed at 16K and increasing total context gives the
+following curve:
+
+![MLA peak memory versus context with a fixed 16K chunk](../assets/mla-peak-vs-context-16k-chunk.png)
+
+The unsplit implementation grows almost linearly with total context even though
+the fresh-token count is fixed. This is a consequence of materializing expanded
+K/V for the entire cached prefix, not of an attention-score matrix.
+
+#### 5.2.2 How SGLang Bounds the Prefix-Expansion Peak
+
+SGLang's relevant mechanism is **chunked prefix cache**, represented by fields
+such as `prefix_chunk_len` and `prefix_chunk_idx`. It divides a long cached
+prefix into bounded chunks. For every chunk, SGLang fetches only that chunk's
+latent rows, expands its K/V, runs attention between the fixed query chunk and
+the current prefix chunk, and then merges the partial output and log-sum-exp
+state with an online-softmax merge. Temporary expanded K/V can therefore be
+released before the next prefix chunk.
+
+Conceptually, the unsplit peak scales as
+
+$$
+C_{\mathrm{unsplit}}=O(L_{\mathrm{context}}\,N_H(D_K+D_V)),
+$$
+
+whereas chunked-prefix expansion changes the transient term to
+
+$$
+C_{\mathrm{split}}=O(L_{\mathrm{prefix\ chunk}}\,N_H(D_K+D_V))
++O(L_{\mathrm{fresh}}N_HD_V).
+$$
+
+This does not reduce the persistent Latent Cache or the total attention work;
+it bounds peak temporary memory by trading one large expansion for multiple
+sequential attention calls and state merges.
+
+This mechanism is distinct from FlashAttention/FlashMLA `num_splits`, which
+partitions KV work among kernel work units and combines partial reductions for
+occupancy and scheduling. `num_splits` alone does not remove a framework-level
+full-context K/V expansion that has already happened before the attention call.
+
+#### 5.2.3 Implemented Prefix-Chunk Trade-off
+
+NanoDeploy now applies this path when the MLA cache uses the packed FP8 layout.
+`DLENGINE_MLA_PREFIX_CHUNK_SIZE` controls the cached-prefix chunk and defaults
+to **131,072 tokens**; setting it to `0` restores the previous unsplit path. The
+setting is explicitly forwarded from the driver to Ray model workers. BF16 MLA
+cache behavior is unchanged because it does not use this FP8 restore path.
+
+The experiment below fixes total context at 1,048,576 tokens and the fresh
+Prefill chunk at 16,384 tokens. It includes packed-cache restoration, K/V
+expansion, attention, and online output/LSE merge. Each point performs one
+unreported warm-up iteration, followed by one CUDA-event-timed steady forward.
+The bars report incremental allocated-memory peak and the line reports latency.
+
+![MLA prefix split memory and latency trade-off](../assets/mla-prefix-split-tradeoff.png)
+
+At the 128K default, peak memory falls from **144.17 GiB to 17.39 GiB** (an
+**87.9% reduction**) while measured latency is **687 ms versus 706 ms** for the
+unsplit path. Smaller chunks reduce capacity further but increase launch and
+merge overhead: 16K reaches 5.85 GiB at 834 ms. The 256K point is fastest in
+this single run at 672 ms but needs 32.53 GiB. Therefore 128K is a capacity-first
+default with near-unsplit throughput rather than the latency-minimum setting.
+
+!!! note "Interpretation boundary"
+
+    The cache contents and projection weights are synthetic, but tensor shapes,
+    dtypes, restore routine, expansion operations, and FlashAttention call match
+    the K3 code path. This is a single-layer allocation experiment; it excludes
+    weights, persistent-cache payload, and surrounding decoder-layer buffers.
+
+### 5.3 Complete-Layer Experiments
+
+Component peaks cannot be added directly because their lifetimes do not fully
+overlap and implementations may reuse buffers. Measure the three decoder-layer
+forms that actually occur in K3:
+
+| Decoder-layer form | K3 placement |
+| --- | --- |
+| KDA + Dense FFN | Layer 1 |
+| KDA + MoE FFN | KDA layers after Layer 1 |
+| MLA + MoE FFN | MLA layers |
+
+The layer-level peak is the deployment-relevant result. Comparing it with the
+component measurements reveals how much memory is saved through buffer reuse
+and kernel fusion.
+
+### 5.4 Prefill Experiment Matrix
+
+Sweep active-token count over $128$, $256$, $512$, $1024$, $2048$, $4096$,
+and $8192$. At representative totals, keep $N_A$ fixed while changing the
+batch/sequence decomposition, for example $1\times4096$, $4\times1024$,
+$16\times256$, and $32\times128$.
+
+This distinction matters because equal token counts need not produce equal
+peaks: MLA workspace can depend on sequence geometry, KDA uses chunked
+recurrence, and MoE temporary storage depends on the distribution of token-to-
+expert assignments. Report both $(B,L)$ and $N_A$ for every point.
+
+### 5.5 Decode Comparison
+
+Run the same component and complete-layer measurements with $L=1$ and sweep
+$B$ over $1$, $8$, $16$, $32$, $64$, $128$, $256$, and $512$. This experiment
+is a comparison rather than the center of the chapter: Decode activation grows
+with the current batch, while its broader capacity limit also includes the
+persistent caches analyzed in Chapter 4.
+
+### 5.6 Remaining Figures and Conclusions
+
+The operator-core figure above is the first result. The remaining work is:
+
+1. **Complete-component peak:** include projections, normalization, routing,
+   shared experts, and other materialized buffers around each measured core.
+2. **Complete-layer peak:** KDA + Dense FFN, KDA + MoE FFN, and MLA + MoE FFN
+   versus active tokens during Prefill.
+3. **Prefill/Decode comparison:** normalized peak memory per active token, with
+   sequence geometry shown explicitly.
+
+The measurements should establish which component controls the transient-memory
+ceiling, whether peak memory is approximately linear in active tokens, how much
+sequence geometry changes that peak, and how accurately isolated component
+measurements predict the peak of a complete decoder layer.
+
+## 6. Parallel Partitioning: Per-Rank Capacity and Communication Volume
+
+This chapter maps the model-level capacity results onto a concrete distributed
+deployment. Partitioning changes both sides of the system budget: it reduces
+the weights, caches, slots, and activations resident on each rank, while adding
+communication at the boundaries between KDA, MLA, and MoE execution.
+
+### 6.1 Parallel Configuration and Tensor Ownership
+
+Define the DP, attention-TP, FFN-EP, FFN-TP, and PP dimensions before applying
+any capacity formula. For each K3 component, identify which tensors are
+sharded, which are replicated, and which rank owns the associated runtime
+state. This establishes the placement model used by both the memory and
+communication calculations.
+
+### 6.2 Per-Rank Capacity
+
+Apply the placement model to the four capacity families established in the
+preceding chapters: weights, MLA Latent Cache, KDA SSM Slots, and transient
+activations. Report each contribution separately and then derive the total
+per-rank footprint, rather than dividing the whole-model footprint by a single
+parallelism factor.
+
+### 6.3 Communication at Component Boundaries
+
+Trace one complete KDA + MoE layer and one MLA + MoE layer. At every transition,
+record the collective operation, participating group, logical tensor shape,
+communication dtype, and bytes transferred. The analysis should include the
+attention-to-FFN transition, MoE token dispatch and combine, FFN-to-attention
+transition, and any reductions required by row-parallel projections.
+
+### 6.4 Prefill and Decode Communication Volume
+
+Express communication volume as a function of active tokens and parallel group
+size. Prefill uses $N_A=\sum_i L_i$, whereas Decode uses $N_A=B$. Separate
+payload volume from collective latency: equal bytes can behave differently for
+large Prefill tensors and many small Decode transfers.
+
+### 6.5 Joint Capacity and Communication Constraints
+
+Combine the per-rank capacity model with the communication model to evaluate a
+parallel configuration. The final result should show how much memory remains
+for active requests, which collective dominates each layer type, and where
+additional partitioning saves capacity at the cost of more communication. This
+provides the deployment setting used by the subsequent Prefill and Decode
+performance analysis.
 
 ## 7. Prefill Analysis
 

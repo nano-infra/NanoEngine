@@ -8,6 +8,90 @@ sparse-attention family. Previously duplicated across ``hopper/attention.py`` an
 
 import torch
 
+
+def merge_attention_states(
+    left: torch.Tensor,
+    left_lse: torch.Tensor,
+    right: torch.Tensor,
+    right_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two attention outputs using their per-head log-sum-exp states."""
+    merged_lse = torch.logaddexp(left_lse, right_lse)
+    left_scale = torch.exp(left_lse - merged_lse).transpose(0, 1).unsqueeze(-1)
+    right_scale = torch.exp(right_lse - merged_lse).transpose(0, 1).unsqueeze(-1)
+    merged = left.float() * left_scale + right.float() * right_scale
+    return merged.to(left.dtype), merged_lse
+
+
+def chunked_prefix_mla_attention(
+    q: torch.Tensor,
+    k_fresh: torch.Tensor,
+    v_fresh: torch.Tensor,
+    cached_latent: torch.Tensor,
+    cached_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kc_weight: torch.Tensor,
+    vc_weight: torch.Tensor,
+    *,
+    chunk_size: int,
+    softmax_scale: float,
+    attention_func,
+) -> torch.Tensor:
+    """Attend to fresh tokens and a bounded expansion of cached MLA rows."""
+    fresh, fresh_lse = attention_func(
+        q,
+        k_fresh,
+        v_fresh,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_q,
+        max_seqlen_q=int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()),
+        max_seqlen_k=int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()),
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_lse=True,
+    )
+    output, lse = fresh, fresh_lse
+    lengths = [int(value) for value in cached_lens.tolist()]
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    max_cached = max(lengths, default=0)
+    heads = q.shape[1]
+    nope_dim = kc_weight.shape[1] // heads
+    value_dim = vc_weight.shape[1] // heads
+    for offset in range(0, max_cached, chunk_size):
+        pieces = [
+            cached_latent[
+                starts[i] + offset : starts[i] + min(length, offset + chunk_size)
+            ]
+            for i, length in enumerate(lengths)
+        ]
+        lens = [piece.shape[0] for piece in pieces]
+        if not sum(lens):
+            continue
+        rows = torch.cat(pieces, dim=0)
+        compressed, rope = rows[:, : kc_weight.shape[0]], rows[:, kc_weight.shape[0] :]
+        k_nope = (compressed @ kc_weight).view(-1, heads, nope_dim)
+        k = torch.cat([k_nope, rope[:, None, :].expand(-1, heads, -1)], dim=-1)
+        v = (compressed @ vc_weight).view(-1, heads, value_dim)
+        cu_k = torch.zeros(len(lens) + 1, device=q.device, dtype=torch.int32)
+        cu_k[1:] = torch.tensor(lens, device=q.device, dtype=torch.int32).cumsum(0)
+        part, part_lse = attention_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()),
+            max_seqlen_k=max(lens),
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_lse=True,
+        )
+        output, lse = merge_attention_states(output, lse, part, part_lse)
+    return output
+
+
 from dlengine.runtime.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
 )
@@ -189,6 +273,8 @@ def topk_indices_to_physical(
 
 
 __all__ = [
+    "chunked_prefix_mla_attention",
+    "merge_attention_states",
     "_compute_cached_split",
     "_interleave_cached_fresh",
     "_gather_kv_cached_concat",

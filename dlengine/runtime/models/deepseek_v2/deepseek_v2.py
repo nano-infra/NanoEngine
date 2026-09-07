@@ -33,6 +33,7 @@ from dlengine.runtime.layers.embed_head import ParallelLMHead, VocabParallelEmbe
 from dlengine.runtime.layers.backends.attention.mla_utils import (
     _gather_cache_cached_only,
     _interleave_cached_fresh,
+    chunked_prefix_mla_attention,
 )
 from dlengine.runtime.layers.backends.dsa.state import (
     IndexerTopKState as _IndexerTopKState,
@@ -1705,6 +1706,30 @@ class DeepseekV2Attention(nn.Module):
                     # k_cached_raw: [total_cached, 576]
                     comp_cached = k_cached_raw[:, : self.kv_lora_rank]
                     kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
+
+                    prefix_chunk_size = int(
+                        os.environ.get("DLENGINE_MLA_PREFIX_CHUNK_SIZE", "131072")
+                    )
+                    if prefix_chunk_size > 0 and k_cache.dtype == torch.float8_e4m3fn:
+                        varlen_func, is_fa3 = _get_prefill_varlen_func()
+                        if not is_fa3 or varlen_func is None:
+                            raise RuntimeError(
+                                "chunked MLA prefix Prefill requires FA3/FA4 return_lse support"
+                            )
+                        attn_output = chunked_prefix_mla_attention(
+                            q_full,
+                            k_expanded_fresh,
+                            v_expanded_fresh,
+                            k_cached_raw,
+                            cached_lens,
+                            context.cu_seqlens_q,
+                            kc_t,
+                            vc_reshaped,
+                            chunk_size=prefix_chunk_size,
+                            softmax_scale=self.softmax_scale,
+                            attention_func=varlen_func,
+                        )
+                        return self.o_proj(attn_output.reshape(q_len, -1))
 
                     k_nope_cached = (comp_cached @ kc_t).view(
                         -1, num_heads, self.qk_nope_head_dim

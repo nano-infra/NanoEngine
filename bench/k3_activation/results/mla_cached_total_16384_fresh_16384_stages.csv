@@ -1,0 +1,6 @@
+stage,allocated_bytes,peak_allocated_bytes,elapsed_seconds
+baseline,0,0,0.00018180592451244593
+restore latent cache,0,0,0.0007136199856176972
+expand cached K/V,0,0,0.0011174889514222741
+join cached + fresh,2424438784,2424438784,0.32987044600304216
+FlashAttention,2827091968,2827091968,9.04515254998114
