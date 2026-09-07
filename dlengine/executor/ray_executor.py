@@ -81,6 +81,10 @@ def _collect_dsv4_debug_env() -> dict[str, str] | None:
         # Force the slow non-absorbed MLA path for GLM-5.3's 256/256 shape;
         # FlashInfer TRTLLM-GEN only accepts the standard DeepSeek shapes.
         "DLENGINE_FORCE_MLA_REFERENCE",
+        # Bound K3 cached-prefix MLA expansion. Ray actors do not inherit this
+        # driver setting, so forward the override explicitly. The model uses
+        # 131072 tokens when the variable is unset.
+        "DLENGINE_MLA_PREFIX_CHUNK_SIZE",
     )
     debug_env = {
         key: value
