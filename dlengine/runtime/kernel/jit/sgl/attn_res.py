@@ -26,12 +26,13 @@ _CONFIG = {
 def _jit_module(chunk_rows: int, occupancy: int, consumer_regs: int):
     args = make_cpp_args(_DIM, _MAX_BANK_ROWS, chunk_rows, occupancy, consumer_regs)
     cls = f"AttnResFusedTmaKernel<{args}>"
-    # tcgen05/TMEM instructions require the architecture-specific target.
-    from tvm_ffi.cpp import extension
+    # tcgen05/TMEM instructions require the current GPU's architecture-specific
+    # target, matching the SGL_CUDA_ARCH macro injected by load_jit().
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
 
     key = "TVM_FFI_CUDA_ARCH_LIST"
     previous = os.environ.get(key)
-    os.environ[key] = "10.3a"
+    os.environ[key] = f"{major}.{minor}a"
     try:
         return load_jit(
             "kimi_k3_attn_res_fused_tma",
