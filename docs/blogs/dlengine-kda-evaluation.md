@@ -110,22 +110,11 @@ attention mechanism to a dense or MoE FFN.
 ```mermaid
 flowchart LR
     X["Embedding output"]
-    X --> L1["Decoder Layer 1<br/>KDA → Dense FFN"]
-    L1 --> L2["Decoder Layer 2<br/>KDA → MoE FFN"]
-    L2 --> L3["Decoder Layer 3<br/>KDA → MoE FFN"]
-    L3 --> L4["Decoder Layer 4<br/>MLA → MoE FFN"]
-
-    subgraph HB["Layers 5--92 · repeated 22 times"]
-        direction LR
-        K1["KDA → MoE FFN"]
-        K2["KDA → MoE FFN"]
-        K3["KDA → MoE FFN"]
-        M1["MLA → MoE FFN"]
-        K1 --> K2 --> K3 --> M1
-    end
-
-    L4 --> K1
-    M1 --> L93["Decoder Layer 93<br/>MLA → MoE FFN"]
+    X --> L1["Layer 1<br/>KDA → Dense FFN"]
+    L1 --> K2["Layers 2--3<br/>(KDA → MoE FFN) × 2"]
+    K2 --> M4["Layer 4<br/>MLA → MoE FFN"]
+    M4 --> REP["Layers 5--92<br/>[(KDA → MoE FFN) × 3<br/>→ MLA → MoE FFN] × 22"]
+    REP --> L93["Layer 93<br/>MLA → MoE FFN"]
     L93 --> N["Final RMSNorm"]
     N --> HEAD["LM head"]
 ```
@@ -134,11 +123,12 @@ At model level, execution resembles:
 
 ```text
 Embedding
-→ [(KDA/Linear Attention → FFN) × 3
-   → (MLA/Full Attention → FFN)] × 23
-→ Final MLA/Full Attention → MoE FFN
-→ Final normalization
-→ LM head
+→ Layer 1: KDA → Dense FFN
+→ Layers 2--3: (KDA → MoE FFN) × 2
+→ Layer 4: MLA → MoE FFN
+→ Layers 5--92: [(KDA → MoE FFN) × 3 → MLA → MoE FFN] × 22
+→ Layer 93: MLA → MoE FFN
+→ Final RMSNorm → LM head
 ```
 
 ## 3. Weight Footprint Analysis
@@ -149,21 +139,8 @@ Weight footprint is the static memory baseline for the later runtime-capacity an
 
 Use a horizontal stacked bar to show the fraction of the complete checkpoint assigned to each model component.
 
-| Component                          | Footprint (GB) |   Share |
-| ---------------------------------- | -------------: | ------: |
-| MoE routed experts                 |      1,446.456 | 92.670% |
-| KDA attention                      |         61.258 |  3.925% |
-| MoE shared experts                 |         24.310 |  1.557% |
-| MLA attention                      |         11.145 |  0.714% |
-| MoE router and latent projections  |         10.637 |  0.681% |
-| Embedding, LM head, and final norm |          4.698 |  0.301% |
-| Dense FFN                          |          1.453 |  0.093% |
-| Vision tower                       |          0.802 |  0.051% |
-| Multimodal projector               |          0.092 |  0.006% |
-| Norm and residual parameters       |          0.008 |  0.001% |
-
 <iframe
-  src="./assets/k3-weight-footprint.html"
+  src="../../assets/k3-weight-footprint.html"
   title="Interactive K3 weight-footprint analysis"
   width="100%"
   height="720"
@@ -171,34 +148,22 @@ Use a horizontal stacked bar to show the fraction of the complete checkpoint ass
   style="border: 0; border-radius: 12px;">
 </iframe>
 
-[Open the interactive weight-footprint view in a separate page](./assets/k3-weight-footprint.html)
+!!! important "Routed experts dominate total weight capacity"
 
-Each routed expert contains exactly one W1, W2, and W3 matrix. Each matrix occupies 5.505 MB of packed payload plus 0.344 MB of scale data, or 5.849 MB in total. Therefore one routed expert occupies 17.547 MB. This is a derived summary, not an additional branch in the footprint tree.
+    Routed experts account for **92.67%**, or **1.446 TB**, of the stored
+    checkpoint tensor payload. Expert parallelism is therefore the primary
+    mechanism for making the model weights fit across devices.
 
-The first-order result is that K3 weight capacity is dominated by routed experts. They account for 92.67% of the stored tensor payload.
+!!! warning "KDA and MLA weights are still a substantial replicated floor"
 
-### 3.2 Non-routed Weight Composition
+    KDA and MLA together occupy **72.403 GB**: **61.258 GB** for KDA and
+    **11.145 GB** for MLA. EP partitions routed experts, but it does not by
+    itself partition these attention weights. With DP+EP and no attention TP,
+    approximately **72.4 GB** of attention weights remains replicated per
+    rank, before embeddings, dense/shared FFNs, caches, and runtime workspaces
+    are included.
 
-The routed experts should be removed in a second chart so that the remaining 114.404 GB is visible. Use a horizontal bar or treemap for KDA, MLA, shared experts, router and latent projections, the dense FFN, embeddings, and the vision components. This view exposes the attention footprint that is hidden in the overall chart.
-
-Within the non-routed footprint, KDA is the largest component at approximately 53.55%, followed by shared experts at 21.25%, MLA at 9.74%, and MoE router and latent projections at 9.30%.
-
-### 3.3 Average Footprint per Layer
-
-Normalize each repeated component by its layer count. This separates total model composition from the cost of one layer instance.
-
-| Component                         | Total (GB) | Layer count | Average (GB/layer) |
-| --------------------------------- | ---------: | ----------: | -----------------: |
-| KDA attention                     |     61.258 |          69 |              0.888 |
-| MLA attention                     |     11.145 |          24 |              0.464 |
-| MoE routed experts                |  1,446.456 |          92 |             15.722 |
-| MoE shared experts                |     24.310 |          92 |              0.264 |
-| MoE router and latent projections |     10.637 |          92 |              0.116 |
-| Dense FFN                         |      1.453 |           1 |              1.453 |
-
-A KDA attention layer stores about 1.91 times as many weight bytes as an MLA attention layer. Nevertheless, one MoE layer stores far more weight than either attention type because it contains 896 routed experts.
-
-### 3.4 Weight Storage Format and Backing Dtype
+### 3.2 Weight Storage Format and Backing Dtype
 
 Use a fourth horizontal stacked bar to show the checkpoint payload by logical weight format. The backing tensor dtype should be shown as a secondary annotation, not as the primary category.
 
@@ -208,19 +173,42 @@ Use a fourth horizontal stacked bar to show the checkpoint payload by logical we
 | BF16           | BF16          |        114.360 |  7.327% | Attention, shared/dense FFN, embeddings, and other uncompressed weights |
 | FP32           | FP32          |          0.044 |  0.003% | Biases and selected numerical parameters                                |
 
-The routed-expert format is MXFP4. Safetensors represents its packed payload and associated metadata with U8 backing tensors; U8 describes the byte container, not an INT8 numerical format. No FP8 tensors are stored in this checkpoint. Storage format is also distinct from compute dtype: runtime kernels interpret the MXFP4 payload according to its quantization metadata, may accumulate in BF16 or FP32, and may create backend-specific packed buffers. Consequently, this chart describes checkpoint footprint; runtime resident memory must be measured separately after TP/EP sharding and weight preparation.
+The U8 tensors contain packed MXFP4 expert weights and quantization metadata; they are not INT8 weights, and the checkpoint contains no FP8 tensors. These values describe checkpoint storage, while per-rank runtime memory depends on sharding and backend weight preparation.
 
 ## 4. Cache Capacity: Latent Cache and SSM Slots
 
-This chapter separates K3's persistent runtime cache into two families. The MLA
-Latent Cache is allocated per cached token and therefore grows linearly with
-resident context length, whereas the KDA SSM Slot is allocated per resident
-sequence and remains fixed with respect to history length. The analysis will
-derive their per-layer and whole-model footprints, include cache dtype and
-allocation granularity, and identify the context-length crossover at which one
-family becomes the dominant cache-capacity cost.
+K3 has two persistent cache families with different capacity laws. Let $N_T$
+denote the number of cached tokens and $N_S$ the number of allocated sequence
+slots.
 
-## 5. Partitioning: Weights, Latent Cache, and SSM Slots
+| Cache tensor | Logical shape | Storage dtype | Whole-model capacity |
+| --- | --- | --- | ---: |
+| MLA latent cache | $[N_T, 512+64]$ | Mixed FP8 and BF16 | 15.744 KB/token |
+| KDA convolution state | $[N_S, 36864, 4]$ | BF16 | 20.349 MB/slot |
+| KDA recurrent state | $[N_S, 96, 128, 128]$ | BF16 | 217.055 MB/slot |
+
+The FP8 MLA layout stores 512 bytes of compressed latent, 16 bytes of FP32
+scales, and 128 bytes of BF16 K-RoPE per token per layer. Across K3, total
+persistent cache capacity is
+
+$$
+C_{\mathrm{cache}}
+= 15.744\,\mathrm{KB} \times N_T
++ 237.404\,\mathrm{MB} \times N_S.
+$$
+
+## 5. Activation Capacity Analysis
+
+Activations are transient tensors created while a batch moves through one
+decoder layer. Unlike weights and persistent caches, most activation buffers
+can be reused after the layer completes, so capacity is determined by peak
+liveness rather than by summing all 93 layers. This chapter will separately
+model Prefill activation peaks as a function of active token count and Decode
+activation peaks as a function of batch size, then account for KDA/MLA
+projection buffers, MoE routing and dispatch buffers, collective communication,
+and backend workspaces.
+
+## 6. Partitioning: Weights, Latent Cache, SSM Slots, and Activations
 
 This chapter maps the capacity results onto a distributed deployment. It will
 show how TP, EP, and DP affect routed and non-routed weights, whether the MLA
@@ -229,10 +217,10 @@ remains per rank for active requests. The result will be a per-rank capacity
 model that connects the static checkpoint footprint to feasible batch size and
 context length before the Prefill and Decode performance analysis.
 
-## 6. Prefill Analysis
+## 7. Prefill Analysis
 
 To be written after the target checkpoint configuration is confirmed.
 
-## 7. Decode Analysis
+## 8. Decode Analysis
 
 To be written after the target checkpoint configuration is confirmed.

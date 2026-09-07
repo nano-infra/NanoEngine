@@ -15,6 +15,6 @@ The local site is available at `http://127.0.0.1:8000/`. Run the same strict bui
 make build
 ```
 
-Site pages live under `docs/site/`. Internal design notes elsewhere under `docs/` are intentionally excluded from the generated artifact.
+Site pages live under `docs/site/`. Internal design notes elsewhere under `docs/` are excluded by default. A long-form article under `docs/blogs/` participates in the site build only when it is linked from `docs/site/blogs/` and added to `mkdocs.yml` navigation.
 
 Every documentation workflow run uploads `dlengine-docs-<commit>` for 14 days. Only users with repository access can download Actions artifacts. GitHub Pages publishing is intentionally disabled because standard Pages would make a site from this private personal repository publicly accessible.

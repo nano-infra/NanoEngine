@@ -37,7 +37,13 @@ theme:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.arithmatex:
+      generic: true
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -64,6 +70,8 @@ nav:
       - Feature Matrix: features.md
       - Supported Models: supported-models.md
       - GLM Recurrent MTP: glm-recurrent-mtp.md
+  - Blog:
+      - Kimi K3 Structure and Capacity: blogs/dlengine-kda-evaluation.md
   - Development:
       - Offline Inference: offline-inference.md
       - Performance Profiling: performance-profiling.md
@@ -76,5 +84,10 @@ extra:
 
 extra_css:
   - assets/stylesheets/dlengine.css
+
+extra_javascript:
+  - assets/javascripts/render-config.js
+  - https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.min.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js
 
 copyright: © 2026 DLEngine contributors.
