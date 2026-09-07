@@ -231,11 +231,16 @@ class Config(BaseModel):
     # while we burn in the new path. Requires FP8 weights and Hopper
     # (sm_90+); the experts layer falls back to the old path otherwise.
     use_mega_moe: bool = False
-    # Cap on tokens-per-rank for the mega-MoE symmetric buffer. Each
-    # routed-expert layer pre-allocates a SymmBuffer sized for this
-    # cap; bench/decode num_tokens must stay <= this value or the call
-    # raises with a helpful message.
-    mega_moe_max_tokens_per_rank: int = 256
+    mega_moe_max_tokens_per_rank: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "MegaMoE symmetric-buffer token capacity per rank. Zero automatically "
+            "covers K3 prefill/decode after attention-TP row sharding (minimum "
+            "256); other models retain 256. Explicit K3 limits must cover the "
+            "configured maximum batch."
+        ),
+    )
 
     # Per-step host-critical-path timing. Driver-side flag — threaded
     # into RunnerConfig at worker init so each Ray actor sees the same
@@ -721,6 +726,35 @@ class Config(BaseModel):
             # handled in the Rust scheduler directly from num_speculative_tokens;
             # nothing to inflate here. The decode loop always runs a single
             # iteration — MTP produces its extra tokens within that one step.
+
+        if self.hf_config.architectures[0] == "KimiK3ForConditionalGeneration":
+            # K3 shards a local attention batch over TP before MegaMoE. DP
+            # routing can place a whole prefill chunk on one group, so dividing
+            # this bound by attention_dp or ffn_ep would underallocate it.
+            # PP admission windows and total prompt length do not enlarge an
+            # individual forward. Include decode/verify and graph batch bounds.
+            max_rows = max(
+                self.max_num_batched_tokens,
+                self.max_num_seqs * (self.num_speculative_tokens + 1),
+                1,
+            )
+            required_capacity = (max_rows + self.attention_tp - 1) // self.attention_tp
+            if self.mega_moe_max_tokens_per_rank == 0:
+                self.mega_moe_max_tokens_per_rank = max(256, required_capacity)
+            elif self.mega_moe_max_tokens_per_rank < required_capacity:
+                raise ValueError(
+                    "K3 mega_moe_max_tokens_per_rank must be at least "
+                    f"{required_capacity} for max_num_batched_tokens="
+                    f"{self.max_num_batched_tokens}, max_num_seqs={self.max_num_seqs}, "
+                    f"and attention_tp={self.attention_tp}; use 0 for automatic sizing"
+                )
+            logger.info(
+                "K3 MegaMoE token capacity per rank: %d (required=%d)",
+                self.mega_moe_max_tokens_per_rank,
+                required_capacity,
+            )
+        elif self.mega_moe_max_tokens_per_rank == 0:
+            self.mega_moe_max_tokens_per_rank = 256
 
         if self.hf_config.architectures[0] in (
             "DeepseekV2ForCausalLM",

@@ -53,10 +53,14 @@ This halves the MLA page storage. KDA recurrent/conv state and model weights
 retain their existing precision, so total process memory is not halved.
 Both chunked prefill cache reuse and CUDA Graph decode use the selected format.
 
-For large K3 prefill batches, also size `--mega_moe_max_tokens_per_rank` to
-cover the tokens each expert-parallel rank receives. Its default is 256; this
-independent MegaMoE capacity limit applies to both BF16 and FP8 KV caches.
-Startup validation of this limit is tracked in [#365](https://github.com/JimyMa/NanoDeploy/issues/365).
+K3 automatically sizes MegaMoE's per-rank capacity for the configured prefill
+chunk and decode batch, including attention-TP padding. With TP8, chunks of
+8192, 16384, and 32768 tokens require capacities of 1024, 2048, and 4096.
+Attention-DP routing can put a full chunk on one group, so DP does not further
+divide this bound. Longer prompts reuse the same buffer across chunks.
+`--mega_moe_max_tokens_per_rank 0` selects automatic sizing (the default);
+explicit smaller capacities fail at startup. Larger chunks require more
+workspace memory independently of the selected KV-cache precision.
 
 Run the checkpoint-attention validator from an installed checkout:
 
