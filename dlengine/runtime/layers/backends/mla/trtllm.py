@@ -71,7 +71,7 @@ class TrtllmMlaAttention(MlaAttentionBase):
         if head_dim < kv_lora_rank:
             raise ValueError(
                 f"Invalid MLA dimensions: cache head_dim={head_dim}, "
-                f"kv_lora_rank={v_head_dim}"
+                f"kv_lora_rank={kv_lora_rank}"
             )
         if mla_qk_nope_head_dim is None:
             raise ValueError("Blackwell MLA requires mla_qk_nope_head_dim")
@@ -160,8 +160,10 @@ class TrtllmMlaAttention(MlaAttentionBase):
                 block_tables = torch.cat((block_tables, padding), dim=1)
         if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
             seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
+        # Absorbed MLA returns compressed values. The model applies W_UV
+        # afterwards to project kv_lora_rank to its configured v_head_dim.
         out = torch.empty(
-            (*query.shape[:-1], self.v_head_dim),
+            (*query.shape[:-1], self.kv_lora_rank),
             dtype=torch.bfloat16,
             device=query.device,
         )
@@ -187,7 +189,7 @@ class TrtllmMlaAttention(MlaAttentionBase):
             is_var_seq=True,
             uses_shared_paged_kv_idx=True,
         )
-        return result.reshape(-1, self.num_heads, self.v_head_dim)
+        return result.reshape(-1, self.num_heads, self.kv_lora_rank)
 
 
 __all__ = ["TrtllmMlaAttention", "_get_trtllm_workspace"]
