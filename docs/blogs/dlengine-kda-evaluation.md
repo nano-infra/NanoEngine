@@ -181,25 +181,22 @@ K3 has two persistent cache families with different capacity laws. Let $N_T$
 denote the number of cached tokens and $N_S$ the number of allocated sequence
 slots.
 
-| Cache tensor | Logical shape | Runtime storage | Whole-model capacity |
+| Cache tensor | Logical shape | Storage dtype | Whole-model capacity |
 | --- | --- | --- | ---: |
-| MLA latent cache | $[N_T,576]$ | BF16 by default; raw E4M3 when `--kv_cache_dtype fp8_e4m3` is selected on Blackwell | 27.648 KB/token BF16 or 13.824 KB/token FP8 |
+| MLA latent cache | $[N_T,512+64]$ | Mixed FP8/BF16 | 15.744 KB/token |
 | KDA convolution state | $[N_S,36864,4]$ | BF16 | 20.349 MB/slot |
 | KDA recurrent state | $[N_S,96,128,128]$ | BF16 | 217.055 MB/slot |
 
-The current K3 Blackwell FP8 implementation stores all 576 latent dimensions
-as raw E4M3 bytes. It is different from the older 656-byte mixed packed layout
-used by the synthetic experiment in Section 5.2. Across K3's 24 MLA and 69 KDA
-layers, the selected FP8 deployment has
+Each MLA layer uses 656 bytes per token: FP8 latent values and scales plus a
+BF16 RoPE component. Across 24 MLA and 69 KDA layers,
 
 $$
 C_{\mathrm{cache}}
-=13.824\,\mathrm{KB}\times N_T
+=15.744\,\mathrm{KB}\times N_T
 +237.404\,\mathrm{MB}\times N_S.
 $$
 
-At one million resident tokens this is 13.5 GiB of MLA cache. The BF16 default
-uses 27 GiB. The MLA latent is replicated across attention-TP ranks because all
+At one million resident tokens this is 15.375 GiB of MLA cache. The MLA latent is replicated across attention-TP ranks because all
 query-head shards consume it; KDA states are head-sharded by attention TP.
 
 ## 5. Activation Capacity Analysis
@@ -230,26 +227,19 @@ $$
 separately to expose allocator behavior but is not treated as tensor capacity.
 All experiments use inference mode and exclude backward activations.
 
-The first measurement uses one NVIDIA B300 SXM6 GPU with BF16 activations. A
-synthetic **1,048,576-token resident context** is allocated before the baseline,
-and the largest Prefill chunk contains **16,384 active tokens**. KDA receives a
-synthetic BF16 convolution state and recurrent state. MLA receives a synthetic
-mixed FP8/BF16 latent cache with the layout from Chapter 4. These persistent
-tensors are deliberately excluded from the incremental activation peak.
-
-The component sweep includes a fresh-only MLA control in which the 16K queries
-attend the 16K fresh tokens. A separate cached-prefix experiment executes the
-target scenario: 1,032,192 cached prefix tokens plus 16,384 fresh tokens, for a
-total context of 1,048,576. The current MoE point uses the single-GPU BF16 reference
-expert implementation with K3's 896 experts, Top-16 routing, latent width 3584,
-and intermediate width 3072. It preserves the activation shapes but is not the
-production MXFP4 MegaMoE kernel; distributed MegaMoE is deferred to the
-partitioning analysis.
-
 ### 5.2 Component-Level Experiments
 
 Measure the three dominant compute components independently before composing
 them into decoder layers.
+
+??? note "Experimental setup"
+
+    Measurements use one NVIDIA B300 SXM6, BF16 activations, and a maximum 16K
+    Prefill chunk. Persistent synthetic KDA state and MLA cache are allocated
+    before the activation baseline. MLA includes fresh-only and 1008K cached +
+    16K fresh cases. MoE includes the local BF16 reference and a NanoDeploy MegaMoE with a supported
+    world-size-one EP group; distributed EP is deferred to the
+    partitioning analysis.
 
 | Target | Measurement boundary | Main transient tensors to inspect |
 | --- | --- | --- |
@@ -270,7 +260,32 @@ At the 16K-token maximum, the measured operator-core peaks are:
 | --- | ---: | ---: |
 | KDA recurrence | 4.125 GiB | 264.00 KiB/token |
 | MLA Prefill attention | 0.375 GiB | 24.00 KiB/token |
-| Local BF16 routed experts | 15.176 GiB | 971.24 KiB/token |
+| Local BF16 routed experts | 7.010 GiB | 448.65 KiB/token |
+
+The local MoE reference explicitly materializes Top-16 token copies with shape
+$[N_A,16,3584]$. One such BF16 buffer is 1.75 GiB at 16K tokens, and roughly
+four buffers of that scale overlap at the measured peak. This is a property of
+the portable reference implementation, not a production MegaMoE workspace
+estimate. An earlier run accidentally retained autograd state and reported
+15.176 GiB; the corrected measurement uses `torch.inference_mode()`.
+
+#### World-Size-One MegaMoE
+
+NanoDeploy now accepts `ffn_ep=1` in `MegaMoEExperts` and uses the initialized WORLD process group when no explicit EP group is supplied. The benchmark executes that production wrapper with K3's 896 experts, Top-16 routing, a 3584-to-3072 expert shape, packed MXFP4 weights, and SiTU activation.
+
+![K3 NanoDeploy MegaMoE EP=1 memory](../assets/megamoe-ws1-activation.png)
+
+MegaMoE allocates one persistent symmetric buffer on first use and reuses it across forwards and decoder layers. For configured capacity `T`, DeepGEMM first aligns the per-rank token capacity to `Ta = 384 ceil(T/384)`. With `R` ranks, `E` experts, and Top-K `K`, the shared expert-token pool is sized as `P = 384 ceil((R Ta min(K, E/R) + (E/R) 191)/384)`. The extra 191-token allowance per local expert covers the largest supported 192-row GEMM tile before final alignment.
+
+The buffer then lays out persistent input, scale, Top-K metadata, expert-token pools, and kernel synchronization metadata. For K3 at `R=1`, `E=896`, `K=16`, `H=3584`, `I=3072`, and `T=16384`, alignment gives `Ta=16512` and `P=435456`. The principal views are `x [Ta,H]` FP8, `x_sf [Ta,H/128]` INT32, Top-K indices and weights `[Ta,K]`, `l1_acts [P,H]` FP8, `l1_acts_sf [16P,H/128]` INT32, `l2_acts [P,I]` FP8, and `l2_acts_sf [16P,I/128]` INT32. DeepGEMM's authoritative layout function sums these views plus barriers, counters, source metadata, and alignment padding. It reports **5.935 GiB logical bytes**; the measured CUDA free-memory delta is **5.939 GiB**. This allocation is outside PyTorch's CUDA allocator and is not multiplied by K3's 92 MoE layers. After allocation, both the
+first and warmed forward add exactly 7,168 bytes per token—the BF16
+$[N_A,3584]$ output—giving **0.109 GiB at 16K**. The combined workspace plus
+forward increment is 6.048 GiB, versus 7.010 GiB dynamically allocated by the
+BF16 reference.
+
+The 16K steady kernel latency is 12.56 ms on one B300. With `ffn_ep=1`, this is a supported local MegaMoE path and has no inter-rank EP traffic. It isolates the kernel's capacity behavior from partitioning costs. The key distinction is that MegaMoE
+moves most Top-16 temporary storage into a fixed, reusable workspace instead of
+allocating several token-expanded tensors during every forward.
 
 All three curves are approximately linear over the measured range. At a fixed
 16K active-token total, KDA and MLA produced the same peak for $1\times16384$,
@@ -359,11 +374,9 @@ path. The setting is forwarded from the driver to Ray model workers. BF16 MLA
 cache behavior is unchanged.
 
 The experiment fixes total context at 1,048,576 tokens and the fresh Prefill
-chunk at 16,384 tokens. It uses an older synthetic 656-byte mixed packed cache,
-then measures restore, K/V expansion, attention, and online output/LSE merge.
-This is not the current K3 Blackwell production layout, which stores 576 raw
-E4M3 bytes per token per layer. Each point performs one unreported warm-up and
-one CUDA-event-timed forward.
+chunk at 16,384 tokens. It uses a synthetic 656-byte mixed cache, then measures restore, K/V expansion,
+attention, and online output/LSE merge. Each point performs one unreported
+warm-up and one CUDA-event-timed forward.
 
 ![MLA prefix split memory and latency trade-off](../assets/mla-prefix-split-tradeoff.png)
 
@@ -379,8 +392,8 @@ and the complete layer.
 
     These points establish the expansion-memory scaling of a synthetic
     single-layer path. They do not validate current K3 FP8 numerical quality or
-    production latency. Chapter 6 uses the actual 576-byte Blackwell cache
-    capacity and treats these activation results only as shape evidence.
+    production latency. Chapter 6 uses the mixed-cache capacity and treats
+    these activation results only as shape evidence.
 
 ### 5.3 Complete-Layer Experiments
 
@@ -499,15 +512,15 @@ the estimate toward **136.7 GB/rank**. Backend repacking and first-use
 workspaces must be added separately.
 
 For a rank owning $N_T$ resident tokens and $N_S$ active sequence slots, the
-production Blackwell FP8 cache estimate is
+mixed-cache estimate is
 
 $$
 M_{\mathrm{rank}}^{\mathrm{cache}}
-=24\times576N_T
+=24\times656N_T
 +\frac{237.404\,\mathrm{MB}}{T_A}N_S.
 $$
 
-Thus a one-million-token request costs 13.5 GiB of MLA cache on every rank in
+Thus a one-million-token request costs 15.375 GiB of MLA cache on every rank in
 its attention-TP group. One KDA slot costs 226.4 MiB at $T_A=1$, but only about
 28.3 MiB at $T_A=8$. TP is therefore highly effective for KDA slots and
 attention weights, but it does not divide the MLA latent cache. The final
@@ -565,7 +578,7 @@ KDA's history-independent compute does not mean zero state traffic. Each layer
 reads and writes roughly 3.44 MB of convolution and recurrent state per sequence
 at $T_A=1$, or about 6.88 MB of state traffic per Decode step. TP divides this
 term by $T_A$. MLA behaves oppositely: at 1M context its FP8 latent-cache lower
-bound is 576 MiB per layer, and all 24 MLA layers expose 13.5 GiB of persistent
+bound is 656 MiB per layer, and all 24 MLA layers expose 15.375 GiB of persistent
 cache bytes per generated token before implementation-specific rereads.
 
 For the 1M/16K cached-Prefill case, expanding one layer's latent cache produces
@@ -645,7 +658,7 @@ Three constraints dominate different operating points:
    replicated shared/router/latent weights remain large. Attention TP is needed
    to avoid carrying the additional 72.4 GB KDA+MLA floor intact.
 2. **Long-context capacity and traffic:** attention TP divides KDA slots but not
-   MLA latent rows. At 1M context, the explicit K3 FP8 option still costs 13.5
+   MLA latent rows. At 1M context, the mixed MLA cache costs 15.375
    GiB per attention rank, and cached-prefix MLA dominates compute and K/V
    traffic unless its expansion is chunked.
 3. **Boundary communication:** Prefill moves large tensors and benefits from

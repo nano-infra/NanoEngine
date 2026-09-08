@@ -63,8 +63,8 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
         **_: object,
     ) -> None:
         super().__init__()
-        if ep_size <= 1:
-            raise ValueError("MegaMoE requires expert parallelism (ffn_ep > 1).")
+        if ep_size < 1:
+            raise ValueError(f"MegaMoE requires a positive ffn_ep; got {ep_size}.")
         if tp_size != 1:
             raise ValueError(
                 "MegaMoE uses the FFN EP axis and requires ffn_tp=1; "
@@ -235,8 +235,16 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
     def _get_buffer(self):
         if self._mega_moe_buf is None:
             deep_gemm = require_deep_gemm()
+            group = self.ep_group
+            if group is None:
+                if not torch.distributed.is_initialized():
+                    raise RuntimeError(
+                        "MegaMoE requires an initialized distributed process "
+                        "group, including when ffn_ep=1."
+                    )
+                group = torch.distributed.group.WORLD
             key = (
-                id(self.ep_group),
+                id(group),
                 self.num_experts,
                 self.max_tokens_per_rank,
                 self.top_k,
@@ -245,7 +253,7 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
             )
             if key not in _SYMM_BUFFER_CACHE:
                 _SYMM_BUFFER_CACHE[key] = deep_gemm.get_symm_buffer_for_mega_moe(
-                    self.ep_group,
+                    group,
                     self.num_experts,
                     self.max_tokens_per_rank,
                     self.top_k,
@@ -279,6 +287,12 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
 
         buf = self._get_buffer()
         deep_gemm = require_deep_gemm()
+        # Newer DeepGEMM builds expose symmetric-buffer views as
+        # DLPack-compatible tvm_ffi tensors. Normalize the one view that needs
+        # a dtype reinterpretation; the FFI accepts the remaining views.
+        buf_x = buf.x
+        if not isinstance(buf_x, torch.Tensor):
+            buf_x = torch.from_dlpack(buf_x)
         # DeepGEMM packs four group-32 FP8 scales into each int32 x_sf
         # element. A regular quant helper returns one float32 per group and is
         # therefore layout-incompatible with SymmBuffer.x_sf.
@@ -286,7 +300,7 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
             hidden_states,
             topk_ids.to(torch.int32),
             topk_weights.to(torch.float32),
-            buf.x.view(torch.float8_e4m3fn),
+            buf_x.view(torch.float8_e4m3fn),
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
