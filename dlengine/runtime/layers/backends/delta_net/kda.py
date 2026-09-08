@@ -1,4 +1,4 @@
-"""Kimi Delta Attention using FlashInfer's public recurrent KDA kernel."""
+"""Kimi Delta Attention with optimized Prefill and Decode kernels."""
 
 from __future__ import annotations
 
@@ -28,20 +28,12 @@ class SigmoidRMSNormGated(nn.Module):
 class FlashInferKda(GenericGatedDeltaNet):
     """K3 KDA with attention-TP sharding and the shared linear-state pool.
 
-    The inherited methods implement only causal depthwise convolution and
-    state-slot hygiene. The recurrence itself is always FlashInfer KDA; there
-    is no GDN/torch fallback.
+    Prefill uses ragged Triton causal convolution plus chunk KDA recurrence.
+    Decode uses fused projection, convolution-update, and recurrent kernels.
     """
 
     def __init__(self, layer_idx: int, state_layer_idx: int, config) -> None:
         nn.Module.__init__(self)
-        try:
-            from flashinfer import recurrent_kda
-        except (ImportError, RuntimeError) as exc:
-            raise RuntimeError(
-                "Kimi K3 requires FlashInfer with recurrent_kda support."
-            ) from exc
-        self._recurrent_kda = recurrent_kda
         try:
             from dlengine.runtime.kernel.triton.fla.kda import chunk_kda
         except (ImportError, RuntimeError) as exc:
@@ -64,7 +56,9 @@ class FlashInferKda(GenericGatedDeltaNet):
             )
         self.num_k_heads = self.num_v_heads = total_heads // tp
         self.head_k_dim = int(linear["head_dim"])
-        self.head_v_dim = int(linear.get("value_head_dim", linear.get("head_dim", config.v_head_dim)))
+        self.head_v_dim = int(
+            linear.get("value_head_dim", linear.get("head_dim", config.v_head_dim))
+        )
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.kv_ratio = 1
@@ -126,7 +120,16 @@ class FlashInferKda(GenericGatedDeltaNet):
         # BF16 even when the global model quantization config is FP8; the
         # correctness fallback below must not reinterpret BF16 bytes as FP8.
         if self._is_glm5_next:
-            for _proj in (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.b_proj, self.f_a_proj, self.f_b_proj, self.o_proj):
+            for _proj in (
+                self.q_proj,
+                self.k_proj,
+                self.v_proj,
+                self.g_proj,
+                self.b_proj,
+                self.f_a_proj,
+                self.f_b_proj,
+                self.o_proj,
+            ):
                 _proj.weight.data = _proj.weight.data.to(torch.bfloat16)
 
         self.conv1d = nn.Conv1d(
@@ -184,10 +187,74 @@ class FlashInferKda(GenericGatedDeltaNet):
         if self.fused_a_beta_weight is None or self.fused_qkvg_weight is None:
             self.prepare_fused_decode_projections()
 
+    def _prefill_causal_conv_qkv(self, q, k, v, context):
+        """Run K3 Prefill convolution directly on ragged Q/K/V tensors.
+
+        The Triton kernel reads and updates the persistent convolution slots in
+        place. This avoids the padded QKV workspace and the separate tail-state
+        extraction used by the generic causal-convolution mixin.
+        """
+        conv_pool = getattr(context, "gdn_conv_states", None)
+        slots = getattr(context, "gdn_state_slots_i32", None)
+        cu_q = context.cu_seqlens_q.to(torch.int32)
+        cu_k = getattr(context, "cu_seqlens_k", None)
+        if conv_pool is None or slots is None or cu_k is None:
+            mixed = torch.cat((q, k, v), dim=-1)
+            mixed = self._apply_conv1d(mixed, context)
+            return mixed.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
+
+        from dlengine.runtime.kernel.triton.generic.k3_causal_conv1d_prefill import (
+            causal_conv1d_fn,
+        )
+
+        num_seqs = cu_q.numel() - 1
+        query_lens = cu_q[1:] - cu_q[:-1]
+        key_lens = cu_k.to(torch.int32)[1:] - cu_k.to(torch.int32)[:-1]
+        has_initial_state = key_lens > query_lens
+        # The list only defines a conservative launch grid. Per-sequence bounds
+        # are read from cu_q inside the kernel, so ragged batches remain exact.
+        seq_lens_cpu = [int(context.max_seqlen_q)] * num_seqs
+        state = conv_pool[self.layer_idx, :, :, 1:]
+        weights = self.conv1d.weight.squeeze(1)
+        q_w, k_w, v_w = weights.split(
+            (self.key_dim, self.key_dim, self.value_dim), dim=0
+        )
+        q_state, k_state, v_state = state.split(
+            (self.key_dim, self.key_dim, self.value_dim), dim=1
+        )
+
+        outputs = []
+        for x, weight, conv_state in (
+            (q, q_w, q_state),
+            (k, k_w, k_state),
+            (v, v_w, v_state),
+        ):
+            out = causal_conv1d_fn(
+                x.transpose(0, 1),
+                weight,
+                None,
+                conv_states=conv_state,
+                query_start_loc=cu_q,
+                cache_indices=slots[:num_seqs],
+                has_initial_state=has_initial_state,
+                activation="silu",
+                seq_lens_cpu=seq_lens_cpu,
+            )
+            outputs.append(out.transpose(0, 1))
+        return tuple(outputs)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_batch_context()
         total_tokens = hidden_states.shape[0]
-        linear = lambda layer, x: F.linear(x, layer.weight.to(x.dtype), getattr(layer, "bias", None)) if (self._is_glm5_next and os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower() in {"1", "true", "yes"}) else layer(x)
+        linear = lambda layer, x: (
+            F.linear(x, layer.weight.to(x.dtype), getattr(layer, "bias", None))
+            if (
+                self._is_glm5_next
+                and os.environ.get("NANO_DISABLE_DEEP_GEMM", "").lower()
+                in {"1", "true", "yes"}
+            )
+            else layer(x)
+        )
         if context.is_prefill:
             q = linear(self.q_proj, hidden_states)
             k = linear(self.k_proj, hidden_states)
@@ -214,14 +281,14 @@ class FlashInferKda(GenericGatedDeltaNet):
             # Tiny GEMM does not support the padded GLM-5.3 KDA layout on all Blackwell builds.
             fused_a_beta = F.linear(hidden_states, self.fused_a_beta_weight)
             beta = fused_a_beta[:, self.head_k_dim : self.head_k_dim + self.num_v_heads]
-            forget = F.linear(fused_a_beta[:, : self.head_k_dim], self.f_b_proj.weight.to(torch.bfloat16))
+            forget = F.linear(
+                fused_a_beta[:, : self.head_k_dim],
+                self.f_b_proj.weight.to(torch.bfloat16),
+            )
 
         if context.is_prefill:
             self._zero_fresh_slots(context)
-        if context.is_prefill:
-            mixed_qkv = torch.cat((q, k, v), dim=-1)
-        if context.is_prefill:
-            qkv = self._apply_conv1d(mixed_qkv, context)
+            q, k, v = self._prefill_causal_conv_qkv(q, k, v, context)
         else:
             from dlengine.runtime.kernel.triton.generic.k3_causal_conv import (
                 k3_causal_conv_update,
@@ -234,12 +301,12 @@ class FlashInferKda(GenericGatedDeltaNet):
             else:
                 conv_pool = conv_pool[self.layer_idx]
                 qkv = k3_causal_conv_update(
-                mixed_qkv,
-                conv_pool,
-                self.conv1d.weight.squeeze(1),
+                    mixed_qkv,
+                    conv_pool,
+                    self.conv1d.weight.squeeze(1),
                     context.gdn_state_slots_i32[:total_tokens],
                 )
-        q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
+            q, k, v = qkv.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
         q = q.view(total_tokens, self.num_k_heads, self.head_k_dim)
         k = k.view(total_tokens, self.num_k_heads, self.head_k_dim)
         v = v.view(total_tokens, self.num_v_heads, self.head_v_dim)
