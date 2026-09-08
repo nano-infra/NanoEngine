@@ -63,7 +63,7 @@ def main() -> None:
             ),
         },
         "persistent_cache_at_1m_gib": {
-            "mla_raw_fp8_all_layers": TOTAL_CONTEXT * 576 * MLA_LAYERS / 2**30,
+            "mla_mixed_fp8_bf16_all_layers": TOTAL_CONTEXT * 656 * MLA_LAYERS / 2**30,
             "mla_bf16_all_layers": TOTAL_CONTEXT * 1152 * MLA_LAYERS / 2**30,
             "kda_slot_tp1": (
                 (
