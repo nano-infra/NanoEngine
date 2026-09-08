@@ -352,6 +352,25 @@ class LocalScheduler:
             engine_id=self.engine_id,
         )
 
+    def stage_batch(
+        self,
+        commands: tuple[AddCommand, ...],
+        sequences: tuple[Sequence, ...],
+    ) -> tuple[AddResult, ...]:
+        """Validate and enqueue a batch before the scheduler timer starts.
+
+        The centralized profiler constructs its waiting queue before timing
+        ``Scheduler.schedule()``.  This helper gives the hierarchical
+        profiler the same boundary while retaining the normal per-request
+        validation and duplicate semantics.
+        """
+        if len(commands) != len(sequences):
+            raise ValueError("admission command/Sequence count mismatch")
+        return tuple(
+            self.add(command, sequence)
+            for command, sequence in zip(commands, sequences, strict=True)
+        )
+
     def _discard_waiting_request(self, request_id: int) -> None:
         record = self._records.get(request_id)
         if record is None:
@@ -429,6 +448,7 @@ class LocalScheduler:
         batch_master_counts: list[int],
         batch_receiver_counts: list[int],
         batch_tokens: list[int],
+        batch_prefill_blocks: list[int],
         padded_completion_len: int,
     ) -> bool:
         attention_sp = self.topology.attention_sp
@@ -487,10 +507,18 @@ class LocalScheduler:
                 * self.config.reserved_blocks_per_req
             )
             block_manager = self._state_manager.block_manager[sp_idx]
+            # The native bulk commit happens after this validation loop, so
+            # account for blocks claimed by earlier requests in this same
+            # batch explicitly.  Previously Python allocation happened
+            # inline and the block manager reflected this automatically.
+            free_blocks_after_batch = (
+                block_manager.num_free_blocks - batch_prefill_blocks[sp_idx]
+            )
             if (
-                block_manager.num_free_blocks
+                free_blocks_after_batch
                 < prefill_blocks + reserved_blocks
-                or not block_manager.can_allocate(sequence)
+                or free_blocks_after_batch
+                < sequence.num_blocks(BlockContextSlot.ACTIVE, sp_idx)
             ):
                 return False
         return self._state_manager.can_fit_lifetime(
@@ -502,6 +530,8 @@ class LocalScheduler:
         commands: tuple[AddCommand, ...],
         reservations: tuple[AdmissionReservation, ...],
         sequences: tuple[Sequence, ...],
+        *,
+        pre_staged: bool = False,
     ) -> tuple[AddResult, ...]:
         """Validate and commit LB-selected placements without replanning."""
         if not len(commands) == len(reservations) == len(sequences):
@@ -509,13 +539,40 @@ class LocalScheduler:
                 "planned admission command/reservation/Sequence count mismatch"
             )
         active_load = self._active_load_state()
-        results = [
-            self.add(command, sequence)
-            for command, sequence in zip(commands, sequences, strict=True)
-        ]
+        if pre_staged:
+            results = []
+            for command, sequence in zip(commands, sequences, strict=True):
+                record = self._records.get(command.request_id)
+                if (
+                    record is None
+                    or record.sequence is not sequence
+                    or record.state != RequestState.WAITING_ADMISSION
+                ):
+                    results.append(
+                        AddResult(
+                            request_id=command.request_id,
+                            accepted=False,
+                            engine_id=self.engine_id,
+                            reason="staged_request_missing",
+                        )
+                    )
+                else:
+                    results.append(
+                        AddResult(
+                            request_id=command.request_id,
+                            accepted=True,
+                            engine_id=self.engine_id,
+                        )
+                    )
+        else:
+            results = [
+                self.add(command, sequence)
+                for command, sequence in zip(commands, sequences, strict=True)
+            ]
         batch_master_counts = [0] * self.topology.attention_sp
         batch_receiver_counts = [0] * self.topology.attention_sp
         batch_tokens = [0] * self.topology.attention_sp
+        batch_prefill_blocks = [0] * self.topology.attention_sp
         admitted = []
         state_mismatch = False
         for index, (command, reservation, result) in enumerate(
@@ -544,6 +601,7 @@ class LocalScheduler:
                     batch_master_counts=batch_master_counts,
                     batch_receiver_counts=batch_receiver_counts,
                     batch_tokens=batch_tokens,
+                    batch_prefill_blocks=batch_prefill_blocks,
                     padded_completion_len=record.padded_completion_len,
                 )
             )
@@ -563,9 +621,6 @@ class LocalScheduler:
                 raise RuntimeError(
                     "planned admission lost local FIFO ownership"
                 )
-            self._state_manager.allocate(sequence)
-            sequence.status = SequenceStatus.RUNNING
-            self._state_manager.running.append(sequence)
             batch_master_counts[reservation.master_sp_idx] += 1
             for sp_idx, token_count in enumerate(
                 reservation.dispatched_tokens
@@ -575,9 +630,28 @@ class LocalScheduler:
                     and sp_idx != reservation.master_sp_idx
                 ):
                     batch_receiver_counts[sp_idx] += 1
+                batch_prefill_blocks[sp_idx] += (
+                    sequence.num_blocks(BlockContextSlot.ACTIVE, sp_idx)
+                )
             batch_tokens[reservation.master_sp_idx] += sequence.num_tokens
             admitted.append(sequence)
 
+        # Placement checks above intentionally remain in Python for contract
+        # diagnostics.  The state transition itself is a native bulk call so
+        # queue mutation and KV allocation do not pay one Python round-trip per
+        # request.  Keep a compatibility fallback for an extension that was
+        # built before the bulk entry point was added; a rebuilt extension
+        # always takes the native branch.
+        native_commit = getattr(
+            self._scheduler, "commit_planned_sequences", None
+        )
+        if native_commit is None:
+            for sequence in admitted:
+                self._state_manager.allocate(sequence)
+                sequence.status = SequenceStatus.RUNNING
+                self._state_manager.running.append(sequence)
+        else:
+            native_commit(admitted)
         admitted_ids = set(self._finalize_admitted(admitted))
         for index, (command, result) in enumerate(
             zip(commands, results, strict=True)
@@ -699,11 +773,47 @@ class LocalScheduler:
         return waiting, running
 
     def plan_decode(self, *, wave_id: int, quantum_id: int) -> LocalDecodeBatch:
+        """Plan one decode batch through the native C++ scheduler.
+
+        The native scheduler call is kept separate from the Python contract
+        bookkeeping so callers that need to measure the scheduler boundary can
+        use the exact same C++ ``Scheduler.schedule()`` call as the
+        centralized path and build the batch afterwards.
+        """
+        return self.build_decode_batch_from_schedule_result(
+            self._scheduler.plan_decode(),
+            wave_id=wave_id,
+            quantum_id=quantum_id,
+        )
+
+    def build_decode_batch_from_schedule_result(
+        self,
+        schedule_result: object,
+        *,
+        wave_id: int,
+        quantum_id: int,
+    ) -> LocalDecodeBatch:
+        """Build contract metadata from an already-computed native result.
+
+        ``schedule_result`` must be the result of this LocalScheduler's
+        underlying native scheduler.  Keeping this conversion outside the
+        native timing interval avoids charging Python-only batch bookkeeping
+        to the scheduler algorithm metric.
+        """
         if self._inflight_ids:
             raise RuntimeError("cannot freeze a second batch while one is in flight")
 
         self._invalidate_active_load_state()
-        sequences = list(self._scheduler.plan_decode()[0])
+        # ``Scheduler.schedule()`` returns a ``ScheduleResult`` while the
+        # legacy ``plan_decode()`` binding returns the raw DP-sequence vector.
+        # Accept both representations so the public helper remains backward
+        # compatible with existing contract callers.
+        dp_seqs = getattr(schedule_result, "dp_seqs", schedule_result)
+        if len(dp_seqs) != 1:
+            raise RuntimeError(
+                "LocalScheduler native result must contain exactly one DP batch"
+            )
+        sequences = list(dp_seqs[0])
         waiting_count, running_count = self._reconcile_preemptions()
         attention_sp = self.topology.attention_sp
         master_counts = [0] * attention_sp

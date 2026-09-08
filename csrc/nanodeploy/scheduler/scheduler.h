@@ -102,6 +102,13 @@ public:
     std::vector<std::vector<std::shared_ptr<Sequence>>> admit();
     std::vector<std::vector<std::shared_ptr<Sequence>>> plan_decode();
 
+    // Commit a batch whose SP/KV placement has already been validated by the
+    // hierarchical admission planner.  The caller removes these sequences
+    // from its waiting queue after validating FIFO order; this method keeps
+    // allocation, status transition, and running-queue insertion native.
+    void commit_planned_sequences(
+        const std::vector<std::shared_ptr<Sequence>>& sequences);
+
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,

@@ -5,8 +5,9 @@ The legacy ``profile_scheduler_scalability.py`` measures one deployment-wide
 C++ ``Scheduler``.  Hierarchical serving has a different ownership boundary:
 one frontend ``RequestRouter`` plans admission, then independent
 ``LocalScheduler`` instances own decode scheduling.  This profiler therefore
-reports the centralized frontend cost, local admission/quantum CPU cost, and a
-modelled distributed critical path separately.
+reports the full control-plane path, scheduler-only local admission/decode
+cost on a matching boundary, and a modelled distributed critical path
+separately.
 
 The workload matches the legacy profiler: one logical node contains eight
 logical GPUs and ``batch_size_per_gpu`` produces the same total request count.
@@ -530,6 +531,22 @@ def _run_admission_once(
     request_ids_by_engine: list[tuple[int, ...]] = []
     actual_sp1 = 0
     actual_sp8 = 0
+    # Queue insertion is setup, matching the centralized profiler's
+    # ``Scheduler.add`` boundary. The timed section below measures only the
+    # planned LocalScheduler admission transition.
+    for scheduler, transport in zip(
+        schedulers, transports.values(), strict=True
+    ):
+        for batch_commands, _reservations in transport.planned_batches:
+            batch_sequences = tuple(
+                sequences[command.request_id] for command in batch_commands
+            )
+            staged = scheduler.stage_batch(batch_commands, batch_sequences)
+            if not all(result.accepted for result in staged):
+                raise RuntimeError(
+                    "LocalScheduler rejected a staged profiling admission"
+                )
+
     for engine_id, (scheduler, transport) in enumerate(
         zip(schedulers, transports.values(), strict=True)
     ):
@@ -545,6 +562,7 @@ def _run_admission_once(
                 batch_commands,
                 reservations,
                 batch_sequences,
+                pre_staged=True,
             )
             engine_commit_ms += (time.perf_counter() - begin) * 1000.0
             if not all(result.accepted for result in results):
@@ -625,6 +643,9 @@ def _run_admission_once(
         "local_commit_sum_ms": local_commit_sum_ms,
         "local_commit_critical_ms": local_commit_critical_ms,
         "router_add_result_ms": router_add_result_ms,
+        # Primary fair-boundary admission metric. Router planning and receipt
+        # handling remain available above as control-plane diagnostics.
+        "scheduler_admission_critical_ms": local_commit_critical_ms,
         "modelled_admission_critical_ms": modelled_admission_critical_ms,
     }
     return (
@@ -668,19 +689,36 @@ def _run_local_quantum(
     *,
     quantum_id: int,
 ) -> dict[str, float]:
-    begin = time.perf_counter()
-    admitted = scheduler.admit()
-    admit_ms = (time.perf_counter() - begin) * 1000.0
-    if admitted:
-        raise RuntimeError("steady-state scheduler unexpectedly admitted work")
-
+    # Keep the primary decode metric on the same native boundary as the
+    # centralized profiler: one call to C++ Scheduler.schedule().  Contract
+    # bookkeeping remains necessary for state progression, but it is measured
+    # separately after the native call and is not charged to scheduler_cpu_ms.
     begin = time.perf_counter()
     scheduler.load_snapshot(wave_id=1, quantum_id=quantum_id)
     pre_load_ms = (time.perf_counter() - begin) * 1000.0
 
-    begin = time.perf_counter()
-    batch = scheduler.plan_decode(wave_id=1, quantum_id=quantum_id)
-    plan_decode_ms = (time.perf_counter() - begin) * 1000.0
+    # The centralized profiler disables cyclic GC around its measured decode
+    # call. Mirror that runtime condition for the native decentralized
+    # boundary, then restore it before Python contract bookkeeping starts.
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        begin = time.perf_counter()
+        schedule_result = scheduler.cpp_scheduler.schedule()
+        native_schedule_ms = (time.perf_counter() - begin) * 1000.0
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    if schedule_result.is_prefill:
+        raise RuntimeError("steady-state scheduler unexpectedly admitted work")
+
+    # Build the hierarchical contract view outside the native scheduler timer.
+    batch = scheduler.build_decode_batch_from_schedule_result(
+        schedule_result,
+        wave_id=1,
+        quantum_id=quantum_id,
+    )
     if not batch.engine_has_real:
         raise RuntimeError("hierarchical profiler produced an all-dummy batch")
 
@@ -701,21 +739,25 @@ def _run_local_quantum(
     begin = time.perf_counter()
     scheduler.load_snapshot(wave_id=1, quantum_id=quantum_id + 1)
     post_load_ms = (time.perf_counter() - begin) * 1000.0
-    scheduler_cpu_ms = (
-        admit_ms
-        + pre_load_ms
-        + plan_decode_ms
+    # This is deliberately the same scheduler-only boundary as the
+    # centralized profiler.  The remaining phases are retained as diagnostic
+    # control-plane bookkeeping, not folded into the primary decode metric.
+    scheduler_cpu_ms = native_schedule_ms
+    contract_overhead_ms = (
+        pre_load_ms
         + mark_first_schedule_ms
         + postprocess_ms
         + post_load_ms
     )
     return {
-        "admit_ms": admit_ms,
+        "admit_ms": 0.0,
         "pre_load_ms": pre_load_ms,
-        "plan_decode_ms": plan_decode_ms,
+        "plan_decode_ms": native_schedule_ms,
+        "native_schedule_ms": native_schedule_ms,
         "mark_first_schedule_ms": mark_first_schedule_ms,
         "postprocess_ms": postprocess_ms,
         "post_load_ms": post_load_ms,
+        "contract_overhead_ms": contract_overhead_ms,
         "scheduler_cpu_ms": scheduler_cpu_ms,
     }
 
@@ -1081,11 +1123,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 records.append(record)
                 admission = record["admission_ms"][
+                    "scheduler_admission_critical_ms"
+                ]["mean"]
+                control_plane_admission = record["admission_ms"][
                     "modelled_admission_critical_ms"
                 ]["mean"]
                 decode = record["modelled_parallel_quantum_ms"]["mean"]
                 print(
-                    f"  admission modelled-critical={admission:.3f} ms | "
+                    f"  admission scheduler-critical={admission:.3f} ms "
+                    f"(control-plane={control_plane_admission:.3f} ms) | "
                     f"decode modelled-critical={decode:.3f} ms",
                     flush=True,
                 )
@@ -1100,11 +1146,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "repo_root": str(REPO_ROOT),
             "model_config_path": str(Path(args.model) / "config.json"),
             "gpus_per_logical_node": GPUS_PER_LOGICAL_NODE,
+            "implementation": {
+                "admission_commit": (
+                    "LocalScheduler.commit_planned_sequences (native C++)"
+                ),
+                "decode_scheduler": (
+                    "LocalScheduler.cpp_scheduler.schedule (native C++)"
+                ),
+                "python_contract_bookkeeping": "diagnostic-only",
+            },
             "timed_scope": (
-                "production RequestRouter least-batch admission planning and "
-                "immediate receipt processing; LocalScheduler load snapshots, "
-                "planned commit, steady-state admit, plan_decode, first-forward "
-                "marking, and postprocess"
+                "primary scheduler-only admission is LocalScheduler planned "
+                "commit after queue insertion; primary decode is native C++ "
+                "Scheduler.schedule(); Router planning/receipt, snapshots, "
+                "first-forward marking, and postprocess remain separate "
+                "diagnostic phases"
             ),
             "excluded_scope": (
                 "Config/LocalScheduler construction, Sequence construction, "
@@ -1113,8 +1169,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "critical_path_definition": (
                 "LocalSchedulers run serially in this CPU harness. Modelled "
-                "parallel metrics take the maximum local CPU cost for matching "
-                "logical iterations and exclude network synchronization."
+                "parallel scheduler-only metrics take the maximum local CPU "
+                "cost for matching logical iterations and exclude network "
+                "synchronization; modelled_admission_critical_ms retains the "
+                "full Router control-plane path."
             ),
             "arguments": {
                 key: str(value) if isinstance(value, Path) else value

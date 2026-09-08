@@ -46,7 +46,7 @@ from nanodeploy.router.request_router import RequestOwner, RequestRouter
 from nanodeploy.router.admission_planner import AdmissionPlannerConfig
 
 
-def test_hierarchical_runtime_env_propagates_dlslime_settings(monkeypatch):
+def test_hierarchical_runtime_env_propagates_actor_settings(monkeypatch):
     expected = {
         "SLIME_VISIBLE_DEVICES": (
             "mlx5_0,mlx5_1,mlx5_2,mlx5_3,"
@@ -54,6 +54,7 @@ def test_hierarchical_runtime_env_propagates_dlslime_settings(monkeypatch):
         ),
         "SLIME_GID_INDEX": "3",
         "SLIME_QP_NUM": "4",
+        "NANODEPLOY_LOG_LEVEL": "WARNING",
     }
     for env_name, value in expected.items():
         monkeypatch.setenv(env_name, value)
@@ -64,11 +65,12 @@ def test_hierarchical_runtime_env_propagates_dlslime_settings(monkeypatch):
     assert manager._runtime_env() == {"env_vars": expected}
 
 
-def test_hierarchical_runtime_env_omits_unset_dlslime_settings(monkeypatch):
+def test_hierarchical_runtime_env_omits_unset_actor_settings(monkeypatch):
     for env_name in (
         "SLIME_VISIBLE_DEVICES",
         "SLIME_GID_INDEX",
         "SLIME_QP_NUM",
+        "NANODEPLOY_LOG_LEVEL",
     ):
         monkeypatch.delenv(env_name, raising=False)
 

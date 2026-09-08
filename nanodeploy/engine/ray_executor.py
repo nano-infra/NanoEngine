@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 import os
@@ -142,6 +143,7 @@ class RayExecutor:
             "SLIME_GID_INDEX",
             "SLIME_QP_NUM",
             "NANODEPLOY_LOG_DECODE_A2A_MASKS",
+            "NANODEPLOY_LOG_LEVEL",
         ):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
@@ -379,7 +381,11 @@ class RayExecutor:
             output_transfer_latency = (
                 recv_timestamp - last_worker_end
             ) * 1000
-            logger.info(f"[METRIC] Output Transfer Latency: {output_transfer_latency:.4f} ms")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "[METRIC] Output Transfer Latency: "
+                    f"{output_transfer_latency:.4f} ms"
+                )
             boundary_metrics = {
                 "actor_submit_latency_ms": submit_latency_ms,
                 "send_seqs_latency_ms": send_seqs_latency_ms,

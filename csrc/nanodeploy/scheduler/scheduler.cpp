@@ -175,6 +175,29 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::plan_decode()
     return _schedule_decode();
 }
 
+void Scheduler::commit_planned_sequences(
+    const std::vector<std::shared_ptr<Sequence>>& sequences)
+{
+    if (sequences.empty()) {
+        return;
+    }
+    if (worker_state.size() != 1) {
+        throw std::runtime_error(
+            "commit_planned_sequences requires a single native DP worker");
+    }
+
+    auto& state = worker_state.front();
+    for (const auto& sequence : sequences) {
+        if (!sequence) {
+            throw std::invalid_argument(
+                "commit_planned_sequences received a null Sequence");
+        }
+        state->allocate(*sequence);
+        sequence->status = SequenceStatus::RUNNING;
+        state->running.push_back(sequence);
+    }
+}
+
 ScheduleResult Scheduler::schedule()
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;

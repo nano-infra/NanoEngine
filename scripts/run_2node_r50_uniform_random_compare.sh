@@ -17,6 +17,10 @@ NUM_REQUESTS="${NUM_REQUESTS:-$(awk -v rate="$RATE" -v seconds="$DURATION_SECOND
 MOE_ROUTING_SEED="${MOE_ROUTING_SEED:-0}"
 ROUNDS="${ROUNDS:-2}"
 DRY_RUN="${DRY_RUN:-0}"
+QUANTUM_DIAGNOSTICS="${QUANTUM_DIAGNOSTICS:-1}"
+RUN_PROJECTED_LOAD="${RUN_PROJECTED_LOAD:-1}"
+NANODEPLOY_LOG_LEVEL="${NANODEPLOY_LOG_LEVEL:-DEBUG}"
+NANODEPLOY_LOG_DECODE_STEP_DETAIL="${NANODEPLOY_LOG_DECODE_STEP_DETAIL:-0}"
 
 RUN_TAG="${RUN_TAG:-two_node_r50_uniform_random_2round_4way_$(date -u +%Y%m%d_%H%M%S)}"
 COMPARE_LOG_DIR="${COMPARE_LOG_DIR:-$ROOT_DIR/bench_logs/$RUN_TAG}"
@@ -40,6 +44,8 @@ print_command() {
     {
         printf "env BASE_LOG_DIR=%q " "$stage_log_dir"
         printf "NANODEPLOY_HIER_WORKER_TRANSPORT=%q " "$worker_transport"
+        printf "NANODEPLOY_LOG_LEVEL=%q " "$NANODEPLOY_LOG_LEVEL"
+        printf "NANODEPLOY_LOG_DECODE_STEP_DETAIL=%q " "$NANODEPLOY_LOG_DECODE_STEP_DETAIL"
         printf "%q " "$@"
         printf "\n"
     } | tee -a "$PROGRESS_LOG"
@@ -62,6 +68,25 @@ if ! [[ "$MOE_ROUTING_SEED" =~ ^-?[0-9]+$ ]]; then
 fi
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
     echo "Error: DRY_RUN must be 0 or 1." >&2
+    exit 2
+fi
+if [[ "$QUANTUM_DIAGNOSTICS" != "0" && "$QUANTUM_DIAGNOSTICS" != "1" ]]; then
+    echo "Error: QUANTUM_DIAGNOSTICS must be 0 or 1." >&2
+    exit 2
+fi
+if [[ "$RUN_PROJECTED_LOAD" != "0" && "$RUN_PROJECTED_LOAD" != "1" ]]; then
+    echo "Error: RUN_PROJECTED_LOAD must be 0 or 1." >&2
+    exit 2
+fi
+case "$NANODEPLOY_LOG_LEVEL" in
+    DEBUG|INFO|WARNING|ERROR|CRITICAL) ;;
+    *)
+        echo "Error: NANODEPLOY_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL." >&2
+        exit 2
+        ;;
+esac
+if [[ "$NANODEPLOY_LOG_DECODE_STEP_DETAIL" != "0" && "$NANODEPLOY_LOG_DECODE_STEP_DETAIL" != "1" ]]; then
+    echo "Error: NANODEPLOY_LOG_DECODE_STEP_DETAIL must be 0 or 1." >&2
     exit 2
 fi
 if [[ ! -f "$START_BENCH_SH" ]]; then
@@ -107,8 +132,10 @@ COMMON_ARGS=(
     --moe-routing-seed "$MOE_ROUTING_SEED"
     --diagnostic-log-interval 0
     --slow-add-threshold-ms 20
-    --quantum-diagnostics
 )
+if [[ "$QUANTUM_DIAGNOSTICS" == "1" ]]; then
+    COMMON_ARGS+=(--quantum-diagnostics)
+fi
 
 run_stage() {
     local stage="$1"
@@ -137,6 +164,8 @@ run_stage() {
     env \
         BASE_LOG_DIR="$stage_log_dir" \
         NANODEPLOY_HIER_WORKER_TRANSPORT="$worker_transport" \
+        NANODEPLOY_LOG_LEVEL="$NANODEPLOY_LOG_LEVEL" \
+        NANODEPLOY_LOG_DECODE_STEP_DETAIL="$NANODEPLOY_LOG_DECODE_STEP_DETAIL" \
         "${cmd[@]}"
     log "DONE stage=$stage"
 }
@@ -146,8 +175,10 @@ log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 log "MODEL_PATH=$MODEL_PATH"
 log "DATASET_PATH=$DATASET_PATH"
 log "RATE=$RATE DURATION_SECONDS=$DURATION_SECONDS NUM_REQUESTS=$NUM_REQUESTS"
-log "ROUNDS=$ROUNDS EXPERIMENTS_PER_ROUND=4 TOTAL_EXPERIMENTS=$((ROUNDS * 4))"
+experiments_per_round=$((2 + 2 * RUN_PROJECTED_LOAD))
+log "ROUNDS=$ROUNDS EXPERIMENTS_PER_ROUND=$experiments_per_round TOTAL_EXPERIMENTS=$((ROUNDS * experiments_per_round))"
 log "MOE_ROUTING_SIMULATION_STRATEGY=uniform_random MOE_ROUTING_SEED=$MOE_ROUTING_SEED"
+log "QUANTUM_DIAGNOSTICS=$QUANTUM_DIAGNOSTICS RUN_PROJECTED_LOAD=$RUN_PROJECTED_LOAD NANODEPLOY_LOG_LEVEL=$NANODEPLOY_LOG_LEVEL NANODEPLOY_LOG_DECODE_STEP_DETAIL=$NANODEPLOY_LOG_DECODE_STEP_DETAIL"
 log "SLIME_VISIBLE_DEVICES=$SLIME_VISIBLE_DEVICES SLIME_GID_INDEX=$SLIME_GID_INDEX SLIME_QP_NUM=$SLIME_QP_NUM"
 
 for ((round = 1; round <= ROUNDS; ++round)); do
@@ -169,21 +200,23 @@ for ((round = 1; round <= ROUNDS; ++round)); do
         zmq \
         "round${round}_hierarchical_zmq_least_batch_uniform_random"
 
-    run_stage \
-        "round${round}_central_least_projected_load" \
-        legacy_global \
-        least_projected_load \
-        LeastProjectedLoad \
-        ray \
-        "round${round}_central_projected_load_uniform_random"
+    if [[ "$RUN_PROJECTED_LOAD" == "1" ]]; then
+        run_stage \
+            "round${round}_central_least_projected_load" \
+            legacy_global \
+            least_projected_load \
+            LeastProjectedLoad \
+            ray \
+            "round${round}_central_projected_load_uniform_random"
 
-    run_stage \
-        "round${round}_hierarchical_least_projected_load" \
-        hierarchical \
-        least_projected_load \
-        LeastBatch \
-        zmq \
-        "round${round}_hierarchical_zmq_rppl_uniform_random"
+        run_stage \
+            "round${round}_hierarchical_least_projected_load" \
+            hierarchical \
+            least_projected_load \
+            LeastBatch \
+            zmq \
+            "round${round}_hierarchical_zmq_rppl_uniform_random"
+    fi
 
     log "ROUND_DONE round=$round/$ROUNDS"
 done

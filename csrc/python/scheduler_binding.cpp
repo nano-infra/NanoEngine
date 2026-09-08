@@ -176,6 +176,10 @@ void bind_scheduler_utils(py::module_& m)
         .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
         .def("admit", &Scheduler::admit, py::call_guard<py::gil_scoped_release>())
         .def("plan_decode", &Scheduler::plan_decode, py::call_guard<py::gil_scoped_release>())
+        .def("commit_planned_sequences",
+             &Scheduler::commit_planned_sequences,
+             py::arg("sequences"),
+             py::call_guard<py::gil_scoped_release>())
 
         // Postprocessing
         .def("postprocess",

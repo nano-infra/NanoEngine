@@ -4,6 +4,15 @@ import sys
 from typing import Optional
 
 
+_LOG_LEVEL_ENV = "NANODEPLOY_LOG_LEVEL"
+
+
+def _configured_log_level() -> int:
+    raw_level = os.getenv(_LOG_LEVEL_ENV, "DEBUG").strip().upper()
+    level = getattr(logging, raw_level, None)
+    return level if isinstance(level, int) else logging.DEBUG
+
+
 # =============================================================================
 # Color Definitions
 # =============================================================================
@@ -148,8 +157,8 @@ class LoggerManager:
 
         # Create a new logger with the specified name
         logger = logging.getLogger(name)
-        # Set the logger's internal level to DEBUG to capture all levels of logs
-        logger.setLevel(logging.DEBUG)
+        configured_level = _configured_log_level()
+        logger.setLevel(configured_level)
         # Prevent log messages from being propagated to the root logger (avoids duplication)
         logger.propagate = False
 
@@ -157,7 +166,7 @@ class LoggerManager:
         if not logger.handlers:
             # Create a console handler to output logs to stdout
             console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.DEBUG)
+            console_handler.setLevel(configured_level)
 
             # Apply our custom colored formatter to the console handler
             formatter = ColoredFormatter(use_relative_path=use_relative_path)

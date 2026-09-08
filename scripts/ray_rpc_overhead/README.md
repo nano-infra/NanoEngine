@@ -71,3 +71,46 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 The run fails if fewer than two live nodes are available or any actor is not
 placed on its assigned node. The JSON records every actor's hostname and Ray
 node ID so that the topology can be audited with the timing results.
+
+## Ray versus DLSLime Sequence transport
+
+`profile_ray_vs_dlslime.py` is the current-checkout transport microbenchmark.
+It compares the full NanoDeploy `Sequence` batch passed as a Ray actor
+argument with the production-shaped empty Ray control command plus native
+Sequence serialization and DLSLime/RDMA `send_seqs`/`recv_seqs`. Both arms
+return the same synthetic token rows through Ray, so output fan-in is common.
+
+The profiler reserves one GPU resource per actor because the production
+endpoint allocates a CUDA-backed pinned host buffer. It does not start a
+ModelRunner, load model weights, execute CUDA kernels, or run the scheduler;
+the GPU is only a resource guard for endpoint setup. DLSLime still uses the
+configured RDMA NICs and pinned host buffers. The `dlslime_*` fields split
+serialization, `write_with_imm`, and ordered future waits. Endpoint setup,
+Sequence construction, and output construction are outside the timed interval.
+
+For a two-node run with eight workers per host:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+export SLIME_VISIBLE_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export SLIME_GID_INDEX=3
+export SLIME_QP_NUM=4
+export PYTHONPATH=/mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July
+cd /tmp
+python3 /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July/scripts/ray_rpc_overhead/profile_ray_vs_dlslime.py \
+  --ray-address <HEAD_IP>:<GCS_PORT> \
+  --logical-workers 16 \
+  --workers-per-node 8 \
+  --batch-sizes 32,64,128 \
+  --sequence-length 8000 \
+  --loop-count 16 \
+  --transports ray,dlslime \
+  --warmup-iterations 20 \
+  --iterations 500 \
+  --output-dir bench_logs/ray_vs_dlslime/20260829_two_node
+```
+
+Use `--logical-workers 32` for four nodes. Outputs are
+`ray_vs_dlslime.json` and `ray_vs_dlslime.csv`. The benchmark is not an
+end-to-end serving result; report `roundtrip_*` and the DLSLime phase breakdown
+as transport overhead only.

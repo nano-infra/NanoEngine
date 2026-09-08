@@ -1,5 +1,7 @@
 import dataclasses
+import logging
 import os
+import time
 
 import torch
 from dlslime import _slime_c
@@ -64,8 +66,8 @@ class RPCServerEndpoint:
             self.server_bindings[i].remote_buffer_ptr = info[1]
 
     def send_seqs(self, dp_seqs: list[list[Sequence]], is_prefill: bool):
-        import time
-        start = time.perf_counter()
+        log_metrics = logger.isEnabledFor(logging.INFO)
+        start = time.perf_counter() if log_metrics else 0.0
         assert len(dp_seqs) == self.world_size
         futures: list[_slime_c.SlimeReadWriteFuture] = []
         total_bytes = 0
@@ -88,17 +90,19 @@ class RPCServerEndpoint:
                 sp_size = -1
             
             off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill, sp_rank, sp_size)
-            total_bytes += off
+            if log_metrics:
+                total_bytes += off
             future = binding.endpoint.write_with_imm(
                 [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
             )
             futures.append(future)
         [future.wait() for future in futures]
-        end = time.perf_counter()
-        logger.info(
-            f"[METRIC] dlslime_send_seqs_overhead_ms: {(end - start) * 1000:.4f}, "
-            f"dlslime_send_seqs_BYTES: {total_bytes}"
-        )
+        if log_metrics:
+            end = time.perf_counter()
+            logger.info(
+                f"[METRIC] dlslime_send_seqs_overhead_ms: {(end - start) * 1000:.4f}, "
+                f"dlslime_send_seqs_BYTES: {total_bytes}"
+            )
 
     def recv_tokens(self):
         pass

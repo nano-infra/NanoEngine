@@ -142,6 +142,14 @@ def test_run_case_profiles_production_hierarchical_contract(
     assert record["actual_sp1_requests"] == case.total_requests - expected_sp8
     assert record["admission_ms"]["router_plan_receipt_ms"]["mean"] > 0.0
     assert record["admission_ms"]["local_commit_critical_ms"]["mean"] > 0.0
+    assert (
+        record["admission_ms"]["scheduler_admission_critical_ms"]["mean"]
+        == record["admission_ms"]["local_commit_critical_ms"]["mean"]
+    )
+    assert (
+        record["admission_ms"]["modelled_admission_critical_ms"]["mean"]
+        >= record["admission_ms"]["scheduler_admission_critical_ms"]["mean"]
+    )
     assert record["modelled_parallel_quantum_ms"]["count"] == 1
     assert record["modelled_global_quantums_per_second"] > 0.0
     assert all(

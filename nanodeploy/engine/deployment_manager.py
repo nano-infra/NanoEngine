@@ -54,10 +54,11 @@ _PROXY_ENV_NAMES = (
     "all_proxy",
     "ALL_PROXY",
 )
-_DLSLIME_ENV_NAMES = (
+_ACTOR_ENV_NAMES = (
     "SLIME_VISIBLE_DEVICES",
     "SLIME_GID_INDEX",
     "SLIME_QP_NUM",
+    "NANODEPLOY_LOG_LEVEL",
 )
 _PROXY_ENV_LOCK = threading.RLock()
 logger = get_logger()
@@ -214,7 +215,7 @@ class DeploymentManager:
             if self.config.ffn_ep > 1
             else {}
         )
-        for env_name in _DLSLIME_ENV_NAMES:
+        for env_name in _ACTOR_ENV_NAMES:
             if env_name in os.environ:
                 env_vars[env_name] = os.environ[env_name]
         return {"env_vars": env_vars}

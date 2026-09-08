@@ -106,6 +106,10 @@ class ProfileCase:
     block_size: int
     loop_count: int
     seed: int
+    # Mixed admission/decode profilers may keep BS/GPU as the public workload
+    # label while adding a small admission cohort to the decode cohort.  The
+    # default preserves the original bulk-only case exactly.
+    request_count_override: int | None = None
 
     @property
     def logical_gpus(self) -> int:
@@ -123,7 +127,15 @@ class ProfileCase:
 
     @property
     def total_requests(self) -> int:
+        if self.request_count_override is not None:
+            if self.request_count_override <= 0:
+                raise ValueError("request_count_override must be positive")
+            return self.request_count_override
         return self.logical_gpus * self.batch_size_per_gpu
+
+    @property
+    def requests_per_dp(self) -> int:
+        return math.ceil(self.total_requests / self.attention_dp)
 
     @property
     def expected_sp8_requests(self) -> int:
@@ -212,9 +224,13 @@ def _scheduler_capacity_blocks(
     case: ProfileCase,
     profiled_decode_iterations: int,
 ) -> int:
+    requests_per_dp = case.requests_per_dp
+    master_requests_per_rank = math.ceil(
+        requests_per_dp / case.attention_sp
+    )
     short_blocks = math.ceil(case.short_context_len / case.block_size)
     if not case.scenario.use_sp8_topology:
-        initial_blocks_per_rank = case.batch_size_per_gpu * short_blocks
+        initial_blocks_per_rank = requests_per_dp * short_blocks
     elif case.scenario.fixed_sp_size == SP8_DEGREE:
         per_request_rank_tokens = math.ceil(
             case.short_context_len / SP8_DEGREE
@@ -223,7 +239,7 @@ def _scheduler_capacity_blocks(
             per_request_rank_tokens / case.block_size
         )
         initial_blocks_per_rank = (
-            case.batch_size_per_gpu
+            requests_per_dp
             * SP8_DEGREE
             * per_request_rank_blocks
         )
@@ -244,11 +260,11 @@ def _scheduler_capacity_blocks(
         long_rank_tokens = math.ceil(case.long_context_len / SP8_DEGREE)
         long_rank_blocks = math.ceil(long_rank_tokens / case.block_size)
         initial_blocks_per_rank = (
-            case.batch_size_per_gpu * short_blocks
+            master_requests_per_rank * short_blocks
             + max_long_per_dp * long_rank_blocks
         )
     generated_master_blocks = (
-        case.batch_size_per_gpu
+        master_requests_per_rank
         * math.ceil(
             profiled_decode_iterations * case.loop_count / case.block_size
         )
@@ -270,9 +286,9 @@ def _new_scheduler(
     return Scheduler(
         f"scheduler-profile-{case.scenario.name}",
         case.loop_count,
-        case.batch_size_per_gpu,
-        case.batch_size_per_gpu * case.long_context_len + 1,
-        case.batch_size_per_gpu * SP8_DEGREE + SP8_DEGREE,
+        math.ceil(case.requests_per_dp / case.attention_sp),
+        case.requests_per_dp * case.long_context_len + 1,
+        case.requests_per_dp * SP8_DEGREE + SP8_DEGREE,
         -1,
         case.attention_dp,
         case.attention_sp,

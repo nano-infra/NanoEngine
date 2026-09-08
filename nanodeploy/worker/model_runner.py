@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import time
 from collections import Counter, defaultdict
@@ -1523,7 +1524,7 @@ class ModelRunner:
                 )
             execution_forwards: list[dict] = []
 
-        if send_timestamp > 0:
+        if send_timestamp > 0 and logger.isEnabledFor(logging.INFO):
             latency = (time.time() - send_timestamp) * 1000
             logger.info(f"[METRIC] Rank {self.rank} Input Transfer Latency: {latency:.4f} ms")
         sp_rank = get_dist_context().attn_sp_rank
