@@ -259,7 +259,14 @@ At the 16K-token maximum, the measured operator-core peaks are:
 | --- | ---: | ---: |
 | KDA recurrence | 4.125 GiB | 264.00 KiB/token |
 | MLA Prefill attention | 0.375 GiB | 24.00 KiB/token |
-| Local BF16 routed experts | 15.176 GiB | 971.24 KiB/token |
+| Local BF16 routed experts | 7.010 GiB | 448.65 KiB/token |
+
+The local MoE reference explicitly materializes Top-16 token copies with shape
+$[N_A,16,3584]$. One such BF16 buffer is 1.75 GiB at 16K tokens, and roughly
+four buffers of that scale overlap at the measured peak. This is a property of
+the portable reference implementation, not a production MegaMoE workspace
+estimate. An earlier run accidentally retained autograd state and reported
+15.176 GiB; the corrected measurement uses `torch.inference_mode()`.
 
 All three curves are approximately linear over the measured range. At a fixed
 16K active-token total, KDA and MLA produced the same peak for $1\times16384$,

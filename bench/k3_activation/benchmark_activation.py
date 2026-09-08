@@ -35,21 +35,22 @@ def shapes(value: str) -> list[tuple[int, int]]:
 
 
 def peak_call(fn, warmup: int) -> tuple[int, int]:
-    for _ in range(warmup):
+    with torch.inference_mode():
+        for _ in range(warmup):
+            output = fn()
+            torch.cuda.synchronize()
+            del output
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        baseline_allocated = torch.cuda.memory_allocated()
+        baseline_reserved = torch.cuda.memory_reserved()
+        torch.cuda.reset_peak_memory_stats()
         output = fn()
         torch.cuda.synchronize()
+        peak_allocated = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
         del output
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    baseline_allocated = torch.cuda.memory_allocated()
-    baseline_reserved = torch.cuda.memory_reserved()
-    torch.cuda.reset_peak_memory_stats()
-    output = fn()
-    torch.cuda.synchronize()
-    peak_allocated = torch.cuda.max_memory_allocated()
-    peak_reserved = torch.cuda.max_memory_reserved()
-    del output
     return peak_allocated - baseline_allocated, peak_reserved - baseline_reserved
 
 
