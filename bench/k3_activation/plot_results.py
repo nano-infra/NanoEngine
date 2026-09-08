@@ -139,3 +139,32 @@ latency_ax.set_ylim(min(latencies) * 0.92, max(latencies) * 1.08)
 memory_ax.set_title("MLA prefix chunking: 1M context, 16K fresh tokens")
 fig.tight_layout()
 fig.savefig(RESULTS / "mla_prefix_split_tradeoff.png", dpi=180, bbox_inches="tight")
+
+mega = load(RESULTS / "activation_peaks_megamoe_ws1.csv")
+reference = load(RESULTS / "activation_peaks_moe.csv")
+mega_by_tokens = {int(row["tokens"]): row for row in mega}
+reference_by_tokens = {int(row["active_tokens"]): row for row in reference}
+tokens = sorted(set(mega_by_tokens) & set(reference_by_tokens))
+workspace_gib = int(mega[0]["workspace_device_bytes_at_capacity"]) / 2**30
+reference_gib = [
+    int(reference_by_tokens[value]["peak_allocated_bytes"]) / 2**30
+    for value in tokens
+]
+mega_dynamic_gib = [
+    int(mega_by_tokens[value]["steady_forward_peak_bytes"]) / 2**30
+    for value in tokens
+]
+mega_total_gib = [workspace_gib + value for value in mega_dynamic_gib]
+fig, ax = plt.subplots(figsize=(8.8, 4.9))
+ax.plot(tokens, reference_gib, marker="o", linewidth=2.4, label="BF16 reference dynamic peak", color="#F4664A")
+ax.plot(tokens, mega_dynamic_gib, marker="o", linewidth=2.4, label="MegaMoE steady dynamic peak", color="#61DDAA")
+ax.plot(tokens, mega_total_gib, marker="o", linewidth=2.4, label="MegaMoE 16K workspace + dynamic", color="#5B8FF9")
+ax.set_xscale("log", base=2)
+ax.set_yscale("log", base=2)
+ax.set_xlabel("Active tokens")
+ax.set_ylabel("Memory (GiB, log scale)")
+ax.set_title("K3 routed experts: reference vs world-size-one MegaMoE")
+ax.grid(alpha=0.25)
+ax.legend(frameon=False)
+fig.tight_layout()
+fig.savefig(RESULTS / "megamoe_ws1_activation.png", dpi=180, bbox_inches="tight")

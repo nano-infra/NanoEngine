@@ -237,8 +237,9 @@ them into decoder layers.
     Measurements use one NVIDIA B300 SXM6, BF16 activations, and a maximum 16K
     Prefill chunk. Persistent synthetic KDA state and MLA cache are allocated
     before the activation baseline. MLA includes fresh-only and 1008K cached +
-    16K fresh cases. MoE uses the local BF16 reference path; production MXFP4
-    MegaMoE is deferred to the partitioning analysis.
+    16K fresh cases. MoE includes the local BF16 reference and a direct
+    world-size-one DeepGEMM MegaMoE control; distributed EP is deferred to the
+    partitioning analysis.
 
 | Target | Measurement boundary | Main transient tensors to inspect |
 | --- | --- | --- |
@@ -267,6 +268,30 @@ four buffers of that scale overlap at the measured peak. This is a property of
 the portable reference implementation, not a production MegaMoE workspace
 estimate. An earlier run accidentally retained autograd state and reported
 15.176 GiB; the corrected measurement uses `torch.inference_mode()`.
+
+#### World-Size-One MegaMoE Control
+
+NanoDeploy's `MegaMoEExperts` wrapper intentionally requires $E>1$, but the
+installed DeepGEMM kernel can execute with a one-rank NCCL group. The control
+therefore calls the same `mega_moe_pre_dispatch` and `fp8_fp4_mega_moe` APIs
+directly with K3's 896 experts, Top-16 routing, $3584\rightarrow3072$
+expert shape, packed MXFP4 weights, and SiTU activation.
+
+![K3 MegaMoE world-size-one activation memory](../assets/megamoe-ws1-activation.png)
+
+For a configured capacity of 16K tokens, DeepGEMM allocates a **5.939 GiB
+symmetric workspace once**. It is owned outside PyTorch's CUDA allocator and is
+therefore measured from the CUDA free-memory delta. After allocation, both the
+first and warmed forward add exactly 7,168 bytes per token—the BF16
+$[N_A,3584]$ output—giving **0.109 GiB at 16K**. The combined workspace plus
+forward increment is 6.048 GiB, versus 7.010 GiB dynamically allocated by the
+BF16 reference.
+
+The 16K steady kernel latency is 12.74 ms on one B300. This point excludes EP
+dispatch traffic and does not make world-size-one a supported serving topology;
+it isolates MegaMoE's capacity behavior. The key distinction is that MegaMoE
+moves most Top-16 temporary storage into a fixed, reusable workspace instead of
+allocating several token-expanded tensors during every forward.
 
 All three curves are approximately linear over the measured range. At a fixed
 16K active-token total, KDA and MLA produced the same peak for $1\times16384$,

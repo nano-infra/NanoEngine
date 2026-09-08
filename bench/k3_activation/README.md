@@ -47,3 +47,16 @@ cached prefix, and 16K fresh queries. It runs one warm-up before measuring one
 steady forward with CUDA events. Incremental peak includes cache restoration,
 K/V expansion, attention, and online output/LSE merging; weights and persistent
 packed cache are allocated before the baseline.
+
+
+Measure the production DeepGEMM MegaMoE kernel without EP communication:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc-per-node=1 \
+  bench/k3_activation/benchmark_megamoe_ws1.py
+```
+
+The NanoDeploy wrapper requires `ffn_ep > 1`, so this benchmark invokes the
+underlying DeepGEMM APIs directly. It uses all 896 K3 experts and separates the
+16K-capacity symmetric workspace (CUDA free-memory delta) from first-forward
+and steady PyTorch allocation peaks.
