@@ -199,255 +199,282 @@ $$
 At one million resident tokens this is 15.375 GiB of MLA cache. The MLA latent is replicated across attention-TP ranks because all
 query-head shards consume it; KDA states are head-sharded by attention TP.
 
-## 5. Activation Capacity Analysis
+## 5. Activation Memory
 
-Activations are transient tensors created while a batch moves through one
-decoder layer. Unlike weights and persistent caches, most activation buffers
-can be reused after the layer completes, so capacity is determined by peak
-liveness rather than by summing all 93 layers. The primary experiment therefore
-measures the incremental peak GPU memory of one component and one complete
-decoder layer. Prefill is the main focus because many active tokens coexist in
-one forward pass; Decode is retained as a smaller batch-size comparison.
+Activation capacity is determined by peak liveness, not by summing all 93
+layers. KDA or MLA executes before its FFN, and the allocator can reuse storage
+between decoder layers. The deployment question is therefore which component
+creates the largest live allocation and which backend reserves persistent
+workspace.
 
-### 5.1 Measurement Scope
+The measurements below use one B300 and a 16K active Prefill chunk. The MLA
+point includes a 1M visible context with the production 128K prefix split. The
+MegaMoE point uses NanoDeploy's world-size-one production wrapper with K3's 896
+MXFP4 experts and Top-16 routing.
 
-Let $B$ be the number of sequences, $L$ the active length per sequence, and
-$N_A=B\times L$ the number of active tokens in the measured forward pass. For
-Decode, $L=1$ and therefore $N_A=B$.
+| Decoder layer form | Where activation memory is spent | Measured capacity to carry forward |
+| --- | --- | ---: |
+| KDA + Dense FFN | KDA chunk recurrence intermediates; Dense FFN intermediate for the 16K fresh rows | KDA core peak: 4.125 GiB |
+| KDA + MoE FFN | KDA recurrence, followed by the reusable MegaMoE buffer and BF16 output | KDA core: 4.125 GiB; MegaMoE: 5.939 GiB persistent + 0.109 GiB dynamic |
+| MLA + MoE FFN | Cached-latent restore, bounded K/V expansion, attention output, followed by MegaMoE | MLA core peak: 17.389 GiB; MegaMoE: 5.939 GiB persistent + 0.109 GiB dynamic |
 
-The activation peak excludes weights, persistent caches, and input tensors that
-already exist before the measured region. For each target, report
+![K3 measured activation and workspace capacity](../assets/activation-capacity-summary.png)
+
+The bars are component reservations, not values to add within a layer. The KDA,
+MLA, and MoE stages execute sequentially. The complete-layer peak is controlled
+by their maximum overlapping liveness and allocator reuse.
+
+### 5.1 MegaMoE Persistent Buffer
+
+MegaMoE reserves one symmetric buffer from its configured maximum token
+capacity and reuses it across forwards and across all 92 MoE layers. At a 16K
+capacity, the measured CUDA reservation is 5.939 GiB. A steady 16K forward adds
+0.109 GiB for the BF16 output, giving 6.048 GiB of reserved buffer plus dynamic
+activation. The persistent reservation must be counted once per process, not
+once per layer.
+
+### 5.2 DeepEP + DeepGEMM
+
+DeepEP + DeepGEMM has the same high-level capacity pattern: a persistent buffer
+is reserved for dispatch and combine, then each forward adds activation for
+routed rows and grouped GEMMs. The ownership differs from MegaMoE. DeepEP owns
+communication and permutation storage, while DeepGEMM consumes the dispatched
+expert rows and produces expert outputs. When these buffers are shared across
+sequential MoE layers, they are also counted once rather than multiplied by
+layer count. Exact bytes are left unreported until an eight-GPU experiment is
+available.
+
+### 5.3 Capacity Conclusion
+
+For the measured 1M-context, 16K-chunk path, bounded MLA prefix expansion is the
+largest activation peak at 17.389 GiB. KDA recurrence peaks at 4.125 GiB.
+MegaMoE contributes a material but predictable 5.939 GiB persistent reservation
+and only 0.109 GiB of steady forward activation at 16K tokens.
+
+## 6. Overview of Performance Analysis
+
+The performance analysis separates Prefill from Decode because they expose
+different independent variables. Prefill is studied as one request advancing
+through a fixed-size fresh chunk. Decode is studied as a batch of active
+sequences, each contributing one token while retaining a potentially long
+visible context.
+
+### 6.1 Prefill: One Request Is Sufficient
+
+<iframe
+  src="../../assets/k3-prefill-performance-overview.html"
+  title="K3 Prefill performance variables"
+  width="100%" height="400" loading="lazy"
+  style="border: 0; border-radius: 12px;">
+</iframe>
+
+For Prefill, one request is sufficient to expose the component-level scaling.
+Let $C$ be the fresh chunk size and $L$ the logical context visible after that
+chunk. The cached prefix contains $L-C$ tokens, so its effective hit rate is
 
 $$
-C_{\mathrm{activation}}^{\mathrm{peak}}
-=C_{\mathrm{peak\ allocated}}-C_{\mathrm{baseline}}.
+r_{\mathrm{hit}}=\frac{L-C}{L}.
 $$
 
-`allocated` memory is the primary metric. `reserved` memory is recorded
-separately to expose allocator behavior but is not treated as tensor capacity.
-All experiments use inference mode and exclude backward activations.
+With the reference chunk fixed at $C=8192$, the context sweep is:
 
-### 5.2 Component-Level Experiments
+| Logical context $L$ | Cached prefix $L-C$ | Fresh chunk $C$ | Effective hit rate |
+| ---: | ---: | ---: | ---: |
+| 8K | 0 | 8K | 0% |
+| 32K | 24K | 8K | 75% |
+| 128K | 120K | 8K | 93.75% |
+| 256K | 248K | 8K | 96.875% |
+| 512K | 504K | 8K | 98.4375% |
+| 1M | 1016K | 8K | 99.21875% |
 
-Measure the three dominant compute components independently before composing
-them into decoder layers.
+This construction separates the variables cleanly:
 
-??? note "Experimental setup"
-
-    Measurements use one NVIDIA B300 SXM6, BF16 activations, and a maximum 16K
-    Prefill chunk. Persistent synthetic KDA state and MLA cache are allocated
-    before the activation baseline. MLA includes fresh-only and 1008K cached +
-    16K fresh cases. MoE includes the local BF16 reference and a NanoDeploy MegaMoE with a supported
-    world-size-one EP group; distributed EP is deferred to the
-    partitioning analysis.
-
-| Target | Measurement boundary | Main transient tensors to inspect |
+| Prefill component | Primary performance variables | Reason |
 | --- | --- | --- |
-| KDA | KDA input to KDA output | Projections, causal-convolution intermediates, recurrence workspace, and output |
-| MLA | MLA input to MLA output | Query/KV projections, attention output, and attention-kernel workspace |
-| MoE | MoE input to merged output | Routing logits, Top-K metadata, token permutation, dispatched expert inputs, grouped-GEMM intermediates, and combine buffers |
+| KDA | Chunk size $C$ | The cached prefix has already been summarized into recurrent state |
+| MLA | Chunk size $C$ and visible context $L$ | The fresh queries still attend cached history |
+| Dense FFN | Chunk size $C$ | Every fresh token executes the same dense matrices |
+| MoE FFN | Chunk size $C$ and routing distribution | Only fresh tokens are routed; expert balance changes achieved utilization |
 
-The first plot compares incremental peak memory against active-token count for
-KDA, MLA, and MoE. A second, normalized view reports bytes per active token to
-show whether each component has a stable linear slope or develops additional
-sequence-length-dependent workspace.
-
-![K3 Prefill component peak activation memory](../assets/prefill-component-peak-memory.png)
-
-At the 16K-token maximum, the measured operator-core peaks are:
-
-| Operator core | Incremental peak | Peak per active token |
-| --- | ---: | ---: |
-| KDA recurrence | 4.125 GiB | 264.00 KiB/token |
-| MLA Prefill attention | 0.375 GiB | 24.00 KiB/token |
-| Local BF16 routed experts | 7.010 GiB | 448.65 KiB/token |
-
-The local MoE reference explicitly materializes Top-16 token copies with shape
-$[N_A,16,3584]$. One such BF16 buffer is 1.75 GiB at 16K tokens, and roughly
-four buffers of that scale overlap at the measured peak. This is a property of
-the portable reference implementation, not a production MegaMoE workspace
-estimate. An earlier run accidentally retained autograd state and reported
-15.176 GiB; the corrected measurement uses `torch.inference_mode()`.
-
-#### World-Size-One MegaMoE
-
-NanoDeploy now accepts `ffn_ep=1` in `MegaMoEExperts` and uses the initialized WORLD process group when no explicit EP group is supplied. The benchmark executes that production wrapper with K3's 896 experts, Top-16 routing, a 3584-to-3072 expert shape, packed MXFP4 weights, and SiTU activation.
-
-![K3 NanoDeploy MegaMoE EP=1 memory](../assets/megamoe-ws1-activation.png)
-
-MegaMoE allocates one persistent symmetric buffer on first use and reuses it across forwards and decoder layers. For configured capacity `T`, DeepGEMM first aligns the per-rank token capacity to `Ta = 384 ceil(T/384)`. With `R` ranks, `E` experts, and Top-K `K`, the shared expert-token pool is sized as `P = 384 ceil((R Ta min(K, E/R) + (E/R) 191)/384)`. The extra 191-token allowance per local expert covers the largest supported 192-row GEMM tile before final alignment.
-
-The buffer then lays out persistent input, scale, Top-K metadata, expert-token pools, and kernel synchronization metadata. For K3 at `R=1`, `E=896`, `K=16`, `H=3584`, `I=3072`, and `T=16384`, alignment gives `Ta=16512` and `P=435456`. The principal views are `x [Ta,H]` FP8, `x_sf [Ta,H/128]` INT32, Top-K indices and weights `[Ta,K]`, `l1_acts [P,H]` FP8, `l1_acts_sf [16P,H/128]` INT32, `l2_acts [P,I]` FP8, and `l2_acts_sf [16P,I/128]` INT32. DeepGEMM's authoritative layout function sums these views plus barriers, counters, source metadata, and alignment padding. It reports **5.935 GiB logical bytes**; the measured CUDA free-memory delta is **5.939 GiB**. This allocation is outside PyTorch's CUDA allocator and is not multiplied by K3's 92 MoE layers. After allocation, both the
-first and warmed forward add exactly 7,168 bytes per token—the BF16
-$[N_A,3584]$ output—giving **0.109 GiB at 16K**. The combined workspace plus
-forward increment is 6.048 GiB, versus 7.010 GiB dynamically allocated by the
-BF16 reference.
-
-The 16K steady kernel latency is 12.56 ms on one B300. With `ffn_ep=1`, this is a supported local MegaMoE path and has no inter-rank EP traffic. It isolates the kernel's capacity behavior from partitioning costs. The key distinction is that MegaMoE
-moves most Top-16 temporary storage into a fixed, reusable workspace instead of
-allocating several token-expanded tensors during every forward.
-
-All three curves are approximately linear over the measured range. At a fixed
-16K active-token total, KDA and MLA produced the same peak for $1\times16384$,
-$4\times4096$, $16\times1024$, and $32\times512$. For these two operator cores
-on this backend, active-token count determined the observed allocation peak;
-the tested batch/sequence decomposition did not.
-
-!!! warning "These are operator-core peaks, not complete-component peaks"
-
-    Projection layers, normalization, residual buffers, KDA convolution, MLA
-    cache gathering, the MoE router and latent projections, and complete-layer
-    buffer reuse are not yet included in the plotted values. The chart is an
-    initial measurement of the dominant kernels, not yet the final decoder-layer
-    capacity model.
-
-#### 5.2.1 MLA With a 1M-Token Cached Prefix
-
-The cached-prefix run follows the allocation path used by K3's non-absorbed MLA
-Prefill implementation. It restores the packed mixed FP8/BF16 latent cache to
-BF16, expands the latent representation into 96-head K/V tensors, joins the
-cached and fresh tensors, and finally executes 16K queries against the complete
-1M-token history.
-
-![MLA cached-prefix 1M-context peak memory](../assets/mla-cached-1m-16k-peak.png)
-
-| Completed stage | Live incremental memory | Peak so far |
-| --- | ---: | ---: |
-| Restore cached latent rows | 1.107 GiB | 3.938 GiB |
-| Expand cached K/V | 83.803 GiB | 83.803 GiB |
-| Join cached and fresh K/V | 145.115 GiB | 145.115 GiB |
-| FlashAttention | 145.490 GiB | 145.490 GiB |
-
-The decisive cost is not the FlashAttention workspace. FlashAttention adds an
-output of approximately 0.375 GiB, while K/V expansion and concatenation create
-the 145.49 GiB peak. The implementation simultaneously retains the restored
-latent rows, expanded cached K/V, expanded fresh K/V, and joined attention
-inputs. Consequently, cached-prefix MLA—not KDA recurrence—is the dominant
-activation-capacity risk in this 1M-context, 16K-chunk setting.
-
-Keeping the fresh chunk fixed at 16K and increasing total context gives the
-following curve:
-
-![MLA peak memory versus context with a fixed 16K chunk](../assets/mla-peak-vs-context-16k-chunk.png)
-
-The unsplit implementation grows almost linearly with total context even though
-the fresh-token count is fixed. This is a consequence of materializing expanded
-K/V for the entire cached prefix, not of an attention-score matrix.
-
-#### 5.2.2 How SGLang Bounds the Prefix-Expansion Peak
-
-SGLang's relevant mechanism is **chunked prefix cache**, represented by fields
-such as `prefix_chunk_len` and `prefix_chunk_idx`. It divides a long cached
-prefix into bounded chunks. For every chunk, SGLang fetches only that chunk's
-latent rows, expands its K/V, runs attention between the fixed query chunk and
-the current prefix chunk, and then merges the partial output and log-sum-exp
-state with an online-softmax merge. Temporary expanded K/V can therefore be
-released before the next prefix chunk.
-
-Conceptually, the unsplit peak scales as
+Using K3's 69 KDA layers, 24 MLA layers, one Dense FFN layer, and 92 MoE
+layers, the one-request Prefill model is
 
 $$
-C_{\mathrm{unsplit}}=O(L_{\mathrm{context}}\,N_H(D_K+D_V)),
+T_{\mathrm{prefill}}(C,L)
+=69t_{\mathrm{KDA}}(C)
++24t_{\mathrm{MLA}}(C,L)
++t_{\mathrm{Dense}}(C)
++92t_{\mathrm{MoE}}(C).
 $$
 
-whereas chunked-prefix expansion changes the transient term to
+The first experiment therefore fixes $C=8\mathrm{K}$ and sweeps the six context
+lengths above. A separate chunk-size sweep then fixes representative contexts
+to determine whether 8K is the best serving point. Multi-request scheduling is
+not needed for this component model; it belongs to the system-level serving
+analysis after the single-request costs are understood.
+
+### 6.2 Decode: Context Length and Batch Size Separate the Components
+
+<iframe
+  src="../../assets/k3-decode-performance-overview.html"
+  title="K3 Decode performance variables"
+  width="100%" height="400" loading="lazy"
+  style="border: 0; border-radius: 12px;">
+</iframe>
+
+During Decode, each active sequence contributes one new token. Let $B$ be the
+Decode batch size and $L$ the resident context length. MLA reads historical
+cache, while KDA consumes a fixed-size recurrent state. Dense and MoE FFNs do
+not inspect history.
+
+| Decode component | Primary performance variables | Expected regime |
+| --- | --- | --- |
+| MLA | Context length $L$, with $B$ reported | Historical-cache traffic grows with visible context |
+| KDA | Batch size $B$ | State size per sequence is independent of history length |
+| Dense FFN | Batch size $B$ | Weight reuse improves as more current tokens share a forward |
+| MoE FFN | Batch size $B$ and routing distribution | Tokens per selected expert determine grouped-GEMM utilization |
+
+The Decode model is
 
 $$
-C_{\mathrm{split}}=O(L_{\mathrm{prefix\ chunk}}\,N_H(D_K+D_V))
-+O(L_{\mathrm{fresh}}N_HD_V).
+T_{\mathrm{decode}}(B,L)
+=69t_{\mathrm{KDA}}(B)
++24t_{\mathrm{MLA}}(B,L)
++t_{\mathrm{Dense}}(B)
++92t_{\mathrm{MoE}}(B).
 $$
 
-This does not reduce the persistent Latent Cache or the total attention work;
-it bounds peak temporary memory by trading one large expansion for multiple
-sequential attention calls and state merges.
+Although context length is MLA's distinguishing variable, every MLA result must
+also report $B$: its actual work scales with the number of active queries as
+well as the history visible to each query. KDA and the FFNs use batch size as
+their main sweep because they have no history-length term.
 
-This mechanism is distinct from FlashAttention/FlashMLA `num_splits`, which
-partitions KV work among kernel work units and combines partial reductions for
-occupancy and scheduling. `num_splits` alone does not remove a framework-level
-full-context K/V expansion that has already happened before the attention call.
+### 6.3 Reference Evaluation Matrix
 
-#### 5.2.3 Synthetic Prefix-Chunk Trade-off
+The following values define the axes used by the detailed performance chapters.
+The highlighted reference point is an 8K Prefill chunk and a 1M maximum serving
+context; Decode batch sizes cover latency-oriented through throughput-oriented
+operation.
 
-`DLENGINE_MLA_PREFIX_CHUNK_SIZE` controls the cached-prefix chunk and defaults
-to **131,072 tokens** for the FP8 path; setting it to `0` restores the unsplit
-path. The setting is forwarded from the driver to Ray model workers. BF16 MLA
-cache behavior is unchanged.
-
-The experiment fixes total context at 1,048,576 tokens and the fresh Prefill
-chunk at 16,384 tokens. It uses a synthetic 656-byte mixed cache, then measures restore, K/V expansion,
-attention, and online output/LSE merge. Each point performs one unreported
-warm-up and one CUDA-event-timed forward.
-
-![MLA prefix split memory and latency trade-off](../assets/mla-prefix-split-tradeoff.png)
-
-In this shape experiment, the 128K point reduces peak memory from 144.17 GiB to
-17.39 GiB. The trend is useful because expanded BF16 K/V has the same shape in
-both layouts. The 687 ms versus 706 ms single-run latency difference is within
-benchmark noise and **must not be interpreted as a production speedup or as
-proof of zero overhead**. The production raw-FP8 paged-cache path still needs an
-end-to-end repeated benchmark including cache write, block-table gather, Ray,
-and the complete layer.
-
-!!! warning "Evidence boundary"
-
-    These points establish the expansion-memory scaling of a synthetic
-    single-layer path. They do not validate current K3 FP8 numerical quality or
-    production latency. Chapter 6 uses the mixed-cache capacity and treats
-    these activation results only as shape evidence.
-
-### 5.3 Complete-Layer Experiments
-
-Component peaks cannot be added directly because their lifetimes do not fully
-overlap and implementations may reuse buffers. Measure the three decoder-layer
-forms that actually occur in K3:
-
-| Decoder-layer form | K3 placement |
+| Parameter | Reference values |
 | --- | --- |
-| KDA + Dense FFN | Layer 1 |
-| KDA + MoE FFN | KDA layers after Layer 1 |
-| MLA + MoE FFN | MLA layers |
+| Prefill chunk size $C$ | 1K, 2K, 4K, **8K**, 16K |
+| Decode batch size $B$ | 1, 8, 16, 32, 64, 128, 256 |
+| Context length $L$ | 8K, 32K, 128K, 256K, 512K, **1M** |
+| Prefix hit rate at $C=8$K | 0%, 75%, 93.75%, 96.875%, 98.4375%, 99.21875% |
 
-The layer-level peak is the deployment-relevant result. Comparing it with the
-component measurements reveals how much memory is saved through buffer reuse
-and kernel fusion.
+The detailed analysis should first report isolated KDA, MLA, Dense, and MoE
+curves over these variables, and then compose them using the actual K3 layer
+counts. End-to-end TTFT and TPOT are validation of that model rather than the
+starting point.
 
-### 5.4 Prefill Experiment Matrix
+## 7. Performance Analysis
 
-Sweep active-token count over $128$, $256$, $512$, $1024$, $2048$, $4096$,
-and $8192$. At representative totals, keep $N_A$ fixed while changing the
-batch/sequence decomposition, for example $1\times4096$, $4\times1024$,
-$16\times256$, and $32\times128$.
+This chapter follows the two serving phases introduced in Chapter 6. Prefill is organized by fresh chunk size and visible context length; Decode is organized by batch size and visible context length. Within each phase, KDA, MLA, and MegaMoE are analyzed separately before their costs are composed at model level.
 
-This distinction matters because equal token counts need not produce equal
-peaks: MLA workspace can depend on sequence geometry, KDA uses chunked
-recurrence, and MoE temporary storage depends on the distribution of token-to-
-expert assignments. Report both $(B,L)$ and $N_A$ for every point.
+Dense FFN is omitted as a dedicated performance section because K3 contains only one Dense FFN layer, compared with 92 MoE layers. Its cost will be retained in the final model-level composition, but it is not part of the primary parameter sweep.
 
-### 5.5 Decode Comparison
+The current results are a first mapping of the available component benchmarks. They do not yet represent complete operator breakdowns:
 
-Run the same component and complete-layer measurements with $L=1$ and sweep
-$B$ over $1$, $8$, $16$, $32$, $64$, $128$, $256$, and $512$. This experiment
-is a comparison rather than the center of the chapter: Decode activation grows
-with the current batch, while its broader capacity limit also includes the
-persistent caches analyzed in Chapter 4.
+| Component | Current measured boundary | Complete boundary to add |
+| --- | --- | --- |
+| KDA | Complete production Prefill operator | Input projections, causal convolution, recurrence, gated normalization, and output projection measured separately |
+| MLA | Cache restore, KV expansion, and attention core | Q/KV/G projections, latent norms, RoPE/cache operations, attention, gate, and output projection |
+| MegaMoE | Pre-dispatch and fused routed-expert operator | Router/latent-down, Top-K, routed path, routed norm/up, shared experts, and output merge |
 
-### 5.6 Remaining Figures and Conclusions
+### 7.1 Prefill
 
-The operator-core figure above is the first result. The remaining work is:
+Prefill considers one request. Let $C$ be its fresh chunk size and $L$ the total visible context after the chunk. KDA and MegaMoE process $C$ rows, whereas MLA processes $C$ queries against $L$ visible tokens.
 
-1. **Complete-component peak:** include projections, normalization, routing,
-   shared experts, and other materialized buffers around each measured core.
-2. **Complete-layer peak:** KDA + Dense FFN, KDA + MoE FFN, and MLA + MoE FFN
-   versus active tokens during Prefill.
-3. **Prefill/Decode comparison:** normalized peak memory per active token, with
-   sequence geometry shown explicitly.
 
-The measurements should establish which component controls the transient-memory
-ceiling, whether peak memory is approximately linear in active tokens, how much
-sequence geometry changes that peak, and how accurately isolated component
-measurements predict the peak of a complete decoder layer.
+#### 7.1.1 KDA
 
-## 6. Joint Capacity, Compute, Memory Traffic, and Communication
+![K3 KDA Prefill stage scaling](../assets/k3-kda-prefill-stage-scaling.svg)
+
+The complete production KDA operator is measured at $C\in\{1\mathrm{K},2\mathrm{K},4\mathrm{K},8\mathrm{K},16\mathrm{K}\}$ under 32K, 128K, 512K, and 1M logical context. All four curves overlap because the cached prefix has already been summarized into the recurrent state. Complete-forward latency rises from approximately 2.28 ms at 1K tokens to 13.17 ms at 16K.
+
+![K3 KDA Prefill stage breakdown](../assets/k3-kda-prefill-breakdown.svg)
+
+The breakdown follows the actual forward path: seven input projections (Q, K, V, output gate, beta, forget-A, and forget-B), ragged causal QKV convolution, chunk KDA recurrence, per-head gated normalization, and output projection. At the 8K reference chunk, their representative isolated times are 2.68, 0.59, 2.50, 0.47, and 0.77 ms respectively. Input projections and recurrence now dominate at approximately 38% and 36% of the isolated-stage sum; causal convolution contributes only 8.4%. The dashed complete-forward line is measured independently; the stacked stages are not used as a substitute for end-to-end latency.
+
+!!! success "Predictable performance"
+
+    KDA latency is highly linear after the small-chunk launch-dominated region: fitting all 20 complete-forward measurements gives $R^2=0.9936$, a slope of approximately $0.731\,\mu\mathrm{s/token}$, and a fixed intercept of approximately $1.00\,\mathrm{ms}$. Together with the stable stage composition, this makes Prefill cost directly predictable for scheduler capacity planning.
+
+!!! important "Chunk-size driven, not context-length driven"
+
+    For a fixed chunk, the complete-forward measurements across 32K, 128K, 512K, and 1M context differ by at most approximately 1.6%, with no growth trend. Once the prefix is represented by the recurrent state, KDA processes only the fresh chunk.
+
+!!! success "SGLang-style ragged convolution removes the former bottleneck"
+
+    NanoDeploy now applies the causal convolution directly to ragged Q, K, and V tensors and fuses persistent-state read and update into the Triton kernel. It no longer constructs a concatenated padded QKV workspace or performs a separate tail-state extraction. At the 8K reference point, convolution falls from approximately 7.98 ms to 0.59 ms (13.5x), while complete-layer latency falls from approximately 15.2 ms to 6.72 ms (2.27x).
+
+    Throughput now rises from 449K tokens/s at 1K to 1.13M at 4K, 1.22M at 8K, and 1.24M at 16K. The remaining plateau begins only after the projection GEMMs and KDA recurrence become the dominant stages; latency scaling alone is still insufficient to label the complete layer compute-bound.
+
+#### 7.1.2 MLA
+
+MLA is reported at two explicit boundaries. The first is the cached-prefix kernel pipeline. The second is the complete K3 MLA attention computation path, which adds all projections, latent normalization and cache write, fresh K/V expansion, gating, and output projection. All experiments use one B300, a mixed FP8/BF16 cache, and the production 128K prefix split. The chunk sweep fixes context at 1M; the complementary context sweep fixes the fresh chunk at 16K.
+
+##### 7.1.2.1 Cached-Prefix Kernel Pipeline
+
+![K3 MLA kernel pipeline across chunk size and context length](../assets/k3-mla-kernel-ab-breakdown.svg)
+
+This figure is a **kernel-pipeline breakdown**, not a Decoder Layer. Panel (a) fixes visible context at 1M and varies the fresh chunk; panel (b) fixes the fresh chunk at 16K and varies visible context from 32K to 1M. Both start from projected Q and fresh compressed KV, then measure FP8 cache restoration, fresh causal attention, cached-prefix K/V expansion, prefix attention, and LSE-weighted result merging.
+
+In panel (a), average achieved throughput for the complete kernel boundary rises from approximately 8.77 × 10^5 GFLOP/s at 1K to 1.57 × 10^6 GFLOP/s at 16K. The B300 BF16 Tensor Core peak is a hardware reference rather than an attainable bound for every restore, merge, or elementwise kernel. At the 1M-context, 16K-chunk point, the pipeline takes 683.6 ms: prefix attention contributes 597.0 ms, prefix K/V expansion 56.0 ms, LSE merge 21.5 ms, cache restore 4.8 ms, and fresh attention 4.3 ms.
+
+![K3 MLA cumulative kernel and layer context scaling](../assets/k3-mla-context-kernel-layer-ab.svg)
+
+Both cumulative panels fix the fresh chunk at 16K and sweep visible context from 32K to 1M. Panel (a) expands the cached-prefix kernel pipeline: prefix K/V expansion grows from 1.46 ms to 56.01 ms, while prefix attention grows from 8.84 ms to 596.69 ms. Panel (b) places that pipeline inside the complete MLA attention layer, adding projections, latent normalization and cache write, fresh K/V expansion, gating, and output projection. The shared axes make the comparatively small layer overhead directly visible.
+
+##### 7.1.2.2 Complete MLA Attention Layer
+
+Panel (b) is the complete K3 MLA attention computation path. The stacked bars are stage measurements, while the black dashed curve is an independently timed complete forward. At 1M context, the complete path takes 689.7 ms, only 6.1 ms above the 683.6 ms kernel pipeline. Therefore long-context MLA is dominated by cached-prefix expansion, attention, and merge rather than its layer projections.
+
+The complete-layer average throughput grows from approximately 8.71 × 10^5 GFLOP/s at 1K to 1.57 × 10^6 GFLOP/s at 16K. This is the appropriate cumulative Layer view; the preceding figure remains the place to diagnose individual cache/attention kernels.
+
+#### 7.1.3 MegaMoE
+
+![K3 balanced MegaMoE Prefill scaling](../assets/k3-megamoe-prefill-scaling.png)
+
+The existing production MXFP4 MegaMoE benchmark uses 896 experts, Top-16 routing, latent width 3584, and intermediate width 3072. Its synthetic expert IDs are round-robin, so the routed-row counts differ by at most one and form the perfect-balance baseline. Latency is nearly flat from 1K to 4K (5.67--6.18 ms), then reaches 7.02 ms at 8K and 12.72 ms at 16K.
+
+The next experiment will measure the complete MoE path and break it into router/latent-down, Top-K, pre-dispatch, fused routed experts, routed norm/up, shared experts, and output merge. Routing imbalance will be added only after its load-distribution metric and synthetic distributions are agreed upon.
+
+### 7.2 Decode
+
+During Decode, each active sequence contributes one token. KDA and MegaMoE primarily sweep batch size $B$; MLA must sweep both $B$ and visible context length $L$.
+
+#### 7.2.1 KDA
+
+![K3 KDA Decode scaling](../assets/k3-kda-decode-scaling.png)
+
+The recurrent-core latency stays near 0.09 ms through batch 8, then reaches 0.535 ms at batch 256. Throughput rises from 11.3K to 478K tokens/s and begins to flatten after batch 128. As in Prefill, the complete KDA projections, convolution, gated normalization, and output projection remain to be added to the breakdown.
+
+#### 7.2.2 MLA
+
+The required evaluation matrix is $B\times L$: batch size controls the number of current queries, while context length controls the latent-cache history read by each query. The current Prefill cached-prefix measurements cannot substitute for the production paged-cache Decode path, so no Decode MLA result is claimed yet.
+
+The breakdown will include query/KV preparation, paged latent-cache attention, output gate, and output projection, with cache traffic reported separately from projection traffic.
+
+#### 7.2.3 MegaMoE
+
+The required Decode sweep is batch size crossed with routing balance. The perfect-balance case will be measured first, followed by controlled imbalance after defining max-to-mean expert load, coefficient of variation, and active-expert ratio. The same complete MoE breakdown used for Prefill will be retained so the small-batch dispatch floor is visible.
+
+### 7.3 Model-Level Composition and Bottleneck Summary
+
+After the complete operator curves are available, the Prefill and Decode models will be composed using K3's actual layer counts:
+
+$$
+T_{mathrm{K3}}
+=69T_{mathrm{KDA}}+24T_{mathrm{MLA}}+92T_{mathrm{MoE}}+T_{mathrm{Dense}}.
+$$
+
+The single Dense FFN term remains in this equation even though it is omitted from the detailed sweep. Final memory-bound or compute-bound labels will require achieved FLOP/s, HBM bytes, SM utilization, tensor-core utilization, and kernel launch gaps rather than latency scaling alone.
+
+The benchmark inputs, raw CSV/JSON results, and plotting scripts are kept under `bench/k3_layer_performance/`.
+
+## 8. Joint Capacity, Compute, Memory Traffic, and Communication
 
 The useful deployment question is not whether one isolated kernel is fast. It
 is whether a parallel layout can hold K3's resident state and keep the GPUs fed
@@ -455,7 +482,7 @@ through both Prefill and Decode. This chapter therefore combines the four
 quantities established above: weights, persistent cache, transient activation,
 and bytes exchanged between the attention and FFN meshes.
 
-### 6.1 Reference Topologies and Ownership
+### 8.1 Reference Topologies and Ownership
 
 Let $D_A$ and $T_A$ denote attention data and tensor parallelism, and let $E$
 and $T_F$ denote FFN expert and tensor parallelism. With no pipeline
@@ -489,7 +516,7 @@ head-sharded by $T_A$.
 | KDA SSM Slot | Requests split by $D_A$ and 96 heads split by $T_A$ |
 | Activations | Local request rows in attention DP; redistributed at attention/FFN boundaries |
 
-### 6.2 Per-Rank Capacity
+### 8.2 Per-Rank Capacity
 
 Using decimal checkpoint payloads, a first-order weight model is
 
@@ -536,7 +563,7 @@ KDA, MLA, and MoE execute sequentially and reuse allocator storage. They are
 upper-bound candidates for a complete-layer peak, while MegaMoE's first-use
 workspace remains a separate deployment reservation.
 
-### 6.3 Compute Model
+### 8.3 Compute Model
 
 The following counts use two FLOPs per multiply-add and checkpoint matrix
 shapes. They are algorithmic counts rather than achieved throughput.
@@ -563,7 +590,7 @@ owning their selected experts. Actual MoE balance depends on the routing
 histogram, so $1/E$ is a capacity rule, not a guarantee that every rank receives
 exactly $1/E$ of the computation.
 
-### 6.4 HBM Traffic and Arithmetic Intensity
+### 8.4 HBM Traffic and Arithmetic Intensity
 
 Decode and Prefill stress different data paths. At batch-one Decode, weights
 have little reuse. One KDA layer has about 0.888 GB of BF16 weights for roughly
@@ -600,7 +627,7 @@ This explains the phase behavior:
 - MoE moves from bandwidth-bound at small batches toward compute-bound only when
   routing supplies enough tokens per local expert to amortize its MXFP4 payload.
 
-### 6.5 Communication Volume
+### 8.5 Communication Volume
 
 A BF16 hidden row has
 
@@ -627,7 +654,7 @@ uniform routing, approximately $1-1/E$ crosses rank boundaries. Indices and
 scores are small beside the dispatched activations. Combine traffic has the
 same first-order dependence on active tokens, Top-K, and latent width.
 
-### 6.6 Measured B300 Collectives
+### 8.6 Measured B300 Collectives
 
 The local experiment used 2 and 4 NVLink-connected NVIDIA B300 SXM6 GPUs, BF16
 `[N_A,7168]` tensors, five warm-up iterations, and twenty CUDA-event-timed
@@ -650,7 +677,7 @@ do establish the local boundary cost and the payload scaling. A production run
 must repeat the same benchmark on the final NVLink/IB topology and measure
 MegaMoE dispatch/combine with the real routing distribution.
 
-### 6.7 Deployment Conclusions
+### 8.7 Deployment Conclusions
 
 Three constraints dominate different operating points:
 
