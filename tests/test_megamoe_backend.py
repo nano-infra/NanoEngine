@@ -46,14 +46,29 @@ def test_megamoe_rejects_ffn_tp_instead_of_padding_batch():
         )
 
 
-def test_megamoe_requires_ep():
-    with pytest.raises(ValueError, match="ffn_ep > 1"):
+def test_megamoe_supports_single_rank():
+    experts = MegaMoEExperts(
+        hidden_size=64,
+        intermediate_size=32,
+        num_experts=8,
+        top_k=2,
+        ep_size=1,
+        tp_size=1,
+        quantization_config=mxfp4_config(),
+    )
+    assert experts.num_local_experts == 8
+    assert experts.gate_up_proj.shape == (8, 64, 32)
+    assert experts.down_proj.shape == (8, 64, 16)
+
+
+def test_megamoe_rejects_non_positive_ep():
+    with pytest.raises(ValueError, match="positive ffn_ep"):
         MegaMoEExperts(
             hidden_size=64,
             intermediate_size=32,
             num_experts=8,
             top_k=2,
-            ep_size=1,
+            ep_size=0,
             tp_size=1,
             quantization_config=mxfp4_config(),
         )

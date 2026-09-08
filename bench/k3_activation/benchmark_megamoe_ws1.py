@@ -11,11 +11,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from dlengine.runtime.layers.backends.experts.mega_moe import MegaMoEExperts
+from dlengine.runtime.models.quant_config import QuantizationConfig
+from dlengine.runtime.runner.runner_config import set_runner_config
+
 EXPERTS = 896
 HIDDEN = 3584
 INTERMEDIATE = 3072
 TOP_K = 16
-SITU_CLAMP = 0.03125
 
 
 def gib(value: int) -> float:
@@ -77,55 +80,47 @@ def main() -> None:
     free_before_workspace, _ = torch.cuda.mem_get_info()
     torch.cuda.reset_peak_memory_stats()
 
-    buf = deep_gemm.get_symm_buffer_for_mega_moe(
-        dist.group.WORLD,
-        EXPERTS,
-        args.capacity,
-        TOP_K,
-        HIDDEN,
-        INTERMEDIATE,
-        use_fp8_dispatch=True,
-        activation="swiglu",
+    quantization_config = QuantizationConfig(
+        format="mxfp4-pack-quantized",
+        config_groups={"g": {"weights": {"group_size": 32}}},
     )
+    set_runner_config(mega_moe_max_tokens_per_rank=args.capacity)
+    with torch.device("meta"):
+        experts = MegaMoEExperts(
+            hidden_size=HIDDEN,
+            intermediate_size=INTERMEDIATE,
+            num_experts=EXPERTS,
+            top_k=TOP_K,
+            ep_size=1,
+            tp_size=1,
+            ep_group=None,
+            quantization_config=quantization_config,
+        )
+    experts.mega_l1_weights = l1
+    experts.mega_l2_weights = l2
+    buf = experts._get_buffer()
     torch.cuda.synchronize()
+    workspace_logical = buf.buffer.numel() * buf.buffer.element_size()
+    regions = ("x", "x_sf", "topk_idx", "topk_weights", "l1_acts", "l1_acts_sf", "l2_acts", "l2_acts_sf")
+    print("workspace logical regions:", flush=True)
+    for name in regions:
+        view = getattr(buf, name)
+        print(f"  {name}: shape={tuple(view.shape)} dtype={view.dtype}", flush=True)
     workspace_live = torch.cuda.memory_allocated() - weight_baseline
     workspace_peak = torch.cuda.max_memory_allocated() - weight_baseline
     free_after_workspace, _ = torch.cuda.mem_get_info()
     workspace_device = free_before_workspace - free_after_workspace
     print(
-        f"workspace device={gib(workspace_device):.3f} GiB "
+        f"workspace logical={gib(workspace_logical):.3f} GiB "
+        f"device={gib(workspace_device):.3f} GiB "
         f"torch_live={gib(workspace_live):.3f} GiB "
         f"torch_peak={gib(workspace_peak):.3f} GiB",
         flush=True,
     )
 
-    x_storage = torch.from_dlpack(buf.x).view(torch.float8_e4m3fn)
-
     def forward(tokens: int, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor):
-        deep_gemm.mega_moe_pre_dispatch(
-            x,
-            ids,
-            weights,
-            x_storage,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            num_tokens=tokens,
-            group_size=32,
-            use_fp4_acts=False,
-        )
-        output = torch.empty_like(x, dtype=torch.bfloat16)
-        deep_gemm.fp8_fp4_mega_moe(
-            output,
-            l1,
-            l2,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=SITU_CLAMP,
-            fast_math=True,
-        )
-        return output
+        assert tokens == x.shape[0]
+        return experts(x, ids, weights)
 
     rows = []
     for tokens in args.tokens:
@@ -169,6 +164,7 @@ def main() -> None:
                 "steady_forward_peak_bytes": steady_peak,
                 "steady_bytes_per_token": steady_peak / tokens,
                 "steady_latency_ms": latency_ms,
+                "workspace_logical_bytes_at_capacity": workspace_logical,
                 "workspace_device_bytes_at_capacity": workspace_device,
                 "workspace_torch_live_bytes_at_capacity": workspace_live,
                 "workspace_torch_peak_bytes_at_capacity": workspace_peak,

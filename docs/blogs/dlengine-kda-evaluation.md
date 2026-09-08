@@ -237,8 +237,8 @@ them into decoder layers.
     Measurements use one NVIDIA B300 SXM6, BF16 activations, and a maximum 16K
     Prefill chunk. Persistent synthetic KDA state and MLA cache are allocated
     before the activation baseline. MLA includes fresh-only and 1008K cached +
-    16K fresh cases. MoE includes the local BF16 reference and a direct
-    world-size-one DeepGEMM MegaMoE control; distributed EP is deferred to the
+    16K fresh cases. MoE includes the local BF16 reference and a NanoDeploy MegaMoE with a supported
+    world-size-one EP group; distributed EP is deferred to the
     partitioning analysis.
 
 | Target | Measurement boundary | Main transient tensors to inspect |
@@ -269,27 +269,21 @@ the portable reference implementation, not a production MegaMoE workspace
 estimate. An earlier run accidentally retained autograd state and reported
 15.176 GiB; the corrected measurement uses `torch.inference_mode()`.
 
-#### World-Size-One MegaMoE Control
+#### World-Size-One MegaMoE
 
-NanoDeploy's `MegaMoEExperts` wrapper intentionally requires $E>1$, but the
-installed DeepGEMM kernel can execute with a one-rank NCCL group. The control
-therefore calls the same `mega_moe_pre_dispatch` and `fp8_fp4_mega_moe` APIs
-directly with K3's 896 experts, Top-16 routing, $3584\rightarrow3072$
-expert shape, packed MXFP4 weights, and SiTU activation.
+NanoDeploy now accepts `ffn_ep=1` in `MegaMoEExperts` and uses the initialized WORLD process group when no explicit EP group is supplied. The benchmark executes that production wrapper with K3's 896 experts, Top-16 routing, a 3584-to-3072 expert shape, packed MXFP4 weights, and SiTU activation.
 
-![K3 MegaMoE world-size-one activation memory](../assets/megamoe-ws1-activation.png)
+![K3 NanoDeploy MegaMoE EP=1 memory](../assets/megamoe-ws1-activation.png)
 
-For a configured capacity of 16K tokens, DeepGEMM allocates a **5.939 GiB
-symmetric workspace once**. It is owned outside PyTorch's CUDA allocator and is
-therefore measured from the CUDA free-memory delta. After allocation, both the
+MegaMoE allocates one persistent symmetric buffer on first use and reuses it across forwards and decoder layers. For configured capacity `T`, DeepGEMM first aligns the per-rank token capacity to `Ta = 384 ceil(T/384)`. With `R` ranks, `E` experts, and Top-K `K`, the shared expert-token pool is sized as `P = 384 ceil((R Ta min(K, E/R) + (E/R) 191)/384)`. The extra 191-token allowance per local expert covers the largest supported 192-row GEMM tile before final alignment.
+
+The buffer then lays out persistent input, scale, Top-K metadata, expert-token pools, and kernel synchronization metadata. For K3 at `R=1`, `E=896`, `K=16`, `H=3584`, `I=3072`, and `T=16384`, alignment gives `Ta=16512` and `P=435456`. The principal views are `x [Ta,H]` FP8, `x_sf [Ta,H/128]` INT32, Top-K indices and weights `[Ta,K]`, `l1_acts [P,H]` FP8, `l1_acts_sf [16P,H/128]` INT32, `l2_acts [P,I]` FP8, and `l2_acts_sf [16P,I/128]` INT32. DeepGEMM's authoritative layout function sums these views plus barriers, counters, source metadata, and alignment padding. It reports **5.935 GiB logical bytes**; the measured CUDA free-memory delta is **5.939 GiB**. This allocation is outside PyTorch's CUDA allocator and is not multiplied by K3's 92 MoE layers. After allocation, both the
 first and warmed forward add exactly 7,168 bytes per token—the BF16
 $[N_A,3584]$ output—giving **0.109 GiB at 16K**. The combined workspace plus
 forward increment is 6.048 GiB, versus 7.010 GiB dynamically allocated by the
 BF16 reference.
 
-The 16K steady kernel latency is 12.74 ms on one B300. This point excludes EP
-dispatch traffic and does not make world-size-one a supported serving topology;
-it isolates MegaMoE's capacity behavior. The key distinction is that MegaMoE
+The 16K steady kernel latency is 12.56 ms on one B300. With `ffn_ep=1`, this is a supported local MegaMoE path and has no inter-rank EP traffic. It isolates the kernel's capacity behavior from partitioning costs. The key distinction is that MegaMoE
 moves most Top-16 temporary storage into a fixed, reusable workspace instead of
 allocating several token-expanded tensors during every forward.
 

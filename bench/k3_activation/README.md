@@ -56,7 +56,4 @@ CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc-per-node=1 \
   bench/k3_activation/benchmark_megamoe_ws1.py
 ```
 
-The NanoDeploy wrapper requires `ffn_ep > 1`, so this benchmark invokes the
-underlying DeepGEMM APIs directly. It uses all 896 K3 experts and separates the
-16K-capacity symmetric workspace (CUDA free-memory delta) from first-forward
-and steady PyTorch allocation peaks.
+This benchmark runs NanoDeploy's `MegaMoEExperts` wrapper with `ffn_ep=1` and all 896 K3 experts. It separates the persistent 16K-capacity symmetric buffer (both DeepGEMM logical bytes and CUDA free-memory delta) from first-forward and steady allocation peaks.
