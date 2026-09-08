@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Two-node rate-50 four-way scheduling comparison</title>
+  <title>双节点 Rate-50 四方案调度对比</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -199,68 +199,51 @@
 <body>
   <main class="shell">
     <header>
-      <div class="eyebrow">NanoDeploy · experiment report · 2026-08-27</div>
-      <h1>Two-node rate-50 four-way scheduling comparison</h1>
-      <p class="lead">
-        Two repetitions compare centralized and hierarchical scheduling with
-        LeastBatch and ProjectedLoad on an identical 15,000-request trace.
-      </p>
+      <div class="eyebrow">NanoDeploy · 实验报告 · 2026-08-27</div>
+      <h1>双节点 Rate-50 四方案调度对比</h1>
+      <p class="lead">相同的 15,000 请求轨迹，比较集中式/分层调度与 LeastBatch/ProjectedLoad，共 2 轮 8 次运行。</p>
       <div class="verdict">
-        Hierarchical + ProjectedLoad is the clear winner. The architecture
-        contributes roughly 7% lower TPOT; ProjectedLoad adds roughly 2% by
-        reducing attention-work skew. The architecture win is host/control-path
-        savings—not faster GPU execution or a cheaper <code>schedule()</code> call.
+        最佳方案是 Hierarchical + ProjectedLoad。分层架构贡献约 7% TPOT 收益，ProjectedLoad 通过降低负载偏斜再贡献约 2%。核心收益来自减少主机控制路径串行化，不是 GPU 更快，也不是 <code>schedule()</code> 更快。
       </div>
     </header>
 
-    <nav class="tabs" aria-label="Report sections">
-      <button class="tab-button active" data-tab="overview">Overview</button>
-      <button class="tab-button" data-tab="breakdown">Critical-path breakdown</button>
-      <button class="tab-button" data-tab="boundaries">Metric boundaries</button>
-      <button class="tab-button" data-tab="validity">Validity & next steps</button>
+    <nav class="tabs" aria-label="报告章节">
+      <button class="tab-button active" data-tab="overview">结果</button>
+      <button class="tab-button" data-tab="breakdown">关键路径拆解</button>
+      <button class="tab-button" data-tab="boundaries">指标口径</button>
+      <button class="tab-button" data-tab="validity">结论边界</button>
     </nav>
 
     <section id="overview" class="tab active">
       <div class="grid">
-        <div class="metric span-3"><div class="label">Best mean TPOT</div><div class="value">72.122 ms</div><div class="detail">−9.189% vs Central-LB</div></div>
-        <div class="metric span-3"><div class="label">Best TPOT p99</div><div class="value">80.015 ms</div><div class="detail">−10.667% vs Central-LB</div></div>
-        <div class="metric span-3"><div class="label">Best Arrival E2E</div><div class="value">44.375 s</div><div class="detail">−9.191% vs Central-LB</div></div>
-        <div class="metric span-3"><div class="label">Best drain time</div><div class="value">78.454 s</div><div class="detail">−15.515% vs Central-LB</div></div>
+        <div class="metric span-3"><div class="label">最佳 TPOT 均值</div><div class="value">72.122 ms</div><div class="detail">比 Central-LB 低 9.189%</div></div>
+        <div class="metric span-3"><div class="label">最佳 TPOT p99</div><div class="value">80.015 ms</div><div class="detail">比 Central-LB 低 10.667%</div></div>
+        <div class="metric span-3"><div class="label">最佳到达 E2E 均值</div><div class="value">44.375 s</div><div class="detail">比 Central-LB 低 9.191%</div></div>
+        <div class="metric span-3"><div class="label">最佳排空时间</div><div class="value">78.454 s</div><div class="detail">比 Central-LB 低 15.515%</div></div>
       </div>
 
       <article class="panel">
-        <h2>Experiment contract</h2>
-        <p>
-          The run covers 2026-08-27 15:11:31–16:19:01 UTC. Each repetition
-          executes Central-LB, Hierarchical-LB, Central-PL, then Hierarchical-PL.
-        </p>
+        <h2>实验条件</h2>
         <div>
           <span class="pill">DeepSeek-V3</span><span class="pill">DP2 / SP8 / TP1</span>
-          <span class="pill">50 req/s</span><span class="pill">300 s arrival window</span>
-          <span class="pill">15,000 requests/run</span><span class="pill">batch 192</span>
+          <span class="pill">50 req/s</span><span class="pill">发压 300 s</span>
+          <span class="pill">15,000 请求/次</span><span class="pill">batch 192</span>
           <span class="pill">loop 16</span><span class="pill">hao_basic</span>
-          <span class="pill">full CUDA graph</span><span class="pill">uniform_random MoE, seed 0</span>
-          <span class="pill">quantum diagnostics enabled</span>
+          <span class="pill">full CUDA graph</span><span class="pill">uniform_random MoE · seed 0</span>
+          <span class="pill">开启 quantum diagnostics</span>
         </div>
-        <p>
-          All eight runs receive the same scheduled arrival trace, 67,140,699
-          prompt tokens, and 9,006,376 output tokens. Central and hierarchical
-          request IDs have a constant warmup offset, but request lengths match
-          exactly by arrival position.
-        </p>
+        <p>8 次运行使用完全相同的到达轨迹：67,140,699 个输入 token、9,006,376 个输出 token。</p>
         <div class="callout">
-          <strong>Validity checks passed</strong>
-          Every run completed 15,000/15,000 requests with zero failures,
-          rejection, fallback, global retry, preemption, or local transient
-          retry. Corrected TPOT &lt; 100 ms/token goodput is 100% in all runs.
+          <strong>运行完整</strong>
+          每次 15,000/15,000 成功，0 失败；无拒绝、fallback、全局重试、抢占或本地瞬态重试；TPOT &lt; 100 ms/token goodput 均为 100%。
         </div>
       </article>
 
       <article class="panel">
-        <h2>Two-repetition average</h2>
+        <h2>两轮平均</h2>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Configuration</th><th>TPOT mean</th><th>TPOT p95</th><th>TPOT p99</th><th>Arrival E2E mean</th><th>Arrival E2E p99</th><th>Runtime</th><th>Drain</th></tr></thead>
+            <thead><tr><th>方案</th><th>TPOT 均值</th><th>TPOT p95</th><th>TPOT p99</th><th>到达 E2E 均值</th><th>到达 E2E p99</th><th>总时长</th><th>排空</th></tr></thead>
             <tbody>
               <tr><td>Central + LeastBatch</td><td>79.420 ms</td><td>88.968 ms</td><td>89.569 ms</td><td>48.867 s</td><td>87.956 s</td><td>394.998 s</td><td>92.861 s</td></tr>
               <tr><td>Central + ProjectedLoad</td><td>77.437 ms</td><td>85.652 ms</td><td>86.006 ms</td><td>47.649 s</td><td>85.103 s</td><td>392.581 s</td><td>90.445 s</td></tr>
@@ -269,9 +252,8 @@
             </tbody>
           </table>
         </div>
-        <p class="small">Arrival E2E is scheduled arrival to benchmark-observed completion. Lower is better.</p>
-
-        <h3>Mean TPOT visual</h3>
+        <p class="small">到达 E2E：计划到达至完成。所有指标越低越好。</p>
+        <h3>TPOT 均值</h3>
         <div class="bar-row"><span>Central + LeastBatch</span><div class="bar-track"><div class="bar central" style="width:100%"></div></div><strong>79.420</strong></div>
         <div class="bar-row"><span>Central + ProjectedLoad</span><div class="bar-track"><div class="bar central" style="width:97.5%"></div></div><strong>77.437</strong></div>
         <div class="bar-row"><span>Hierarchical + LeastBatch</span><div class="bar-track"><div class="bar hier" style="width:92.7%"></div></div><strong>73.638</strong></div>
@@ -279,284 +261,165 @@
       </article>
 
       <article class="panel">
-        <h2>Effect decomposition</h2>
+        <h2>收益拆分</h2>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Comparison</th><th>TPOT mean</th><th>TPOT p95</th><th>TPOT p99</th><th>Arrival E2E mean</th><th>Arrival E2E p99</th><th>Drain</th></tr></thead>
+            <thead><tr><th>对比</th><th>TPOT 均值</th><th>TPOT p95</th><th>TPOT p99</th><th>到达 E2E 均值</th><th>到达 E2E p99</th><th>排空</th></tr></thead>
             <tbody>
-              <tr><td>Hier vs central · LeastBatch</td><td>−7.280%</td><td>−8.109%</td><td>−7.740%</td><td>−7.304%</td><td>−7.616%</td><td>−14.391%</td></tr>
-              <tr><td>Hier vs central · ProjectedLoad</td><td>−6.863%</td><td>−7.350%</td><td>−6.966%</td><td>−6.869%</td><td>−6.990%</td><td>−13.258%</td></tr>
-              <tr><td>PL vs LB · central</td><td>−2.497%</td><td>−3.727%</td><td>−3.977%</td><td>−2.493%</td><td>−3.244%</td><td>−2.602%</td></tr>
-              <tr><td>PL vs LB · hierarchical</td><td>−2.059%</td><td>−2.933%</td><td>−3.172%</td><td>−2.036%</td><td>−2.588%</td><td>−1.313%</td></tr>
-              <tr class="best"><td>Best vs Central-LB</td><td>−9.189%</td><td>−10.803%</td><td>−10.667%</td><td>−9.191%</td><td>−10.007%</td><td>−15.515%</td></tr>
+              <tr><td>Hier vs Central · LeastBatch</td><td>−7.280%</td><td>−8.109%</td><td>−7.740%</td><td>−7.304%</td><td>−7.616%</td><td>−14.391%</td></tr>
+              <tr><td>Hier vs Central · ProjectedLoad</td><td>−6.863%</td><td>−7.350%</td><td>−6.966%</td><td>−6.869%</td><td>−6.990%</td><td>−13.258%</td></tr>
+              <tr><td>PL vs LB · Central</td><td>−2.497%</td><td>−3.727%</td><td>−3.977%</td><td>−2.493%</td><td>−3.244%</td><td>−2.602%</td></tr>
+              <tr><td>PL vs LB · Hierarchical</td><td>−2.059%</td><td>−2.933%</td><td>−3.172%</td><td>−2.036%</td><td>−2.588%</td><td>−1.313%</td></tr>
+              <tr class="best"><td>最佳方案 vs Central-LB</td><td>−9.189%</td><td>−10.803%</td><td>−10.667%</td><td>−9.191%</td><td>−10.007%</td><td>−15.515%</td></tr>
             </tbody>
           </table>
         </div>
-        <p>
-          The best stack raises complete-window output throughput by about 3.8%.
-          Runtime moves less than request latency because every run contains the
-          same roughly 302-second arrival trace; most separation is in drain.
-        </p>
-        <p>
-          Hierarchical-PL beats Central-LB on corrected TPOT for 99.86% and
-          99.82% of arrival-matched requests in repetitions one and two. Arrival
-          E2E win rates are 99.69% and 99.67%. Requests sharing a quantum are not
-          independent system repetitions, so these rates show breadth—not a
-          30,000-trial confidence interval.
-        </p>
+        <p>最佳方案整体吞吐提升约 3.8%。两轮性能排序完全一致：H-PL &lt; H-LB &lt; C-PL &lt; C-LB。</p>
       </article>
 
       <article class="panel">
-        <h2>ProjectedLoad mechanism</h2>
+        <h2>ProjectedLoad 的作用</h2>
         <div class="grid">
-          <div class="metric span-3"><div class="label">Central-LB rank-work CV</div><div class="value" style="color:var(--central)">8.88%</div></div>
-          <div class="metric span-3"><div class="label">Hierarchical-LB rank-work CV</div><div class="value" style="color:var(--central)">5.22%</div></div>
-          <div class="metric span-3"><div class="label">Central-PL rank-work CV</div><div class="value">1.65%</div></div>
-          <div class="metric span-3"><div class="label">Hierarchical-PL rank-work CV</div><div class="value">1.87%</div></div>
+          <div class="metric span-3"><div class="label">Central-LB 跨 rank 负载 CV</div><div class="value" style="color:var(--central)">8.88%</div></div>
+          <div class="metric span-3"><div class="label">Hierarchical-LB 跨 rank 负载 CV</div><div class="value" style="color:var(--central)">5.22%</div></div>
+          <div class="metric span-3"><div class="label">Central-PL 跨 rank 负载 CV</div><div class="value">1.65%</div></div>
+          <div class="metric span-3"><div class="label">Hierarchical-PL 跨 rank 负载 CV</div><div class="value">1.87%</div></div>
         </div>
-        <p>
-          ProjectedLoad compresses cross-rank attention-work skew from roughly
-          5–9% to roughly 2%. This supports load balance as the mechanism behind
-          its additional 2.1–2.5% mean and 3.2–4.0% p99 TPOT improvement.
-        </p>
-        <div class="callout">
-          <strong>Magnitude needs more repetitions</strong>
-          Hierarchical ProjectedLoad improves mean TPOT by 3.29% in repetition
-          one and 0.80% in repetition two. Direction is consistent; exact mean
-          effect size is not established. Its p99 gains are steadier at 3.23%
-          and 3.11%.
-        </div>
+        <p>ProjectedLoad 把 attention-work 偏斜从约 5%–9% 压到约 2%，对应均值约 2% 和 p99 约 3%–4% 的额外收益。</p>
+        <div class="callout"><strong>幅度仍需复测</strong>Hierarchical 下均值收益两轮分别为 3.29% 和 0.80%；方向一致，但精确幅度尚不稳定。</div>
       </article>
     </section>
 
     <section id="breakdown" class="tab">
       <article class="panel">
-        <h2>How the global critical path was reconstructed</h2>
-        <p>
-          Central diagnostics contain one global record per quantum.
-          Hierarchical diagnostics contain one record per engine, so records are
-          grouped by <code>(wave_id, quantum_id)</code> and the engine with the
-          maximum <code>quantum_total_ms</code> is selected as the global critical
-          record. Totals below are averaged across the two repetitions.
-        </p>
-        <pre>known non-executor = schedule + admission + exposed consensus wait + postprocess
-host residual      = quantum_total - execute - known non-executor</pre>
+        <h2>拆解方法</h2>
+        <p>Central 每个 quantum 只有一条全局记录。Hierarchical 按 <code>(wave_id, quantum_id)</code> 分组，取 <code>quantum_total_ms</code> 最大的 engine 作为全局关键路径。下表为两轮平均。</p>
+        <pre>已知非执行时间 = schedule + admission + consensus 暴露等待 + postprocess
+主机残差       = quantum_total - execute - 已知非执行时间</pre>
       </article>
 
       <article class="panel">
-        <h2>LeastBatch architecture comparison</h2>
+        <h2>LeastBatch：架构差异</h2>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Accumulated critical-path component</th><th>Central</th><th>Hierarchical</th><th>Hier delta</th></tr></thead>
+            <thead><tr><th>关键路径累计项</th><th>Central</th><th>Hierarchical</th><th>变化</th></tr></thead>
             <tbody>
-              <tr><td><code>executor.run</code></td><td>373.276 s</td><td>377.791 s</td><td class="delta-bad">+4.515 s (+1.21%)</td></tr>
-              <tr><td>Known non-executor stages</td><td>1.726 s</td><td>3.117 s</td><td class="delta-bad">+1.391 s</td></tr>
-              <tr><td>Unattributed in-quantum host residual</td><td>13.754 s</td><td>0.715 s</td><td class="delta-good">−13.039 s</td></tr>
-              <tr><td>Outside recorded decode quantums</td><td>≈6.242 s</td><td>≈0.011 s</td><td class="delta-good">−6.231 s</td></tr>
-              <tr class="best"><td>Benchmark runtime</td><td>394.998 s</td><td>381.634 s</td><td class="delta-good">−13.364 s</td></tr>
+              <tr><td><code>executor.run</code></td><td>373.276 s</td><td>377.791 s</td><td class="delta-bad">+4.515 s（+1.21%）</td></tr>
+              <tr><td>已知非执行阶段</td><td>1.726 s</td><td>3.117 s</td><td class="delta-bad">+1.391 s</td></tr>
+              <tr><td>quantum 内未归因主机残差</td><td>13.754 s</td><td>0.715 s</td><td class="delta-good">−13.039 s</td></tr>
+              <tr><td>decode quantum 外时间</td><td>≈6.242 s</td><td>≈0.011 s</td><td class="delta-good">−6.231 s</td></tr>
+              <tr class="best"><td>总运行时长</td><td>394.998 s</td><td>381.634 s</td><td class="delta-good">−13.364 s</td></tr>
             </tbody>
           </table>
         </div>
       </article>
 
       <article class="panel">
-        <h2>ProjectedLoad architecture comparison</h2>
+        <h2>ProjectedLoad：架构差异</h2>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Accumulated critical-path component</th><th>Central</th><th>Hierarchical</th><th>Hier delta</th></tr></thead>
+            <thead><tr><th>关键路径累计项</th><th>Central</th><th>Hierarchical</th><th>变化</th></tr></thead>
             <tbody>
-              <tr><td><code>executor.run</code></td><td>371.227 s</td><td>376.873 s</td><td class="delta-bad">+5.647 s (+1.52%)</td></tr>
-              <tr><td>Known non-executor stages</td><td>1.671 s</td><td>2.920 s</td><td class="delta-bad">+1.248 s</td></tr>
-              <tr><td>Unattributed in-quantum host residual</td><td>13.436 s</td><td>0.696 s</td><td class="delta-good">−12.740 s</td></tr>
-              <tr><td>Outside recorded decode quantums</td><td>≈6.248 s</td><td>≈0.102 s</td><td class="delta-good">−6.146 s</td></tr>
-              <tr class="best"><td>Benchmark runtime</td><td>392.581 s</td><td>380.590 s</td><td class="delta-good">−11.991 s</td></tr>
+              <tr><td><code>executor.run</code></td><td>371.227 s</td><td>376.873 s</td><td class="delta-bad">+5.647 s（+1.52%）</td></tr>
+              <tr><td>已知非执行阶段</td><td>1.671 s</td><td>2.920 s</td><td class="delta-bad">+1.248 s</td></tr>
+              <tr><td>quantum 内未归因主机残差</td><td>13.436 s</td><td>0.696 s</td><td class="delta-good">−12.740 s</td></tr>
+              <tr><td>decode quantum 外时间</td><td>≈6.248 s</td><td>≈0.102 s</td><td class="delta-good">−6.146 s</td></tr>
+              <tr class="best"><td>总运行时长</td><td>392.581 s</td><td>380.590 s</td><td class="delta-good">−11.991 s</td></tr>
             </tbody>
           </table>
         </div>
       </article>
 
       <article class="panel">
-        <h2>Where the win is—and is not</h2>
+        <h2>收益到底来自哪里</h2>
         <div class="grid">
-          <div class="callout warn span-4">
-            <strong>Not faster GPU/model execution</strong>
-            Cumulative executor time is 1.2–1.5% higher under hierarchical
-            scheduling. GPU rank time per output token is also slightly higher.
-          </div>
-          <div class="callout warn span-4">
-            <strong>Not a cheaper schedule() call</strong>
-            LeastBatch scheduling rises from 0.705 s to 0.881 s accumulated,
-            about 1.61 ms versus 1.98 ms per global critical quantum.
-          </div>
-          <div class="callout span-4">
-            <strong>Yes: host critical-path savings</strong>
-            Roughly 13 s of in-quantum residual and 6 s outside decode quantums
-            leave the serialized centralized path.
-          </div>
+          <div class="callout warn span-4"><strong>不是 GPU 更快</strong>Hierarchical 的累计 executor 时间反而高 1.2%–1.5%，单位输出 token 的 GPU rank 时间也略高。</div>
+          <div class="callout warn span-4"><strong>不是 schedule() 更快</strong>LeastBatch 的显式调度累计时间从 0.705 s 增至 0.881 s，每个关键 quantum 约从 1.61 ms 增至 1.98 ms。</div>
+          <div class="callout span-4"><strong>是主机关键路径变短</strong>集中式路径减少约 13 s 的 quantum 内残差和约 6 s 的 quantum 外串行时间。</div>
         </div>
 
-        <h3>Centralized critical path</h3>
-        <div class="flow central" aria-label="Centralized critical path diagram">
-          <div class="node">Synchronous frontend add<br><span class="small">≈6–6.6 s accumulated</span></div>
-          <div class="arrow">→</div>
-          <div class="node">One global scheduler step<br><span class="small">≈31.4 ms residual / quantum</span></div>
-          <div class="arrow">→</div>
-          <div class="node">Global DP2 executor<br><span class="small">single serialized host path</span></div>
+        <h3>集中式</h3>
+        <div class="flow central" aria-label="集中式关键路径">
+          <div class="node">同步前端 add<br><span class="small">累计约 6–6.6 s</span></div><div class="arrow">→</div>
+          <div class="node">单一全局调度步<br><span class="small">残差约 31.4 ms/quantum</span></div><div class="arrow">→</div>
+          <div class="node">全局 DP2 executor<br><span class="small">主机路径串行</span></div>
         </div>
 
-        <h3>Hierarchical critical path</h3>
-        <div class="flow hier" aria-label="Hierarchical critical path diagram">
-          <div class="node">Timely staged ingress<br><span class="small">≈0.2 ms dispatch lag</span></div>
-          <div class="arrow">→</div>
-          <div class="node">Independent LocalSchedulers<br><span class="small">≈1.6 ms residual / critical quantum</span></div>
-          <div class="arrow">→</div>
-          <div class="node">Parallel engine progress<br><span class="small">higher explicit coordination, lower serialization</span></div>
+        <h3>分层式</h3>
+        <div class="flow hier" aria-label="分层式关键路径">
+          <div class="node">及时 staged ingress<br><span class="small">dispatch lag 约 0.2 ms</span></div><div class="arrow">→</div>
+          <div class="node">独立 LocalScheduler<br><span class="small">残差约 1.6 ms/关键 quantum</span></div><div class="arrow">→</div>
+          <div class="node">两个 engine 并行推进<br><span class="small">协调更多，串行更少</span></div>
         </div>
 
-        <p>
-          Central synchronous add acceptance averages 0.40–0.44 ms/request.
-          Across 15,000 requests, that is 6–6.6 seconds and is consistent with
-          most of the centralized time outside recorded decode quantums. Under
-          Poisson bursts it also accumulates into visible dispatch lag.
-        </p>
-        <p>
-          The supported interpretation is therefore broad: hierarchical
-          scheduling removes centralized host orchestration and ingress
-          serialization from the critical path. It does not make the scheduler
-          algorithm itself cheaper.
-        </p>
+        <div class="verdict">结论：分层调度降低的是集中式主机控制路径和同步 ingress 的串行化开销，不是调度算法计算本身。</div>
       </article>
     </section>
 
     <section id="boundaries" class="tab">
       <article class="panel">
-        <h2>TTFT values are not directly comparable</h2>
+        <h2>TTFT 不能直接横比</h2>
         <div class="grid">
-          <div class="metric span-4"><div class="label">Central displayed TTFT</div><div class="value" style="color:var(--central)">≈3 ms</div><div class="detail">legacy Sequence bootstrap metric</div></div>
-          <div class="metric span-4"><div class="label">Hier displayed TTFT</div><div class="value">584–596 ms</div><div class="detail">dispatch → authoritative planned AddResult</div></div>
-          <div class="metric span-4"><div class="label">Hier model TTFT</div><div class="value">1.72–1.78 s</div><div class="detail">central model TTFT unavailable</div></div>
+          <div class="metric span-4"><div class="label">Central 展示的 TTFT</div><div class="value" style="color:var(--central)">≈3 ms</div><div class="detail">旧 Sequence bootstrap 指标</div></div>
+          <div class="metric span-4"><div class="label">Hierarchical 展示的 TTFT</div><div class="value">584–596 ms</div><div class="detail">dispatch 至权威 AddResult</div></div>
+          <div class="metric span-4"><div class="label">Hierarchical model TTFT</div><div class="value">1.72–1.78 s</div><div class="detail">Central 没有对应数据</div></div>
         </div>
-        <p>
-          Centralized scheduling records 607–626 ms mean dispatch lag, while
-          hierarchical dispatch lag is about 0.2 ms. Hierarchical dispatches on
-          time and puts most admission wait in the staged queue: 570–584 ms on
-          average, versus only about 2.8 ms for admission RPC itself.
-        </p>
-        <div class="callout warn">
-          <strong>Use Arrival E2E for the end-to-end comparison</strong>
-          Scheduled-arrival-to-completion contains both placements of delay and
-          still favors hierarchical scheduling by 6.9–7.3% at the same Router
-          policy. This run cannot establish cross-architecture model TTFT because
-          central model-first-token time is absent.
-        </div>
+        <p>Central 的平均 dispatch lag 为 607–626 ms；Hierarchical 约 0.2 ms，但 staged queue 为 570–584 ms。两者只是把等待记在了不同位置。</p>
+        <div class="callout warn"><strong>端到端必须看“计划到达至完成”</strong>该口径已经包含两种等待位置，同策略下 Hierarchical 仍快 6.9%–7.3%。本实验不能给出跨架构 model TTFT 结论。</div>
       </article>
 
       <article class="panel">
-        <h2>Corrected TPOT contract</h2>
-        <p>
-          Corrected <code>tpot_with_queue_ms</code> uses a scheduler execution
-          boundary for both architectures, keeps GPU-capacity queue time, and
-          removes unused decode slots from the final fixed 16-loop quantum. It
-          excludes benchmark dispatch, non-capacity RPC/command pickup, and
-          non-capacity waiting before first scheduler execution.
-        </p>
-        <p>
-          This is why the TPOT result is useful for steady-state scheduling, but
-          Arrival E2E remains necessary for user-visible end-to-end behavior.
-        </p>
+        <h2>TPOT 口径</h2>
+        <p><code>tpot_with_queue_ms</code> 使用统一的调度执行边界，保留 GPU 容量排队，扣除最后一个 16-loop quantum 中未生成真实 token 的槽位；不包含 benchmark dispatch、非容量 RPC/command pickup，以及首次调度前的非容量等待。</p>
+        <p>因此 TPOT 用于稳态调度对比；用户可见端到端表现看 Arrival E2E。</p>
       </article>
 
       <article class="panel">
-        <h2>Tail diagnostic retained</h2>
-        <p>
-          Hierarchical ProjectedLoad repetition two contains a rare control-path
-          outlier: global-capacity-queue max is 300.528 ms and admission-RPC max
-          is 323.793 ms. Capacity-queue p99 remains zero and admission-RPC p99 is
-          5.478 ms, with no failure or retry. It does not change the aggregate
-          conclusion but should remain visible in future tail comparisons.
-        </p>
+        <h2>尾部异常</h2>
+        <p>Hierarchical-PL 第二轮出现少量控制路径异常：容量队列 max 300.528 ms，admission RPC max 323.793 ms；但容量队列 p99 为 0，RPC p99 为 5.478 ms，且无失败和重试。它不影响总趋势，但后续要继续观察。</p>
       </article>
     </section>
 
     <section id="validity" class="tab">
       <article class="panel">
-        <h2>What is confirmed</h2>
-        <div class="verdict">
-          In this instrumented rate-50 comparison, the hierarchical stack lowers
-          latency primarily by removing centralized host-side orchestration and
-          synchronous ingress serialization from the critical path. It does not
-          win through lower GPU execution time or a faster measured
-          <code>schedule()</code>. ProjectedLoad adds a separate load-balance gain.
-        </div>
-        <p>
-          This uses “scheduling overhead” in the broad system sense of
-          centralized control-path serialization. It must not be shortened to
-          “the scheduling algorithm became cheaper.”
-        </p>
+        <h2>已确认</h2>
+        <div class="verdict">Rate-50 下，Hierarchical + ProjectedLoad 是当前最优方案。分层架构的主要收益来自缩短主机控制关键路径；ProjectedLoad 的额外收益来自降低 attention-work 偏斜。</div>
       </article>
 
       <article class="panel">
-        <h2>What is not yet confirmed</h2>
+        <h2>尚未确认</h2>
         <ul>
-          <li>
-            The roughly 13-second central quantum residual is not subdivided. It
-            contains metrics updates, output construction, rank-load diagnostic
-            payload construction, per-step logging, and Python bookkeeping
-            between measured stage boundaries.
-          </li>
-          <li>
-            Quantum diagnostics are enabled everywhere, but their implementation
-            cost may be asymmetric. The result localizes the gain to the host
-            path; it does not fully separate production orchestration from
-            diagnostic overhead.
-          </li>
-          <li>
-            Central uses Ray worker transport and hierarchical uses ZMQ. The
-            experiment compares current deployable stacks, not an isolated
-            scheduler-architecture coefficient.
-          </li>
-          <li>
-            Every repetition uses the same C-LB, H-LB, C-PL, H-PL order, so
-            time/order drift is not counterbalanced.
-          </li>
-          <li>
-            Two system repetitions establish a consistent direction, not a
-            precise effect-size confidence interval or capacity knee.
-          </li>
+          <li>Central 约 13 s 的 quantum 残差尚未细分，包含 metrics、输出整理、诊断 payload、逐步日志和 Python bookkeeping。</li>
+          <li>所有运行都开启 diagnostics，但两条代码路径的诊断成本可能不对称；尚不能把全部残差都算成生产调度开销。</li>
+          <li>Central 使用 Ray，Hierarchical 使用 ZMQ。当前结论是整套可部署方案对比，不是纯架构单变量结论。</li>
+          <li>每轮顺序固定为 C-LB、H-LB、C-PL、H-PL，未抵消时间顺序影响；系统级重复也只有两轮。</li>
         </ul>
       </article>
 
       <article class="panel">
-        <h2>Recommended confirmation runs</h2>
+        <h2>下一步</h2>
         <ol>
-          <li>Repeat the four-way comparison with quantum diagnostics disabled.</li>
-          <li>Add timers around central pre-executor bookkeeping, postprocess-to-return work, diagnostic construction, logging, and frontend add.</li>
-          <li>Isolate worker transport where the runtime supports it.</li>
-          <li>Counterbalance configurations with ABBA or Latin-square ordering over at least four repetitions.</li>
-          <li>Sweep above rate 50 to locate each stack's goodput/capacity knee.</li>
+          <li>关闭 quantum diagnostics 重跑四方案。</li>
+          <li>细分 Central 的 executor 前后 bookkeeping、日志、诊断构造和 frontend add。</li>
+          <li>可行时隔离 worker transport 变量。</li>
+          <li>用 ABBA 或拉丁方顺序至少跑 4 轮。</li>
+          <li>继续提高 rate，找到各方案的 goodput/容量拐点。</li>
         </ol>
-        <p>
-          For the current production choice at rate 50, evidence favors
-          <code>hierarchical + least_projected_load</code>. These follow-ups are
-          for causal attribution and capacity characterization, not because the
-          observed whole-stack ordering is ambiguous.
-        </p>
       </article>
 
       <article class="panel">
-        <h2>Artifacts and definitions</h2>
+        <h2>原始材料</h2>
         <ul>
-          <li><a href="../../bench_logs/two_node_r50_uniform_random_2round_4way_20260827_151131/compare.progress">Experiment progress</a></li>
-          <li><a href="../../scripts/run_2node_r50_uniform_random_compare.sh">Four-way runner</a></li>
-          <li><a href="../../scripts/README.md#默认-tpot-口径">Serving metric definitions</a></li>
-          <li><a href="../../utils_analysis/analyze_2node_qdiag_ab.py">Quantum A/B analyzer</a></li>
+          <li><a href="../../bench_logs/two_node_r50_uniform_random_2round_4way_20260827_151131/compare.progress">实验进度</a></li>
+          <li><a href="../../scripts/run_2node_r50_uniform_random_compare.sh">四方案运行脚本</a></li>
+          <li><a href="../../scripts/README.md#默认-tpot-口径">Serving 指标定义</a></li>
+          <li><a href="../../utils_analysis/analyze_2node_qdiag_ab.py">Quantum A/B 分析脚本</a></li>
         </ul>
-        <p>All request summaries, JSONL records, quantum diagnostics, and console logs are under:</p>
         <pre>bench_logs/two_node_r50_uniform_random_2round_4way_20260827_151131/</pre>
       </article>
     </section>
 
-    <p class="footer">Generated from the completed eight-run comparison; no runtime code was changed for this report.</p>
+    <p class="footer">基于已完成的 8 次运行整理；本报告未修改任何运行时代码。</p>
   </main>
 
   <script>

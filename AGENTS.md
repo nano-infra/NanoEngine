@@ -20,6 +20,16 @@ Use four-space indentation in Python, `snake_case` for functions and modules, `P
 
 Add a focused regression test for each behavior change. Name tests `test_<behavior>` and use pytest parametrization when validating policy or topology variants. Run the smallest relevant CPU test first, then the CUDA/Ray or multi-rank suite matching the affected path. There is no configured numeric coverage gate; meaningful edge-case and failure-path assertions are expected.
 
+## Agent Development Workflow
+
+- Before implementation, inspect the relevant code, tests, configuration, dependencies, and adjacent features. Restate the requirement, key assumptions, and smallest viable change; ask only questions the repository cannot answer that materially affect the design, and wait for confirmation before editing.
+- Prefer the smallest change that matches nearby patterns. Do not add speculative abstractions or handling for cases that cannot occur.
+- For bug fixes, first add a minimal deterministic reproducer and confirm the failure; then diagnose from evidence and retain a regression test.
+- Before refactoring, add characterization tests for current behavior, including unusual edge cases, and verify they pass on the original code.
+- After implementation, adversarially test relevant invalid inputs, boundaries, concurrency, network failures, and assumptions; fix findings and retain regression coverage.
+- In code review, report only security, performance, and logic defects. For every finding, give the file, line, and triggering condition; ignore style-only comments.
+- For long architecture, pull request, or research deliverables, use a self-contained single-file HTML report with tabs, diagrams, and visual emphasis instead of lengthy Markdown.
+
 ## Agent-Specific Repository Instructions
 
 - Use `python3` for all Python commands. Do not invoke `python` or `uv run`, and do not create or modify a virtual environment unless the user explicitly requests it.
