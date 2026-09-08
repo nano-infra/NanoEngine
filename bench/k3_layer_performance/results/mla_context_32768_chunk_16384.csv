@@ -1,0 +1,2 @@
+context,chunk,prefix_split,qkv_gate_projection_ms,latent_norm_cache_write_ms,fresh_kv_expansion_ms,cache_restore_ms,fresh_attention_ms,prefix_kv_expansion_ms,prefix_attention_ms,lse_merge_ms,gate_output_projection_ms,kernel_pipeline_ms,layer_stage_sum_ms,full_layer_ms
+32768,16384,131072,2.3500161170959473,0.18751999735832214,1.4656959772109985,0.08320000022649765,4.339871883392334,1.4633920192718506,8.83836841583252,2.681472063064575,1.8271679878234863,17.403456516563892,23.242239892482758,23.31603240966797
