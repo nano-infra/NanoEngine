@@ -417,27 +417,81 @@ The breakdown follows the actual forward path: seven input projections (Q, K, V,
 
     Throughput now rises from 449K tokens/s at 1K to 1.13M at 4K, 1.22M at 8K, and 1.24M at 16K. The remaining plateau begins only after the projection GEMMs and KDA recurrence become the dominant stages; latency scaling alone is still insufficient to label the complete layer compute-bound.
 
+
+##### 7.1.1.1 16K-Chunk Accumulation
+
+For comparison with MLA, the following GB200 KDA view repeats the measured
+TP1, batch-one, 16K Prefill chunk cost across 64 chunks. KDA's recurrent state
+already summarizes the prefix, so the marginal cost is effectively independent
+of visible context. The green bars are the measured critical-rank chunk time;
+the orange line is the discrete cumulative sum.
+
+![GB200 KDA 16K chunk marginal and cumulative context cost](../assets/gb200-kda-16k-accumulation.svg)
+
+The cumulative line uses KDA's recurrent-state property: once the state is
+updated, a later chunk does not revisit the full historical token sequence. It
+is therefore a state-based accumulation rather than a separate 1M execution.
+The flat marginal bars and near-linear cumulative line provide the contrast to
+MLA's context-dependent growth. This is one representative KDA layer; the full
+model uses its actual TP/DP layout and includes communication and the other layers.
+
+
 #### 7.1.2 MLA
 
-MLA is reported at two explicit boundaries. The first is the cached-prefix kernel pipeline. The second is the complete K3 MLA attention computation path, which adds all projections, latent normalization and cache write, fresh K/V expansion, gating, and output projection. All experiments use one B300, a mixed FP8/BF16 cache, and the production 128K prefix split. The chunk sweep fixes context at 1M; the complementary context sweep fixes the fresh chunk at 16K.
+MLA is reported at three related views. The cached-prefix pipeline isolates the long-history attention work; the complete MLA layer adds projections, cache write, gating and output projection; the final GB200 trace accumulates a complete layer over all 16K chunks from an empty cache. The first two views use one B300, a mixed FP8/BF16 cache and a 128K prefix split. The accumulation trace uses one GB200, TP1 and raw FP8 KV, so its absolute time is kept separate from the B300 measurements.
 
 ##### 7.1.2.1 Cached-Prefix Kernel Pipeline
 
-![K3 MLA kernel pipeline across chunk size and context length](../assets/k3-mla-kernel-ab-breakdown.svg)
+![K3 MLA kernel pipeline across fresh chunk size](../assets/k3-mla-kernel-ab-breakdown.svg)
 
-This figure is a **kernel-pipeline breakdown**, not a Decoder Layer. Panel (a) fixes visible context at 1M and varies the fresh chunk; panel (b) fixes the fresh chunk at 16K and varies visible context from 32K to 1M. Both start from projected Q and fresh compressed KV, then measure FP8 cache restoration, fresh causal attention, cached-prefix K/V expansion, prefix attention, and LSE-weighted result merging.
+This figure is a **kernel-pipeline breakdown**, not a Decoder Layer. It fixes visible context at 1M and varies the fresh chunk. The stages start from projected Q and fresh compressed KV, then measure FP8 cache restoration, fresh causal attention, cached-prefix K/V expansion, prefix attention, and LSE-weighted result merging. The next figure presents the context sweep and complete-layer comparison.
 
-In panel (a), average achieved throughput for the complete kernel boundary rises from approximately 8.77 × 10^5 GFLOP/s at 1K to 1.57 × 10^6 GFLOP/s at 16K. The B300 BF16 Tensor Core peak is a hardware reference rather than an attainable bound for every restore, merge, or elementwise kernel. At the 1M-context, 16K-chunk point, the pipeline takes 683.6 ms: prefix attention contributes 597.0 ms, prefix K/V expansion 56.0 ms, LSE merge 21.5 ms, cache restore 4.8 ms, and fresh attention 4.3 ms.
-
-![K3 MLA cumulative kernel and layer context scaling](../assets/k3-mla-context-kernel-layer-ab.svg)
-
-Both cumulative panels fix the fresh chunk at 16K and sweep visible context from 32K to 1M. Panel (a) expands the cached-prefix kernel pipeline: prefix K/V expansion grows from 1.46 ms to 56.01 ms, while prefix attention grows from 8.84 ms to 596.69 ms. Panel (b) places that pipeline inside the complete MLA attention layer, adding projections, latent normalization and cache write, fresh K/V expansion, gating, and output projection. The shared axes make the comparatively small layer overhead directly visible.
+In this chunk sweep, average achieved throughput for the complete kernel boundary rises from approximately 8.77 × 10^5 GFLOP/s at 1K to 1.57 × 10^6 GFLOP/s at 16K. The B300 BF16 Tensor Core peak is a hardware reference rather than an attainable bound for every restore, merge, or elementwise kernel. At the 1M-context, 16K-chunk point, the pipeline takes 683.6 ms: prefix attention contributes 597.0 ms, prefix K/V expansion 56.0 ms, LSE merge 21.5 ms, cache restore 4.8 ms, and fresh attention 4.3 ms.
 
 ##### 7.1.2.2 Complete MLA Attention Layer
 
-Panel (b) is the complete K3 MLA attention computation path. The stacked bars are stage measurements, while the black dashed curve is an independently timed complete forward. At 1M context, the complete path takes 689.7 ms, only 6.1 ms above the 683.6 ms kernel pipeline. Therefore long-context MLA is dominated by cached-prefix expansion, attention, and merge rather than its layer projections.
+The complete-layer view adds Q/KV/G projections, latent normalization and cache write, fresh K/V expansion, gating and output projection around the cached-prefix pipeline.
 
-The complete-layer average throughput grows from approximately 8.71 × 10^5 GFLOP/s at 1K to 1.57 × 10^6 GFLOP/s at 16K. This is the appropriate cumulative Layer view; the preceding figure remains the place to diagnose individual cache/attention kernels.
+![K3 MLA cumulative kernel and layer context scaling](../assets/k3-mla-context-kernel-layer-ab.svg)
+
+Both panels fix the fresh chunk at 16K and sweep visible context from 32K to 1M. The legends distinguish **Pipeline · …** in panel (a) from **Layer · …** in panel (b); the latter contains the complete layer and includes the pipeline as one stacked stage. At 1M context, the complete path takes 689.7 ms, only 6.1 ms above the 683.6 ms pipeline. Long-context MLA is therefore dominated by cached-prefix expansion, attention and merge; the added layer projections are comparatively small. The black dashed curve is an independent complete-forward timing.
+
+#### 7.1.2.3 16K-Chunk Marginal Cost and Cumulative Context Cost
+
+The previous context-scaling plot shows the cost of one selected final chunk. To
+show how a cold Prefill reaches the maximum context, we ran the representative
+MLA layer sequentially from an empty cache on one GB200: TP1, layer 3, raw FP8
+KV cache, 16K fresh tokens per chunk, and 64 chunks up to $2^{20}$ tokens. The
+bar for chunk $i$ is its measured marginal layer-forward time at visible context
+$L_i=16K\,i$; the purple line is the direct cumulative sum:
+
+$$
+T_{\mathrm{cold}}(L_n)=\sum_{i=1}^{n}\Delta T_i.
+$$
+
+![GB200 MLA 16K chunk marginal and cumulative context cost](../assets/gb200-mla-16k-accumulation.svg)
+
+The red horizontal line is the GB200 TP1 KDA 16K-chunk baseline, and the
+vertical marker identifies the crossover near 32K visible context. MLA becomes
+more expensive from the next chunk onward. The first un-warmed trace contained
+a JIT outlier; it is retained in the raw results but excluded from the plotted
+curve. The reported trace warms every shape before measuring all 64 chunks.
+MLA's attention and prefix expansion continue to read historical tokens, so the
+marginal curve grows with $L_i$ and its cumulative sum grows much faster than
+linearly.
+
+!!! important "MLA context scaling: measured numbers"
+
+    The marginal MLA layer time rises from **13.5 ms** at 16K visible context to **757.1 ms** at 1M, about **56×**. The cumulative representative-layer time reaches **3.63 s at 128K**, **6.34 s at 512K**, and **24.73 s at 1M**. The comparable KDA 16K chunk is **28.63 ms**, with a state-based 1M accumulation of **1.83 s**. MLA is therefore about **26× slower for the final chunk** and **13.5× slower cumulatively** under these TP1 measurements.
+
+!!! abstract "MLA versus KDA: scheduling implication"
+
+    Each bar is one additional 16K chunk and the curve is their direct sum. MLA's marginal cost is approximately linear in historical context, so its accumulated cold-Prefill cost grows much faster than linearly. KDA's recurrent state summarizes the prefix: a fixed-size chunk does not revisit the full historical token sequence, and its chunk cost is primarily a function of fresh $C$. MLA scheduling must include current historical context in every chunk estimate; KDA scheduling can primarily plan against fresh tokens.
+
+!!! note "Scope of the comparison"
+
+    These are representative single-layer GB200 measurements, not full-model TTFT. The MLA curve is a measured 64-chunk trace after shape warmup; the KDA cumulative value is a state-based accumulation of the measured TP1 16K chunk. They establish context-scaling behavior and admission-planning implications, not a universal end-to-end latency ratio.
+
 
 #### 7.1.3 MegaMoE
 
@@ -447,25 +501,58 @@ The existing production MXFP4 MegaMoE benchmark uses 896 experts, Top-16 routing
 
 The next experiment will measure the complete MoE path and break it into router/latent-down, Top-K, pre-dispatch, fused routed experts, routed norm/up, shared experts, and output merge. Routing imbalance will be added only after its load-distribution metric and synthetic distributions are agreed upon.
 
+#### 7.1.4 Dense FFN: linear fresh-token work
+
+K3 has one dense FFN layer. For Prefill, every fresh token executes the same dense matrices, so its cost is primarily proportional to chunk size and benefits from larger chunks through weight reuse. It has no recurrent-state shortcut and no expert dispatch; keep it in the layer composition even though it is not the dominant 92-layer MoE term.
+
 ### 7.2 Decode
 
-During Decode, each active sequence contributes one token. KDA and MegaMoE primarily sweep batch size $B$; MLA must sweep both $B$ and visible context length $L$.
+Decode emits one token per active sequence. Unlike Prefill, the useful workload
+coordinates are local batch $B$ and visible context $L$. KDA reads and updates a
+fixed recurrent state; MLA reads the latent cache for every query; routed MoE
+adds batch-dependent expert reuse and load imbalance. All batch values below are
+per attention-DP group unless stated otherwise, and timings use the slowest rank.
 
-#### 7.2.1 KDA
+#### 7.2.1 KDA: fixed state, batch-driven scaling
 
-![K3 KDA Decode scaling](../assets/k3-kda-decode-scaling.png)
+![GB200 KDA Decode batch scaling](../assets/gb200-kda-decode-batch.svg)
 
-The recurrent-core latency stays near 0.09 ms through batch 8, then reaches 0.535 ms at batch 256. Throughput rises from 11.3K to 478K tokens/s and begins to flatten after batch 128. As in Prefill, the complete KDA projections, convolution, gated normalization, and output projection remain to be added to the breakdown.
+The GB200 single-card graph sweep shows the KDA batch curve directly: latency rises from about **0.152 ms at B=1** to **0.639 ms at B=256**, while local throughput increases as the recurrent core reaches a useful GEMM size. Because the recurrent state has fixed size, increasing context alone does not create a new KDA attention axis. These are single-card measurements; multi-card TP/DP selection is deferred to §8.
 
-#### 7.2.2 MLA
+#### 7.2.2 MLA: batch and context are both first-class axes
 
-The required evaluation matrix is $B\times L$: batch size controls the number of current queries, while context length controls the latent-cache history read by each query. The current Prefill cached-prefix measurements cannot substitute for the production paged-cache Decode path, so no Decode MLA result is claimed yet.
+MLA Decode is evaluated with batch size $B$ as the independent variable at fixed total context $N=B\times L$; each curve holds the total tokens in the request group approximately constant. The single-card complete real-weight MLA layer includes Q/KV projections, paged absorbed attention, output gate/value projection and output; values use FP8 KV and contexts 1K–1M.
 
-The breakdown will include query/KV preparation, paged latent-cache attention, output gate, and output projection, with cache traffic reported separately from projection traffic.
+![GB200 MLA Decode batch and context scaling](../assets/gb200-mla-decode-context.svg)
 
-#### 7.2.3 MegaMoE
+!!! success "Takeaway · fixed total context"
 
-The required Decode sweep is batch size crossed with routing balance. The perfect-balance case will be measured first, followed by controlled imbalance after defining max-to-mean expert load, coefficient of variation, and active-expert ratio. The same complete MoE breakdown used for Prefill will be retained so the small-batch dispatch floor is visible.
+    At a fixed total context $N=B\times L$, changing batch size mainly redistributes the same tokens across sequences. MLA Decode latency therefore tracks the visible context term most strongly; batch adds projection and launch overhead but does not remove the long-context cost.
+
+
+![GB200 MLA Decode batch scaling at fixed context](../assets/gb200-mla-decode-batch-context.svg)
+
+At fixed total context, changing batch mostly redistributes the same tokens across sequences; the measured attention time remains dominated by the visible context term, while larger batch adds projection and launch work. Multi-card TP/CP and cache ownership are deferred to §8.
+
+!!! important "MLA Decode takeaway"
+
+    Decode selection is a $(B,L)$ decision. A configuration that wins at batch one and 8K may lose at batch 32 and 1M; compare equal global batch, then apply the memory screen. Context length directly increases MLA cache reads, while KDA's recurrent state keeps its context dependence largely out of the per-token kernel.
+
+#### 7.2.3 MegaMoE: reuse and routing determine the batch curve
+
+The complete real-checkpoint FFN layer is shown as a single-card token-batch proxy with synthetic normal activations. It includes router, shared experts, latent projections and packed MXFP4 expert weights; the routing-load curve is carried as context for later multi-card analysis.
+
+![GB200 FFN Decode token-batch proxy](../assets/gb200-moe-decode-batch.svg)
+
+The proxy shows the expected batch amortization and why routing imbalance must remain visible. It is not a multi-card EP result; conversion and expert-owner costs are analyzed later.
+
+!!! note "Decode selection order"
+
+    First establish the single-card $(B,L)$ baseline shown here. Then, in §8, screen weights/cache capacity and add TP, DP, CP, EP and conversion costs. Report TPOT and concurrency separately; a single-layer graph is not an end-to-end Decode SLO.
+
+#### 7.2.4 Dense FFN: batch amortization
+
+Dense Decode has fixed weights and one current token per active sequence. Its latency therefore follows local batch size through GEMM utilization and launch amortization, without a context-length scan or routing imbalance. The single dense layer is a small additive term in TPOT; the measured MoE and MLA paths remain the dominant selection constraints.
 
 ### 7.3 Model-Level Composition and Bottleneck Summary
 
