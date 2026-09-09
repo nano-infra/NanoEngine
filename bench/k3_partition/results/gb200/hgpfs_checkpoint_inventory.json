@@ -1,0 +1,682 @@
+{
+  "path": "/hgpfs/Kimi-K3",
+  "index_path": "/hgpfs/Kimi-K3/model.safetensors.index.json",
+  "expected_shards": 96,
+  "present_shards": 96,
+  "files": [
+    {
+      "file": "model-00001-of-000096.safetensors",
+      "file_bytes": 2341216112,
+      "expected_bytes": 2341216112,
+      "complete": true,
+      "tensors": 23
+    },
+    {
+      "file": "model-00002-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00003-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00004-of-000096.safetensors",
+      "file_bytes": 16567501776,
+      "expected_bytes": 16567501776,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00005-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00006-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00007-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00008-of-000096.safetensors",
+      "file_bytes": 16567501776,
+      "expected_bytes": 16567501776,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00009-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00010-of-000096.safetensors",
+      "file_bytes": 16990911504,
+      "expected_bytes": 16990911504,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00011-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00012-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00013-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00014-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00015-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00016-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00017-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00018-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00019-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00020-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00021-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00022-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00023-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00024-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00025-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00026-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00027-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00028-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00029-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00030-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00031-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00032-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00033-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00034-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00035-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00036-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00037-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00038-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00039-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00040-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00041-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00042-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00043-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00044-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00045-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00046-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00047-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00048-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00049-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00050-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00051-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00052-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00053-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00054-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00055-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00056-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00057-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00058-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00059-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00060-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00061-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00062-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00063-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00064-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00065-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00066-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00067-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00068-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00069-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00070-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00071-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00072-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00073-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00074-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00075-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00076-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00077-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00078-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00079-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00080-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00081-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00082-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00083-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00084-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00085-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00086-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00087-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00088-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00089-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00090-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00091-of-000096.safetensors",
+      "file_bytes": 16990916912,
+      "expected_bytes": 16990916912,
+      "complete": true,
+      "tensors": 5404
+    },
+    {
+      "file": "model-00092-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00093-of-000096.safetensors",
+      "file_bytes": 16567507176,
+      "expected_bytes": 16567507176,
+      "complete": true,
+      "tensors": 5398
+    },
+    {
+      "file": "model-00094-of-000096.safetensors",
+      "file_bytes": 4697664072,
+      "expected_bytes": 4697664072,
+      "complete": true,
+      "tensors": 5
+    },
+    {
+      "file": "model-00095-of-000096.safetensors",
+      "file_bytes": 92289328,
+      "expected_bytes": 92289328,
+      "complete": true,
+      "tensors": 3
+    },
+    {
+      "file": "model-00096-of-000096.safetensors",
+      "file_bytes": 802448352,
+      "expected_bytes": 802448352,
+      "complete": true,
+      "tensors": 165
+    }
+  ],
+  "missing_shards": [],
+  "index_total_bytes": 1560860324864
+}

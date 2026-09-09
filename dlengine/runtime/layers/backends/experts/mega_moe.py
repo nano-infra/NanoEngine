@@ -252,6 +252,14 @@ class MegaMoEExperts(DistributedRoutedExpertsBase):
                 self.intermediate_size,
             )
             if key not in _SYMM_BUFFER_CACHE:
+                # Mixed Gloo/NCCL groups created by DeviceMesh initialize the
+                # CUDA communicator lazily. NCCL symmetric window registration
+                # requires it to exist before rendezvous (otherwise some NCCL
+                # builds crash in ncclCommWindowRegister).
+                bootstrap = torch.zeros(1, device=self.gate_up_proj.device)
+                torch.distributed.all_reduce(bootstrap, group=group)
+                torch.cuda.current_stream().synchronize()
+                del bootstrap
                 _SYMM_BUFFER_CACHE[key] = deep_gemm.get_symm_buffer_for_mega_moe(
                     group,
                     self.num_experts,

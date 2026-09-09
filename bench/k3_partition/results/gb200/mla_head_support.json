@@ -1,0 +1,218 @@
+[
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 6,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 6,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 12,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 12,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 16,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 16,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 24,
+    "return_lse": false,
+    "status": "Error in function 'computeCtaAndClusterConfig' at /workspace/include/flashinfer/trtllm/fmha/fmhaKernels.cuh:444: The numHeadsQ/numHeadsKv is not supported."
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 24,
+    "return_lse": true,
+    "status": "Error in function 'computeCtaAndClusterConfig' at /workspace/include/flashinfer/trtllm/fmha/fmhaKernels.cuh:444: The numHeadsQ/numHeadsKv is not supported."
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 32,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 32,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 48,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 48,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 64,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 64,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 96,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 96,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 128,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 128,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 6,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 6,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 12,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 12,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 16,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 16,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 24,
+    "return_lse": false,
+    "status": "Error in function 'computeCtaAndClusterConfig' at /workspace/include/flashinfer/trtllm/fmha/fmhaKernels.cuh:444: The numHeadsQ/numHeadsKv is not supported."
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 24,
+    "return_lse": true,
+    "status": "Error in function 'computeCtaAndClusterConfig' at /workspace/include/flashinfer/trtllm/fmha/fmhaKernels.cuh:444: The numHeadsQ/numHeadsKv is not supported."
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 32,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 32,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 48,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 48,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 64,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 64,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 96,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 96,
+    "return_lse": true,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 128,
+    "return_lse": false,
+    "status": "pass"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 128,
+    "return_lse": true,
+    "status": "pass"
+  }
+]

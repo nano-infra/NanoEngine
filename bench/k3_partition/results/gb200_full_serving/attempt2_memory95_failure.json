@@ -1,0 +1,120 @@
+{
+  "model": "/hgpfs/Kimi-K3",
+  "status": "failed",
+  "workloads": [
+    {
+      "prompt_tokens": 5,
+      "output_tokens": [
+        17374,
+        20829,
+        10,
+        427,
+        414,
+        1008,
+        606,
+        142957
+      ],
+      "output_text": " Paris.\",\n+            \"The Eiffel",
+      "elapsed_seconds": 0.919420444406569,
+      "status": "completed"
+    },
+    {
+      "prompt_tokens": 1024,
+      "output_tokens": [
+        387,
+        1008,
+        10484,
+        318,
+        15383,
+        387,
+        1008,
+        10484
+      ],
+      "output_text": " isThe capital of France isThe capital",
+      "elapsed_seconds": 8.128149119205773,
+      "status": "completed"
+    },
+    {
+      "prompt_tokens": 8192,
+      "output_tokens": [
+        318,
+        15383,
+        387,
+        1008,
+        10484,
+        318,
+        15383,
+        387
+      ],
+      "output_text": " of France isThe capital of France is",
+      "elapsed_seconds": 8.01185928285122,
+      "status": "completed"
+    },
+    {
+      "prompt_tokens": 32768,
+      "output_tokens": [
+        318,
+        318,
+        318,
+        15383,
+        387,
+        1008,
+        10484,
+        318,
+        15383,
+        387,
+        1008
+      ],
+      "output_text": " of of of France isThe capital of France isThe",
+      "elapsed_seconds": 10.49933436140418,
+      "status": "completed"
+    },
+    {
+      "prompt_tokens": 131072,
+      "output_tokens": [
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        10484,
+        318,
+        15383,
+        387,
+        1008,
+        10484,
+        318,
+        15383,
+        387
+      ],
+      "output_text": " capital capital capital capital capital capital capital capital capital capital capital capital capital capital capital of France isThe capital of France is",
+      "elapsed_seconds": 19.583448535762727,
+      "status": "completed"
+    }
+  ],
+  "config": {
+    "attention_tp": 8,
+    "attention_dp": 2,
+    "ffn_ep": 16,
+    "max_model_len": 1048576,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 4,
+    "gpu_memory_utilization": 0.95,
+    "kv_cache_dtype": "fp8_e4m3",
+    "enforce_eager": false
+  },
+  "load_seconds": 171.14120024908334,
+  "effective_max_model_len": 1048576,
+  "kv_blocks": 37106,
+  "error": "\u001b[36mray::ModelRunner.run_from_bytes()\u001b[39m (pid=38395, ip=172.27.7.201, actor_id=816732fb9ced019dd32ed1b31d000000, repr=<dlengine.runtime.runner.model_runner.ModelRunner object at 0xe9f3dd4ae7e0>)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 2138, in run_from_bytes\n    return self.run_prepared(prepared)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 2005, in run_prepared\n    logits = self.run_model(input_ids, positions, is_prefill)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 1575, in run_model\n    hidden = self.model(input_ids, positions)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 446, in forward\n    return self.model(input_ids, positions, inputs_embeds)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 417, in forward\n    hidden, prefix = self.layers[i](positions, hidden, prefix, bank)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 338, in forward\n    self.self_attn(hidden) if self.is_kda else self.self_attn(positions, hidden)\n                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 101, in forward\n    return super().forward(positions, hidden_states)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/deepseek_v2/deepseek_v2.py\", line 1719, in forward\n    attn_output = chunked_prefix_mla_attention(\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/layers/backends/attention/mla_utils.py\", line 75, in chunked_prefix_mla_attention\n    k = torch.cat([k_nope, rope[:, None, :].expand(-1, heads, -1)], dim=-1)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py\", line 116, in __torch_function__\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 540.00 MiB. GPU 3 has a total capacity of 184.31 GiB of which 537.62 MiB is free. Including non-PyTorch memory, this process has 183.77 GiB memory in use. Of the allocated memory 162.83 GiB is allocated by PyTorch, with 17.88 MiB allocated in private pools (e.g., CUDA Graphs), and 5.51 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/bench/k3_partition/full_serving.py\", line 46, in main\n    t=time.perf_counter(); outputs=generate(engine,use_tqdm=False)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/offline/generate.py\", line 40, in generate\n    result = engine.step()\n             ^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/engine/llm_engine.py\", line 395, in step\n    runner_outs = self._run_scheduled_step(schedule_result)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/engine/llm_engine.py\", line 204, in _run_scheduled_step\n    all_outs = self.executor.run_wait_runner_outs(handle)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/executor/ray_executor.py\", line 421, in run_wait_runner_outs\n    return [self._to_runner_out(result) for result in ray.get(handle[\"futures\"])]\n                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/ray/_private/worker.py\", line 2986, in get\n    values, debugger_breakpoint = worker.get_objects(\n                                  ^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/ray/_private/worker.py\", line 1050, in get_objects\n    raise value.as_instanceof_cause()\nray.exceptions.RayTaskError(OutOfMemoryError): \u001b[36mray::ModelRunner.run_from_bytes()\u001b[39m (pid=38395, ip=172.27.7.201, actor_id=816732fb9ced019dd32ed1b31d000000, repr=<dlengine.runtime.runner.model_runner.ModelRunner object at 0xe9f3dd4ae7e0>)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 2138, in run_from_bytes\n    return self.run_prepared(prepared)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 2005, in run_prepared\n    logits = self.run_model(input_ids, positions, is_prefill)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/runner/model_runner.py\", line 1575, in run_model\n    hidden = self.model(input_ids, positions)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 446, in forward\n    return self.model(input_ids, positions, inputs_embeds)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 417, in forward\n    hidden, prefix = self.layers[i](positions, hidden, prefix, bank)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 338, in forward\n    self.self_attn(hidden) if self.is_kda else self.self_attn(positions, hidden)\n                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/kimi_k3/kimi_k3.py\", line 101, in forward\n    return super().forward(positions, hidden_states)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/models/deepseek_v2/deepseek_v2.py\", line 1719, in forward\n    attn_output = chunked_prefix_mla_attention(\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/mnt/public/majinming/src/JimyMa/NanoDeploy/dlengine/runtime/layers/backends/attention/mla_utils.py\", line 75, in chunked_prefix_mla_attention\n    k = torch.cat([k_nope, rope[:, None, :].expand(-1, heads, -1)], dim=-1)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py\", line 116, in __torch_function__\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 540.00 MiB. GPU 3 has a total capacity of 184.31 GiB of which 537.62 MiB is free. Including non-PyTorch memory, this process has 183.77 GiB memory in use. Of the allocated memory 162.83 GiB is allocated by PyTorch, with 17.88 MiB allocated in private pools (e.g., CUDA Graphs), and 5.51 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)\n"
+}

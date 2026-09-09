@@ -1693,8 +1693,8 @@ class DeepseekV2Attention(nn.Module):
                 if total_cached > 0:
                     k_cached_raw = k_cached_raw.squeeze(1)
                     if k_cache.dtype == torch.float8_e4m3fn:
-                        # FP8 packed cache (656 bytes/token): dequantize+unpack
-                        # back to bf16 [total_cached, 576] before BF16 matmuls.
+                        # Restore raw Blackwell FP8 or packed FP8 rows to
+                        # BF16 [total_cached, 576] before BF16 matmuls.
                         restore_fn = getattr(self, "_restore_fp8_cache_fn", None)
                         if restore_fn is None:
                             from dlengine.runtime.kernel.triton.hopper.fp8_utils import (
@@ -1710,12 +1710,18 @@ class DeepseekV2Attention(nn.Module):
                     prefix_chunk_size = int(
                         os.environ.get("DLENGINE_MLA_PREFIX_CHUNK_SIZE", "131072")
                     )
-                    if prefix_chunk_size > 0 and k_cache.dtype == torch.float8_e4m3fn:
+                    use_chunked_prefix = prefix_chunk_size > 0
+                    if use_chunked_prefix:
                         varlen_func, is_fa3 = _get_prefill_varlen_func()
                         if not is_fa3 or varlen_func is None:
-                            raise RuntimeError(
-                                "chunked MLA prefix Prefill requires FA3/FA4 return_lse support"
-                            )
+                            if k_cache.dtype == torch.float8_e4m3fn:
+                                raise RuntimeError(
+                                    "chunked MLA prefix Prefill requires FA3/FA4 return_lse support"
+                                )
+                            # Preserve the existing BF16 fallback on backends
+                            # that cannot return prefix log-sum-exp values.
+                            use_chunked_prefix = False
+                    if use_chunked_prefix:
                         attn_output = chunked_prefix_mla_attention(
                             q_full,
                             k_expanded_fresh,

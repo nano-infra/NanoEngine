@@ -115,6 +115,14 @@ class TrtllmMlaAttention(MlaAttentionBase):
         ntps = context.num_tokens_per_seq
         batch_size = q.shape[0] // ntps
         query = q.reshape(batch_size, ntps, self.num_heads, self.head_dim)
+        # TRTLLM-GEN rejects 24 Q heads and 96-head large batches.
+        # Heads attend independently, so zero padding preserves real outputs.
+        # Keep padding inside the graph and slice before the model's W_UV.
+        if self.num_heads in (24, 96):
+            padded_heads = 32 if self.num_heads == 24 else 128
+            query = torch.nn.functional.pad(
+                query, (0, 0, 0, padded_heads - self.num_heads)
+            )
         block_tables = context.block_tables[0, :batch_size]
         # Attention-DP ranks without a local request execute a synthetic one-token
         # batch so that the shared EP collectives stay ordered. The generic dummy
@@ -191,7 +199,9 @@ class TrtllmMlaAttention(MlaAttentionBase):
             is_var_seq=True,
             uses_shared_paged_kv_idx=True,
         )
-        return result.reshape(-1, self.num_heads, self.kv_lora_rank)
+        return result[..., : self.num_heads, :].reshape(
+            -1, self.num_heads, self.kv_lora_rank
+        )
 
 
 __all__ = ["TrtllmMlaAttention", "_get_trtllm_workspace"]
