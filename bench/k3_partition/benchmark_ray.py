@@ -180,10 +180,10 @@ class Worker:
         faulthandler.dump_traceback_later(120, repeat=True)
         try:
             from bench.k3_partition.component_kernels import measure_kda, measure_cp, measure_moe, measure_transition, measure_validation
-            from bench.k3_partition.extended_kernels import measure_checkpoint, measure_mla, measure_real_moe, measure_equal_kda, measure_equal_mla, measure_mla_tp1, measure_cold
+            from bench.k3_partition.extended_kernels import measure_checkpoint, measure_mla, measure_real_moe, measure_equal_kda, measure_equal_mla, measure_mla_tp1, measure_cold, measure_cold_trace
             from bench.k3_partition.paged_cp import measure_paged_cp
             from bench.k3_partition.expert_tp import measure_expert_tp
-            return {"kda": measure_kda, "cp": measure_cp, "moe": measure_moe, "transition": measure_transition, "validation": measure_validation, "checkpoint": measure_checkpoint, "mla": measure_mla, "paged_cp": measure_paged_cp, "real_moe": measure_real_moe, "equal_kda": measure_equal_kda, "equal_mla": measure_equal_mla, "mla_tp1": measure_mla_tp1, "cold": measure_cold, "expert_tp": measure_expert_tp}[kind](self)
+            return {"kda": measure_kda, "cp": measure_cp, "moe": measure_moe, "transition": measure_transition, "validation": measure_validation, "checkpoint": measure_checkpoint, "mla": measure_mla, "paged_cp": measure_paged_cp, "real_moe": measure_real_moe, "equal_kda": measure_equal_kda, "equal_mla": measure_equal_mla, "mla_tp1": measure_mla_tp1, "cold": measure_cold, "cold_trace": measure_cold_trace, "expert_tp": measure_expert_tp}[kind](self)
         finally:
             faulthandler.cancel_dump_traceback_later()
 
@@ -207,7 +207,7 @@ def main():
     parser.add_argument("--tokens", nargs="+", type=int, default=[1, 8, 128, 1024, 8192, 16384])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
-    parser.add_argument("--stages", nargs="+", choices=["baseline", "graphs", "kda", "cp", "moe", "transition", "validation", "checkpoint", "mla", "paged_cp", "real_moe", "equal_kda", "equal_mla", "mla_tp1", "cold", "expert_tp"], default=["baseline"])
+    parser.add_argument("--stages", nargs="+", choices=["baseline", "graphs", "kda", "cp", "moe", "transition", "validation", "checkpoint", "mla", "paged_cp", "real_moe", "equal_kda", "equal_mla", "mla_tp1", "cold", "cold_trace", "expert_tp"], default=["baseline"])
     parser.add_argument("--world-size", type=int, choices=[1, 2, 4, 8, 16], default=16)
     parser.add_argument("--gpu-offset", type=int, default=0, help="Skip this many GPUs in sorted-node allocation order")
     args = parser.parse_args()
@@ -216,7 +216,7 @@ def main():
     nodes = sorted((n for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0)), key=lambda n: n["NodeManagerAddress"])
     if sum(int(n["Resources"]["GPU"]) for n in nodes) < args.world_size + args.gpu_offset:
         raise RuntimeError("Insufficient Ray GPU resources")
-    if args.world_size != 16 and any(s in args.stages for s in ("cp", "moe", "transition", "validation", "paged_cp", "real_moe", "cold", "expert_tp")):
+    if args.world_size != 16 and any(s in args.stages for s in ("cp", "moe", "transition", "validation", "paged_cp", "real_moe", "cold", "cold_trace", "expert_tp")):
         parser.error("Legacy component stages require world size 16")
     root = str(Path(__file__).resolve().parents[2])
     workers = []

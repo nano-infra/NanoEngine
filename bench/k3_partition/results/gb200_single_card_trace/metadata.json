@@ -1,0 +1,9 @@
+{
+  "card": "GB200",
+  "gpu": "NVIDIA GB200",
+  "layer": 3,
+  "cache_dtype": "fp8_e4m3",
+  "chunk_tokens": 16384,
+  "max_context": 1048576,
+  "trace_kind": "measured single-card MLA layer from empty cache"
+}

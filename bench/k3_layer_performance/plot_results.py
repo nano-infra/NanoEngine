@@ -201,10 +201,20 @@ plt.close(fig)
 layer_stages = [("qkv_gate_projection_ms", "Q/KV/G projections"), ("latent_norm_cache_write_ms", "Latent norm + cache write"), ("fresh_kv_expansion_ms", "Fresh K/V expansion"), ("kernel_pipeline_ms", "Cached-prefix kernel pipeline"), ("gate_output_projection_ms", "Gate + output projection")]
 
 # Paired cumulative context sweep: cached-prefix kernels and complete MLA layer.
+# Prefix legend labels make clear that the right panel contains the whole left
+# pipeline as one stacked stage; both panels intentionally reuse the same sweep.
+pipeline_legend_stages = [(key, f"Pipeline · {label}") for key, label in kernel_stages]
+layer_legend_stages = [
+    ("qkv_gate_projection_ms", "Layer · Q/KV/G projections"),
+    ("latent_norm_cache_write_ms", "Layer · latent norm + cache write"),
+    ("fresh_kv_expansion_ms", "Layer · fresh K/V expansion"),
+    ("kernel_pipeline_ms", "Layer · cached-prefix pipeline"),
+    ("gate_output_projection_ms", "Layer · gate + output projection"),
+]
 fig, axes = plt.subplots(1, 2, figsize=(15.2, 5.7), sharey=True)
 for panel, stages_for_panel, title, total_key in (
-    (axes[0], kernel_stages, "(a) Cached-prefix kernel pipeline", "kernel_pipeline_ms"),
-    (axes[1], layer_stages, "(b) Complete MLA attention layer", "full_layer_ms"),
+    (axes[0], pipeline_legend_stages, "(a) Pipeline only · fixed 16K chunk", "kernel_pipeline_ms"),
+    (axes[1], layer_legend_stages, "(b) Complete layer · pipeline included", "full_layer_ms"),
 ):
     base = [0.0] * len(mla_context_rows)
     for key, label in stages_for_panel:
