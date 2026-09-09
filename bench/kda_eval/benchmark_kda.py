@@ -44,7 +44,7 @@ def git_commit() -> str:
         return "unknown"
 
 
-def cuda_times(fn, restore, warmup: int, repeats: int) -> list[float]:
+def cuda_times(fn, restore, warmup: int, repeats: int, include_restore: bool = False) -> list[float]:
     for _ in range(warmup):
         restore()
         fn()
@@ -53,8 +53,12 @@ def cuda_times(fn, restore, warmup: int, repeats: int) -> list[float]:
     end = torch.cuda.Event(enable_timing=True)
     times = []
     for _ in range(repeats):
-        restore()
-        start.record()
+        if include_restore:
+            start.record()
+            restore()
+        else:
+            restore()
+            start.record()
         fn()
         end.record()
         end.synchronize()
@@ -127,7 +131,9 @@ def benchmark_prefill(args) -> list[dict]:
                         lower_bound=args.lower_bound,
                     )
 
-                times = cuda_times(run, restore, args.warmup, args.repeats)
+                times = cuda_times(
+                    run, restore, args.warmup, args.repeats, args.include_state_restore
+                )
                 p50, p90, p99 = (
                     percentile(times, 0.50),
                     percentile(times, 0.90),
@@ -194,7 +200,9 @@ def benchmark_decode(args) -> list[dict]:
                 lower_bound=args.lower_bound,
             )
 
-        times = cuda_times(run, restore, args.warmup, args.repeats)
+        times = cuda_times(
+            run, restore, args.warmup, args.repeats, args.include_state_restore
+        )
         p50, p90, p99 = [percentile(times, q) for q in (0.50, 0.90, 0.99)]
         rows.append(
             {
@@ -231,6 +239,7 @@ def main():
     parser.add_argument("--lower-bound", type=float, default=-5.0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--include-state-restore", action="store_true")
     parser.add_argument("--skip-prefill", action="store_true")
     parser.add_argument("--skip-decode", action="store_true")
     args = parser.parse_args()
@@ -256,6 +265,7 @@ def main():
         "block_size": args.block_size,
         "warmup": args.warmup,
         "repeats": args.repeats,
+        "include_state_restore": args.include_state_restore,
     }
     try:
         import flashinfer
