@@ -378,7 +378,7 @@ starting point.
 
 This chapter follows the two serving phases introduced in Chapter 6. Prefill is organized by fresh chunk size and visible context length; Decode is organized by batch size and visible context length. Within each phase, KDA, MLA, and MegaMoE are analyzed separately before their costs are composed at model level.
 
-Dense FFN is omitted as a dedicated performance section because K3 contains only one Dense FFN layer, compared with 92 MoE layers. Its cost will be retained in the final model-level composition, but it is not part of the primary parameter sweep.
+Dense FFN has one layer in K3, so it is not multiplied by a layer count like KDA, MLA, or MoE. It is nevertheless measured because its wide 33,792-channel gated MLP is a useful reference for token-parallel GEMM scaling and for the model-level latency sum.
 
 The current results are a first mapping of the available component benchmarks. They do not yet represent complete operator breakdowns:
 
@@ -386,6 +386,7 @@ The current results are a first mapping of the available component benchmarks. T
 | --- | --- | --- |
 | KDA | Complete production Prefill operator | Input projections, causal convolution, recurrence, gated normalization, and output projection measured separately |
 | MLA | Cache restore, KV expansion, and attention core | Q/KV/G projections, latent norms, RoPE/cache operations, attention, gate, and output projection |
+| Dense FFN | Complete gated MLP | Gate/up projections, SiLU-and-multiply, and down projection |
 | MegaMoE | Pre-dispatch and fused routed-expert operator | Router/latent-down, Top-K, routed path, routed norm/up, shared experts, and output merge |
 
 ### 7.1 Prefill
@@ -501,9 +502,15 @@ The existing production MXFP4 MegaMoE benchmark uses 896 experts, Top-16 routing
 
 The next experiment will measure the complete MoE path and break it into router/latent-down, Top-K, pre-dispatch, fused routed experts, routed norm/up, shared experts, and output merge. Routing imbalance will be added only after its load-distribution metric and synthetic distributions are agreed upon.
 
-#### 7.1.4 Dense FFN: linear fresh-token work
+#### 7.1.4 Dense FFN
 
-K3 has one dense FFN layer. For Prefill, every fresh token executes the same dense matrices, so its cost is primarily proportional to chunk size and benefits from larger chunks through weight reuse. It has no recurrent-state shortcut and no expert dispatch; keep it in the layer composition even though it is not the dominant 92-layer MoE term.
+![K3 Dense FFN Prefill and Decode scaling](../assets/dense-ffn-scaling.svg)
+
+The single dense FFN uses a gated SwiGLU path with hidden width $7168$ and intermediate width $33792$. For each active token, the gate and up projections produce two $33792$-wide tensors, SiLU-and-multiply forms the gated intermediate, and the down projection returns to $7168$. The benchmark measures the complete three-matrix path in BF16 on one B300; it is a component boundary, not a full Decoder Layer.
+
+During Prefill, latency rises from 0.891 ms at 1K fresh tokens to 12.406 ms at 16K. Achieved throughput increases from $1.11\times10^6$ to $1.28\times10^6$ GFLOP/s and is nearly saturated by 8K tokens. The approximately linear latency is mainly a consequence of processing more rows, while the nearly flat throughput curve shows that the wide GEMMs have reached steady throughput.
+
+Because K3 has only one Dense FFN layer, its Prefill cost is added once in the model equation. It does not require a context-length sweep: like MoE, it processes only the current chunk.
 
 ### 7.2 Decode
 
@@ -550,9 +557,9 @@ The proxy shows the expected batch amortization and why routing imbalance must r
 
     First establish the single-card $(B,L)$ baseline shown here. Then, in §8, screen weights/cache capacity and add TP, DP, CP, EP and conversion costs. Report TPOT and concurrency separately; a single-layer graph is not an end-to-end Decode SLO.
 
-#### 7.2.4 Dense FFN: batch amortization
+#### 7.2.4 Dense FFN
 
-Dense Decode has fixed weights and one current token per active sequence. Its latency therefore follows local batch size through GEMM utilization and launch amortization, without a context-length scan or routing imbalance. The single dense layer is a small additive term in TPOT; the measured MoE and MLA paths remain the dominant selection constraints.
+The Dense FFN follows the same batch-size sweep shown above. Its Decode cost depends on active batch size, not resident context length. Latency stays near 0.25 ms through batch 32 and reaches 0.317 ms at batch 256; achieved throughput rises from $3.84\times10^3$ to $7.83\times10^5$ GFLOP/s. Small batches are launch- and weight-bandwidth dominated, while larger batches expose tensor-core throughput. The single dense layer is a small additive term in TPOT.
 
 ### 7.3 Model-Level Composition and Bottleneck Summary
 
@@ -563,7 +570,7 @@ T_{\mathrm{K3}}
 =69T_{\mathrm{KDA}}+24T_{\mathrm{MLA}}+92T_{\mathrm{MoE}}+T_{\mathrm{Dense}}.
 $$
 
-The single Dense FFN term remains in this equation even though it is omitted from the detailed sweep. Final memory-bound or compute-bound labels will require achieved FLOP/s, HBM bytes, SM utilization, tensor-core utilization, and kernel launch gaps rather than latency scaling alone.
+The single Dense FFN term remains in this equation and is added once. Final memory-bound or compute-bound labels will require achieved FLOP/s, HBM bytes, SM utilization, tensor-core utilization, and kernel launch gaps rather than latency scaling alone.
 
 The benchmark inputs, raw CSV/JSON results, and plotting scripts are kept under `bench/k3_layer_performance/`.
 

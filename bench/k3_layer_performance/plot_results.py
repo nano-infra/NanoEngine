@@ -13,6 +13,8 @@ with (root / "mla_full_breakdown.csv").open() as f:
     mla_full = list(csv.DictReader(f))
 with (root / "megamoe_chunk.csv").open() as f:
     mega = list(csv.DictReader(f))
+with (root / "dense_ffn.csv").open() as f:
+    dense = list(csv.DictReader(f))
 mla = [json.loads(p.read_text()) for p in root.glob("mla_cache_total_*_split_131072.json")]
 
 
@@ -263,6 +265,25 @@ lh, ll = ax.get_legend_handles_labels(); rh, rl = right.get_legend_handles_label
 fig.legend(lh + rh, ll + rl, loc="lower center", bbox_to_anchor=(.5, .01), ncol=3, frameon=False)
 fig.tight_layout(rect=(0, .16, 1, 1))
 fig.savefig(root / "mla_layer_breakdown.svg", bbox_inches="tight")
+plt.close(fig)
+
+# Dense FFN Prefill/Decode scaling.
+dense_prefill = sorted((r for r in dense if r["mode"] == "prefill"), key=lambda r: int(r["tokens"]))
+dense_decode = sorted((r for r in dense if r["mode"] == "decode"), key=lambda r: int(r["tokens"]))
+fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.9))
+for ax, rows, title in ((axes[0], dense_prefill, "(a) Prefill · one request"), (axes[1], dense_decode, "(b) Decode · active batch")):
+    x = [int(r["tokens"]) for r in rows]
+    ax.plot(x, [float(r["latency_ms"]) for r in rows], "o-", linewidth=2.2, color="tab:blue", label="Latency")
+    right = ax.twinx()
+    right.plot(x, [float(r["gflops"]) for r in rows], "s--", linewidth=1.8, color="tab:orange", label="Achieved GFLOP/s")
+    ax.set_xscale("log", base=2); ax.set_yscale("log")
+    ax.set_xticks(x, [f"{v // 1024}K" if v >= 1024 else str(v) for v in x])
+    ax.set_xlabel("Fresh tokens" if rows is dense_prefill else "Decode batch size")
+    ax.set_ylabel("Latency (ms)"); right.set_ylabel("Achieved GFLOP/s")
+    ax.set_title(title); ax.grid(True, which="both", alpha=.23); scientific_axis(right)
+fig.suptitle("K3 Dense SwiGLU FFN scaling · one B300 · BF16", y=.99)
+fig.tight_layout(rect=(0, 0, 1, .94))
+fig.savefig(root / "dense-ffn-scaling.svg", bbox_inches="tight")
 plt.close(fig)
 
 # MegaMoE Prefill: perfectly balanced routed rows.

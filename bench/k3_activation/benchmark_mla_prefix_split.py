@@ -28,10 +28,17 @@ PACKED = 656
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prefix-chunk-size", type=int, default=131_072)
+    parser.add_argument("--total-context", type=int, default=TOTAL)
+    parser.add_argument("--fresh-chunk", type=int, default=FRESH)
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--warmup", type=int, default=1)
     args = parser.parse_args()
     if args.prefix_chunk_size < 0:
         raise ValueError("prefix chunk size must be non-negative")
+    if not 0 < args.fresh_chunk <= args.total_context:
+        raise ValueError("fresh chunk must be in (0, total context]")
+    total = args.total_context
+    fresh = args.fresh_chunk
 
     torch.cuda.set_device(0)
     from flash_attn.cute import flash_attn_varlen_func
@@ -43,21 +50,21 @@ def main() -> None:
         chunked_prefix_mla_attention,
     )
 
-    cached = TOTAL - FRESH
+    cached = total - fresh
     packed_cache = torch.zeros(cached, PACKED, device="cuda", dtype=torch.uint8)
-    compressed_fresh = torch.zeros(FRESH, LATENT, device="cuda", dtype=torch.bfloat16)
-    kpe_fresh = torch.zeros(FRESH, ROPE, device="cuda", dtype=torch.bfloat16)
-    q = torch.zeros(FRESH, HEADS, NOPE + ROPE, device="cuda", dtype=torch.bfloat16)
+    compressed_fresh = torch.zeros(fresh, LATENT, device="cuda", dtype=torch.bfloat16)
+    kpe_fresh = torch.zeros(fresh, ROPE, device="cuda", dtype=torch.bfloat16)
+    q = torch.zeros(fresh, HEADS, NOPE + ROPE, device="cuda", dtype=torch.bfloat16)
     kc = torch.zeros(LATENT, HEADS * NOPE, device="cuda", dtype=torch.bfloat16)
     vc = torch.zeros(LATENT, HEADS * VALUE, device="cuda", dtype=torch.bfloat16)
     cached_lens = torch.tensor([cached], device="cuda", dtype=torch.int32)
-    cu_q = torch.tensor([0, FRESH], device="cuda", dtype=torch.int32)
+    cu_q = torch.tensor([0, fresh], device="cuda", dtype=torch.int32)
 
-    k_nope_fresh = (compressed_fresh @ kc).view(FRESH, HEADS, NOPE)
+    k_nope_fresh = (compressed_fresh @ kc).view(fresh, HEADS, NOPE)
     k_fresh = torch.cat(
         [k_nope_fresh, kpe_fresh[:, None, :].expand(-1, HEADS, -1)], dim=-1
     )
-    v_fresh = (compressed_fresh @ vc).view(FRESH, HEADS, VALUE)
+    v_fresh = (compressed_fresh @ vc).view(fresh, HEADS, VALUE)
     torch.cuda.synchronize()
     baseline = torch.cuda.memory_allocated()
 
@@ -74,15 +81,15 @@ def main() -> None:
             v_cached = (compressed_cached @ vc).view(cached, HEADS, VALUE)
             k = torch.cat([k_cached, k_fresh], dim=0)
             v = torch.cat([v_cached, v_fresh], dim=0)
-            cu_k = torch.tensor([0, TOTAL], device="cuda", dtype=torch.int32)
+            cu_k = torch.tensor([0, total], device="cuda", dtype=torch.int32)
             result = flash_attn_varlen_func(
                 q,
                 k,
                 v,
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=cu_k,
-                max_seqlen_q=FRESH,
-                max_seqlen_k=TOTAL,
+                max_seqlen_q=fresh,
+                max_seqlen_k=total,
                 softmax_scale=(NOPE + ROPE) ** -0.5,
                 causal=True,
             )
@@ -117,12 +124,12 @@ def main() -> None:
     elapsed_ms = start.elapsed_time(end)
     peak = torch.cuda.max_memory_allocated() - baseline
     live = torch.cuda.memory_allocated() - baseline
-    assert out.shape == (FRESH, HEADS, VALUE)
+    assert out.shape == (fresh, HEADS, VALUE)
 
     result = {
-        "total_context": TOTAL,
+        "total_context": total,
         "cached_prefix": cached,
-        "fresh_chunk": FRESH,
+        "fresh_chunk": fresh,
         "prefix_chunk_size": args.prefix_chunk_size,
         "incremental_peak_bytes": peak,
         "incremental_live_bytes": live,
@@ -133,10 +140,10 @@ def main() -> None:
     }
     print(json.dumps(result, indent=2), flush=True)
 
-    output = Path(__file__).parent / "results"
+    output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     suffix = str(args.prefix_chunk_size) if args.prefix_chunk_size else "unsplit"
-    stem = f"mla_prefix_split_{suffix}"
+    stem = f"mla_cache_total_{total}_fresh_{fresh}_split_{suffix}"
     (output / f"{stem}.json").write_text(json.dumps(result, indent=2) + "\n")
     with (output / f"{stem}.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, lineterminator="\n", fieldnames=result.keys())

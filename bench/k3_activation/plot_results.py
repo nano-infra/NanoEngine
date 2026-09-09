@@ -168,3 +168,23 @@ ax.grid(alpha=0.25)
 ax.legend(frameon=False)
 fig.tight_layout()
 fig.savefig(RESULTS / "megamoe_ws1_activation.png", dpi=180, bbox_inches="tight")
+
+# Chapter 5 summary: production-relevant activation/workspace reservations.
+labels = ["KDA\nrecurrence", "MLA 1M/16K\n128K split", "MegaMoE\n16K capacity"]
+dynamic = [4429185024 / 2**30, 18673041920 / 2**30, 117440512 / 2**30]
+persistent = [0, 0, 6377439232 / 2**30]
+fig, ax = plt.subplots(figsize=(8.8, 4.9))
+x = list(range(len(labels)))
+ax.bar(x, persistent, label="Persistent reusable buffer", color="#607D8B")
+ax.bar(x, dynamic, bottom=persistent, label="Incremental activation peak", color="#4C78A8")
+for i, (reserved, transient) in enumerate(zip(persistent, dynamic)):
+    total = reserved + transient
+    ax.text(i, total + 0.35, f"{total:.2f} GiB", ha="center", fontweight="bold")
+ax.set_xticks(x, labels)
+ax.set_ylabel("Device memory (GiB)")
+ax.set_ylim(0, max(p + d for p, d in zip(persistent, dynamic)) * 1.16)
+ax.set_title("K3 measured activation and workspace capacity")
+ax.grid(axis="y", alpha=0.22)
+ax.legend(frameon=False)
+fig.tight_layout()
+fig.savefig(RESULTS / "activation_capacity_summary.png", dpi=180, bbox_inches="tight")
