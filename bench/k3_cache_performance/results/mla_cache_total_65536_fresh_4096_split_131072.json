@@ -1,0 +1,12 @@
+{
+  "total_context": 65536,
+  "cached_prefix": 61440,
+  "fresh_chunk": 4096,
+  "prefix_chunk_size": 131072,
+  "incremental_peak_bytes": 6241190400,
+  "incremental_live_bytes": 100663296,
+  "steady_forward_ms": 18.671295166015625,
+  "warmup_iterations": 2,
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "cache_layout": "packed mixed FP8/BF16, 656 bytes/token"
+}
