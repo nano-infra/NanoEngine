@@ -25,20 +25,20 @@ GLM5.2: Indexer shared across layers 78/21, R_share=3.714, 1M context):
 
     python -m pip install numpy matplotlib
 
-    python docs/blogs/plot_hisparse_capacity.py \
+    python docs/site/blogs/plot_hisparse_capacity.py \
         --config-name glm51_h100_dp16_ep_16 \
         --shared-ratios 1.0 --max-model-len 262144 \
         --output docs/imgs/glm51_h100_dp16_ep_16.png
-    python docs/blogs/plot_hisparse_capacity.py \
+    python docs/site/blogs/plot_hisparse_capacity.py \
         --config-name glm51_h100_dp32_ep_32 \
         --shared-ratios 1.0 --max-model-len 262144 \
         --weights-gb 43.42 --memory-fraction 0.82 \
         --output docs/imgs/glm51_h100_dp32_ep_32.png
-    python docs/blogs/plot_hisparse_capacity.py \
+    python docs/site/blogs/plot_hisparse_capacity.py \
         --config-name glm52_h100_dp16_ep_16 \
         --shared-ratios 3.714 --max-model-len 1048576 \
         --output docs/imgs/glm52_h100_dp16_ep_16.png
-    python docs/blogs/plot_hisparse_capacity.py \
+    python docs/site/blogs/plot_hisparse_capacity.py \
         --config-name glm52_h100_dp32_ep_32 \
         --shared-ratios 3.714 --max-model-len 1048576 \
         --weights-gb 43.42 --memory-fraction 0.82 \
