@@ -9,6 +9,8 @@ edit_uri: edit/Pure_dp/docs/site/
 
 theme:
   name: material
+  logo: assets/nanoengine-logo.svg
+  favicon: assets/nanoengine-logo.svg
   palette:
     - scheme: default
       primary: custom
