@@ -14,6 +14,7 @@ These notes are grouped by the question they answer.
 ## Sparse attention and capacity
 
 - [HiSparse Capacity](dlengine-hisparse-capacity.md)
+- [HiSparse Capacity（中文）](dlengine-hisparse-capacity.zh.md)
 - [NSA](dlengine-nsa.md)
 
 The K3 evaluation is the main end-to-end study. The other notes document

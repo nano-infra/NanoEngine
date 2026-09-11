@@ -75,6 +75,7 @@ nav:
       - Kimi K3 Structure and Capacity: blogs/dlengine-kda-evaluation.md
       - DLEngine: blogs/dlengine-engine.md
       - HiSparse Capacity: blogs/dlengine-hisparse-capacity.md
+      - HiSparse Capacity (中文): blogs/dlengine-hisparse-capacity.zh.md
       - MTP: blogs/dlengine-mtp.md
       - NSA: blogs/dlengine-nsa.md
   - Development:
