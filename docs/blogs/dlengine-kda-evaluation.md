@@ -574,6 +574,8 @@ The benchmark inputs, raw CSV/JSON results, and plotting scripts are kept under 
 
 ## 8. Intra-Layer Parallelism Overview
 
+K3 needs parallel execution to meet capacity and latency targets. Its computation graph then includes layout conversions along the Attention → FFN → Attention path, in addition to the layer computations and their internal communication:
+
 $$
 T_{\mathrm{layer}} = T_{\mathrm{compute}} + T_{\mathrm{collective}} + T_{\mathrm{layout\ transition}}.
 $$
@@ -644,7 +646,7 @@ replicated latent traffic, better kernel geometry, and greater resident-request
 capacity. A claim of both $1/T_A$ and an additional $1/P$ compute reduction
 would double-count the same workers.
 
-There is a second, useful MLA convention:**CP nested inside an existing
+There is a second, useful MLA convention: **CP nested inside an existing
 projection-TP group**, as in decode context parallelism. Let $T_A$ be projection
 TP and $P\mid T_A$. Then
 
@@ -936,8 +938,8 @@ when the implementation and measurements establish that overlap.
 | MoE | Routed and shared FFN work over fresh rows |
 | Dense | Three dense projections over fresh rows |
 
-The KDA recurrence countis a rough Decode count, not an exact count for all
-chunked-Prefill intermediates. MLA's 0.464 GFLOP/token projection/expansion
+The chunked-Prefill KDA recurrence requires its own work estimate; a Decode
+state-update count does not cover its intermediates. MLA's 0.464 GFLOP/token projection/expansion
 baseline also needs **cached-prefix KV expansion** added during Prefill:
 $2(L-C)h(128+128)512$ FLOPs per MLA layer.
 
@@ -957,7 +959,7 @@ with fixed split size $S$, it is proportional to
 $\min(S,L/P)\,h/T_{\mathrm{head}}$. In nested CP the effective head count per
 rank increases, so split size and merge workspace need to be retuned together.
 
-For cold chunked Prefillwith $J=L/C$, attention visits $L(L+1)/2$ causal pairs.
+For cold chunked Prefill with $J=L/C$, attention visits $L(L+1)/2$ causal pairs.
 The current expanded-MLA implementation re-expands historical latent rows on
 each chunk, so the total prefix rows expanded are
 $C J(J-1)/2$. The 128K workspace split bounds liveness within a chunk; it does
@@ -983,6 +985,7 @@ cannot establish cold maximum-context TTFT.
 
 ### 9.3 Experimental Setup and Boundary Costs
 
+The distributed measurements used four nodes and 16 NVIDIA GB200 GPUs.
 One worker was pinned to each GPU; groups of 2/4 remained within a node, while
 8/16 spanned nodes. Local topology reports NV18 peer links. Multi-node NCCL and
 MegaMoE with NCCL symmetric memory both completed. Thus a node boundary alone
@@ -999,6 +1002,7 @@ rank controls completion; raw per-rank results remain available.
 
 
 
+A 256 MiB device copy, counting reads and writes, achieved **6.52–6.54
 TB/s/rank**, median 6.54 TB/s. This is an empirical streaming-copy reference,
 not guaranteed effective bandwidth for irregular cache access. The accompanying
 BF16 GEMM sweep uses actual KDA projection dimensions and TP-sharded widths.
@@ -1083,6 +1087,7 @@ acceptance criterion.
 
 #### 9.5.1 Context-Parallel Attention Core
 
+<!-- BEGIN CP_MEASUREMENT_TABLE -->
 | Effective head TP | CP | 32K cached tokens (ms) | 128K cached tokens (ms) | 1M cached tokens (ms) |
 | --- | --- | --- | --- | --- |
 | 16 | 1 | 0.908 | 3.571 | 32.885 |
@@ -1214,6 +1219,7 @@ backend** before allocation allowed all three EP experiments to complete. This
 selection is explicit in the harness; it has not been silently applied to the
 serving runtime.
 
+A second MoE matrix loads checkpoint layer 1, including the actual router,
 896 packed expert weights, shared experts, latent down/up and normalization.
 It measures the **complete FFN**, including shared/routed overlap and
 communication, at EP4/8/16 and different source counts. Inputs are synthetic
@@ -1280,7 +1286,7 @@ prototypes, not accepted `ffn_tp>1` serving configurations.
 
 ### 9.7 Complete Prefill and TTFT
 
-Consider a final 8K Prefill chunkending at visible length $2^{20}$, with
+Consider a final 8K Prefill chunk ending at visible length $2^{20}$, with
 EP16 and one active attention-DP group. Use the complete KDA and MLA boundaries,
 plus complete FFN at the original 4/8/16-source ownership. The communication
 column substitutes 93 eager RS→AG pairs for the 93 output all-reduces already
@@ -1573,6 +1579,7 @@ Independent process worlds corroborate the small-batch TP8 latency floor. All 16
 
 ### 10.4 MLA Decode
 
+We loaded checkpoint MLA layer 3 (zero-based) and timed its complete production
 forward: Q/KV projections, normalization, cache write, Prefill restore/expansion
 or absorbed paged Decode, output-value projection, gate and output all-reduce.
 The matrix covers TP1/2/4/8/16, contexts 1K/8K/32K/128K/512K/1M, both cache
@@ -1598,6 +1605,7 @@ These columns use local batch one, explicit FP8 KV and maximum-rank graph median
 
 #### 10.4.1 Paged CP and Layout Conversion
 
+The CP experiment uses paged compressed MLA with $d_q=576,d_v=512$ through
 the installed TRTLLM-GEN kernel. At a fixed projection TP $T_A$, each CP rank
 first owns $96/T_A$ query heads. Q all-gather supplies the $P$ head slices to
 each context shard; local attention processes $L/P$ cached tokens. A stable
