@@ -1087,7 +1087,6 @@ acceptance criterion.
 
 #### 9.5.1 Context-Parallel Attention Core
 
-<!-- BEGIN CP_MEASUREMENT_TABLE -->
 | Effective head TP | CP | 32K cached tokens (ms) | 128K cached tokens (ms) | 1M cached tokens (ms) |
 | --- | --- | --- | --- | --- |
 | 16 | 1 | 0.908 | 3.571 | 32.885 |
