@@ -62,8 +62,11 @@ plugins:
 
 nav:
   - Home: index.md
+  - Documentation map: documentation-map.md
   - Get Started:
       - Installation: installation.md
+      - Offline Inference: offline-inference.md
+  - Operate:
       - Production Serving: online-serving.md
       - Transport-neutral P/D: pd-fabric-deployment.md
   - Reference:
@@ -78,7 +81,6 @@ nav:
       - MTP: blogs/dlengine-mtp.md
       - NSA: blogs/dlengine-nsa.md
   - Development:
-      - Offline Inference: offline-inference.md
       - Performance Profiling: performance-profiling.md
 
 extra:

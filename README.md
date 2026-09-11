@@ -60,5 +60,5 @@ See individual component [license](./LICENSE).
 ## 📞 Support
 
 - **Issues**: [GitHub Issues](https://github.com/JimyMa/NanoDeploy/issues)
-- **Documentation**: Check component READMEs
+- **Documentation**: Start with the [documentation map](./docs/README.md)
 - **Contribution workflow**: [GitHub Issue and Pull Request Workflow](./docs/github-workflow.zh.md)
