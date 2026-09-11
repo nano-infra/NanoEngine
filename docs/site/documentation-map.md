@@ -36,4 +36,4 @@ Long-form measurements and architecture explanations are collected in the
 Put user-facing, executable instructions in `docs/site/`; add the page to
 `docs/mkdocs.yml` navigation. Put a decision, proposal, or migration plan in
 the `docs/` root and link it from `docs/README.md`. Put a benchmark narrative
-or explanatory deep dive in `docs/blogs/` and add it to both blog indexes.
+or explanatory deep dive in `docs/site/blogs/` and add it to the site blog index.

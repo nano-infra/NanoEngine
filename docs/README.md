@@ -50,10 +50,10 @@ MVP proposal kept for historical context. New HiSparse decisions belong in
 `hisparse-design.md` (and its Chinese counterpart) so there is one canonical
 design pair.
 
-### Research articles — `docs/blogs/`
+### Research articles — `docs/site/blogs/`
 
 Articles explain measurements or implementation details at greater length.
-Start with the [blog index](blogs/index.md). An article becomes part of the
+Start with the [blog index](site/blogs/index.md). An article becomes part of the
 site only when it is listed in both that index and `mkdocs.yml`.
 
 ## Build the documentation site
@@ -73,6 +73,6 @@ Pages remains disabled because this repository is private.
 
 When adding documentation, choose the layer by audience first. Keep runnable
 instructions in `docs/site/`, decisions and proposed work in the root `docs/`,
-and measured deep dives in `docs/blogs/`. Give a design note a status and a
+and measured deep dives in `docs/site/blogs/`. Give a design note a status and a
 canonical filename, link related documents from this map, and update the
 MkDocs navigation whenever a site page is added or renamed.
