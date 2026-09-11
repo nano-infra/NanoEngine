@@ -339,53 +339,53 @@ $$
 
 #### 6.1 GLM5.1（256K）
 
-![GLM5.1 H100 DP16EP16 worker capacity](../imgs/glm51_h100_dp16_ep_16.png)
+![GLM5.1 H100 DP16EP16 worker capacity](../assets/glm51_h100_dp16_ep_16.png)
 
 > **图结论：** 增大 $`R_{Host}`$ 会提高 worker aggregate capacity，但会降低固定 per-sequence Buffer 下的最大请求数；更大的 Buffer 用更低并发换取更大的 hot window。
 
 DP16EP16 的 256K lower crossing 为 $`R_{Host}\approx14.05`$。$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/81.67/38.35/16.69`$。
 
-![GLM5.1 H100 DP32EP32 worker capacity](../imgs/glm51_h100_dp32_ep_32.png)
+![GLM5.1 H100 DP32EP32 worker capacity](../assets/glm51_h100_dp32_ep_32.png)
 
 > **图结论：** 更大的 $`M_{cache}`$ 同时降低容量 crossing，并把各并发的 top-k ratio ceiling 推向右侧。
 
 DP32EP32 的 256K lower crossing 为 $`R_{Host}\approx0.77`$；$`N_{bs,max}=1/2/4/8`$ 的上界约为 $`128/256/233.4/114.2`$。
 
-![GLM5.1 H200 DP8EP8 worker capacity](../imgs/glm51_h200_dp8_ep_8.png)
+![GLM5.1 H200 DP8EP8 worker capacity](../assets/glm51_h200_dp8_ep_8.png)
 
 > **H200 DP8EP8：** 取 $`F=0.86`$、$`M_{weights}=106.72\ \mathrm{GB}`$，则 $`M_{cache}=137.97\times0.86-106.72=11.9342\ \mathrm{GB}`$。256K lower crossing 为 $`R_{Host}\approx1.452`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/136.5/65.78`$。
 
-![GLM5.1 H200 DP16EP16 worker capacity](../imgs/glm51_h200_dp16_ep_16.png)
+![GLM5.1 H200 DP16EP16 worker capacity](../assets/glm51_h200_dp16_ep_16.png)
 
 > **H200 DP16EP16：** $`M_{cache}=137.97\times0.85-64.52=52.7545\ \mathrm{GB}`$。256K lower crossing 为 $`R_{Host}\approx0.268`$，低于图片横轴起点 $`2^{-1}=0.5`$；因此图中的整个可见区间均已达到 256K。$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/512/307.8`$。
 
-![GLM5.1 H200 DP32EP32 worker capacity](../imgs/glm51_h200_dp32_ep_32.png)
+![GLM5.1 H200 DP32EP32 worker capacity](../assets/glm51_h200_dp32_ep_32.png)
 
 > **H200 DP32EP32：** $`M_{cache}=137.97\times0.85-43.42=73.8545\ \mathrm{GB}`$。256K lower crossing 进一步降至 $`R_{Host}\approx0.189`$，同样位于图片范围左侧；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/512/432.8`$。
 
 #### 6.2 GLM5.2（1M）
 
-![GLM5.2 H100 DP16EP16 worker capacity](../imgs/glm52_h100_dp16_ep_16.png)
+![GLM5.2 H100 DP16EP16 worker capacity](../assets/glm52_h100_dp16_ep_16.png)
 
 > **图结论：** 1M target 把 lower crossing 推到 $`R_{Host}\approx71.85`$；$`N_{bs,max}=8`$ 的 top-k ceiling 位于 crossing 左侧，因此不可达。
 
 $`N_{bs,max}=1/2/4`$ 的可行上界约为 $`512/303.3/142.4`$。
 
-![GLM5.2 H100 DP32EP32 worker capacity](../imgs/glm52_h100_dp32_ep_32.png)
+![GLM5.2 H100 DP32EP32 worker capacity](../assets/glm52_h100_dp32_ep_32.png)
 
 > **图结论：** DP32EP32 将 1M crossing 降到 $`R_{Host}\approx3.12`$，并使 $`N_{bs,max}=1/2/4/8`$ 均可达。
 
 对应上界约为 $`512/1024/866.9/424.2`$。
 
-![GLM5.2 H200 DP8EP8 worker capacity](../imgs/glm52_h200_dp8_ep_8.png)
+![GLM5.2 H200 DP8EP8 worker capacity](../assets/glm52_h200_dp8_ep_8.png)
 
 > **H200 DP8EP8：** 取 $`F=0.86`$、$`M_{weights}=106.72\ \mathrm{GB}`$，$`M_{cache}=11.9342\ \mathrm{GB}`$。1M lower crossing 为 $`R_{Host}\approx5.943`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/507.0/244.3`$。
 
-![GLM5.2 H200 DP16EP16 worker capacity](../imgs/glm52_h200_dp16_ep_16.png)
+![GLM5.2 H200 DP16EP16 worker capacity](../assets/glm52_h200_dp16_ep_16.png)
 
 > **H200 DP16EP16：** 在 $`M_{cache}=52.7545\ \mathrm{GB}`$ 下，1M lower crossing 降至 $`R_{Host}\approx1.076`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/2048/1143.0`$。
 
-![GLM5.2 H200 DP32EP32 worker capacity](../imgs/glm52_h200_dp32_ep_32.png)
+![GLM5.2 H200 DP32EP32 worker capacity](../assets/glm52_h200_dp32_ep_32.png)
 
 > **H200 DP32EP32：** 在 $`M_{cache}=73.8545\ \mathrm{GB}`$ 下，1M lower crossing 为 $`R_{Host}\approx0.756`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/2048/1607.6`$。
 

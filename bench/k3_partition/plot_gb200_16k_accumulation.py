@@ -32,6 +32,6 @@ handles=[bars,ax.lines[-1],ax2.lines[0]];ax.legend(handles,[h.get_label() for h 
 ax.set_title('GB200 single-card MLA layer · measured 16K chunks from empty cache')
 fig.text(.5,.01,'TP1, MLA layer 3, raw FP8 KV cache, 1,048,576-token endpoint. Each bar is one sequential chunk; purple curve is the direct cumulative sum. This is a representative layer trace, not full-model serving TTFT.',ha='center',fontsize=8)
 fig.tight_layout(rect=(0,.07,1,.96))
-for p in [ROOT/'results/gb200_single_card_trace/mla_16k_accumulation.svg',Path('docs/blogs/assets/gb200-mla-16k-accumulation.svg')]:p.parent.mkdir(parents=True,exist_ok=True);fig.savefig(p,bbox_inches='tight')
+for p in [ROOT/'results/gb200_single_card_trace/mla_16k_accumulation.svg',Path('docs/site/assets/gb200-mla-16k-accumulation.svg')]:p.parent.mkdir(parents=True,exist_ok=True);fig.savefig(p,bbox_inches='tight')
 fig.savefig('/tmp/gb200-mla-16k-accumulation.png',dpi=140,bbox_inches='tight')
 print('first marginal ms',marginal[0],'last marginal ms',marginal[-1],'cumulative sec',cumulative[-1])

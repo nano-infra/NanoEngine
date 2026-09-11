@@ -37,7 +37,7 @@ def save(fig, name, title, footer):
     fig.suptitle(title, fontsize=15, fontweight='bold', y=.98)
     fig.text(.5, .02, footer, ha='center', va='bottom', fontsize=9, color='#475569')
     fig.tight_layout(rect=(0, .12, 1, .88))
-    for folder in ('docs/blogs/assets', 'docs/site/assets'):
+    for folder in ('docs/site/assets', 'docs/site/assets'):
         path = ROOT / folder / (name + '.svg')
         fig.savefig(path, bbox_inches='tight')
         path.write_text('\n'.join(s.rstrip() for s in path.read_text().splitlines()) + '\n')

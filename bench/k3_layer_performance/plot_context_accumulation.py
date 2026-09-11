@@ -43,7 +43,7 @@ ax[1].grid(alpha=.22,which='both');ax[1].legend(fontsize=8,frameon=False)
 fig.suptitle('GB200-only planning view · MLA layer 3 · 16K fresh chunk · raw context sweep data from one B300 card',fontsize=12)
 fig.text(.5,.01,'Red points are measured B300 layer-3 pipeline points; blue/purple curves reconstruct intermediate chunks by log-context interpolation. Validate with a per-chunk GB200 trace before using for SLOs.',ha='center',fontsize=8)
 fig.tight_layout(rect=(0,.07,1,.93))
-for path in [ROOT/'results/mla-context-accumulation-gb200.svg',Path('docs/blogs/assets/mla-context-accumulation-gb200.svg')]:
+for path in [ROOT/'results/mla-context-accumulation-gb200.svg',Path('docs/site/assets/mla-context-accumulation-gb200.svg')]:
     path.parent.mkdir(parents=True,exist_ok=True);fig.savefig(path,bbox_inches='tight')
 fig.savefig('/tmp/mla-context-accumulation-gb200.png',dpi=140,bbox_inches='tight')
 print('Measured points:',list(zip(xs,ys)))

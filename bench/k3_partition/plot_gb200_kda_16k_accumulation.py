@@ -24,6 +24,6 @@ ax.legend([bars,line],[bars.get_label(),line.get_label()],loc='upper left',frame
 ax.set_title('GB200 single-card KDA layer · 16K chunks')
 fig.text(.5,.01,f'TP1, batch 1, max-rank measured chunk time from gb200_graph_kda; KDA recurrent state makes marginal cost context-independent, so cumulative values are i × {m:.2f} ms. This is a layer model, not full-model TTFT.',ha='center',fontsize=8)
 fig.tight_layout(rect=(0,.07,1,.96))
-for p in [ROOT/'results/gb200_graph_kda/kda_16k_accumulation.svg',Path('docs/blogs/assets/gb200-kda-16k-accumulation.svg')]:
+for p in [ROOT/'results/gb200_graph_kda/kda_16k_accumulation.svg',Path('docs/site/assets/gb200-kda-16k-accumulation.svg')]:
  p.parent.mkdir(parents=True,exist_ok=True);fig.savefig(p,bbox_inches='tight')
 print('chunk_ms',m,'cumulative_1m_s',cum[-1])
