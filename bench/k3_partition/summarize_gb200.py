@@ -134,7 +134,7 @@ def plot(kda, cp, moe, transition):
     ax.legend(fontsize=8)
     fig.suptitle('K3 parallel-layout evidence on 16 GB200 GPUs\nComponent measurements and capacity estimates; not full-model serving benchmarks', fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, .94))
-    destination = ROOT / 'docs/blogs/assets/k3-gb200-joint.svg'
+    destination = ROOT / 'docs/site/assets/k3-gb200-joint.svg'
     fig.savefig(destination, bbox_inches='tight')
     fig.savefig('/tmp/k3-gb200-joint.png', dpi=140, bbox_inches='tight')
     plt.close(fig)

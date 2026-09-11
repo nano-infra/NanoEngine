@@ -40,7 +40,7 @@ def main():
     fig.suptitle('GB200: phase, context length and conversion cost change the best layout\nPanels a–c: FP8 cache. Real-weight MLA layer; CP is a component prototype',fontsize=13)
     fig.tight_layout(rect=(0,0,1,.94))
     root=Path(__file__).resolve().parents[2]
-    fig.savefig(root/'docs/blogs/assets/k3-gb200-serving.svg',bbox_inches='tight')
+    fig.savefig(root/'docs/site/assets/k3-gb200-serving.svg',bbox_inches='tight')
     fig.savefig('/tmp/k3-gb200-serving.png',dpi=140,bbox_inches='tight')
 
 if __name__=='__main__':main()

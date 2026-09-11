@@ -1,6 +1,6 @@
 ## DLEngine - MTP 投机解码
 
-> 当前部署参数、支持边界和验收清单以 [GLM Recurrent MTP](../site/glm-recurrent-mtp.md) 为准。本文保留实现原理与带环境口径的历史性能快照。
+> 当前部署参数、支持边界和验收清单以 [GLM Recurrent MTP](../glm-recurrent-mtp.md) 为准。本文保留实现原理与带环境口径的历史性能快照。
 
 ### 1. 背景：为什么需要投机解码？
 

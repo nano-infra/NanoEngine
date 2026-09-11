@@ -493,7 +493,7 @@ $$
 
 #### 6.2 GLM5.1 (256K, per-layer Indexer)
 
-![GLM5.1 H100 DP16EP16 worker capacity](../imgs/glm51_h100_dp16_ep_16.png)
+![GLM5.1 H100 DP16EP16 worker capacity](../assets/glm51_h100_dp16_ep_16.png)
 
 > **Figure conclusion.** Raising $`R_{Host}`$ increases aggregate worker capacity toward the Indexer ceiling, but reduces the maximum request count available to any fixed per-sequence Buffer. A larger Buffer improves each request's hot window at the cost of lower concurrency.
 
@@ -508,7 +508,7 @@ On **DP16EP16** ($`M_{cache}\approx3.65\ \mathrm{GB}`$), the worker reaches the 
 
 Thus $`N_{bs,max}=8`$ remains reachable, but only in a narrow ratio interval. This does not mean eight simultaneous 256K requests fit; it means the worker has at least one 256K of aggregate logical capacity while retaining the top-k minimum for eight active sequences.
 
-![GLM5.1 H100 DP32EP32 worker capacity](../imgs/glm51_h100_dp32_ep_32.png)
+![GLM5.1 H100 DP32EP32 worker capacity](../assets/glm51_h100_dp32_ep_32.png)
 
 > **Figure conclusion.** Raising $`R_{Host}`$ increases aggregate worker capacity toward the Indexer ceiling, but reduces the maximum request count available to any fixed per-sequence Buffer. A larger Buffer improves each request's hot window at the cost of lower concurrency.
 
@@ -525,7 +525,7 @@ The lower endpoint is shared because worker capacity is independent of how the t
 
 #### 6.3 GLM5.2 (1M, shared Indexer)
 
-![GLM5.2 H100 DP16EP16 worker capacity](../imgs/glm52_h100_dp16_ep_16.png)
+![GLM5.2 H100 DP16EP16 worker capacity](../assets/glm52_h100_dp16_ep_16.png)
 
 > **Figure conclusion.** Raising $`R_{Host}`$ increases aggregate worker capacity toward the Indexer ceiling, but reduces the maximum request count available to any fixed per-sequence Buffer. A larger Buffer improves each request's hot window at the cost of lower concurrency.
 
@@ -540,7 +540,7 @@ On **DP16EP16**, the worker reaches the 1M aggregate-capacity target at $`R_{Hos
 
 Compared with GLM5.1, the longer context moves the shared lower crossing much farther right. At $`N_{bs,max}=8`$, the top-k ceiling falls below that crossing, so no ratio satisfies both constraints.
 
-![GLM5.2 H100 DP32EP32 worker capacity](../imgs/glm52_h100_dp32_ep_32.png)
+![GLM5.2 H100 DP32EP32 worker capacity](../assets/glm52_h100_dp32_ep_32.png)
 
 > **Figure conclusion.** Raising $`R_{Host}`$ increases aggregate worker capacity toward the Indexer ceiling, but reduces the maximum request count available to any fixed per-sequence Buffer. A larger Buffer improves each request's hot window at the cost of lower concurrency.
 

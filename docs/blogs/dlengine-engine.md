@@ -37,8 +37,8 @@ DLEngine 在底层将 Attention 与 FFN 的并行策略完全解耦（如图 1 �
 - 双 Device Mesh 抽象： 在物理集群之上构建两套独立的逻辑设备网格。一套专用于管理 Attention 的 DP/TP 拓扑，另一套专用于管理 MoE 的 EP 拓扑。
 - 无缝的并行域转换 (Parallelism Transition)： 当 Token 完成 Attention 计算进入专家层时，引擎会自动通过底层的高效通信算子（如基于 DeepEP 的 All-to-All），在两个 Device Mesh 间进行数据流重组与切换。确保了 Attention 层享受纯 DP 的极简调度，而 FFN 层能瞬间切换到 EP 模式。
 
-![dlengine-dp-ep-sp-tp](../imgs/EP-SP.PNG)
-![dlengine-scheduler](../imgs/scheduler.PNG)
+![dlengine-dp-ep-sp-tp](../assets/EP-SP.PNG)
+![dlengine-scheduler](../assets/scheduler.PNG)
 
 #### 3.3 全局调度器 (Global Scheduler)
 
