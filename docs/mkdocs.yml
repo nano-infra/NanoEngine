@@ -71,6 +71,7 @@ nav:
       - Supported Models: supported-models.md
       - GLM Recurrent MTP: glm-recurrent-mtp.md
   - Blog:
+      - Blog index: blogs/index.md
       - Kimi K3 Structure and Capacity: blogs/dlengine-kda-evaluation.md
       - DLEngine: blogs/dlengine-engine.md
       - HiSparse Capacity: blogs/dlengine-hisparse-capacity.md
