@@ -611,11 +611,11 @@ This chapter focuses on **intra-layer parallelism**: TP, CP and EP inside a deco
 
 MLA distributes projection/head work with TP, independent requests with DP, and history with CP.
 
-| Choice | Capacity effect | Compute and HBM effect | Communication and selection rule |
-| --- | --- | --- | --- |
-| More DP | Weights replicated; requests and their caches assigned to different groups | More independent requests run concurrently | Little attention-internal communication; does not accelerate one request |
-| More TP | Most projections/head weights shrink; compressed latent cache stays replicated | Head work shrinks, but every head shard still consumes the same latent history | Projection reductions and attention/FFN transitions; useful for weight fit and long Prefill |
-| More CP | Persistent history can shrink as $1/P$ | Work on one long history is distributed; query or head geometry changes | Exchange queries/KV and merge partial softmax outputs; worthwhile only after including these costs |
+| Choice | Weight sharding | Activation sharding | KV-cache / history sharding | Added communication and selection rule |
+| --- | --- | --- | --- | --- |
+| More DP | Replicates projection and attention weights in each request group | Each group owns independent request rows | Each group owns the cache for its requests | No attention-internal exchange; increases independent-request throughput but does not accelerate one request |
+| More TP | Shards projection and head weights across ranks | Head/output shards require reductions or owner restoration | Compressed latent cache remains replicated across TP ranks | Projection reductions plus attention/FFN boundary conversions; useful when weight fit or single-request Prefill dominates |
+| More CP (**KV all-gather + LSE merge**) | Keeps projection weights TP-sharded | Queries are exchanged or replicated to history owners | History pages are partitioned approximately as $1/P$ per rank | Query/KV exchange and numerically correct LSE merge; worthwhile only when cache capacity or long-history work repays these costs |
 
 **Prefill CP and Decode CP address different bottlenecks.** Splitting fresh
 query tokens during Prefill can distribute large $CL$ attention work, but
