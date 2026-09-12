@@ -4,7 +4,7 @@ This companion focuses on cold and continuation Prefill. It assumes the model st
 
 ## 9. Prefill
 
-Prefill parallelism is evaluated by fresh chunk size, cached history and time to first token. First screen weight, cache and activation capacity; then compare complete component times and the transitions defined in §8.5. Cold Prefill must include all chunks, while continuation Prefill processes only the new suffix.
+The objective of this article is to choose the fastest legal Prefill parallel layout for each workload. The choice must fit weights, cache and activation memory, meet the TTFT target, and minimize the complete layer cost: attention, KDA/MLA state movement, FFN execution, collectives, and transitions between their layouts. Fresh chunk size and cached history define the workload; they are inputs to the choice, not separate ends in themselves. Cold Prefill must include all chunks, while continuation Prefill processes only the new suffix. We first filter illegal sharding layouts, then rank the survivors by measured end-to-end chunk time and accumulated TTFT.
 
 ### 9.1 Capacity and Legal Sharding
 
@@ -582,7 +582,7 @@ using achievable throughput at the same latency and maximum-context admission
 constraint, then compare GPU-hour cost. No price/performance winner can be
 established here without target-system measurements and prices.
 
-### 9.9 Prefill Selection
+### 9.9 Prefill Parallel-Strategy Selection
 
 Reject layouts that fail §9.1 before comparing TTFT. For a long cold request, the measured TP16/EP16 run is faster than TP8/EP16; larger chunks also reduce repeated expansion and launch overhead in the isolated MLA trace. Neither observation establishes an optimal chunk size for sustained whole-model serving.
 

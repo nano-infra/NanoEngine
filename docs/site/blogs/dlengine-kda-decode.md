@@ -4,7 +4,7 @@ This companion focuses on Decode, resident cache capacity, batch/context scaling
 
 ## 10. Decode
 
-Decode parallelism is evaluated at fixed global batch and context distribution. Each active sequence emits one token per step. The goals are resident-request capacity and throughput subject to TPOT; the Prefill TTFT ranking does not determine the Decode ranking.
+The objective of this article is to choose the fastest legal Decode parallel layout for each batch and context regime. Each active sequence emits one token per step, so the selected layout must fit weights, resident KV/KDA state and transient buffers, satisfy the TPOT and capacity constraints, and minimize the complete per-token layer cost: attention, state reads, FFN execution, collectives, and layout transitions. We compare candidates at fixed global batch and context distribution, filter capacity failures first, and then optimize throughput and tail latency. The Prefill TTFT ranking does not determine the Decode ranking; changing the mesh can also require a Prefill-to-Decode state migration.
 
 ### 10.1 Resident Capacity and Admission
 
@@ -210,7 +210,7 @@ The plotted measurements preserve the benchmark data while making the scaling tr
 
 TP8 has the lowest near-cap mean TPOT among these single runs, while TP16 has the fastest near-cap TTFT. Eight output tokens per request and no concurrent-load sweep are insufficient to establish sustained throughput or a tail-latency SLO.
 
-### 10.7 Decode Selection and Prefill Handoff
+### 10.7 Decode Parallel-Strategy Selection and Prefill Handoff
 
 Filter by resident capacity, then compare equal-global-load TP/DP candidates. Enable nested MLA CP only when its capacity benefit or cache-read savings justify query exchange, merge and changed boundaries at the target batch and context. Keep EP16 as the current 16-GB200 FFN baseline until an alternative is validated with complete FFN work and source ownership.
 
