@@ -582,22 +582,28 @@ $$
 
 Capacity legality comes first; latency and throughput are compared only among layouts that fit.
 
-```mermaid
-flowchart LR
-    subgraph Single[Single-card graph]
-        X1[Hidden states] --> A1[Attention]
-        A1 --> F1[FFN]
-        F1 --> Y1[Next layer]
-    end
-    subgraph Parallel[Distributed graph]
-        X2[Hidden states] --> A2[Attention shard]
-        A2 --> C1[Collective / layout conversion]
-        C1 --> F2[FFN or expert dispatch]
-        F2 --> C2[Collective / layout conversion]
-        C2 --> Y2[Next attention shard]
-    end
-    Single -. capacity/SLO bound .-> Parallel
-```
+<div style="display:flex;gap:1.25rem;align-items:stretch;flex-wrap:wrap;margin:1rem 0">
+  <div style="flex:1 1 18rem;border:1px solid #94a3b8;border-radius:.5rem;padding:1rem;background:#f8fafc">
+    <strong>Single-card graph</strong>
+    <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-top:.8rem">
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#dbeafe">Hidden states</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#bfdbfe">Attention</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#bbf7d0">FFN</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#e2e8f0">Next layer</span>
+    </div>
+  </div>
+  <div style="flex:1 1 24rem;border:1px solid #7c3aed;border-radius:.5rem;padding:1rem;background:#faf5ff">
+    <strong>Distributed graph</strong>
+    <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-top:.8rem">
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#dbeafe">Hidden states</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#bfdbfe">Attention shard</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#fed7aa">Collective<br>/ layout conversion</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#bbf7d0">FFN / expert dispatch</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#fed7aa">Collective<br>/ layout conversion</span><b>→</b>
+      <span style="padding:.45rem .65rem;border-radius:.35rem;background:#e2e8f0">Next attention shard</span>
+    </div>
+  </div>
+</div>
 
 This chapter focuses on **intra-layer parallelism**: TP, CP and EP inside a decoder layer, together with DP for independent requests. Pipeline parallelism (PP), which partitions layers across stages, and Attention–FFN disaggregation (AFD), which separates execution domains, are outside the current comparison. They remain higher-level deployment dimensions and are not mixed into the capacity and latency analysis below.
 
