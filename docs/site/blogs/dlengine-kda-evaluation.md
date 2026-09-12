@@ -1454,15 +1454,10 @@ The reserve includes the measured EP16 6.50 GiB buffer; it is an explicit planni
 assumption, not a measured whole-model peak. Embedding/LM head are TP-sharded.
 All rows use EP16 and FFN TP1.
 
-| Attention layout | Weights (GiB/rank) | FP8 cache + state/request/rank (GiB) | Total FP8 requests at maximum length | Total BF16 requests at maximum length |
-| --- | ---: | ---: | ---: | ---: |
-| DP16×TP1 | 190.74 | 13.721 | 0 | 0 |
-| DP8×TP2 | 155.24 | 13.611 | 0 | 0 |
-| DP4×TP4 | 137.48 | 13.555 | 4 | 0 |
-| DP2×TP8 | 128.61 | 13.528 | 4 | 2 |
-| DP1×TP16 | 124.17 | 13.514 | 2 | 1 |
-| DP2×TP8, nested CP2* | 128.61 | 6.778 | 10 | 4 |
-| DP2×TP8, nested CP4* | 128.61 | 3.403 | 20 | 10 |
+![10.1 Decode measurements](../assets/activation-capacity-summary.png)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 The FP8 column requires explicit cache selection; `auto` uses the BF16 column.
 The CP rows (*) assume balanced pages and unchanged KDA request ownership;
@@ -1518,23 +1513,17 @@ The RS→AG measurements in §9.3 establish the small-message floor as well as t
 
 ### 10.3 KDA Decode
 
-| TP | DP | Decode B=1, graph (µs) | Decode B=128, graph (µs) | Decode B=256, graph (µs) |
-| --- | --- | --- | --- | --- |
-| 1 | 16 | 152.0 | 353.3 | 639.3 |
-| 2 | 8 | 108.1 | 220.9 | 393.8 |
-| 4 | 4 | 79.4 | 147.7 | 227.5 |
-| 8 | 2 | 74.0 | 110.3 | 176.0 |
-| 16 | 1 | 82.8 | 113.6 | 142.5 |
+![10.3 Decode measurements](../assets/gb200-kda-decode-batch.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 Batches are local to each request-DP group. Complete KDA CUDA Graph measurements include output all-reduce; the eager TP8 batch-one measurement exceeds 1 ms because of launch gaps. Compare equal global population before ranking throughput.
 
-| Actual world size = TP | Decode B1 (ms) | Decode B8 (ms) | Decode B128 (ms) |
-| --- | --- | --- | --- |
-| 1 | 0.153 | 0.163 | 0.355 |
-| 2 | 0.106 | 0.112 | 0.219 |
-| 4 | 0.079 | 0.080 | 0.147 |
-| 8 | 0.072 | 0.076 | 0.110 |
-| 16 | 0.083 | 0.073 | 0.114 |
+![10.3 Decode measurements](../assets/gb200-kda-decode-batch.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 Independent process worlds corroborate the small-batch TP8 latency floor. All 16 GPUs need not cooperate in one request, but the full checkpoint must still pass the capacity screen.
 
@@ -1554,13 +1543,10 @@ maximum rank of each rank's median.
 
 
 
-| TP | 8K Decode (ms) | 128K Decode (ms) | 1M Decode (ms) |
-| --- | --- | --- | --- |
-| 1 | 0.138 | 0.162 | 0.253 |
-| 2 | 0.112 | 0.138 | 0.269 |
-| 4 | 0.111 | 0.135 | 0.293 |
-| 8 | 0.097 | 0.129 | 0.223 |
-| 16 | 0.114 | 0.151 | 0.245 |
+![10.4 Decode measurements](../assets/gb200-mla-decode-context.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 These columns use local batch one, explicit FP8 KV and maximum-rank graph medians. The Prefill columns and workspace fix are reported in §9.5. The local head-padding and short-sequence numerical checks described there apply to this shared implementation as well.
 
@@ -1578,20 +1564,10 @@ It excludes projections, cache append, output-value/gate projections and the
 final TP output reduction, which are included in the full-MLA table instead.
 
 <!-- BEGIN PAGED_CP_TABLE -->
-| Projection TP | Local batch | Context | CP1 (ms) | Best measured CP | Best (ms) | Ratio |
-| --- | --- | --- | --- | --- | --- | --- |
-| 8 | 1 | 8K | 0.015 | 1 | 0.015 | 1.00× |
-| 8 | 1 | 128K | 0.033 | 1 | 0.033 | 1.00× |
-| 8 | 1 | 1024K | 0.128 | 1 | 0.128 | 1.00× |
-| 8 | 8 | 8K | 0.017 | 1 | 0.017 | 1.00× |
-| 8 | 8 | 128K | 0.102 | 1 | 0.102 | 1.00× |
-| 8 | 8 | 1024K | 0.682 | 8 | 0.260 | 2.62× |
-| 8 | 32 | 8K | 0.037 | 1 | 0.037 | 1.00× |
-| 8 | 32 | 128K | 0.365 | 4 | 0.228 | 1.60× |
-| 8 | 32 | 1024K | 2.896 | 8 | 0.711 | 4.07× |
-| 16 | 1 | 1024K | 0.128 | 8 | 0.128 | 1.00× |
-| 16 | 8 | 1024K | 0.681 | 8 | 0.228 | 2.98× |
-| 16 | 32 | 1024K | 2.865 | 16 | 0.493 | 5.81× |
+![10.4.1 Decode measurements](../assets/gb200-mla-decode-batch-context.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 <!-- END PAGED_CP_TABLE -->
 
 These are FP8, maximum-rank medians; batch is per request-DP group. TP4/8/16,
@@ -1628,11 +1604,10 @@ serving; the measured prototype is under `bench/k3_partition/paged_cp.py`.
 
 The complete FFN row sweep in §9.6 uses the same current-token operator for both phases. The small-batch columns are the relevant Decode points; source distribution and routing must match the attention output.
 
-| EP | 16 inputs (ms) | 128 inputs (ms) |
-| --- | --- | --- |
-| 4 | 0.267 | 0.436 |
-| 8 | 0.172 | 0.252 |
-| 16 | 0.146 | 0.210 |
+![10.5 Decode measurements](../assets/gb200-moe-decode-batch.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 Inputs are synthetic normal activations passed through checkpoint layer 1. EP4/8/16 use different replica counts on 16 GPUs, so equal local input rows do not imply equal global throughput. Routed-only EP×TP results in §9.6 include their conversions but exclude router/shared/latent work.
 
@@ -1648,20 +1623,10 @@ FFN and decoder transitions. It is an attention budget, **not TPOT**, and should
 not have another output all-reduce added to it.
 
 <!-- BEGIN EQUAL_LOAD_TABLE -->
-| Global B | Context | TP | Local B | 69 KDA (ms) | 24 MLA (ms) | Attention sum (ms) | Pass memory screen |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 8 | 8K | 4 | 2 | 5.50 | 2.73 | 8.22 | yes |
-| 8 | 8K | 8 | 4 | 5.37 | 2.54 | 7.92 | yes |
-| 8 | 8K | 16 | 8 | 5.06 | 2.83 | 7.89 | yes |
-| 8 | 128K | 4 | 2 | 5.50 | 3.51 | 9.01 | yes |
-| 8 | 128K | 8 | 4 | 5.37 | 3.78 | 9.16 | yes |
-| 8 | 128K | 16 | 8 | 5.06 | 5.31 | 10.37 | yes |
-| 32 | 8K | 4 | 8 | 5.62 | 2.86 | 8.47 | yes |
-| 32 | 8K | 8 | 16 | 5.35 | 2.99 | 8.34 | yes |
-| 32 | 8K | 16 | 32 | 5.41 | 3.82 | 9.23 | yes |
-| 32 | 128K | 4 | 8 | 5.62 | 5.79 | 11.40 | yes |
-| 32 | 128K | 8 | 16 | 5.35 | 6.78 | 12.13 | yes |
-| 32 | 128K | 16 | 32 | 5.41 | 11.76 | 17.17 | no |
+![10.6 Decode measurements](../assets/gb200-kda-decode-batch.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 <!-- END EQUAL_LOAD_TABLE -->
 
 To obtain a decoder estimate, replace each measured output all-reduce with
@@ -1676,21 +1641,10 @@ residual ownership and conversions at their boundaries.
 
 The full-model execution record and allocator settings are in §9.7.1. The following extracts its seven post-first-token intervals per request.
 
-| Input tokens | Output tokens | Mean TPOT (ms) |
-| --- | --- | --- |
-| 5 | 8 | 29.30 |
-| 1024 | 8 | 62.26 |
-| 8192 | 8 | 48.00 |
-| 32768 | 8 | 29.21 |
-| 131072 | 8 | 31.42 |
-| 524288 | 8 | 34.30 |
-| 1048560 | 8 | 41.37 |
+![10.6.1 Decode measurements](../assets/k3-gb200-serving.svg)
 
-| Attention TP / EP16 | KV utilization setting | Effective context cap | Near-cap mean TPOT (ms) |
-| --- | --- | --- | --- |
-| 4 | 0.91 | 1048576 | 43.25 |
-| 8 | 0.88 | 1048576 | 41.37 |
-| 16 | 0.88 | 1048576 | 47.83 |
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 TP8 has the lowest near-cap mean TPOT among these single runs, while TP16 has the fastest near-cap TTFT. Eight output tokens per request and no concurrent-load sweep are insufficient to establish sustained throughput or a tail-latency SLO.
 
@@ -1705,14 +1659,10 @@ Switching meshes after Prefill requires cache/state migration. Prefer stable own
 The completed coverage is deliberately finite; the Cartesian product of every
 world, phase and independent mesh has not been executed:
 
-| Question | Completed evidence | Remaining boundary |
-| --- | --- | --- |
-| World size 1/2/4/8/16 | Actual independent worlds for KDA/collectives; MLA TP1/2/4/8/16 groups in the 16-rank job | Full checkpoint on fewer than 16 GB200 rejected by the all-resident capacity model |
-| Ordinary lengths and maximum context | MLA 1K–1M, Prefill/Decode and batch sweeps; full TP8 from 5 tokens through the near-cap request; full TP4/16 at 5, 8K, 128K and near-cap | Sustained mixed-length load, concurrent long-request saturation and p99 |
-| MLA CP | Expanded-Prefill core and paged absorbed Decode; latter includes Q exchange and output restoration | Full-model persistent CP cache/scheduler integration and cold-Prefill CP |
-| KDA DP/TP and MLA DP/TP | Complete components, equal global Decode populations, full model with a shared attention mesh | Independent KDA/MLA meshes and their measured inter-layer remapping |
-| FFN EP/TP | Complete real FFN EP4/8/16; native expert-TP1/2/4 routed branch, balanced/hot routes, conversions and nonzero checks | Expert-TP serving integration and real-traffic routing distributions |
-| B200/B300 and long-text quality | Primary hardware specifications and byte-budget sensitivity; GB200 repeated-pattern capacity execution | New B200/B300 runs and long-document retrieval/reasoning accuracy |
+![10.8 Decode measurements](../assets/k3-gb200-serving.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 Select a layout by filtering for correctness and maximum-context admission
 first, then optimizing measured serving throughput under latency constraints:
@@ -1749,15 +1699,10 @@ evidence rather than declaring one universal winner. Use the following policy:
    must exceed cache/state transfer plus conversion and synchronization costs.
    Stage-specific meshes are worthwhile only after those edges are measured.
 
-| Serving objective | Recommended starting point | Why and what must still be verified |
-| --- | --- | --- |
-| Balanced deployment with long-context requests | **Attention DP2×TP8, FFN EP16×TP1** | Strong reduction of attention weights, two request groups, full checkpoint reached the near-cap request at 0.88 utilization; validate concurrent admission, sustained TPOT and output quality |
-| More independent requests at shorter contexts | Compare **DP4×TP4** with **DP2×TP8**, both EP16 | TP4 keeps attention within each four-GPU node and supplies more DP groups; use equal global load, not equal per-group batch |
-| Lowest latency for one long Prefill request | Include **DP1×TP16/EP16** in the comparison | More attention GPUs and wider FFN source distribution; fewer DP groups and more replicated latent-cache copies per request |
-| More resident long-context requests | Extend TP8 with **nested MLA CP2**, then CP4 if needed; leave KDA ownership fixed | Targets MLA's replicated cache directly; integrate paged-cache ownership, query exchange and output reshaping before claiming a serving benefit |
-| Prefill rows are concentrated on 4/8 attention ranks | Experiment with routed-branch redistribution to all 16 EP sources | Measured conversion-inclusive benefit at 8K; retain original ownership for shared FFN and return outputs before latent-up |
-| Expert-owner communication or hot experts dominate | Investigate **EP8×expert-TP2** after the EP16 baseline | Native MXFP4 prototype measured including conversions; compare live routing and topology before integrating it into serving |
-| Pure DP16 attention with EP16 | Reject for this checkpoint/storage format | About 190.74 GiB weights/rank already exceed the observed 184.31 GiB HBM |
+![10.8 Decode measurements](../assets/k3-gb200-serving.svg)
+
+The plotted measurements preserve the benchmark data while making the scaling trend and the selection boundary visible.
+
 
 The current runtime has one shared `attention_tp`/`attention_dp` mesh for KDA and
 MLA. A configurable `attention_sp` dimension in the generic context object is
