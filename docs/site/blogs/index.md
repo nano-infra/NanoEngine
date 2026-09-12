@@ -4,7 +4,9 @@ These notes are grouped by the question they answer.
 
 ## K3 model and performance
 
-- [Kimi K3 Structure and Capacity](dlengine-kda-evaluation.md) — model structure, capacity, intra-layer parallelism, Prefill, Decode, and 1M-context serving.
+- [Kimi K3 Overview](dlengine-kda-overview.md) — model structure, capacity, common layer analysis, and intra-layer parallelism.
+- [Kimi K3 Prefill](dlengine-kda-prefill.md) — Prefill capacity, chunk scaling, sharding, and TTFT.
+- [Kimi K3 Decode](dlengine-kda-decode.md) — Decode cache capacity, batch/context scaling, and serving selection.
 
 ## Engine and serving architecture
 
