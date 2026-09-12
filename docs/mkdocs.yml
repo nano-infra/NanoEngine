@@ -77,7 +77,9 @@ nav:
       - GLM Recurrent MTP: glm-recurrent-mtp.md
   - Blog:
       - Blog index: blogs/index.md
-      - Kimi K3 Structure and Capacity: blogs/dlengine-kda-evaluation.md
+      - Kimi K3 Overview: blogs/dlengine-kda-overview.md
+      - Kimi K3 Prefill: blogs/dlengine-kda-prefill.md
+      - Kimi K3 Decode: blogs/dlengine-kda-decode.md
       - DLEngine: blogs/dlengine-engine.md
       - HiSparse Capacity: blogs/dlengine-hisparse-capacity.md
       - MTP: blogs/dlengine-mtp.md
