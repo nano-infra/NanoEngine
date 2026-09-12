@@ -937,12 +937,10 @@ when the implementation and measurements establish that overlap.
 
 
 
-| Component | Prefill work |
-| --- | --- |
-| KDA | Projection and chunked recurrence over fresh rows |
-| MLA | Causal attention plus cached-prefix restoration and expansion |
-| MoE | Routed and shared FFN work over fresh rows |
-| Dense | Three dense projections over fresh rows |
+![9.2 Prefill measurements](../assets/mla-context-accumulation-gb200.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 
 The chunked-Prefill KDA recurrence requires its own work estimate; a Decode
 state-update count does not cover its intermediates. MLA's 0.464 GFLOP/token projection/expansion
@@ -972,13 +970,10 @@ $C J(J-1)/2$. The 128K workspace split bounds liveness within a chunk; it does
 not persist expanded KV between chunks. For an 8K serving chunk:
 
 <!-- BEGIN PHASE_WORK_TABLE -->
-| Context cap/endpoint | 8K cold chunks | Cold work (PFLOP) | Final 8K chunk (PFLOP) | Decode work/token (TFLOP) | FP8 cache/request (GiB) |
-| --- | --- | --- | --- | --- | --- |
-| 8K | 1 | 1.74 | 1.74 | 0.248 | 0.105 |
-| 32K | 4 | 7.59 | 2.05 | 0.371 | 0.422 |
-| 128K | 16 | 40.32 | 3.30 | 0.864 | 1.688 |
-| 512K | 64 | 320.87 | 8.29 | 2.835 | 6.750 |
-| 1024K | 128 | 1067.33 | 14.94 | 5.463 | 13.500 |
+![9.2 Prefill measurements](../assets/mla-context-accumulation-gb200.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END PHASE_WORK_TABLE -->
 
 Cold Prefill includes fixed per-token work, causal MLA attention and repeated
@@ -1018,12 +1013,10 @@ over them; each point has five warmups and three trials of thirty replays.
 The eager reference is retained separately. The following are directly timed
 **RS→AG pairs** on BF16 hidden states:
 
-| TP group | Batch 1, with TP padding (µs) | 128 rows (µs) | 8K rows / 112 MiB (ms) | 16K rows / 224 MiB (ms) |
-| ---: | ---: | ---: | ---: | ---: |
-| 2 | 35.9 | 45.1 | 0.330 | 0.596 |
-| 4 | 42.0 | 49.1 | 0.373 | 0.686 |
-| 8 | 53.9 | 56.9 | 0.394 | 0.719 |
-| 16 | 77.9 | 76.1 | 0.477 | 0.746 |
+![9.3 Prefill measurements](../assets/k3-gb200-joint.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 
 These measurements establish both a size-dependent bandwidth term and a small
 message floor. At TP8, 93 such boundaries amount to about **36.7 ms per 8K
@@ -1033,23 +1026,17 @@ capture lowers launch overhead but barely changes large-message bandwidth.
 
 ### 9.4 KDA Prefill
 
-| TP | DP | 8K Prefill, eager (ms) |
-| --- | --- | --- |
-| 1 | 16 | 14.462 |
-| 2 | 8 | 8.090 |
-| 4 | 4 | 4.883 |
-| 8 | 2 | 3.714 |
-| 16 | 1 | 3.372 |
+![9.4 Prefill measurements](../assets/k3-kda-prefill-scaling.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 
 Each point processes one 8K request per DP group and includes output all-reduce. These are per-group eager latencies, not equal-global-load throughput. The current ragged convolution path prevents unchanged Prefill CUDA Graph capture.
 
-| Actual world size = TP | 8K Prefill (ms) |
-| --- | --- |
-| 1 | 14.469 |
-| 2 | 8.040 |
-| 4 | 4.594 |
-| 8 | 3.654 |
-| 16 | 3.372 |
+![9.4 Prefill measurements](../assets/k3-kda-prefill-scaling.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 
 The second sweep uses actual NCCL worlds of 1/2/4/8 ranks; world 16 comes from the original job. Concurrent jobs used other GPU allocations. These isolated layers do not establish full-checkpoint capacity on the smaller worlds.
 
@@ -1057,13 +1044,10 @@ The second sweep uses actual NCCL worlds of 1/2/4/8 ranks; world 16 comes from t
 
 The complete layer includes projections, cache write, restore/expansion, attention and output all-reduce. The first table fixes an 8K fresh suffix ending at 1M visible tokens.
 
-| TP | 1M/8K Prefill (ms) | BF16 Prefill transient (GiB) |
-| --- | --- | --- |
-| 1 | 441.18 | 17.79 |
-| 2 | 242.49 | 9.53 |
-| 4 | 124.29 | 5.40 |
-| 8 | 63.54 | 3.33 |
-| 16 | 42.23 | 2.30 |
+![9.5 Prefill measurements](../assets/k3-mla-prefill-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 
 Prefill uses three trials of three eager forwards after warmup, reporting the maximum per-rank median. Transient memory excludes resident weights/cache and initialized Decode workspace.
 
@@ -1093,13 +1077,10 @@ acceptance criterion.
 
 #### 9.5.1 Context-Parallel Attention Core
 
-| Effective head TP | CP | 32K cached tokens (ms) | 128K cached tokens (ms) | 1M cached tokens (ms) |
-| --- | --- | --- | --- | --- |
-| 16 | 1 | 0.908 | 3.571 | 32.885 |
-| 8 | 2 | 0.900 | 3.004 | 26.991 |
-| 4 | 4 | 1.073 | 3.256 | 24.998 |
-| 2 | 8 | 1.365 | 3.409 | 24.588 |
-| 1 | 16 | 2.070 | 3.855 | 24.826 |
+![9.5.1 Prefill measurements](../assets/k3-mla-context-kernel-layer-ab.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END CP_MEASUREMENT_TABLE -->
 
 The table fixes one request and 16 cooperating GPUs, so
@@ -1128,11 +1109,10 @@ per point, taking the slowest rank; they include eager host/metadata gaps and
 are less statistically robust than the repeated steady-state timings above.
 
 <!-- BEGIN COLD_TABLE -->
-| TP | Cold 8K (s) | Cold 128K (s) | Cold 1M (s) |
-| --- | --- | --- | --- |
-| 4 | 0.004 | 0.167 | 8.632 |
-| 8 | 0.003 | 0.106 | 4.491 |
-| 16 | 0.003 | 0.087 | 2.941 |
+![9.5.2 Prefill measurements](../assets/gb200-mla-16k-accumulation.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END COLD_TABLE -->
 
 This is one MLA layer, not whole-model TTFT. At the maximum endpoint, recomputing
@@ -1156,13 +1136,10 @@ kernel shapes; this is a performance experiment, not a checkpoint-quality test.
 All groups contain 896 experts with Top-16 routing.
 
 <!-- BEGIN MOE_MEASUREMENT_TABLE -->
-| EP16 total input rows | Balanced graph (ms) | Hot graph (ms) |
-| --- | --- | --- |
-| 16 | 0.185 | 0.087 |
-| 128 | 0.205 | 0.359 |
-| 2048 | 0.287 | 1.350 |
-| 8192 | 0.455 | 4.670 |
-| 32768 | 1.426 | 17.768 |
+![9.6 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END MOE_MEASUREMENT_TABLE -->
 
 “Balanced” assigns consecutive token/expert pairs round-robin over all 896
@@ -1173,11 +1150,10 @@ distribution. The tiny-batch hot case can run faster because fewer expert
 weights participate; large batches expose the overloaded owner.
 
 <!-- BEGIN SOURCE_MEASUREMENT_TABLE -->
-| Source ranks | Rows/active source | Routed path, graph (ms) |
-| --- | --- | --- |
-| 4 | 2048 | 1.503 |
-| 8 | 1024 | 1.404 |
-| 16 | 512 | 0.455 |
+![9.6 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END SOURCE_MEASUREMENT_TABLE -->
 
 The last table holds **8K real tokens and the expert-load histogram fixed**.
@@ -1194,12 +1170,10 @@ to the routed branch. Nonzero row markers, expert IDs and scores were checked
 for exact round-trip ownership before timing.
 
 <!-- BEGIN TRANSITION_MEASUREMENT_TABLE -->
-| Total rows | Original sources | Original routed path (ms) | Redistribution + routed path + inverse (ms) | Redistribution round trip alone (ms) |
-| --- | --- | --- | --- | --- |
-| 2048 | 4 | 0.471 | 0.387 | 0.091 |
-| 2048 | 8 | 0.458 | 0.387 | 0.098 |
-| 8192 | 4 | 1.502 | 0.637 | 0.173 |
-| 8192 | 8 | 1.406 | 0.679 | 0.209 |
+![9.6 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END TRANSITION_MEASUREMENT_TABLE -->
 
 At 8K rows from 8 source ranks, the complete routed branch falls from about
@@ -1233,11 +1207,10 @@ production request routing histogram. Each table row evenly distributes
 input ownership across its EP group; EP4/8 simultaneously run 4/2 FFN replicas.
 
 <!-- BEGIN REAL_MOE_TABLE -->
-| EP | 16 inputs (ms) | 128 inputs (ms) | 2K inputs (ms) | 8K inputs (ms) | 8K expert max/mean |
-| --- | --- | --- | --- | --- | --- |
-| 4 | 0.267 | 0.436 | 0.870 | 2.205 | 12.87 |
-| 8 | 0.172 | 0.252 | 0.429 | 1.099 | 12.53 |
-| 16 | 0.146 | 0.210 | 0.291 | 0.596 | 12.52 |
+![9.6 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END REAL_MOE_TABLE -->
 
 The roughly 12–13× expert max/mean load at 8K inputs demonstrates why the
@@ -1256,14 +1229,10 @@ owners. These conversions are included in three-trial graph timing. Router,
 shared FFN and latent down/up are excluded from this routed-branch comparison.
 
 <!-- BEGIN EXPERT_TP_TABLE -->
-| Routing | EP × expert TP | 16 inputs (ms) | 128 inputs (ms) | 2K inputs (ms) | 8K inputs (ms) | Max relative L2 |
-| --- | --- | --- | --- | --- | --- | --- |
-| balanced | 16 × 1 | 0.186 | 0.205 | 0.265 | 0.422 | 0.00000 |
-| balanced | 8 × 2 | 0.248 | 0.263 | 0.355 | 0.557 | 0.00336 |
-| balanced | 4 × 4 | 0.364 | 0.374 | 0.489 | 0.907 | 0.00381 |
-| hot | 16 × 1 | 0.087 | 0.358 | 1.166 | 4.359 | 0.00000 |
-| hot | 8 × 2 | 0.124 | 0.268 | 0.826 | 2.761 | 0.00342 |
-| hot | 4 × 4 | 0.147 | 0.274 | 0.815 | 2.739 | 0.00385 |
+![9.6 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END EXPERT_TP_TABLE -->
 
 “Hot” uses the same extreme 16-expert route as §9.6; “balanced” spreads routes
@@ -1299,11 +1268,10 @@ included in the attention timings; it is a model correction, not another
 independently added full all-reduce.
 
 <!-- BEGIN COMPLETE_PREFILL_BUDGET -->
-| TP / EP16 | 69 KDA (s) | 24 complete MLA (s) | 92 complete FFN (s) | Boundary correction (s) | Component estimate (s) |
-| --- | --- | --- | --- | --- | --- |
-| 4 | 0.337 | 2.983 | 0.222 | 0.005 | 3.546 |
-| 8 | 0.256 | 1.525 | 0.173 | 0.002 | 1.957 |
-| 16 | 0.233 | 1.013 | 0.083 | 0.005 | 1.335 |
+![9.7 Prefill measurements](../assets/k3-prefill-component-scaling.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END COMPLETE_PREFILL_BUDGET -->
 
 This estimate includes considerably more work than the preprojected attention
@@ -1347,15 +1315,10 @@ per group (two across DP2), not the four requests in the simplified
 an analytical resident-token estimate as the runtime's admission limit.
 
 <!-- BEGIN FULL_SERVING_TABLE -->
-| Input tokens | Output tokens | TTFT (s) | Mean TPOT (ms) | Request wall time (s) |
-| --- | --- | --- | --- | --- |
-| 5 | 8 | 0.811 | 29.30 | 1.017 |
-| 1024 | 8 | 8.805 | 62.26 | 9.241 |
-| 8192 | 8 | 6.444 | 48.00 | 6.780 |
-| 32768 | 8 | 9.960 | 29.21 | 10.164 |
-| 131072 | 8 | 19.467 | 31.42 | 19.687 |
-| 524288 | 8 | 66.235 | 34.30 | 66.475 |
-| 1048560 | 8 | 182.276 | 41.37 | 182.566 |
+![9.7.1 Prefill measurements](../assets/k3-gb200-serving.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END FULL_SERVING_TABLE -->
 
 These are **actual full-model wall-clock measurements**, one request at a time,
@@ -1388,11 +1351,10 @@ to 0.88 allowed the context sweep through the near-cap request to complete.
 without persistent communication buffers and Prefill workspace.**
 
 <!-- BEGIN FULL_SERVING_LAYOUT_TABLE -->
-| Attention TP / EP16 | KV utilization setting | Effective context cap | 128K TTFT (s) | Near-cap TTFT (s) | Near-cap mean TPOT (ms) |
-| --- | --- | --- | --- | --- | --- |
-| 4 | 0.91 | 1048576 | 27.63 | 292.29 | 43.25 |
-| 8 | 0.88 | 1048576 | 19.47 | 182.28 | 41.37 |
-| 16 | 0.88 | 1048576 | 19.71 | 136.72 | 47.83 |
+![9.7.1 Prefill measurements](../assets/k3-gb200-serving.svg)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END FULL_SERVING_LAYOUT_TABLE -->
 
 TP4, TP8 and TP16 all retained the configured 1M cap and completed the near-cap
@@ -1427,16 +1389,10 @@ are memory-only balanced estimates; high short-context counts may exceed
 scheduler/graph/state-slot limits and have no latency guarantee.
 
 <!-- BEGIN HW_CAPACITY_TABLE -->
-| HBM planning profile | GPUs = EP | Attention TP | Weights (GiB/rank) | 8K requests | 128K requests | Maximum-length requests |
-| --- | --- | --- | --- | --- | --- | --- |
-| B200 180GB | 16 | 8 | 128.6 | 284 | 22 | 2 |
-| B300 270GB | 8 | 8 | 212.8 | 140 | 10 | 1 |
-| B300 288GB | 8 | 4 | 221.7 | 330 | 30 | 2 |
-| B300 288GB | 8 | 8 | 212.8 | 266 | 20 | 2 |
-| B300 270GB | 16 | 1 | 190.7 | 1984 | 336 | 32 |
-| B300 288GB | 16 | 1 | 190.7 | 2816 | 480 | 64 |
-| GB200 measured | 16 | 4 | 137.5 | 664 | 60 | 4 |
-| GB200 measured | 16 | 8 | 128.6 | 536 | 40 | 4 |
+![9.8 Prefill measurements](../assets/activation-capacity-summary.png)
+
+The plotted measurements preserve the same rows as the benchmark output; the figure exposes the scaling trend without making the reader decode a numeric matrix.
+
 <!-- END HW_CAPACITY_TABLE -->
 
 Several choices follow before performance tuning:
