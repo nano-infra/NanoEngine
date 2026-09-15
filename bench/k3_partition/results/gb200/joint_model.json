@@ -1,0 +1,127 @@
+{
+  "cache_dtype": "fp8_e4m3",
+  "cache_bytes_per_token_layer": 576,
+  "hbm_bytes": 197897748480,
+  "reserve_bytes": 21474836480,
+  "layout_estimates": [
+    {
+      "attn_tp": 1,
+      "mla_cp": 1,
+      "dp": 16,
+      "weights_gb": 204.808170016,
+      "weights_gib": 190.74247220158577,
+      "shell_replicated_weights_gib": 190.74247220158577,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 13.721099853515625,
+      "sequences_per_dp": 0,
+      "total_1m_sequences": 0,
+      "status": "current mesh"
+    },
+    {
+      "attn_tp": 2,
+      "mla_cp": 1,
+      "dp": 8,
+      "weights_gb": 166.684230944,
+      "weights_gib": 155.2367871105671,
+      "shell_replicated_weights_gib": 157.4242871105671,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 13.610549926757812,
+      "sequences_per_dp": 0,
+      "total_1m_sequences": 0,
+      "status": "current mesh"
+    },
+    {
+      "attn_tp": 4,
+      "mla_cp": 1,
+      "dp": 4,
+      "weights_gb": 147.622261408,
+      "weights_gib": 137.48394456505775,
+      "shell_replicated_weights_gib": 140.76519456505775,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 13.555274963378906,
+      "sequences_per_dp": 1,
+      "total_1m_sequences": 4,
+      "status": "current mesh"
+    },
+    {
+      "attn_tp": 8,
+      "mla_cp": 1,
+      "dp": 2,
+      "weights_gb": 138.09127664,
+      "weights_gib": 128.60752329230309,
+      "shell_replicated_weights_gib": 132.43564829230309,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 13.527637481689453,
+      "sequences_per_dp": 2,
+      "total_1m_sequences": 4,
+      "status": "current mesh"
+    },
+    {
+      "attn_tp": 16,
+      "mla_cp": 1,
+      "dp": 1,
+      "weights_gb": 133.325784256,
+      "weights_gib": 124.16931265592575,
+      "shell_replicated_weights_gib": 128.27087515592575,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 13.513818740844727,
+      "sequences_per_dp": 2,
+      "total_1m_sequences": 2,
+      "status": "current mesh"
+    },
+    {
+      "attn_tp": 8,
+      "mla_cp": 2,
+      "dp": 2,
+      "weights_gb": 138.09127664,
+      "weights_gib": 128.60752329230309,
+      "shell_replicated_weights_gib": 132.43564829230309,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 6.777637481689453,
+      "sequences_per_dp": 5,
+      "total_1m_sequences": 10,
+      "status": "nested CP design estimate"
+    },
+    {
+      "attn_tp": 8,
+      "mla_cp": 4,
+      "dp": 2,
+      "weights_gb": 138.09127664,
+      "weights_gib": 128.60752329230309,
+      "shell_replicated_weights_gib": 132.43564829230309,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 3.402637481689453,
+      "sequences_per_dp": 10,
+      "total_1m_sequences": 20,
+      "status": "nested CP design estimate"
+    },
+    {
+      "attn_tp": 16,
+      "mla_cp": 4,
+      "dp": 1,
+      "weights_gb": 133.325784256,
+      "weights_gib": 124.16931265592575,
+      "shell_replicated_weights_gib": 128.27087515592575,
+      "reserve_gib": 20.0,
+      "cache_per_1m_sequence_gib": 3.3888187408447266,
+      "sequences_per_dp": 11,
+      "total_1m_sequences": 11,
+      "status": "nested CP design estimate"
+    }
+  ],
+  "algorithmic_work": {
+    "fixed_gflop_per_token": 206.433158464,
+    "prefill_1m_8192": {
+      "fixed_pflop": 1.691100434137088,
+      "mla_attention_pflop": 12.61690196852736,
+      "cached_kv_expansion_pflop": 0.628370895273984
+    },
+    "prefill_1m_16384": {
+      "fixed_pflop": 3.382200868274176,
+      "mla_attention_pflop": 25.13484789055488,
+      "cached_kv_expansion_pflop": 0.623423092948992
+    },
+    "absorbed_decode_mla_gflop_per_layer_at_1m": 219.043332096,
+    "expanded_decode_equivalent_mla_gflop_per_layer_at_1m": 64.42450944
+  }
+}

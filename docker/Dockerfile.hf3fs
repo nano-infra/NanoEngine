@@ -1,0 +1,62 @@
+# Adds 3FS USRBIO (hf3fs_py_usrbio) support on top of the DLEngine image.
+#
+# The prebuilt wheel is compiled on Ubuntu 22.04 (jammy); its native lib
+# libhf3fs_api_shared.so depends on boost 1.74 / ICU 70 / glog / gflags / ...
+# which differ from DLEngine's Ubuntu 24.04 (noble) sonames. So instead of
+# apt-installing them, we copy the exact runtime .so from the hf3fs:dev-py312
+# image and add them to LD_LIBRARY_PATH.
+#
+# Build (context = this docker/ dir, wheel must be copied here first):
+#   cp /path/to/3FS/dist/hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl \
+#      DLEngine/docker/
+#   docker build -f docker/Dockerfile.hf3fs -t dlengine:cu128-devel-3fs docker/
+
+ARG DLENGINE_BASE=dlengine:0.2.0-cu128-devel
+ARG HF3FS_RUNTIME_IMAGE=hf3fs:dev-py312
+ARG HF3FS_WHEEL=hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl
+
+FROM ${HF3FS_RUNTIME_IMAGE} AS hf3fs-runtime
+
+FROM ${DLENGINE_BASE}
+
+RUN mkdir -p /opt/hf3fs/lib
+
+# Runtime .so pulled from the jammy hf3fs image (soname-compatible with the wheel).
+COPY --from=hf3fs-runtime \
+    /lib/x86_64-linux-gnu/libboost_atomic.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_context.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_filesystem.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_program_options.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_regex.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_system.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libboost_thread.so.1.74.0 \
+    /lib/x86_64-linux-gnu/libdouble-conversion.so.3 \
+    /lib/x86_64-linux-gnu/libgflags.so.2.2 \
+    /lib/x86_64-linux-gnu/libglog.so.0 \
+    /lib/x86_64-linux-gnu/libevent-2.1.so.7 \
+    /lib/x86_64-linux-gnu/libdwarf.so.1 \
+    /lib/x86_64-linux-gnu/libaio.so.1 \
+    /lib/x86_64-linux-gnu/libunwind.so.8 \
+    /lib/x86_64-linux-gnu/libicui18n.so.70 \
+    /lib/x86_64-linux-gnu/libicuuc.so.70 \
+    /lib/x86_64-linux-gnu/libicudata.so.70 \
+    /lib/x86_64-linux-gnu/libelf.so.1 \
+    /lib/x86_64-linux-gnu/libnl-route-3.so.200 \
+    /lib/x86_64-linux-gnu/libnl-3.so.200 \
+    /opt/hf3fs/lib/
+
+ARG HF3FS_WHEEL
+# Keep the original wheel filename: pip requires a PEP 427 compliant name.
+COPY ${HF3FS_WHEEL} /tmp/hf3fs_wheel/
+
+RUN python3 -m pip install --break-system-packages --no-cache-dir --no-index /tmp/hf3fs_wheel/*.whl \
+    && rm -rf /tmp/hf3fs_wheel
+
+# wheel installs hf3fs_py_usrbio*.so + libhf3fs_api_shared.so into dist-packages;
+# add it plus the copied jammy libs to the loader path.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages:/opt/hf3fs/lib:${LD_LIBRARY_PATH}
+
+# Build-time sanity check: fails the build if the import does not work.
+RUN python3 -c "import hf3fs_py_usrbio, hf3fs_fuse.io; print('hf3fs import ok', hf3fs_py_usrbio.__name__)"
+
+LABEL org.opencontainers.image.vendor.hf3fs="hf3fs_py_usrbio-1.2.9+22fca04-cp312"

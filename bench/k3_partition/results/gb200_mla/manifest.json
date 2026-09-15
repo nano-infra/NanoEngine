@@ -1,0 +1,17 @@
+{
+  "combined_rows": 5600,
+  "unique_points": 350,
+  "inputs": {
+    "TP2/4/8/16": {
+      "path": "bench/k3_partition/results/gb200_mla_fixed_partial/mla.csv",
+      "sha256": "368d4d877617c096ea338d88cedaa62a2ddec8cc337c1943dd5dc7c84edc1d12",
+      "filter": "tp != 1"
+    },
+    "TP1": {
+      "path": "bench/k3_partition/results/gb200_mla_final/mla_tp1.csv",
+      "sha256": "a83379b3f5bc0a702312fc7bffbdcf0a8cdde4e8116536ac6dc0d6e1613dae97",
+      "filter": "all"
+    }
+  },
+  "conditions": "TP2/4/8/16: bounded BF16 prefix and 24-to-32 head padding. TP1: also 96-to-128 padding. All rows complete MLA layer 3 with real checkpoint weights, synthetic histories."
+}

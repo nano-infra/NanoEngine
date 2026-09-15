@@ -1,0 +1,16 @@
+{
+  "assumptions": [
+    "All-resident weights, no PP/offload, TP-sharded embedding/head",
+    "20 GiB planning allowance includes communication and live transient allocations",
+    "BF16 default K3 cache; explicit fp8_e4m3 uses raw Blackwell 576-byte pages",
+    "CP is nested in projection TP and not production K3 runtime support",
+    "World32 and both B300/B200 capacity budgets are analytical, not this run hardware",
+    "Counts are memory-only balanced upper estimates, not scheduler or SLO limits"
+  ],
+  "fixed_gflops_per_token": 206.433158464,
+  "cache_bytes_per_token_layer": {
+    "bfloat16": 1152,
+    "fp8_e4m3": 576
+  },
+  "checkpoint_path": "/hgpfs/Kimi-K3"
+}

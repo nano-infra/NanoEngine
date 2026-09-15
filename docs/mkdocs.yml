@@ -1,0 +1,104 @@
+site_name: DLEngine
+site_description: Distributed inference for state-of-the-art large models
+docs_dir: site
+site_dir: generated
+
+repo_name: JimyMa/NanoDeploy
+repo_url: https://github.com/JimyMa/NanoDeploy
+edit_uri: edit/Pure_dp/docs/site/
+
+theme:
+  name: material
+  logo: assets/nanoengine-logo.svg
+  favicon: assets/nanoengine-logo.svg
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.tracking
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Documentation map: documentation-map.md
+  - Get Started:
+      - Installation: installation.md
+      - Offline Inference: offline-inference.md
+  - Operate:
+      - Production Serving: online-serving.md
+      - Transport-neutral P/D: pd-fabric-deployment.md
+  - Reference:
+      - Feature Matrix: features.md
+      - Supported Models: supported-models.md
+      - GLM Recurrent MTP: glm-recurrent-mtp.md
+  - Blog:
+      - Blog index: blogs/index.md
+      - Kimi K3 Overview: blogs/dlengine-kda-overview.md
+      - Kimi K3 Prefill: blogs/dlengine-kda-prefill.md
+      - Kimi K3 Decode: blogs/dlengine-kda-decode.md
+      - DLEngine: blogs/dlengine-engine.md
+      - HiSparse Capacity: blogs/dlengine-hisparse-capacity.md
+      - MTP: blogs/dlengine-mtp.md
+      - NSA: blogs/dlengine-nsa.md
+  - Development:
+      - Performance Profiling: performance-profiling.md
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/JimyMa/NanoDeploy
+
+extra_css:
+  - assets/stylesheets/dlengine.css
+
+extra_javascript:
+  - assets/javascripts/render-config.js
+  - https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.min.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js
+
+copyright: © 2026 DLEngine contributors.

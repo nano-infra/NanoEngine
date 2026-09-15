@@ -1,0 +1,209 @@
+from types import SimpleNamespace
+
+import dlengine._rust.proto as proto
+from dlengine.engine.llm_engine import LLMEngine
+from dlengine.engine.scheduler import scheduler_token_budget
+
+
+def test_scheduler_budget_scales_with_pipeline_size():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=16384 * 16,
+        pp=16,
+        pp_prefill_scheduler_depth=0,
+    )
+
+    assert scheduler_token_budget(config) == 16384 * 16
+
+
+def test_scheduler_budget_auto_covers_1m_in_62_microbatches():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=1_000_000,
+        pp=8,
+        pp_prefill_scheduler_depth=0,
+    )
+
+    budget = scheduler_token_budget(config)
+
+    assert budget == 1_000_000
+    assert (
+        config.max_num_batched_tokens * 61
+        < budget
+        <= config.max_num_batched_tokens * 62
+    )
+
+
+def test_scheduler_budget_auto_caps_window_at_64_microbatches():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=2_000_000,
+        pp=8,
+        pp_prefill_scheduler_depth=0,
+    )
+
+    assert scheduler_token_budget(config) == 16384 * 64
+
+
+def test_scheduler_budget_respects_explicit_depth_and_model_boundary():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=50_000,
+        pp=8,
+        pp_prefill_scheduler_depth=4,
+    )
+
+    assert scheduler_token_budget(config) == 50_000
+
+
+def test_scheduler_budget_pp1_behavior_is_unchanged():
+    config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_model_len=1_000_000,
+        pp=1,
+        pp_prefill_scheduler_depth=64,
+    )
+
+    assert scheduler_token_budget(config) == 16384
+
+
+class _FakeRunnerOut:
+    def __init__(self, token_ids, logprobs=None, server_handler_ns=0):
+        self.token_ids = token_ids
+        self.logprobs = logprobs
+        self.server_handler_ns = server_handler_ns
+
+
+class _FakeRunnerIn:
+    fragments = {}
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    @classmethod
+    def from_bytes(cls, payload):
+        return cls(payload)
+
+    @classmethod
+    def dummy(cls, *_args):
+        return cls(b"dummy")
+
+    def to_bytes(self):
+        return self.payload
+
+    def prefill_microbatches(self, _max_tokens):
+        return self.fragments[self.payload]
+
+
+class _FakeExecutor:
+    def __init__(self, token_by_payload, logprobs_by_payload=None):
+        self.token_by_payload = token_by_payload
+        self.logprobs_by_payload = logprobs_by_payload or {}
+        self.events = []
+        self.submitted_payloads = []
+
+    def run_batch_bytes_async(self, payloads, is_prefill):
+        assert is_prefill is True
+        self.events.append(("submit", payloads[0]))
+        self.submitted_payloads.append(payloads)
+        return payloads
+
+    def max_inflight_requests(self):
+        return 16
+
+    def run_wait_runner_outs(self, payloads):
+        self.events.append(("wait", payloads[0]))
+        outputs = []
+        for payload in payloads:
+            token_ids = self.token_by_payload.get(payload, 0)
+            if not isinstance(token_ids, list):
+                token_ids = [[token_ids]]
+            outputs.append(
+                _FakeRunnerOut(token_ids, self.logprobs_by_payload.get(payload), 1)
+            )
+        return outputs
+
+
+def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
+    monkeypatch.setattr(proto, "RunnerIn", _FakeRunnerIn)
+    monkeypatch.setattr(proto, "RunnerOut", _FakeRunnerOut)
+    _FakeRunnerIn.fragments = {
+        b"batch": [
+            (b"request0_chunk0", [(0, False)]),
+            (b"request0_tail_request1_head", [(0, True), (1, False)]),
+            (b"request1_tail", [(1, True)]),
+        ]
+    }
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.engine_id = "engine"
+    engine.config = SimpleNamespace(
+        max_num_batched_tokens=4,
+        pp_prefill_pipeline_depth=3,
+        num_kvcache_blocks=16,
+        executor_backend="ray",
+    )
+    engine.executor = _FakeExecutor(
+        {
+            b"request0_chunk0": 1,
+            b"request0_tail_request1_head": [[2], [0]],
+            b"request1_tail": 3,
+        },
+        {
+            b"request0_tail_request1_head": [[0.2], [0.0]],
+            b"request1_tail": [[0.3]],
+        },
+    )
+    schedule_result = SimpleNamespace(dp_group_seq_ids=[[100, 200]])
+
+    outputs = engine._run_static_pp_prefill_pipeline(
+        [b"batch"], schedule_result, inner=1, tp_size=1, pp_size=2
+    )
+
+    assert outputs[0].token_ids == [[2], [3]]
+    assert outputs[0].logprobs == [[0.2], [0.3]]
+    assert engine.executor.events == [
+        ("submit", b"request0_chunk0"),
+        ("submit", b"request0_tail_request1_head"),
+        ("submit", b"request1_tail"),
+        ("wait", b"request0_chunk0"),
+        ("wait", b"request0_tail_request1_head"),
+        ("wait", b"request1_tail"),
+    ]
+
+
+def test_static_pp_prefill_pads_shorter_dp_cells_with_dummy(monkeypatch):
+    monkeypatch.setattr(proto, "RunnerIn", _FakeRunnerIn)
+    monkeypatch.setattr(proto, "RunnerOut", _FakeRunnerOut)
+    _FakeRunnerIn.fragments = {
+        b"cell0": [
+            (b"cell0_chunk0", [(0, False)]),
+            (b"cell0_chunk1", [(0, True)]),
+        ],
+        b"cell1": [(b"cell1_chunk0", [(0, True)])],
+    }
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.engine_id = "engine"
+    engine.config = SimpleNamespace(
+        max_num_batched_tokens=4,
+        pp_prefill_pipeline_depth=2,
+        num_kvcache_blocks=16,
+    )
+    engine.executor = _FakeExecutor(
+        {b"cell0_chunk0": 1, b"cell0_chunk1": 2, b"cell1_chunk0": 3}
+    )
+
+    outputs = engine._run_static_pp_prefill_pipeline(
+        [b"cell0", b"cell1"],
+        SimpleNamespace(dp_group_seq_ids=[[100], [200]]),
+        inner=2,
+        tp_size=1,
+        pp_size=2,
+    )
+
+    assert [out.token_ids for out in outputs] == [[[2]], [[3]]]
+    assert engine.executor.submitted_payloads == [
+        [b"cell0_chunk0", b"cell1_chunk0"] * 2,
+        [b"cell0_chunk1", b"dummy"] * 2,
+    ]

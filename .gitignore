@@ -197,10 +197,10 @@ cython_debug/
 
 *.pyi
 
-# NanoDeploy generated files
-NanoDeploy/nanodeploy/fbs/
-NanoDeploy/engine_rpc_pb2.py
-NanoDeploy/engine_rpc_pb2_grpc.py
+# DLEngine generated files
+dlengine/dlengine/fbs/
+dlengine/engine_rpc_pb2.py
+dlengine/engine_rpc_pb2_grpc.py
 
 # rust
 .cargo/
@@ -216,3 +216,15 @@ scripts/.bin/
 # vibe-codinig
 .claude
 .claude/settings.local.json
+*.log
+
+.codex
+
+# 3FS USRBIO wheel copied into the docker build context (see docker/README.md)
+docker/*.whl
+
+docs/generated/
+
+# Local documentation rendering runtimes (MkDocs uses pinned CDN versions)
+docs/site/assets/javascripts/mermaid.min.js
+docs/site/assets/javascripts/mathjax/

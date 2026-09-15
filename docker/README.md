@@ -1,274 +1,178 @@
-# Docker 安装与配置指南
+# DLEngine Docker Images
 
-## 1. Docker 安装
+This directory holds the container build definitions for DLEngine.
 
-### Ubuntu/Debian 系统
+| File                                     | Image                        | Purpose                                                                                                         |
+| ---------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| [`Dockerfile`](./Dockerfile)             | `dlengine:0.2.0-cu128-devel` | CUDA 12.8 development image (PyTorch + DeepEP/DeepGEMM/FlashMLA/FlashInfer/flash-attn/DLSlime + Rust toolchain) |
+| [`Dockerfile.hf3fs`](./Dockerfile.hf3fs) | `dlengine:cu128-devel-3fs`   | The dev image **plus 3FS USRBIO** (`hf3fs_py_usrbio`) support                                                   |
 
-```bash
-# 更新软件包索引
-sudo apt-get update
+______________________________________________________________________
 
-# 安装必要的依赖
-sudo apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release
+## Development image (`Dockerfile`)
 
-# 添加 Docker 官方 GPG 密钥
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+Built from NVIDIA CUDA 12.8 devel (Ubuntu 24.04, Python 3.12), PyTorch 2.10 CUDA 12.8,
+source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed
+Rust, and the build toolchains needed for DLEngine. The image intentionally **does not
+include the DLEngine source tree**; mount or clone DLEngine inside the container and
+install it there. This keeps the expensive dependency layers reusable across source changes.
 
-# 设置 Docker 仓库
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+### Pinned third-party dependencies
 
-# 安装 Docker Engine
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+The development image pins every external build dependency. Prefer tags when upstream
+provides a usable tag; otherwise pin the exact commit that has been smoke-tested.
 
-# 启动 Docker 服务
-sudo systemctl start docker
-sudo systemctl enable docker
+| Library                                                    | Pinned version / ref                    | Notes                                                               |
+| ---------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| PyTorch                                                    | `2.10.0+cu128`                          | CUDA 12.8 wheel.                                                    |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)            | `567632dd` (`v1.2.1-25-g567632d`)       | Nearest tag: `v1.2.1`; pinned commit is the tested post-tag build.  |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)        | `891d57b4` (`v2.1.1.post3-16-g891d57b`) | Nearest tag: `v2.1.1.post3`; pinned commit reports package `2.5.0`. |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)        | `71c7379`                               | Upstream currently has no tags; pinned by commit.                   |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer)  | `v0.6.9`                                | Built from source.                                                  |
+| [flash-attn](https://github.com/Dao-AILab/flash-attention) | `v2.8.1` wheel for `cu12` / `torch2.10` | Uses the release wheel.                                             |
+| [DLSlime](https://github.com/Deeplink-org/DLSlime)         | `v0.1.16`                               | Builds `dlslime`; `dlslime-ctrl` is not built in this image.        |
+| Rust                                                       | `1.95.0` via rustup                     | Minimal rustup toolchain; not installed from apt.                   |
 
-# 将当前用户添加到 docker 组（避免每次使用 sudo）
-sudo usermod -aG docker $USER
-# 注意：需要重新登录或执行 newgrp docker 使组权限生效
-```
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs.
 
-### 验证安装
+### Build
 
 ```bash
-docker --version
-docker run hello-world
+docker build --network host \
+  -f docker/Dockerfile \
+  -t dlengine:0.2.0-cu128-devel \
+  .
 ```
 
-## 2. Docker Compose 安装
+Private mirrors or proxies can be passed with Docker build args in local environments;
+the image does not require them.
 
-### 方法一：使用 Docker 官方插件（推荐）
-
-Docker Compose 已经作为插件包含在 Docker Engine 中，安装 Docker 时会自动安装。
+### Run for local development
 
 ```bash
-# 验证安装
-docker compose version
+docker run --gpus all --rm -it --network host --ipc=host \
+  --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
+  --device=/dev/infiniband \
+  -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -v $PWD:/workspace/DLEngine \
+  -w /workspace/DLEngine/dlengine \
+  dlengine:0.2.0-cu128-devel
 ```
 
-### 方法二：独立安装 Docker Compose
-
-如果使用旧版本的 Docker，可以单独安装：
+Inside the container, install DLEngine from the mounted checkout (the GPU
+compute kernels ship inside the `dlengine.runtime.kernel` subpackage):
 
 ```bash
-# 下载最新版本的 Docker Compose
-sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-
-# 添加执行权限
-sudo chmod +x /usr/local/bin/docker-compose
-
-# 验证安装
-docker-compose --version
+python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 
-## 3. Docker 代理配置
+______________________________________________________________________
 
-### 3.1 为 Docker 守护进程配置代理（拉取镜像时使用）
+## 3FS USRBIO image (`Dockerfile.hf3fs`)
 
-创建或编辑 `/etc/docker/daemon.json`：
+Adds 3FS USRBIO support (`hf3fs_py_usrbio` + `hf3fs_fuse`) on top of the dev image, for
+testing 3FS access (FUSE/POSIX and USRBIO) from inside a DLEngine container.
+
+### Why it is built this way
+
+- The dev image is **Ubuntu 24.04 (noble), Python 3.12** → use the **cp312** wheel.
+- The prebuilt wheel is compiled on **Ubuntu 22.04 (jammy)**; its native lib
+  `libhf3fs_api_shared.so` depends on **boost 1.74 / ICU 70 / glog / gflags / ...**, whose
+  sonames differ from noble's (boost 1.83 / ICU 74). So instead of `apt install`, we
+  **copy the exact runtime `.so` from the `hf3fs:dev-py312` image** into `/opt/hf3fs/lib`
+  and add it (plus the wheel's install dir) to `LD_LIBRARY_PATH`.
+- RDMA userspace libs (`libibverbs`/`librdmacm`/`libmlx5`/`rdma-core`) are already present
+  in the dev image, which USRBIO needs.
+
+### Prerequisites
+
+- Base image `dlengine:0.2.0-cu128-devel` built (see above).
+- Runtime image `hf3fs:dev-py312` available locally (provides the jammy `.so`).
+- The **cp312** wheel copied into this `docker/` directory (it is git-ignored):
 
 ```bash
-sudo mkdir -p /etc/docker
-sudo tee /etc/docker/daemon.json > /dev/null <<EOF
-{
-  "proxies": {
-    "http-proxy": "http://proxy.example.com:8080",
-    "https-proxy": "http://proxy.example.com:8080",
-    "no-proxy": "localhost,127.0.0.1,docker-registry.example.com,.corp"
-  }
-}
-EOF
+cp /path/to/3FS/dist/hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl \
+   DLEngine/docker/
 ```
 
-**注意**：将 `proxy.example.com:8080` 替换为你的实际代理地址。
-
-### 3.2 为 Docker 服务配置系统代理
-
-创建 systemd 服务覆盖目录：
+### Build
 
 ```bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
+cd DLEngine
+docker build -f docker/Dockerfile.hf3fs -t dlengine:cu128-devel-3fs docker/
 ```
 
-创建代理配置文件 `/etc/systemd/system/docker.service.d/http-proxy.conf`：
+Build args (optional): `DLENGINE_BASE`, `HF3FS_RUNTIME_IMAGE`, `HF3FS_WHEEL`.
+
+The Dockerfile runs `python3 -c "import hf3fs_py_usrbio, hf3fs_fuse.io"` as the last step,
+so a successful build **guarantees the import works** (import needs neither RDMA hardware
+nor a mount).
+
+> Note: keep the original wheel filename. Newer pip (Ubuntu 24.04) rejects a renamed
+> `*.whl` with "is not a valid wheel filename", so the wheel is copied into a directory and
+> installed via a glob.
+
+### Run (to actually exercise USRBIO)
+
+`import` works anywhere, but real USRBIO read/write needs RDMA + the 3FS mount visible in
+the container.
+
+**Recommended: bind-mount the host's existing FUSE mount (consumer mode).**
+
+The host already runs `hf3fs_fuse_main` and mounts at `/3fs/mnt`. You only need the
+container to *see* that mount — no need to start FUSE again inside the container.
 
 ```bash
-sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
-[Service]
-Environment="HTTP_PROXY=http://127.0.0.1:17897"
-Environment="HTTPS_PROXY=http://127.0.0.1:17897"
-Environment="NO_PROXY=localhost,127.0.0.1,docker-registry.example.com,.corp"
-EOF
+docker run --gpus all --rm -it \
+  --network host \
+  --device /dev/infiniband \
+  --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
+  --ipc=host \
+  --mount type=bind,source=/3fs,target=/3fs,bind-propagation=rslave \
+  dlengine:cu128-devel-3fs zsh
 ```
 
-### 3.3 重启 Docker 服务使配置生效
+Equivalent shorter form:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
+docker run ... -v /3fs/mnt:/3fs/mnt:rslave ...
+# or bind the parent tree:
+docker run ... -v /3fs:/3fs:rslave ...
 ```
 
-### 3.4 验证代理配置
+Notes:
+
+- **`bind-propagation=rslave` (or `:rslave`) is the important part.** FUSE is a mount on
+  top of a directory; plain `-v /3fs/mnt:/3fs/mnt` without propagation often shows an
+  empty directory inside the container. `rslave` lets the host FUSE mount propagate in
+  one direction (host → container). Prefer `rslave` over `rshared`.
+- **`--device /dev/fuse` is NOT required** for this consumer pattern. `/dev/fuse` is only
+  needed when you run `hf3fs_fuse_main` *inside* the container to create a new mount.
+- Host mount must use `allow_other` (yours does) so non-root users in the container can
+  access files.
+- RDMA still needs `--network host`, `--device /dev/infiniband`, `IPC_LOCK`, `memlock`.
+
+**Alternative: mount 3FS inside the container (heavier).**
+
+Only if you cannot bind-mount the host mount:
 
 ```bash
-# 检查 Docker 服务环境变量
-sudo systemctl show --property=Environment docker
-
-# 测试拉取镜像
-docker pull hello-world
+docker run ... \
+  --device /dev/fuse \
+  --privileged \   # or CAP_SYS_ADMIN + /dev/fuse
+  ...
+# then run hf3fs_fuse_main --launcher_cfg /opt/3fs/etc/hf3fs_fuse_main_launcher.toml
 ```
 
-## 4. Docker Compose 代理配置
+This requires shipping `/opt/3fs/bin` + configs into the image or mounting them separately.
 
-### 4.1 在 docker-compose.yml 中配置代理
-
-在 `docker-compose.yml` 文件中为服务添加环境变量：
-
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    environment:
-      - HTTP_PROXY=http://proxy.example.com:8080
-      - HTTPS_PROXY=http://proxy.example.com:8080
-      - NO_PROXY=localhost,127.0.0.1
-    # ... 其他配置
-```
-
-### 4.2 使用 .env 文件配置代理
-
-创建 `.env` 文件（与 docker-compose.yml 同目录）：
+Verify inside the container:
 
 ```bash
-HTTP_PROXY=http://proxy.example.com:8080
-HTTPS_PROXY=http://proxy.example.com:8080
-NO_PROXY=localhost,127.0.0.1
+df -h | grep hf3fs          # should show /3fs/mnt
+ls /3fs/mnt                 # should list cluster dirs, not empty
+python3 tools/3fs/benchmark/bench_3fs.py --engine both --op read \
+  --dir /3fs/mnt/<writable> --bs 1M --size 64M --numjobs 1
 ```
 
-在 `docker-compose.yml` 中引用：
-
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    environment:
-      - HTTP_PROXY=${HTTP_PROXY}
-      - HTTPS_PROXY=${HTTPS_PROXY}
-      - NO_PROXY=${NO_PROXY}
-```
-
-### 4.3 在构建时使用代理
-
-如果需要构建镜像时使用代理，在 `docker-compose.yml` 中配置：
-
-```yaml
-services:
-  app:
-    build:
-      context: .
-      args:
-        - HTTP_PROXY=http://proxy.example.com:8080
-        - HTTPS_PROXY=http://proxy.example.com:8080
-```
-
-## 5. 常用代理配置示例
-
-### 5.1 国内镜像加速（推荐）
-
-如果在中国大陆，可以使用镜像加速器，编辑 `/etc/docker/daemon.json`：
-
-```json
-{
-  "registry-mirrors": [
-    "https://docker.mirrors.ustc.edu.cn",
-    "https://hub-mirror.c.163.com",
-    "https://mirror.baidubce.com"
-  ]
-}
-```
-
-然后重启 Docker：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
-
-### 5.2 企业内网代理示例
-
-```json
-{
-  "proxies": {
-    "http-proxy": "http://proxy.company.com:3128",
-    "https-proxy": "http://proxy.company.com:3128",
-    "no-proxy": "localhost,127.0.0.1,*.company.local,10.0.0.0/8"
-  }
-}
-```
-
-## 6. 故障排查
-
-### 检查 Docker 日志
-
-```bash
-sudo journalctl -u docker.service
-```
-
-### 测试代理连接
-
-```bash
-# 测试 HTTP 代理
-curl -x http://proxy.example.com:8080 http://www.google.com
-
-# 测试 HTTPS 代理
-curl -x http://proxy.example.com:8080 https://www.google.com
-```
-
-### 清除代理配置
-
-如果需要清除代理配置：
-
-```bash
-# 删除代理配置文件
-sudo rm /etc/systemd/system/docker.service.d/http-proxy.conf
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
-
-## 7. 使用说明
-
-启动 Redis 和 RedisInsight：
-
-```bash
-# 进入 docker 目录
-cd docker
-
-# 启动服务
-docker compose up -d
-
-# 查看服务状态
-docker compose ps
-
-# 查看日志
-docker compose logs -f
-
-# 停止服务
-docker compose down
-
-# 停止并删除数据卷
-docker compose down -v
-```
-
-访问：
-
-- Redis: `localhost:6379`
-- RedisInsight: `http://localhost:8001`
+See the 3FS docs for demos, benchmark and troubleshooting: `docs/3FS/README.md`.

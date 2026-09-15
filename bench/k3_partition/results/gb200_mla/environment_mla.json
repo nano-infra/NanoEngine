@@ -1,0 +1,275 @@
+{
+  "timestamp_utc": "2026-09-08T17:36:59.052484+00:00",
+  "nodes": [
+    {
+      "ip": "172.27.10.203",
+      "id": "8bfe1820823da771262dbe50fc94cb8230573dec65bb7fed8d7ac6d3"
+    },
+    {
+      "ip": "172.27.14.59",
+      "id": "f9a27b44e419ca743d583d82818ef17e8b96a0130d015a9bbccfadaf"
+    },
+    {
+      "ip": "172.27.4.88",
+      "id": "0ddb23b2c85d01d9d37a806caa25aed0df8a298ef360aa5aa155b98f"
+    },
+    {
+      "ip": "172.27.7.201",
+      "id": "2b322421f8b4304b6bb92fb74b3a1a2055f2921ff13819603c914cf4"
+    }
+  ],
+  "world_size": 16,
+  "workers": [
+    {
+      "rank": 0,
+      "host": "is-ddfl5vivone4o23l-devmachine-0",
+      "visible_devices": "0",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 1,
+      "host": "is-ddfl5vivone4o23l-devmachine-0",
+      "visible_devices": "1",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 2,
+      "host": "is-ddfl5vivone4o23l-devmachine-0",
+      "visible_devices": "2",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 3,
+      "host": "is-ddfl5vivone4o23l-devmachine-0",
+      "visible_devices": "3",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 4,
+      "host": "is-ddij4qmmoajibsxl-devmachine-0",
+      "visible_devices": "0",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 5,
+      "host": "is-ddij4qmmoajibsxl-devmachine-0",
+      "visible_devices": "1",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 6,
+      "host": "is-ddij4qmmoajibsxl-devmachine-0",
+      "visible_devices": "2",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 7,
+      "host": "is-ddij4qmmoajibsxl-devmachine-0",
+      "visible_devices": "3",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 8,
+      "host": "is-ddjrn7bpkepip4i6-devmachine-0",
+      "visible_devices": "0",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 9,
+      "host": "is-ddjrn7bpkepip4i6-devmachine-0",
+      "visible_devices": "1",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 10,
+      "host": "is-ddjrn7bpkepip4i6-devmachine-0",
+      "visible_devices": "2",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 11,
+      "host": "is-ddjrn7bpkepip4i6-devmachine-0",
+      "visible_devices": "3",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tPIX\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tPIX\t X \tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\t X \tPIX\t\t\t\t\nNIC3\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_2\n  NIC1: mlx5_3\n  NIC2: mlx5_6\n  NIC3: mlx5_7\n\n"
+    },
+    {
+      "rank": 12,
+      "host": "is-ddfkf6aei34awwby-devmachine-0",
+      "visible_devices": "0",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tNODE\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\t\t\t\t\nNIC5\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\t\t\t\t\nNIC6\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\t\t\t\t\nNIC7\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n\n"
+    },
+    {
+      "rank": 13,
+      "host": "is-ddfkf6aei34awwby-devmachine-0",
+      "visible_devices": "1",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tNODE\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\t\t\t\t\nNIC5\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\t\t\t\t\nNIC6\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\t\t\t\t\nNIC7\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n\n"
+    },
+    {
+      "rank": 14,
+      "host": "is-ddfkf6aei34awwby-devmachine-0",
+      "visible_devices": "2",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tNODE\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\t\t\t\t\nNIC5\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\t\t\t\t\nNIC6\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\t\t\t\t\nNIC7\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n\n"
+    },
+    {
+      "rank": 15,
+      "host": "is-ddfkf6aei34awwby-devmachine-0",
+      "visible_devices": "3",
+      "gpu": "NVIDIA GB200",
+      "hbm_bytes": 197897748480,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "nccl": [
+        2,
+        28,
+        9
+      ],
+      "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t0-71\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t72-143\t1\t\tN/A\nNIC0\tNODE\tNODE\tSYS\tSYS\t X \tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tNODE\tNODE\tSYS\tSYS\tNODE\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tNODE\tNODE\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\t\t\t\t\nNIC5\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\t\t\t\t\nNIC6\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\t\t\t\t\nNIC7\tSYS\tSYS\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n\n"
+    }
+  ],
+  "warmup": 5,
+  "repeats": 30,
+  "trials": 3,
+  "tokens": [
+    1,
+    8,
+    128,
+    1024,
+    8192,
+    16384
+  ]
+}

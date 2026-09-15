@@ -1,0 +1,7 @@
+{
+  "ep": 4,
+  "expert_tp": 4,
+  "intermediate": 768,
+  "failure": "DeepGEMM MegaMoE TMA alignment assertion: num_bytes % 16 == 0 or not require_tma_alignment",
+  "completed": "EP16/TP1 and EP8/TP2 all points"
+}

@@ -1,0 +1,275 @@
+{
+  "assembled_utc": "2026-09-08T18:44:11.784070+00:00",
+  "note": "Final artifact integrity manifest. Current source hashes are not asserted to be historical run hashes; use each run environment metadata and MLA merge manifest. Progress snapshots are not independent trials.",
+  "final_data": {
+    "gb200/collectives.csv": {
+      "sha256": "705c9a5e44b3f03d6b3d49754abe06325268bebb3687855e39c8db16bb16e802",
+      "rows": 1920,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_graph_kda/kda.csv": {
+      "sha256": "2f77ddeabf7f55ec66541eb083ed95ea3e0871d613bb503c44cdb9e8125b774b",
+      "rows": 640,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_checkpoint/checkpoint.csv": {
+      "sha256": "42448b2c357228807d6a92b47d3fe8d824a762c8031f46f77e1804376a47139b",
+      "rows": 48,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_mla/mla.csv": {
+      "sha256": "ceb4aa815ae04a93ff06640cd16281a38bb1651fd4ae1656484a17af5422f028",
+      "rows": 5600,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_equal_mla/equal_mla.csv": {
+      "sha256": "56f6921f9e1e3cfab95588a19d71f196b8233dba8fdb69e3f34c372052258aa1",
+      "rows": 2880,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_real_moe/equal_kda.csv": {
+      "sha256": "64c982cbfadba1b5d0b6d28cbed015924fd1e02534ed80f80ffef8025dee5ed8",
+      "rows": 320,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_mla_final/paged_cp.csv": {
+      "sha256": "76b8ade1b02a6a86c540837db572a1beb07dfa02a9bd54462e694f156583ef90",
+      "rows": 6816,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_real_moe/real_moe.csv": {
+      "sha256": "34baf83184d4c3c359cad91ee60f9b73359e7aea2751b4508527a6d14746f558",
+      "rows": 400,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_cold/cold.csv": {
+      "sha256": "917ff6e9fffeed36ec576213b1c5716fe072ecc1f0b7dd5a47e4fcbef3b7fa9f",
+      "rows": 352,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_expert_tp/expert_tp.csv": {
+      "sha256": "2cc867c17e9ab542a92730a7c788fc5e340fa29a996c8b1b119d1e240d20221a",
+      "rows": 384,
+      "ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "gb200_full_serving/result.json": {
+      "sha256": "0f7814da90b0670b8e591ccddf763c40f7faefe1d928c120b8d9576cc9c8f9ff",
+      "status": "completed"
+    },
+    "gb200_full_tp4/result.json": {
+      "sha256": "cd6a9b2b9fec3ca973c6056a0e718b4a15729555a916b3e6729402c052747946",
+      "status": "completed"
+    },
+    "gb200_full_tp16/result.json": {
+      "sha256": "4b9780d8789585c3d692db61ca0350c78b2e372bd1be02ebeaa60ccf4e10444b",
+      "status": "completed"
+    },
+    "serving_model/capacity.csv": {
+      "sha256": "4c70e4135d5fdd9076cbe9ac044beaef090a8e0821dab055571612053ef5256c",
+      "rows": 2496
+    },
+    "serving_model/work.csv": {
+      "sha256": "db4433c085eee82e88f6f6a4d032187041c242575475871ab0495a87812c7048",
+      "rows": 6
+    }
+  },
+  "current_source_sha256": {
+    "bench/k3_partition/expert_tp.py": "e546e42568daeb515170105d1f90a80a09da2b692bb025e5bfd887a30d30b285",
+    "bench/k3_partition/component_kernels.py": "cda0b470bf194c79ba6a43c5f9e970e8d982c1fd9b6512203063c3cd7c9d7736",
+    "bench/k3_partition/plot_collectives.py": "69edfed534932374e6ae9ede18099d2c572b031e5946f1706fdda6f55f664ff2",
+    "bench/k3_partition/benchmark_collectives.py": "c0655988a0f91761abfc3c0efdf9e6bf2bd2f9edbf449fbe9f4582b7e1d3cfba",
+    "bench/k3_partition/analyze_model_costs.py": "c6b27107d44cb1438200ecd49d1bacfd1feabdf46ae087a46775e687a1cb72e6",
+    "bench/k3_partition/analyze_joint.py": "bbbccd749fb394c7b5ac1c6caba02e11797274807143697b426aee6380b958f1",
+    "bench/k3_partition/full_serving.py": "a08f1251045558c3213678edf61a694b9b1a961cc5412500c00100ec92366df5",
+    "bench/k3_partition/analyze_serving.py": "692977305b895a33a4638382796bf643b27986649e285c19d904b5c439d35d5e",
+    "bench/k3_partition/paged_cp.py": "44a89ae70d4f01d8530ca167cb53bcb624ba3881a9fc7b46c57230f4970d76e1",
+    "bench/k3_partition/summarize_extended.py": "48e9593ef7b1ac497baca114ce03f9b3aaafc1b0c79ae237010f7a63d381fbeb",
+    "bench/k3_partition/cp_merge.py": "8a4aeef3c86553a3798f3f79a6eca62779822ce41e2918a624608111b81dffda",
+    "bench/k3_partition/extended_kernels.py": "93927cb351a8c7d7aaee1c88cebad3ee3e95d55685d7d8fe1021f83c96a0f0e0",
+    "bench/k3_partition/audit_checkpoint.py": "24b6e232815888c1c37bf184b2e55e037d330e186af820abbfe18b24ade4dca9",
+    "bench/k3_partition/probe_mla_heads.py": "da6c718be2db398bcbe9e2e469a160ee8e277298901b5a3fb33596a01a5c9ded",
+    "bench/k3_partition/summarize_gb200.py": "4b2c3b533a2e07e8f62c3ba24ae5eff0e69276339075bd7abda1c80c3af05821",
+    "bench/k3_partition/plot_serving.py": "3e45b707a36bf65141359de7bf8614110af1144dd8ca6da16a59f4a14c560e02",
+    "bench/k3_partition/benchmark_ray.py": "1b833470a7e2e0fd545d336a81a9a697cfb9ff3ff8a934b1c5a47dd74556e698",
+    "dlengine/runtime/layers/backends/mla/trtllm.py": "5eb57a299051b47912627a0dee0b734eca844e949f50ffe3409b7e82eab86ff0",
+    "dlengine/runtime/layers/backends/experts/mega_moe.py": "77c59c6c92f77e9eb40bf27af9358e6c4e3c34b5d48c8a1c6198d413f91fe805",
+    "dlengine/runtime/models/deepseek_v2/deepseek_v2.py": "fb9e44e4a762676e8e3613e103493bff55a5ea45c56b56b6d1471e4df2bc38d7",
+    "tests/test_mla_decode_head_padding.py": "6e71a62462459c259102d63d42eeca7c9ae9ab5d37d710da7ed354b777e256e0"
+  },
+  "verification": {
+    "targeted_suite": "Initial run: 61 passed, one new FP8 head-padding tolerance check failed on 2 of 1572864 values. Adjusted absolute tolerance to .003, matching existing native CP reference, and added a relative-L2 bound; all four padding cases then passed. All 62 distinct selected tests passed across these runs.",
+    "docs": "MkDocs strict build passed",
+    "python": "21 relevant Python files compiled",
+    "full_model": "All three TP4/8/16 EP16 runs completed 1048560 input + 8 output tokens, configured cap 1048576. Single-run measurements, no p99/concurrency/long-text quality claim."
+  }
+}

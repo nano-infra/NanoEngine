@@ -1,0 +1,72 @@
+## Configuration Reference
+
+### Engine Parameters
+
+| Parameter                | Type  | Default            | Description                                                          |
+| ------------------------ | ----- | ------------------ | -------------------------------------------------------------------- |
+| `model`                  | str   | Required           | Model path or HuggingFace ID                                         |
+| `mode`                   | str   | `"hybrid"`         | Engine mode: `prefill`, `decode`, `hybrid`                           |
+| `host`                   | str   | `"0.0.0.0"`        | Bind address                                                         |
+| `port`                   | int   | `0`                | Service port (`0` lets the OS allocate an available port)            |
+| `max_model_len`          | int   | `None`             | Maximum sequence length; inferred from model config when omitted      |
+| `max_num_batched_tokens` | int   | `16384`            | Max tokens per batch                                                 |
+| `max_num_seqs`           | int   | `256`              | Max concurrent sequences                                             |
+| `kvcache_block_size`     | int   | `256`              | KV cache block size (64 for MLA models)                              |
+| `gpu_memory_utilization` | float | `0.9`              | GPU memory usage fraction                                            |
+| `enforce_eager`          | bool  | `False`            | Disable CUDA Graph (for debugging)                                   |
+| `hardware_backend`       | str   | `"auto"`           | Hardware backend: `auto`, `blackwell`, `hopper`, or `gpu_generic`    |
+| `ray_address`            | str   | `"auto"`           | Ray cluster address (`auto` discovers a local cluster)               |
+| `master_address`         | str   | `None`             | Optional legacy rendezvous override; normally discovered from rank 0 |
+| `ctrl_address`           | str   | `None`             | dlslime-ctrl HTTP address for PD disaggregation                      |
+| `log_level`              | str   | `"CRITICAL"`       | Logging level                                                        |
+| `profiler_dir`           | str   | `"./profiler_res"` | Output root for runtime profiler traces                              |
+
+When `port` is left at `0`, DLEngine binds an OS-assigned port and logs the
+resulting bind and advertise endpoints. NanoCtrl registration uses the
+advertise endpoint, never the wildcard bind address.
+
+An omitted `max_model_len` (or `None` in Python) follows
+`text_config.max_position_embeddings` when present, then the top-level
+`max_position_embeddings`. An explicit positive value takes precedence. If neither
+model field is available, the engine warns and falls back to 16,384 tokens.
+The effective service limit may be reduced at startup to fit available KV cache;
+`max_num_batched_tokens` independently controls the per-forward token budget.
+
+### Runtime Profiling
+
+A running OpenAI server can delimit a profiling window through its management
+API:
+
+```bash
+curl -X POST http://127.0.0.1:<port>/start_profiler \
+  -H 'content-type: application/json' \
+  -d '{"trace_name":"baseline"}'
+
+# Send the inference requests to capture.
+
+curl -X POST http://127.0.0.1:<port>/stop_profiler
+```
+
+`trace_name` accepts 1-64 letters, numbers, dots, underscores, or hyphens.
+Traces from every worker are written below
+`<profiler_dir>/<trace_name>/`, and the stop response lists the files. Restrict
+these management endpoints to trusted networks in production.
+
+Profiling starts only through `/start_profiler` and continues until
+`/stop_profiler`; step-based automatic profiling is not supported.
+
+### Tensor Parallelism
+
+`attention_tp` and `ffn_tp` must be positive integers. There is no generic
+upper bound of 8: TP16 and larger values are accepted when the model's sharded
+head counts and the selected backend support them. For example, a compatible
+Kimi K3 topology can use `attention_tp=16, ffn_ep=16, ffn_tp=1`; a compatible
+GQA topology can use `attention_tp=16, ffn_tp=16`.
+
+Attention query heads must divide evenly across TP ranks. Qwen/Gemma GQA paths
+also require divisible KV-head counts; KV-head replication is not implemented.
+Kimi K3 MLA shares compressed KV across TP ranks, so its single compressed KV
+head does not limit TP to 1. Model-specific TP1 guards (including the configured
+DeepSeek/GLM paths and HiSparse), expert/quantization alignment requirements, and
+matching attention/FFN worker counts still apply. Configuration acceptance alone
+does not certify a model/backend topology for end-to-end serving.
