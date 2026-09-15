@@ -1,4 +1,4 @@
-# DLEngine: Distributed Inference for State-of-the-Art Large Models
+# NanoEngine: Distributed Inference for State-of-the-Art Large Models
 
 DLEngine is a distributed inference system built primarily for serving state-of-the-art large models. It combines cluster-wide GPU resource management, prefill/decode disaggregation, wide expert parallelism, sparse attention, and long-context inference behind OpenAI- and Anthropic-compatible APIs.
 
