@@ -351,35 +351,25 @@ class DeepseekV2MoE(nn.Module):
             runner_config = get_runner_config()
             routing_strategy = runner_config.moe_routing_simulation_strategy
             if routing_strategy == "uniform_random":
-                selected_experts = torch.randint(
-                    low=0,
-                    high=self.num_experts,
-                    size=(hidden_states.shape[0], self.top_k),
-                    dtype=torch.int64,
-                    device=hidden_states.device,
-                )
-                routing_weights = torch.ones(
-                    (hidden_states.shape[0], self.top_k),
-                    dtype=torch.float32,
-                    device=hidden_states.device,
-                )
-            else:
-                sorted_topk = (
-                    context.is_prefill
-                    if hasattr(context, "is_prefill")
-                    else True
-                )
-                routing_weights, selected_experts = deepseek_grouped_topk(
-                    router_logits,
-                    top_k=self.top_k,
-                    num_expert_group=self.num_expert_group,
-                    topk_group=self.topk_group,
-                    scoring_func=self.scoring_func,
-                    renormalize=self.renormalize_routing_weights,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    e_score_correction_bias=self.gate.e_score_correction_bias,
-                    sorted_topk=sorted_topk,
-                )
+                # Match vLLM: randomize router logits, then use the model's
+                # normal top-k/grouped-top-k selection and weighting path.
+                router_logits = torch.rand_like(router_logits)
+            sorted_topk = (
+                context.is_prefill
+                if hasattr(context, "is_prefill")
+                else True
+            )
+            routing_weights, selected_experts = deepseek_grouped_topk(
+                router_logits,
+                top_k=self.top_k,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                scoring_func=self.scoring_func,
+                renormalize=self.renormalize_routing_weights,
+                routed_scaling_factor=self.routed_scaling_factor,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                sorted_topk=sorted_topk,
+            )
 
             if routing_strategy == "perfect_eplb":
                 ep_size = get_dist_context().ffn_ep_world_size

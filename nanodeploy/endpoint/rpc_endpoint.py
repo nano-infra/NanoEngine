@@ -11,6 +11,20 @@ from nanodeploy.logging import get_logger
 logger = get_logger("NANODEPLOY")
 
 
+RPC_BUFFER_SIZE_DEFAULT = 8 * 32_000_000
+
+
+def get_rpc_buffer_size() -> int:
+    raw = os.environ.get("NANODEPLOY_RPC_BUFFER_SIZE", str(RPC_BUFFER_SIZE_DEFAULT))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("NANODEPLOY_RPC_BUFFER_SIZE must be an integer") from exc
+    if value <= 0:
+        raise ValueError("NANODEPLOY_RPC_BUFFER_SIZE must be positive")
+    return value
+
+
 def _get_slime_qp_num() -> int:
     raw = os.environ.get("SLIME_QP_NUM", "1")
     try:

@@ -11,7 +11,10 @@ from ray.util.placement_group import placement_group, remove_placement_group
 
 from nanodeploy.config import Config
 
-from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
+from nanodeploy.endpoint.rpc_endpoint import (
+    RPCServerEndpoint,
+    get_rpc_buffer_size,
+)
 from nanodeploy.engine.execution_boundary import ExecutionBoundaryRecorder
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
@@ -144,6 +147,7 @@ class RayExecutor:
             "SLIME_QP_NUM",
             "NANODEPLOY_LOG_DECODE_A2A_MASKS",
             "NANODEPLOY_LOG_LEVEL",
+            "NANODEPLOY_RPC_BUFFER_SIZE",
         ):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
@@ -195,7 +199,7 @@ class RayExecutor:
                 self.workers.append(worker)
 
         self.endpoint = RPCServerEndpoint(
-            32 * 32_000_000,
+            get_rpc_buffer_size(),
             self.config.attn_world_size,
             self.config.attention_sp,
             self.config.attention_tp,

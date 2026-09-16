@@ -21,7 +21,10 @@ from nanodeploy._cpp import (
     update_seqs_inner_loop,
 )
 from nanodeploy.config import Config
-from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
+from nanodeploy.endpoint.rpc_endpoint import (
+    RPCClientEndpoint,
+    get_rpc_buffer_size,
+)
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.engine.worker_transport import (
     DecodeCommand,
@@ -286,7 +289,7 @@ class ModelRunner:
         self.preallocate_kvcache()
 
         self.endpoint = RPCClientEndpoint(
-            32 * 32_000_000, self.engine_local_rank
+            get_rpc_buffer_size(), self.engine_local_rank
         )
         self._zmq_worker_config: WorkerZmqConfig | None = None
 
