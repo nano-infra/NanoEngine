@@ -11,7 +11,7 @@ from nanodeploy.logging import get_logger
 logger = get_logger("NANODEPLOY")
 
 
-RPC_BUFFER_SIZE_DEFAULT = 8 * 32_000_000
+RPC_BUFFER_SIZE_DEFAULT = 32 * 32_000_000
 
 
 def get_rpc_buffer_size() -> int:
