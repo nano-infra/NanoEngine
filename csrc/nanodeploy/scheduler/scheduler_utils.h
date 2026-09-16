@@ -24,6 +24,8 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                     int                                               eos_id,
                                     bool                                              is_prefill,
                                     bool                                              update_metrics,
+                                    double                                            step_duration_ms,
+                                    int                                               loop_count,
                                     ThreadPool*                                       thread_pool = nullptr);
 
 }  // namespace nanodeploy

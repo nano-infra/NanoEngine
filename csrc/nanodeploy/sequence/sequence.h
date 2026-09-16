@@ -102,7 +102,7 @@ struct OptionalStringHash {
 
 class Sequence {
 public:
-    static constexpr int block_size = 256;
+    static int block_size;
 
     Sequence(const std::vector<int>& token_ids,
              double                  temperature = 1.0,

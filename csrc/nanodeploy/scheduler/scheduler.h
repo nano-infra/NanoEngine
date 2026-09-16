@@ -75,12 +75,14 @@ public:
               int                loop_count,
               int                max_num_seqs,
               int                max_num_batched_tokens,
+              int                max_num_recv_seqs,
               int                eos,
               int                attention_dp,
               int                attention_sp,
               int                num_kvcache_blocks,
               int                kvcache_block_size,
-              const std::string& mode);
+              const std::string& mode,
+              double             reserved_blocks_per_req);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -91,7 +93,9 @@ public:
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-                     bool                                                       update_metrics = true);
+                     bool                                                       update_metrics,
+                     double                                                     step_duration_ms,
+                     int                                                        loop_count);
 
     // State queries
     bool is_finished() const;
@@ -133,10 +137,12 @@ private:
     int         loop_count_;
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
+    int         max_num_recv_seqs_;
     int         eos_;
     int         attention_dp_;
     int         attention_sp_;
     std::string mode_;
+    double reserved_blocks_per_req_;
 
     int dp_rr_counter_ = 0;
 

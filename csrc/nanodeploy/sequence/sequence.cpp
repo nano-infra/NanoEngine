@@ -8,6 +8,8 @@
 
 namespace nanodeploy {
 
+int Sequence::block_size = 256;
+
 // BlockContext Implementation
 
 BlockContext::BlockContext(const std::string& engine_id, int attention_sp, int attention_dp)

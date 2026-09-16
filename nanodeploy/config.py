@@ -55,6 +55,9 @@ class Config:
     # performance optimization
     use_dlslime_rpc: bool = True
 
+    # reserve for decode
+    reserved_blocks_per_req: float = 1.0
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

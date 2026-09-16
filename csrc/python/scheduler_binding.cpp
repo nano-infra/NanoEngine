@@ -23,7 +23,9 @@ void bind_scheduler_utils(py::module_& m)
           py::arg("dp_sp_token_ids"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
-          py::arg("update_metrics") = true,
+          py::arg("update_metrics"),
+          py::arg("step_duration_ms"),
+          py::arg("loop_count"),
           py::arg("thread_pool")    = nullptr,
           py::call_guard<py::gil_scoped_release>());
 
@@ -109,17 +111,19 @@ void bind_scheduler_utils(py::module_& m)
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
-        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, const std::string&, double>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"),
+             py::arg("max_num_recv_seqs"),
              py::arg("eos"),
              py::arg("attention_dp"),
              py::arg("attention_sp"),
              py::arg("num_kvcache_blocks"),
              py::arg("kvcache_block_size"),
-             py::arg("mode"))
+             py::arg("mode"),
+             py::arg("reserved_blocks_per_req"))
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
@@ -132,7 +136,9 @@ void bind_scheduler_utils(py::module_& m)
              &Scheduler::postprocess,
              py::arg("dp_seqs"),
              py::arg("dp_token_ids"),
-             py::arg("update_metrics") = true,
+             py::arg("update_metrics"),
+             py::arg("step_duration_ms"),
+             py::arg("loop_count"),
              py::call_guard<py::gil_scoped_release>())
 
         // State queries

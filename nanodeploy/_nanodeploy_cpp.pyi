@@ -75,11 +75,11 @@ class BlockContext:
 class BlockContextSlot:
     """
     Members:
-
+    
       ACTIVE
-
+    
       MIGRATE
-
+    
       SWAP
     """
     ACTIVE: typing.ClassVar[BlockContextSlot]  # value = <BlockContextSlot.ACTIVE: 0>
@@ -505,11 +505,11 @@ class PrefillMetadata:
 class RoutingStrategy:
     """
     Members:
-
+    
       RoundRobin
-
+    
       LeastBatch
-
+    
       LeastCache
     """
     LeastBatch: typing.ClassVar[RoutingStrategy]  # value = <RoutingStrategy.LeastBatch: 1>
@@ -900,13 +900,13 @@ class SequenceMetric:
 class SequenceStatus:
     """
     Members:
-
+    
       WAITING
-
+    
       RUNNING
-
+    
       FINISHED
-
+    
       TO_BE_MIGRATED
     """
     FINISHED: typing.ClassVar[SequenceStatus]  # value = <SequenceStatus.FINISHED: 2>
@@ -1063,7 +1063,7 @@ class ServerMetric:
     @property
     def uptime(self) -> float:
         ...
-def deserialize(data_ptr: typing.SupportsInt, data_len: typing.SupportsInt) -> list[...]:
+def deserialize(data_ptr: typing.SupportsInt, data_len: typing.SupportsInt) -> list[typing.Sequence]:
     ...
 def postprocess_sequences(worker_states: ..., std: ..., dp_sp_seqs: collections.abc.Sequence[collections.abc.Sequence[typing.Sequence]], dp_sp_token_ids: collections.abc.Sequence[collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]]], eos_id: typing.SupportsInt, is_prefill: bool, update_metrics: bool = True, thread_pool: ... = None) -> list[tuple[typing.Sequence, int]]:
     ...
@@ -1071,7 +1071,7 @@ def prepare_decode_cpp(dp_seqs: collections.abc.Sequence[typing.Sequence], sp_ra
     ...
 def prepare_prefill_cpp(seqs: collections.abc.Sequence[typing.Sequence], sp_rank: typing.SupportsInt, sp_size: typing.SupportsInt, block_size: typing.SupportsInt, max_num_seqs: typing.SupportsInt) -> PrefillMetadata:
     ...
-def serialize(data_ptr: typing.SupportsInt, buffer_size: typing.SupportsInt, seqs: collections.abc.Sequence[...], is_prefill: bool) -> int:
+def serialize(data_ptr: typing.SupportsInt, buffer_size: typing.SupportsInt, seqs: collections.abc.Sequence[typing.Sequence], is_prefill: bool) -> int:
     ...
 def update_seqs_inner_loop(dp_seqs: collections.abc.Sequence[typing.Sequence], sp_rank: typing.SupportsInt) -> None:
     ...

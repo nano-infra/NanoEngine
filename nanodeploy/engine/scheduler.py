@@ -28,12 +28,14 @@ class Scheduler(_CppScheduler):
             config.loop_count,
             config.max_num_seqs,
             config.max_num_batched_tokens,
+            config.max_num_recv_seqs,
             config.eos,
             config.attention_dp,
             config.attention_sp,
             config.num_kvcache_blocks,
             config.kvcache_block_size,
-            config.mode
+            config.mode,
+            config.reserved_blocks_per_req
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
@@ -51,8 +53,11 @@ class Scheduler(_CppScheduler):
         dp_sp_seqs: list[list[Sequence]],
         dp_sp_token_ids: list[list[list[int]]],
         metrics_manager: "MetricsManager | None" = None,
+        step_duration_ms: float = 0.0,
+        loop_count: int = 1,
     ):
         # Use the C++ implementation directly
         return super().postprocess(
-            dp_sp_seqs, dp_sp_token_ids, metrics_manager is not None
+            dp_sp_seqs, dp_sp_token_ids, metrics_manager is not None,
+            step_duration_ms, loop_count
         )

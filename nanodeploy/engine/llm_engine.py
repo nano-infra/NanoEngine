@@ -163,10 +163,13 @@ class LLMEngine:
                             seq.metric.record_first_token()
                             seq.metric.num_generated_tokens = 1
         else:
+            step_start = time.perf_counter()
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            step_duration_ms = (time.perf_counter() - step_start) * 1000.0
             post_sch_begin = time.time()
             self.scheduler.postprocess(
-                filtered_dp_sp_seqs, token_ids, self.metrics_manager
+                filtered_dp_sp_seqs, token_ids, self.metrics_manager,
+                step_duration_ms, self.config.loop_count
             )
             post_sch_end = time.time()
         outputs = []

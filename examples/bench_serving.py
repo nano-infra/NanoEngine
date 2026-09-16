@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--model-path", type=str, default="/models/qwen3-235B-Instruct-2507-FP8", help="Model path.")
     parser.add_argument("--max-model-len", type=int, default=4096, help="Max model length.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
+    parser.add_argument("--gpu-memory-limit-gb", type=float, default=None, help="GPU memory limit in GB.")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
@@ -84,10 +85,11 @@ def get_dataset(args):
         raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
 
     if len(df) < args.num_requests:
-        print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Using {len(df)}.")
-        args.num_requests = len(df)
-    else:
-        df = df.head(args.num_requests)
+        print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")
+        repeats = (args.num_requests // len(df)) + 1
+        df = pd.concat([df] * repeats, ignore_index=True)
+    
+    df = df.head(args.num_requests)
 
     prompts = []
     sampling_params_list = []
@@ -132,6 +134,53 @@ def print_model_config(engine):
     else:
         print("Config not accessible directly from engine.")
     print("=" * 40 + "\n")
+
+
+def run_warmup(engine, max_num_seqs, world_size):
+    """Runs warmup phase before the actual benchmark."""
+    warmup_input_len = 512
+    warmup_output_len = 256
+    num_warmup_requests = max_num_seqs * world_size
+    
+    print(f"\n{'=' * 60}")
+    print(f"Running Warmup Phase: {num_warmup_requests} requests")
+    print(f"  Input tokens: {warmup_input_len}")
+    print(f"  Output tokens: {warmup_output_len}")
+    print(f"{'=' * 60}\n")
+    
+    # Generate warmup requests
+    warmup_prompts = [
+        [randint(0, 10000) for _ in range(warmup_input_len)]
+        for _ in range(num_warmup_requests)
+    ]
+    warmup_sampling_params = SamplingParams(
+        temperature=0.6, 
+        ignore_eos=True, 
+        max_tokens=warmup_output_len
+    )
+    
+    warmup_seqs = []
+    for prompt in warmup_prompts:
+        seq = Sequence(token_ids=prompt, sampling_params=warmup_sampling_params)
+        warmup_seqs.append(seq)
+        engine.add_request(seq)
+    
+    # Process warmup requests
+    warmup_start = time.perf_counter()
+    with tqdm(total=num_warmup_requests, desc="Warmup Requests") as pbar:
+        completed = 0
+        while completed < num_warmup_requests:
+            if not engine.is_finished():
+                outputs, _, _, _, _ = engine.step()
+                for seq_id, _ in outputs:
+                    completed += 1
+                    pbar.update(1)
+            else:
+                time.sleep(0.001)
+    
+    warmup_time = time.perf_counter() - warmup_start
+    print(f"\nWarmup completed in {warmup_time:.2f}s")
+    print(f"{'=' * 60}\n")
 
 
 def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requests):
@@ -246,6 +295,26 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
         print(f"  P99:  {tpot_stats.get('p99', 0):.2f}")
         print()
 
+    # TPOT exclude first token
+    itls_ex_first = [s.metric.avg_itl_exclude_first for s in completed_seqs if s.metric.avg_itl_exclude_first]
+    if itls_ex_first:
+        print("--- ITL Wo Queue (exclude first token) (ms/token) ---")
+        print(f"  Avg:  {np.mean(itls_ex_first):.2f}")
+        print(f"  P50:  {np.median(itls_ex_first):.2f}")
+        print(f"  P90:  {np.percentile(itls_ex_first, 90):.2f}")
+        print(f"  P99:  {np.percentile(itls_ex_first, 99):.2f}")
+        print()
+
+    # ITL with decode queue
+    itls_with_dq = [s.metric.avg_itl_with_decode_queue for s in completed_seqs if s.metric.avg_itl_with_decode_queue]
+    if itls_with_dq:
+        print("--- ITL With Decode Queue (ms/token) ---")
+        print(f"  Avg:  {np.mean(itls_with_dq):.2f}")
+        print(f"  P50:  {np.median(itls_with_dq):.2f}")
+        print(f"  P90:  {np.percentile(itls_with_dq, 90):.2f}")
+        print(f"  P99:  {np.percentile(itls_with_dq, 99):.2f}")
+        print()
+
     if tpot_wq_stats:
         print("--- TPOT with Queueing Time (ms/token) ---")
         print(f"  Avg:  {tpot_wq_stats.get('avg', 0):.2f}")
@@ -272,6 +341,7 @@ def main():
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_limit_gb=args.gpu_memory_limit_gb,
         master_address=args.master_address,
         ray_address=args.ray_address,
         mode="decode",
@@ -292,6 +362,10 @@ def main():
     
     # Print Config
     print_model_config(engine)
+
+    # Run Warmup
+    world_size = args.ep
+    run_warmup(engine, args.max_num_seqs, world_size)
 
     # Prepare Data
     prompts, sampling_params_list = get_dataset(args)

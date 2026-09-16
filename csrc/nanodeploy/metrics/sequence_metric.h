@@ -20,6 +20,7 @@ public:
     void record_decode_scheduled();
     void record_first_token();
     void record_token();
+    void record_step_tokens(int num_tokens, double step_itl_ms);
     void record_completion();
 
     std::optional<double> ttft() const;
@@ -29,6 +30,8 @@ public:
     std::optional<double> queueing_time_ms() const;
     std::optional<double> decode_queue_time_ms() const;
     std::optional<double> avg_itl() const;
+    std::optional<double> avg_itl_exclude_first() const;
+    std::optional<double> avg_itl_with_decode_queue() const;
     std::optional<double> p50_itl() const;
     std::optional<double> p99_itl() const;
 
