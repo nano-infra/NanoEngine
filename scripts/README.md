@@ -22,7 +22,7 @@ python3 scripts/benchmark_least_batch_cpu.py \
   --prompt-tokens 32 \
   --modeled-commit-gate-ms 10 \
   --repeats 5 \
-  --json-output docs-dev/2026-08-25/least_batch_cpu_benchmark.json
+  --json-output ../NanoDeploy-July-docsdev/2026-08-25/least_batch_cpu_benchmark.json
 ```
 
 这个基准可以验证请求分发、receipt/commit 解耦、消息 batching、payload 单次传输
@@ -48,7 +48,7 @@ python3 -m scripts.benchmark_least_batch_ray_cpu \
   --batch-size 64 \
   --prompt-tokens 32 \
   --repeats 5 \
-  --json-output docs-dev/2026-08-25/least_batch_ray_cpu_benchmark.json
+  --json-output ../NanoDeploy-July-docsdev/2026-08-25/least_batch_ray_cpu_benchmark.json
 ```
 
 默认按 Ray `NodeManagerAddress` 选择前两个存活 CPU 节点。需要固定机器时，各传
@@ -88,7 +88,7 @@ scripts/run_2node_rate30_6min_matrix.sh
 ```
 
 详细备用记录见
-[`docs-dev/2026-07-28/rate30_6min_2node_matrix/Runbook.md`](../docs-dev/2026-07-28/rate30_6min_2node_matrix/Runbook.md)。
+[`../NanoDeploy-July-docsdev/2026-07-28/rate30_6min_2node_matrix/Runbook.md`](../NanoDeploy-July-docsdev/2026-07-28/rate30_6min_2node_matrix/Runbook.md)。
 
 ### 默认 TPOT 口径
 

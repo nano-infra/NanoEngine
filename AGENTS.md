@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`nanodeploy/` contains the Python package. Runtime orchestration lives in `engine/`, distributed worker code in `worker/`, model and kernel implementations in `models/`, `layers/`, and `kernels/`, and request routing in `router/`. Native C++20 code and pybind11 bindings are under `csrc/nanodeploy/` and `csrc/python/`. Put regression tests in `tests/` using `test_*.py`; keep runnable demonstrations in `examples/`. Operational and analysis tools belong in `scripts/` and `utils_analysis/`. Design notes live in `docs/`; dated investigation notes may go in `docs-dev/`. Treat `build/`, profiler output, and `bench_logs/` as generated artifacts.
+`nanodeploy/` contains the Python package. Runtime orchestration lives in `engine/`, distributed worker code in `worker/`, model and kernel implementations in `models/`, `layers/`, and `kernels/`, and request routing in `router/`. Native C++20 code and pybind11 bindings are under `csrc/nanodeploy/` and `csrc/python/`. Put regression tests in `tests/` using `test_*.py`; keep runnable demonstrations in `examples/`. Operational and analysis tools belong in `scripts/` and `utils_analysis/`. Design notes live in `docs/`; dated investigation notes may go in the scratch directory `../NanoDeploy-July-docsdev/`, which sits outside this repository. Treat `build/`, profiler output, and `bench_logs/` as generated artifacts.
 
 ## Build, Test, and Development Commands
 
@@ -65,12 +65,12 @@ Add a focused regression test for each behavior change. Name tests `test_<behavi
 
 - After changing C++ sources, reinstall with `python3 -m pip install -v -e .` before running the full project.
 - Modify NanoDeploy code only; do not patch external dependency libraries.
-- Save useful interim reasoning or research notes under `docs-dev/` for later reference.
+- Save useful interim reasoning or research notes under `../NanoDeploy-July-docsdev/` for later reference. This directory is outside the repository; do not recreate `docs-dev/` inside it.
 - By default, do not compute SHA/hash values for files, logs, datasets, or runtime state; do not validate hash chains; and do not reconstruct historical state during startup, resume, execution, or shutdown for hash validation unless the user explicitly requests it.
 - Subagents may be used for suitable independent work.
 - Commit changes promptly with clear, accurate messages so work remains traceable.
 - Request elevated permissions before every GPU operation.
-- When context exceeds 220,000 characters, and before context compaction, record the current time, objective, and completed work in `docs-dev/<date>/Progress.md`. Read that file before resuming after compaction to avoid duplicate work.
+- When context exceeds 220,000 characters, and before context compaction, record the current time, objective, and completed work in `../NanoDeploy-July-docsdev/<date>/Progress.md`. Read that file before resuming after compaction to avoid duplicate work.
 
 ## Commit & Pull Request Guidelines
 
