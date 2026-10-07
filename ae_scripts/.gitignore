@@ -1,0 +1,72 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments and Python packaging outputs
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Notebook, editor, and operating-system files
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Generated figures and document previews
+*.png
+*.pdf
+
+# Local environment files
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Machine-specific paths. Copy paths.env.example to paths.env and fill it in.
+/paths.env
+
+# Transient process state
+*.pid
+*.pgid
+*.pid.lock
+nohup.out
+
+# Regenerable experiment outputs. Published figures and reference inputs live
+# outside these directories and remain tracked.
+/fig*/results/
+/fig12/cache/
+/fig12/data/
+/fig13/kv-distributions/
+/fig15/e2e_results/
+/fig15/profiling_results/
+/algorithm/results/
+/bench_logs/
+/fig13/*generated.csv
+/fig13/profiling_results/

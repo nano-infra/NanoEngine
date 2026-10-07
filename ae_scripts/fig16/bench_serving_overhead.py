@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""Local request driver for the Fig. 16 NanoDeploy ablation."""
+
+import argparse
+import os
+import time
+from dataclasses import asdict
+from random import seed
+from typing import Mapping
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+# Constants
+MAX_INPUT_LEN = 1024
+MAX_OUTPUT_LEN = 1024
+DEFAULT_MAX_REQUEST_TOKENS = 910_000
+DEFAULT_RAY_ADDRESS = "10.102.252.174:6380"
+SEED = 0
+WORKER_NETWORK_ENV_NAMES = (
+    "GLOO_SOCKET_IFNAME",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_IB_HCA",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_TC",
+    "SLIME_VISIBLE_DEVICES",
+    "SLIME_GID_INDEX",
+    "SLIME_QP_NUM",
+)
+
+# specific seed
+seed(SEED)
+np.random.seed(SEED)
+
+
+def merge_worker_runtime_env(
+    runtime_env: Mapping[str, object] | None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Copy the validated driver networking settings to Ray workers."""
+
+    source = os.environ if environ is None else environ
+    merged = dict(runtime_env or {})
+    env_vars = dict(merged.get("env_vars") or {})
+    env_vars.update(
+        {name: source[name] for name in WORKER_NETWORK_ENV_NAMES if name in source}
+    )
+    merged["env_vars"] = env_vars
+    return merged
+
+
+def patch_ray_worker_environment() -> None:
+    """Inject driver-side network settings into every NanoDeploy Ray actor."""
+
+    from nanodeploy.engine import ray_executor
+
+    original_model_runner = ray_executor.ModelRunner
+
+    class ModelRunnerWithNetworkEnv:
+        @staticmethod
+        def options(**kwargs):
+            kwargs["runtime_env"] = merge_worker_runtime_env(
+                kwargs.get("runtime_env")
+            )
+            return original_model_runner.options(**kwargs)
+
+    ray_executor.ModelRunner = ModelRunnerWithNetworkEnv
+
+
+def constrain_bundles_to_node(
+    bundles: list[dict[str, float]], node_ip: str
+) -> list[dict[str, float]]:
+    """Add a hard Ray node-resource requirement to placement-group bundles."""
+
+    node_resource = f"node:{node_ip}"
+    constrained = []
+    for bundle in bundles:
+        constrained_bundle = dict(bundle)
+        constrained_bundle[node_resource] = 0.001
+        constrained.append(constrained_bundle)
+    return constrained
+
+
+def patch_ray_node_selection(node_ips: list[str] | None) -> None:
+    """Pin legacy NanoDeploy placement groups to explicitly selected nodes."""
+
+    if not node_ips:
+        return
+
+    from nanodeploy.engine import ray_executor
+
+    original_get_nodes = ray_executor.get_available_nodes_with_master_first
+    original_placement_group = ray_executor.placement_group
+    selected_ip_by_node_id: dict[str, str] = {}
+
+    def get_selected_nodes(master_address: str):
+        available_nodes = original_get_nodes(master_address)
+        available_by_ip = {
+            str(node.get("NodeManagerAddress")): node for node in available_nodes
+        }
+        missing = [node_ip for node_ip in node_ips if node_ip not in available_by_ip]
+        if missing:
+            raise RuntimeError(
+                "requested Ray nodes are unavailable or occupied: "
+                + ", ".join(missing)
+            )
+        selected = [available_by_ip[node_ip] for node_ip in node_ips]
+        for node_ip, node in zip(node_ips, selected):
+            resource_name = f"node:{node_ip}"
+            if resource_name not in node.get("Resources", {}):
+                raise RuntimeError(
+                    f"Ray node {node_ip} does not expose resource {resource_name}"
+                )
+            selected_ip_by_node_id[str(node["NodeID"])] = node_ip
+        print("Pinned NanoDeploy nodes: " + ", ".join(node_ips))
+        return selected
+
+    def placement_group_on_selected_node(*args, **kwargs):
+        target_node_id = str(kwargs.get("_soft_target_node_id", ""))
+        node_ip = selected_ip_by_node_id.get(target_node_id)
+        if node_ip is None:
+            raise RuntimeError(
+                f"NanoDeploy requested an unselected Ray node: {target_node_id}"
+            )
+        if "bundles" in kwargs:
+            kwargs["bundles"] = constrain_bundles_to_node(
+                kwargs["bundles"], node_ip
+            )
+        elif args:
+            positional = list(args)
+            positional[0] = constrain_bundles_to_node(positional[0], node_ip)
+            args = tuple(positional)
+        else:
+            raise RuntimeError("Ray placement_group call has no bundles")
+        return original_placement_group(*args, **kwargs)
+
+    ray_executor.get_available_nodes_with_master_first = get_selected_nodes
+    ray_executor.placement_group = placement_group_on_selected_node
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Serving benchmark for NanoDeploy.")
+    parser.add_argument("--num-requests", type=int, default=256, help="Number of requests.")
+    parser.add_argument("--request-rate", type=float, default=8, help="Requests per second.")
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=1.0,
+        help="Burstiness factor (1.0 = Poisson).",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="/models/qwen3-235B-Instruct-2507-FP8",
+        help="Model path.",
+    )
+    parser.add_argument("--max-model-len", type=int, default=4096, help="Max model length.")
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization.",
+    )
+    parser.add_argument(
+        "--gpu-memory-limit-gb",
+        type=float,
+        default=None,
+        help="GPU memory limit in GB.",
+    )
+    parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
+    parser.add_argument(
+        "--cuda-graph-mode",
+        type=str,
+        default="full",
+        choices=["full", "piecewise"],
+        help="CUDA Graph mode for decode.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="random",
+        choices=["random", "csv"],
+        help="Dataset type.",
+    )
+    parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
+    parser.add_argument(
+        "--max-input-len",
+        type=int,
+        default=None,
+        help="Filter out CSV rows with prompt_len >= this value.",
+    )
+    parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_TOKENS,
+        help=(
+            "Filter out CSV rows where prompt_len + output_len exceeds this "
+            f"value (default: {DEFAULT_MAX_REQUEST_TOKENS}; 0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--itl-log-path",
+        type=str,
+        default="itl_samples.jsonl",
+        help="Path to save ITL samples (JSONL).",
+    )
+
+    # Distributed / Cluster arguments
+    parser.add_argument("--master-address", type=str, default=None, help="Ray master address.")
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default=os.environ.get("RAY_ADDR", DEFAULT_RAY_ADDRESS),
+        help=f"Ray cluster address (default: {DEFAULT_RAY_ADDRESS}).",
+    )
+    parser.add_argument(
+        "--node-ips",
+        nargs="+",
+        help="Ordered Ray worker IPs to use; the master IP must be first.",
+    )
+
+    # Parallelism arguments
+    parser.add_argument("--tp", type=int, default=1, help="Tensor Parallel size.")
+    parser.add_argument("--sp", type=int, default=1, help="Sequence Parallel size.")
+    parser.add_argument("--dp", type=int, default=1, help="Data Parallel size.")
+    parser.add_argument("--ep", type=int, default=1, help="Expert Parallel size.")
+
+    # Engine args
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=128,
+        help="Max sequences per iteration.",
+    )
+    parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
+    parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
+    parser.add_argument(
+        "--segment-size",
+        type=int,
+        default=65536,
+        help=(
+            "KV accounting granularity. With --dynamic-sp-size-strategy=bucket, "
+            "the bucket policy, not this value, selects the participating SP size."
+        ),
+    )
+    parser.add_argument("--sp-backend", type=str, default="hao_basic",
+                        choices=["legacy_ll", "hao_basic", "nccl"],
+                        help="SP all-to-all backend.")
+    parser.add_argument("--disable-non-uniform-split", action="store_true",
+                        help="Disable non-uniform KVCache partitioning.")
+    parser.add_argument("--fixed-sp-size", type=int, default=0,
+                        help="Fixed number of participating SP ranks per request (0 = disabled).")
+    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
+                        help="Enable dynamic SP size.")
+    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
+                        help="Use the new decode dynamic SP scheduler instead of the legacy path.")
+    parser.add_argument("--dynamic-sp-size-strategy", type=str, default="legacy",
+                        choices=["legacy", "long_short_sp8", "bucket"],
+                        help="SP size selection policy for the legacy dynamic-SP path.")
+    parser.add_argument(
+        "--dynamic-sp-bucket-preset",
+        type=str,
+        default="none",
+        choices=["none", "deepseek_v3"],
+        help="Named sequence-length bucket policy (used only with strategy=bucket).",
+    )
+    parser.add_argument(
+        "--dynamic-sp-bucket-policy",
+        type=str,
+        default="",
+        help=(
+            "Explicit bucket policy such as '1:1024-104448;5:104449-174080'. "
+            "Used only with strategy=bucket."
+        ),
+    )
+    parser.add_argument("--long-request-sp-threshold", type=int, default=100000,
+                        help="Prompt threshold for long_short_sp8 to select SP=8.")
+    parser.add_argument("--long-request-sp-size", type=int, default=0,
+                        help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
+
+    parser.add_argument("--routing-strategy", type=str, default="RoundRobin",
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
+                        help="Routing strategy.")
+    parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
+                        choices=["legacy_global", "hierarchical"],
+                        help="Scheduler architecture (default: legacy_global).")
+    parser.add_argument(
+        "--router-policy",
+        type=str,
+        default="least_batch",
+        choices=[
+            "round_robin",
+            "least_batch",
+            "least_batch_v2",
+            "least_cache",
+        ],
+        help="Hierarchical load-balancer policy (default: least_batch).",
+    )
+
+    # Profiler arguments
+    parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
+    parser.add_argument("--profiler-start-step", type=int, default=40)
+    parser.add_argument("--profiling-step", type=int, default=16)
+    parser.add_argument("--profiler-dir", default="./profiler_logs")
+    parser.add_argument("--profiler-start-time", type=float)
+    parser.add_argument("--profiling-duration", type=float)
+
+    args = parser.parse_args()
+
+    if args.dataset == "csv":
+        if args.csv_path is None:
+            parser.error("--csv-path is required when --dataset=csv")
+        if not os.path.exists(args.csv_path):
+            parser.error(f"CSV file not found: {args.csv_path}")
+    if args.max_request_tokens < 0:
+        parser.error("--max-request-tokens must be non-negative")
+    if args.request_rate <= 0:
+        parser.error("--request-rate must be positive")
+    if args.num_requests <= 0:
+        parser.error("--num-requests must be positive")
+    if args.node_ips:
+        if len(set(args.node_ips)) != len(args.node_ips):
+            parser.error("--node-ips must not contain duplicates")
+        expected_nodes = (args.ep + 7) // 8
+        if len(args.node_ips) != expected_nodes:
+            parser.error(
+                f"--node-ips requires {expected_nodes} IPs for EP={args.ep}"
+            )
+    # NanoDeploy-July removed the old long_short_sp8 and enable_dynamic_sp_size
+    # knobs.  Preserve old AE command lines by translating long_short_sp8 to
+    # the corresponding named bucket policy before validation.
+    if args.dynamic_sp_size_strategy == "long_short_sp8":
+        args.dynamic_sp_size_strategy = "bucket"
+        if args.dynamic_sp_bucket_preset == "none" and not args.dynamic_sp_bucket_policy.strip():
+            args.dynamic_sp_bucket_preset = (
+                "kimi_k2" if "kimi" in args.model_path.lower() else "deepseek_v3"
+            )
+
+    bucket_configured = (
+        args.dynamic_sp_bucket_preset != "none"
+        or bool(args.dynamic_sp_bucket_policy.strip())
+    )
+    if args.dynamic_sp_size_strategy == "bucket":
+        if not bucket_configured:
+            parser.error(
+                "strategy=bucket requires --dynamic-sp-bucket-preset or "
+                "--dynamic-sp-bucket-policy"
+            )
+        if (
+            args.dynamic_sp_bucket_preset != "none"
+            and args.dynamic_sp_bucket_policy.strip()
+        ):
+            parser.error("select a bucket preset or an explicit policy, not both")
+        if args.use_new_decode_dynamic_sp_scheduler:
+            parser.error(
+                "strategy=bucket uses the legacy can_allocate path and cannot be "
+                "combined with --use-new-decode-dynamic-sp-scheduler"
+            )
+    elif bucket_configured:
+        parser.error("bucket preset/policy requires --dynamic-sp-size-strategy=bucket")
+
+    return args
+
+
+def get_dataset_generator(args):
+    """Generates the dataset of prompts and sampling params as a generator."""
+    if args.dataset == "random":
+        print(
+            "Generating random dataset generator "
+            f"(input: {MAX_INPUT_LEN}, output: {MAX_OUTPUT_LEN})..."
+        )
+        for _ in range(args.num_requests):
+            prompt = np.random.randint(0, 10000, size=MAX_INPUT_LEN).tolist()
+            sp = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=MAX_OUTPUT_LEN)
+            yield prompt, sp
+        return
+
+    # CSV dataset
+    print(f"Reading dataset from CSV: {args.csv_path}...")
+    df = pd.read_csv(args.csv_path)
+
+    if "prompt_len" not in df.columns or "output_len" not in df.columns:
+        raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
+
+    if args.max_request_tokens > 0:
+        orig_len = len(df)
+        request_tokens = df["prompt_len"] + df["output_len"]
+        df = df[request_tokens <= args.max_request_tokens].reset_index(drop=True)
+        print(
+            "Filtered by "
+            f"max_request_tokens={args.max_request_tokens} "
+            f"(prompt_len + output_len <= limit): {orig_len} -> {len(df)} rows"
+        )
+
+    if args.max_input_len is not None:
+        orig_len = len(df)
+        df = df[df["prompt_len"] < args.max_input_len].reset_index(drop=True)
+        print(f"Filtered by max_input_len={args.max_input_len}: {orig_len} -> {len(df)} rows")
+
+    if df.empty:
+        raise ValueError("CSV dataset has no rows after applying length filters")
+
+    if len(df) < args.num_requests:
+        print(
+            f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. "
+            "Cycling data to meet request count."
+        )
+        # No need to physical concat, just cycle logic in loop
+
+    # Pre-calculate cycling indices to avoid mental overhead during yield
+    num_rows = len(df)
+
+    for i in range(args.num_requests):
+        row = df.iloc[i % num_rows]
+        prompt_len = int(row["prompt_len"])
+        output_len = int(row["output_len"])
+
+        if prompt_len > args.max_model_len or prompt_len + output_len > args.max_model_len:
+            # Reserve at least 4 tokens for prompt
+            if args.max_model_len - output_len < 4:
+                output_len = args.max_model_len - 4
+                prompt_len = 4
+            else:
+                prompt_len = args.max_model_len - output_len
+
+        prompt = np.random.randint(0, 10000, size=prompt_len).tolist()
+        sp = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_len)
+        yield prompt, sp
+
+    print(f"Generator prepared for {args.num_requests} requests from CSV")
+
+
+def generate_arrival_times(num_requests, rate, burstiness):
+    """Generates request arrival times based on burstiness factor."""
+    if burstiness == 1.0:
+        intervals = np.random.exponential(1.0 / rate, num_requests)
+    else:
+        shape = 1.0 / (burstiness**2)
+        scale = burstiness**2 / rate
+        intervals = np.random.gamma(shape, scale, num_requests)
+    return np.cumsum(intervals)
+
+
+def print_model_config(engine):
+    """Prints the model configuration from the engine."""
+    print("\n" + "=" * 40)
+    print("Model Configuration")
+    print("=" * 40)
+    if hasattr(engine, 'config'):
+        # Assuming config is a dataclass or has __dict__
+        conf = engine.config
+        try:
+            # If it's a dataclass
+            conf_dict = asdict(conf)
+        except TypeError:
+             # Fallback if not a dataclass
+            conf_dict = conf.__dict__ if hasattr(conf, '__dict__') else {}
+
+        for k, v in conf_dict.items():
+            print(f"{k}: {v}")
+    else:
+        print("Config not accessible directly from engine.")
+    print("=" * 40 + "\n")
+
+
+def run_warmup(engine, max_num_seqs, world_size):
+    """Runs warmup phase before the actual benchmark."""
+    warmup_input_len = 512
+    warmup_output_len = 256
+    num_warmup_requests = 256
+
+    print(f"\n{'=' * 60}")
+    print(f"Running Warmup Phase: {num_warmup_requests} requests")
+    print(f"  Input tokens: {warmup_input_len}")
+    print(f"  Output tokens: {warmup_output_len}")
+    print("  Fixed warmup requests: 256")
+    print(f"{'=' * 60}\n")
+
+    # Generate warmup requests
+    # Warmup is small, list is fine
+    warmup_prompts = [
+        np.random.randint(0, 10000, size=warmup_input_len).tolist()
+        for _ in range(num_warmup_requests)
+    ]
+    warmup_sampling_params = SamplingParams(
+        temperature=0.6,
+        ignore_eos=True,
+        max_tokens=warmup_output_len
+    )
+
+    warmup_seqs = []
+    for prompt in warmup_prompts:
+        seq = Sequence(token_ids=prompt, sampling_params=warmup_sampling_params)
+        warmup_seqs.append(seq)
+        engine.add_request(seq)
+
+    # Process warmup requests
+    warmup_start = time.perf_counter()
+    with tqdm(total=num_warmup_requests, desc="Warmup Requests") as pbar:
+        completed = 0
+        while completed < num_warmup_requests:
+            if not engine.is_finished():
+                outputs, _, _, _, _ = engine.step()
+                for seq_id, _ in outputs:
+                    completed += 1
+                    pbar.update(1)
+            else:
+                time.sleep(0.001)
+
+    warmup_time = time.perf_counter() - warmup_start
+    print(f"\nWarmup completed in {warmup_time:.2f}s")
+    if warmup_time > 0:
+        print(
+            "Warmup effective throughput: "
+            f"{num_warmup_requests / warmup_time:.2f} requests/s"
+        )
+    print(f"{'=' * 60}\n")
+
+
+def run_benchmark(engine, request_generator, arrival_times, num_requests):
+    """Runs the main benchmark loop with rate-controlled request submission."""
+    seq_map = {}
+    completed_latencies = []
+
+    # Pre-load all request data without submitting
+    print(f"Preparing {num_requests} requests for rate-controlled submission...")
+    all_seqs = []
+    for _ in range(num_requests):
+        try:
+            prompt, sp = next(request_generator)
+        except StopIteration:
+            break
+        seq = Sequence(token_ids=prompt, sampling_params=sp)
+        all_seqs.append(seq)
+        seq_map[seq.seq_id] = seq
+
+    requests_to_send = len(all_seqs)
+    print(
+        f"Prepared {requests_to_send} requests. "
+        "Submitting according to arrival_times (rate-controlled)."
+    )
+
+    next_idx = 0
+    start_time = time.perf_counter()
+
+    with tqdm(total=requests_to_send, desc="Processing Requests") as pbar:
+        while next_idx < requests_to_send or not engine.is_finished():
+            now = time.perf_counter() - start_time
+
+            # Submit all requests whose arrival time has passed
+            while next_idx < requests_to_send and arrival_times[next_idx] <= now:
+                engine.add_request(all_seqs[next_idx])
+                next_idx += 1
+
+            if not engine.is_finished():
+                outputs, _, _, _, _ = engine.step()
+                for seq_id, _ in outputs:
+                    if seq_id in seq_map:
+                        seq = seq_map[seq_id]
+                        if seq.metric and seq.metric.e2e_latency:
+                            completed_latencies.append(seq.metric.e2e_latency / 1000)
+                            avg_lat = np.mean(completed_latencies)
+                            pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
+                        pbar.update(1)
+            else:
+                # Engine idle: wait for next scheduled arrival
+                if next_idx < requests_to_send:
+                    wait = arrival_times[next_idx] - (time.perf_counter() - start_time)
+                    if wait > 0:
+                        time.sleep(min(wait, 0.005))
+                else:
+                    break  # All sent and engine finished
+
+    total_time = time.perf_counter() - start_time
+    return total_time, seq_map
+
+
+def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path=None):
+    """Calculates and prints performance metrics."""
+    completed_seqs = [s for s in seq_map.values() if s.metric and s.metric.completion_time]
+
+    total_input = sum(s.metric.num_prompt_tokens for s in completed_seqs)
+    total_output = sum(s.metric.num_generated_tokens for s in completed_seqs)
+
+    throughput = total_output / total_time
+
+    ttft_samples = [s.metric.ttft for s in completed_seqs if s.metric.ttft]
+    avg_ttft = np.mean(ttft_samples) if ttft_samples else 0
+
+    latency_samples = [s.metric.e2e_latency for s in completed_seqs if s.metric.e2e_latency]
+    avg_latency = np.mean(latency_samples) / 1000 if latency_samples else 0
+
+    # TPOT stats (Inter-Token Latency) - Aggregate all individual token samples
+    all_itl_samples = []
+    for s in completed_seqs:
+        if s.metric and s.metric.itl_samples:
+            all_itl_samples.extend(s.metric.itl_samples)
+
+    tpot_stats = {}
+    if all_itl_samples:
+        tpot_stats = {
+            "avg": np.mean(all_itl_samples),
+            "p50": np.median(all_itl_samples),
+            "p90": np.percentile(all_itl_samples, 90),
+            "p95": np.percentile(all_itl_samples, 95),
+            "p99": np.percentile(all_itl_samples, 99)
+        }
+
+    # TPOT with queueing
+    tpot_wq_samples = [
+        seq.metric.avg_tpot_with_queueing
+        for seq in completed_seqs
+        if seq.metric.avg_tpot_with_queueing
+    ]
+    tpot_wq_stats = {}
+    if tpot_wq_samples:
+         tpot_wq_stats = {
+            "avg": np.mean(tpot_wq_samples),
+            "p50": np.percentile(tpot_wq_samples, 50),
+            "p90": np.percentile(tpot_wq_samples, 90),
+            "p95": np.percentile(tpot_wq_samples, 95),
+            "p99": np.percentile(tpot_wq_samples, 99)
+        }
+
+    # Queueing time
+    queueing_samples = [
+        seq.metric.queueing_time_ms
+        for seq in completed_seqs
+        if seq.metric.queueing_time_ms
+    ]
+    queueing_stats = {}
+    if queueing_samples:
+        queueing_stats = {
+            "avg": np.mean(queueing_samples),
+            "p50": np.percentile(queueing_samples, 50),
+            "p90": np.percentile(queueing_samples, 90),
+            "p95": np.percentile(queueing_samples, 95),
+            "p99": np.percentile(queueing_samples, 99)
+        }
+
+    decode_queue_samples = [
+        seq.metric.decode_queue_time_ms
+        for seq in completed_seqs
+        if seq.metric.decode_queue_time_ms
+    ]
+    decode_queue_stats = {}
+    if decode_queue_samples:
+        decode_queue_stats = {
+            "avg": np.mean(decode_queue_samples),
+            "p50": np.percentile(decode_queue_samples, 50),
+            "p90": np.percentile(decode_queue_samples, 90),
+            "p95": np.percentile(decode_queue_samples, 95),
+            "p99": np.percentile(decode_queue_samples, 99)
+        }
+
+    # Goodput
+    slo_threshold = 100 # ms
+    slo_success = sum(1 for s in tpot_wq_samples if s < slo_threshold)
+    total_seqs = len(completed_seqs)
+    goodput = (slo_success / total_seqs * 100) if total_seqs > 0 else 0
+
+    print("\n" + "=" * 60)
+    print("--- Benchmark Results ---")
+    print("=" * 60)
+    print(f"Total time: {total_time:.2f}s")
+    print(f"Requests sent: {requests_sent}")
+    print(f"Requests completed: {total_seqs}")
+    print(f"Total input tokens: {total_input}")
+    print(f"Total output tokens: {total_output}")
+    print(f"Throughput: {throughput:.2f} tokens/s")
+    print(f"Average TTFT: {avg_ttft:.2f} ms")
+    print(f"Average E2E Latency: {avg_latency:.2f} s")
+    print()
+
+    if tpot_stats:
+        print("--- TPOT without Queueing Time (ms/token) ---")
+        print(f"  Avg:  {tpot_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {tpot_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {tpot_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {tpot_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {tpot_stats.get('p99', 0):.2f}")
+        print()
+
+    # ITL with decode queue
+    itls_with_dq = [
+        seq.metric.avg_itl_with_decode_queue
+        for seq in completed_seqs
+        if seq.metric.avg_itl_with_decode_queue
+    ]
+    if itls_with_dq:
+        print("--- ITL With Decode Queue (ms/token) ---")
+        print(f"  Avg:  {np.mean(itls_with_dq):.2f}")
+        print(f"  P50:  {np.median(itls_with_dq):.2f}")
+        print(f"  P90:  {np.percentile(itls_with_dq, 90):.2f}")
+        print(f"  P95:  {np.percentile(itls_with_dq, 95):.2f}")
+        print(f"  P99:  {np.percentile(itls_with_dq, 99):.2f}")
+        print()
+
+    if queueing_stats:
+        print("--- Queueing Time (ms) ---")
+        print(f"  Avg:  {queueing_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {queueing_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {queueing_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {queueing_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {queueing_stats.get('p99', 0):.2f}")
+        print()
+
+    if decode_queue_stats:
+        print("--- Decode Queue Time (ms) ---")
+        print(f"  Avg:  {decode_queue_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {decode_queue_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {decode_queue_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {decode_queue_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {decode_queue_stats.get('p99', 0):.2f}")
+        print()
+
+    print("--- Goodput (SLO: TPOT with queueing < 100ms) ---")
+    print(f"  SLO Success: {slo_success}/{total_seqs}")
+    print(f"  Goodput: {goodput:.2f}%")
+    print("=" * 60 + "\n")
+
+    if itl_log_path:
+        print(f"Logging ITL samples to {itl_log_path}...")
+        data = []
+        for s in completed_seqs:
+            if s.metric and s.metric.itl_samples:
+                data.append({
+                    "seq_id": s.seq_id,
+                    "itl_samples": s.metric.itl_samples,
+                    "prompt_len": s.metric.num_prompt_tokens,
+                    "output_len": s.metric.num_generated_tokens,
+                    "queueing_time_ms": s.metric.queueing_time_ms,
+                    "decode_queue_time_ms": s.metric.decode_queue_time_ms,
+                    "avg_itl_with_decode_queue_ms": s.metric.avg_itl_with_decode_queue
+                })
+
+        if data:
+            df = pd.DataFrame(data)
+            df.to_json(itl_log_path, orient="records", lines=True)
+            print(f"Saved {len(df)} ITL samples to {itl_log_path}.")
+        else:
+            print("No ITL samples to log.")
+
+
+def main():
+    args = parse_args()
+
+    # Import NanoDeploy only after CLI parsing so --help and argument validation
+    # do not initialize CUDA/Triton on a login node.
+    global LLM, SamplingParams, Sequence
+    from nanodeploy import LLM, SamplingParams
+    from nanodeploy.engine.sequence import Sequence
+
+    patch_ray_worker_environment()
+    patch_ray_node_selection(args.node_ips)
+
+    print(
+        f"\n--- Benchmark: {args.num_requests} reqs, "
+        f"{args.request_rate} req/s, burst={args.burstiness} ---"
+    )
+
+    # Initialize Engine
+    print(
+        f"Scheduler architecture: {args.scheduler_arch}, "
+        f"Routing strategy: {args.routing_strategy}, "
+        f"Router policy: {args.router_policy}"
+    )
+    engine = LLM(
+        args.model_path,
+        enforce_eager=args.enforce_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_limit_gb=args.gpu_memory_limit_gb,
+        master_address=args.master_address,
+        ray_address=args.ray_address,
+        mode="decode",
+        dummy_prefill=args.dummy_prefill,
+        dummy_weight=True,
+        perfect_eplb=False,
+        moe_routing_simulation_strategy="uniform_random",
+        attention_dp=args.dp,
+        attention_sp=args.sp,
+        attention_tp=args.tp,
+        ffn_dp=1,
+        ffn_ep=args.ep,
+        ffn_tp=1,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=1024000,
+        loop_count=args.loop_count,
+        routing_strategy=args.routing_strategy,
+        scheduler_arch=args.scheduler_arch,
+        router_policy=args.router_policy,
+        segment_size=args.segment_size,
+        kvcache_block_size=64,
+        max_num_recv_seqs=32,
+        enable_profiler=args.enable_profiler,
+        profiler_start_step=args.profiler_start_step,
+        profiling_step=args.profiling_step,
+        profiler_dir=args.profiler_dir,
+        profiler_start_time=args.profiler_start_time,
+        profiling_duration=args.profiling_duration,
+        enable_non_uniform_split=not args.disable_non_uniform_split,
+        fixed_sp_size=args.fixed_sp_size,
+        sp_backend=args.sp_backend,
+        dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
+        dynamic_sp_bucket_preset=args.dynamic_sp_bucket_preset,
+        dynamic_sp_bucket_policy=args.dynamic_sp_bucket_policy,
+    )
+
+    # Print Config
+    print_model_config(engine)
+
+    # Run Warmup
+    world_size = args.ep
+    run_warmup(engine, args.max_num_seqs, world_size)
+
+    # Prepare Data
+    request_generator = get_dataset_generator(args)
+    arrival_times = generate_arrival_times(args.num_requests, args.request_rate, args.burstiness)
+
+    # Run Benchmark
+    total_time, seq_map = run_benchmark(
+        engine, request_generator, arrival_times, args.num_requests
+    )
+
+    # Report
+    calculate_and_print_metrics(
+        total_time,
+        seq_map,
+        args.num_requests,
+        itl_log_path=args.itl_log_path,
+    )
+
+
+if __name__ == "__main__":
+    main()

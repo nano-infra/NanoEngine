@@ -1,0 +1,6 @@
+case,panel,system,dataset,dispatch_policy,request_rate,duration_sec,max_num_seqs,gpu_memory_utilization
+lb_nano,(a),NanoDeploy,issue01,LeastBatch,25,360,192,0.90
+lb_vllm,(a),vLLM,issue01,waiting_x4_plus_running,25,600,256,0.90
+lb_vllm_least_cache,(a),vLLM,issue01,least_cache,60,600,256,0.87
+hol_nano,(b),NanoDeploy,issue05,LeastBatch,30,600,256,0.90
+hol_vllm,(b),vLLM,issue05,waiting_x4_plus_running,17,600,256,0.87
