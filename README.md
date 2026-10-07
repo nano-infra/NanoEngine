@@ -12,15 +12,15 @@ installed versions after building.
 
 | Component | Version | Source |
 |---|---|---|
-| DLSlime | `4f1fce6a45e3310cbc80f474f0264e4fa88b1f5e` | `git@github.com:DeepLink-org/DLSlime.git` |
+| DLSlime | `4f1fce6a45e3310cbc80f474f0264e4fa88b1f5e` | `git@github.com:nano-infra/DLSlime.git` |
 | DeepEP | `1.2.1+73b6ea4` | commit `73b6ea4a439ba03a695563f9fd242c8e4b02b37c` |
 | DeepGEMM | `2.3.0+477618c` | commit `477618cd51baffca09c4b0b87e97c03fe827ef03` |
 | FlashMLA | `1.0.0+1408756` | `git@github.com:deepseek-ai/FlashMLA.git` |
 
 Notes:
 
-- The pinned DLSlime commit lives on branch `hao-basic-alltoall-offsets`, not
-  on `main`. Fetch that branch explicitly; a plain clone of `main` will not
+- The pinned DLSlime commit is the tip of `feat/hao-basic-alltoall-offsets`,
+  not of `main`. Fetch that branch explicitly; a plain clone of `main` will not
   contain it.
 - DLSlime must be compiled with CUDA and `BUILD_INTRA_OPS=ON`. The default
   PyPI build does not provide the intra-node all-to-all operators.
