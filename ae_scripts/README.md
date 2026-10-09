@@ -34,7 +34,7 @@ Verify the exact API required by the AE scripts with:
 python3 -c "import dlslime; print(dlslime.__file__); print(dlslime.AllToAllBuffer, dlslime.KernelImpl.Basic)"
 ```
 
-## Shared model directories
+## Shared model and dataset paths
 
 Model checkpoints, datasets, and external checkouts are configured in
 [`paths.env`](paths.env) (copy [`paths.env.example`](paths.env.example) and fill
@@ -44,12 +44,75 @@ it in). The keys used by the scripts are:
 |---|---|
 | `AE_DPSK_MODEL` | DeepSeek-V3 checkpoint |
 | `AE_KIMI_MODEL` | Kimi-K2-Instruct-0905 checkpoint |
-| `AE_DATASET_ROOT` | dataset root |
+| `AE_DATASET_ROOT` | dataset root with the figure-specific subdirectory layout described below |
+| `AE_DATASET_SHAREGPT4O` | directory containing the ShareGPT-4o CSV |
+| `AE_DATASET_MIXLONG_0326` | directory containing the Issue 1% and Issue 5% CSVs |
+| `AE_DATASET_MADHA` | full path to the GitHub Issues CSV |
 | `AE_VLLM_ROOT` | vLLM checkout |
 
 Figure-specific instructions may use `--model-path <model-path>` when the model
 location is user-selectable. For multi-node experiments, every path in
 `paths.env` must resolve to the same location on all nodes.
+
+## Included workload traces
+
+The four preprocessed request-length traces used for the ShareGPT-4o,
+Issue 1%, Issue 5%, and GitHub Issues workloads are included in
+[`dataset/`](dataset/). These workload names describe the input traces and
+are independent of the model selected for an experiment. No additional
+dataset download or regeneration is needed to obtain these four CSVs.
+
+| Workload | File under `dataset/` | Requests | Composition |
+|---|---|---:|---|
+| ShareGPT-4o | [`sharegpt4o-mixed-random-60k.csv`](dataset/sharegpt4o-mixed-random-60k.csv) | 60,000 | Short-context requests |
+| Issue 1% | [`sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv`](dataset/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv) | 60,000 | 59,400 short + 600 long requests |
+| Issue 5% | [`sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv`](dataset/sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv) | 60,000 | 57,000 short + 3,000 long requests |
+| GitHub Issues | [`Gemini_Issues_Stats_rename-shuffle.csv`](dataset/Gemini_Issues_Stats_rename-shuffle.csv) | 2,776 | Long-context requests |
+
+The files occupy 2,992,270 bytes in total (approximately 2.85 MiB,
+uncompressed). Each row specifies one request using `prompt_len` and
+`output_len`, both measured in tokens. The CSVs contain request-length
+metadata rather than the original prompt or response text. The mixed traces
+also contain `total_len` and `type` (`short` or `long`). The GitHub Issues
+trace additionally contains `type`, `query_id`, `num_total_tokens`, and
+`pd_ratio`.
+
+The row counts and mixture ratios above describe the supplied files before
+any experiment-specific sampling or filtering. For example, the two-node
+basic test filters Issue 1% requests to fit its KV-cache capacity; its
+run-local input is therefore a subset of the supplied trace. See the
+figure-specific README for the request count and filtering used in a run.
+
+### Configure the bundled traces
+
+The CSVs are stored directly under `dataset/`. Figures 12, 15, and 20 also
+look for the original `sharegpt-4o/`, `sharegpt-4o-mixlong-0326/`, and `madha/`
+subdirectories below `AE_DATASET_ROOT`. On a fresh checkout, run the following
+once from `ae_scripts/` to create relative file links for that layout:
+
+```zsh
+mkdir -p dataset/sharegpt-4o dataset/sharegpt-4o-mixlong-0326 dataset/madha
+ln -s ../sharegpt4o-mixed-random-60k.csv dataset/sharegpt-4o/
+ln -s ../sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv dataset/sharegpt-4o-mixlong-0326/
+ln -s ../sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv dataset/sharegpt-4o-mixlong-0326/
+ln -s ../Gemini_Issues_Stats_rename-shuffle.csv dataset/madha/
+```
+
+After copying `paths.env.example` to `paths.env`, set the following entries.
+Replace `/absolute/path/to/NanoDeploy/ae_scripts` with the absolute path to
+your checkout, visible at the same location on every worker:
+
+```text
+AE_DATASET_ROOT=/absolute/path/to/NanoDeploy/ae_scripts/dataset
+AE_DATASET_SHAREGPT4O=/absolute/path/to/NanoDeploy/ae_scripts/dataset/sharegpt-4o
+AE_DATASET_MIXLONG_0326=/absolute/path/to/NanoDeploy/ae_scripts/dataset/sharegpt-4o-mixlong-0326
+AE_DATASET_MADHA=/absolute/path/to/NanoDeploy/ae_scripts/dataset/madha/Gemini_Issues_Stats_rename-shuffle.csv
+```
+
+Use literal absolute paths in `paths.env`: the Python path loader does not
+expand shell variables or `~`. The three directory entries and the one CSV
+entry above cover these four supplied traces. Other optional workloads in
+`paths.env.example`, such as `AE_DATASET_0110`, require their own inputs.
 
 ## AE container
 
