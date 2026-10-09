@@ -15,6 +15,13 @@ The only code imported outside this directory is the vLLM checkout selected by
 `--vllm-workdir`; the model, dataset, Python/CUDA environment, SSH aliases, and
 shared artifact filesystem remain environment inputs.
 
+When using `manual_multinode_poisson_runner.py` directly, configure only the
+model and dataset aliases selected for the run in `ae_scripts/paths.env`.
+Kimi uses `AE_KIMI_MODEL` as the checkpoint directory directly. Qwen and `1k1k`
+paths are optional and are required only when those workloads are selected.
+Explicit paths supplied by figure launchers replace the corresponding aliases
+without requiring their default path settings.
+
 ## Fig. 5 source experiments
 
 All three presets use 4 nodes × 8 H200 GPUs, DP=32, TP=1, DCP=1, EP enabled,

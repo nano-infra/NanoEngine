@@ -24,7 +24,7 @@ import time
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping, TextIO
+from typing import Any, Callable, Literal, Mapping, TextIO
 
 BENCHMARKS_DIR = Path(__file__).resolve().parent
 AE_ROOT = BENCHMARKS_DIR.parents[1]
@@ -362,35 +362,37 @@ class BenchTimeoutError(TimeoutError):
 # Machine-specific roots live in paths.env; only file names live here.
 # -----------------------------------------------------------------------------
 
-MIXLONG_0326 = require("AE_DATASET_MIXLONG_0326")
-SHAREGPT4O = require("AE_DATASET_SHAREGPT4O")
+# Resolve a configured alias only when a selected case needs it. Launchers
+# can still replace any alias with an explicit path before resolving the case.
+PathAlias = str | Callable[[], str]
 
-MODELS: dict[str, str] = {
-    "deepseek_v3_1024k": require("AE_DPSK_MODEL"),
-    "kimi_k2_instruct_0905":
-    f"{require('AE_KIMI_MODEL_HF')}/snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73",
-    "qwen3_235b_fp8_1024k": require("AE_QWEN3_MODEL_1024K"),
-    "qwen3_235b_fp8": require("AE_QWEN3_MODEL"),
+MODELS: dict[str, PathAlias] = {
+    "deepseek_v3_1024k": lambda: require("AE_DPSK_MODEL"),
+    "kimi_k2_instruct_0905": lambda: require("AE_KIMI_MODEL"),
+    "qwen3_235b_fp8_1024k": lambda: require("AE_QWEN3_MODEL_1024K"),
+    "qwen3_235b_fp8": lambda: require("AE_QWEN3_MODEL"),
 }
 
-DATASETS: dict[str, str] = {
-    "1k1k": require("AE_DATASET_0110"),
-    "long_full": require("AE_DATASET_MADHA"),
-    # "issue01_halfhalf":
-    # f"{MIXLONG_0326}/sharegpt4o-halfhalf_geminiissue_r0.01_n60000_60k.csv",
-    "issue01_random":
-    f"{MIXLONG_0326}/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv",
-    "issue03_random":
-    f"{MIXLONG_0326}/sharegpt4o-random_geminiissue_r0.03_n60000.csv",
-    # "issue05_halfhalf":
-    # f"{MIXLONG_0326}/sharegpt4o-halfhalf_geminiissue_r0.05_n60000_60k.csv",
-    "issue05_random":
-    f"{MIXLONG_0326}/sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv",
-    # "short_halfhalf":
-    # f"{SHAREGPT4O}/sharegpt4o-mixed-half-half-60k.csv",
-    "short_random":
-    f"{SHAREGPT4O}/sharegpt4o-mixed-random-60k.csv",
+DATASETS: dict[str, PathAlias] = {
+    "1k1k": lambda: require("AE_DATASET_0110"),
+    "long_full": lambda: require("AE_DATASET_MADHA"),
+    "issue01_random": lambda: str(
+        Path(require("AE_DATASET_MIXLONG_0326"))
+        / "sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv"
+    ),
+    "issue03_random": lambda: str(
+        Path(require("AE_DATASET_MIXLONG_0326"))
+        / "sharegpt4o-random_geminiissue_r0.03_n60000.csv"
+    ),
+    "issue05_random": lambda: str(
+        Path(require("AE_DATASET_MIXLONG_0326"))
+        / "sharegpt4o-random_geminiissue_r0.05_n60000_60k.csv"
+    ),
+    "short_random": lambda: str(
+        Path(require("AE_DATASET_SHAREGPT4O")) / "sharegpt4o-mixed-random-60k.csv"
+    ),
 }
+
 
 CLUSTERS: dict[str, ClusterSpec] = {
     "1node_h200":
@@ -1213,12 +1215,14 @@ def write_shell_script(path: Path, command: str) -> None:
 
 def resolve_alias_path(
     raw_value: str,
-    aliases: Mapping[str, str],
+    aliases: Mapping[str, PathAlias],
     *,
     label: str,
     expect_file: bool,
 ) -> Path:
     resolved = aliases.get(raw_value, raw_value)
+    if callable(resolved):
+        resolved = resolved()
     path = Path(resolved).expanduser()
     if expect_file:
         if not path.is_file():
@@ -1239,8 +1243,8 @@ def resolve_case(
     *,
     clusters: Mapping[str, ClusterSpec] = CLUSTERS,
     strategies: Mapping[str, StrategySpec] = STRATEGIES,
-    datasets: Mapping[str, str] = DATASETS,
-    models: Mapping[str, str] = MODELS,
+    datasets: Mapping[str, PathAlias] = DATASETS,
+    models: Mapping[str, PathAlias] = MODELS,
 ) -> ResolvedCase:
     try:
         cluster = clusters[case.cluster]

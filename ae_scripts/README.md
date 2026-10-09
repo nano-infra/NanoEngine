@@ -43,12 +43,18 @@ it in). The keys used by the scripts are:
 | Key | Contents |
 |---|---|
 | `AE_DPSK_MODEL` | DeepSeek-V3 checkpoint |
-| `AE_KIMI_MODEL` | Kimi-K2-Instruct-0905 checkpoint |
+| `AE_KIMI_MODEL` | Kimi-K2-Instruct-0905 checkpoint directory, used directly |
 | `AE_DATASET_ROOT` | dataset root with the figure-specific subdirectory layout described below |
 | `AE_DATASET_SHAREGPT4O` | directory containing the ShareGPT-4o CSV |
 | `AE_DATASET_MIXLONG_0326` | directory containing the Issue 1% and Issue 5% CSVs |
 | `AE_DATASET_MADHA` | full path to the GitHub Issues CSV |
 | `AE_VLLM_ROOT` | vLLM checkout |
+
+Configure only the model and dataset paths needed by the selected experiments.
+The shared vLLM runner and Fig. 12 resolve paths for selected workloads only;
+unused Qwen and `1k1k` inputs can remain unset. Set `AE_KIMI_MODEL` to the actual
+checkpoint directory (including a snapshot directory when using the Hugging
+Face cache); no cache-root key or fixed snapshot suffix is required.
 
 Figure-specific instructions may use `--model-path <model-path>` when the model
 location is user-selectable. For multi-node experiments, every path in

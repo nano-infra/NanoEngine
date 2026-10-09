@@ -20,7 +20,7 @@ from e2e_config import (
     VLLM_BASELINES,
     VLLM_MASTER_ADDR,
     VLLM_REMOTE_HOSTS,
-    VLLM_WORKDIR,
+    get_vllm_workdir,
     VllmBaseline,
     Workload,
     WORKLOADS,
@@ -312,7 +312,7 @@ def preflight_two_node_worker(
     dataset_paths: dict[str, Path],
 ) -> None:
     checks: list[tuple[str, Path]] = [
-        ("-d", VLLM_WORKDIR),
+        ("-d", get_vllm_workdir()),
         ("-f", HARNESS),
     ]
     for workload in workloads:
@@ -362,7 +362,7 @@ def preflight_four_node_workers(
     dataset_paths: dict[str, Path],
 ) -> None:
     checks: list[tuple[str, Path]] = [
-        ("-d", VLLM_WORKDIR),
+        ("-d", get_vllm_workdir()),
         ("-f", HARNESS),
     ]
     for workload in workloads:
@@ -498,7 +498,7 @@ def configure_runner(
     args: argparse.Namespace,
     dataset_paths: dict[str, Path],
 ) -> str:
-    for workload in WORKLOADS:
+    for workload in selected_workloads(args.workload):
         runner.MODELS[workload.model_name] = str(workload.model_path.resolve())
         dataset_path = dataset_paths.get(
             workload.dataset_name, workload.dataset_path.resolve()
@@ -530,7 +530,7 @@ def configure_runner(
             base_cluster,
             master_addr=args.master_addr,
             remote_hosts=remote_hosts,
-            workdir=str(VLLM_WORKDIR.resolve()),
+            workdir=str(get_vllm_workdir().resolve()),
             ssh_opts=tuple(four_node_ssh_options(args)),
         )
         return cluster_name
@@ -541,7 +541,7 @@ def configure_runner(
         base_cluster,
         master_addr=args.master_addr,
         remote_hosts=(args.remote_host,),
-        workdir=str(VLLM_WORKDIR.resolve()),
+        workdir=str(get_vllm_workdir().resolve()),
         ssh_opts=tuple(ssh_options(args)),
         local_shell="zsh",
         local_shell_flags=("-lc",),
@@ -666,7 +666,7 @@ def main() -> int:
     run_label = f"fig12-{args.nodes}node-{args.run_id}"
     require_path(E2E_DIR, "vLLM E2E directory", directory=True)
     require_path(HARNESS, "vLLM harness", directory=False)
-    require_path(VLLM_WORKDIR, "vLLM checkout", directory=True)
+    require_path(get_vllm_workdir(), "vLLM checkout", directory=True)
     for workload in workloads:
         require_path(workload.model_path, workload.label + " model", directory=True)
         require_path(
