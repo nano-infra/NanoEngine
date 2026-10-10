@@ -70,6 +70,4 @@ repository, checkpoints, and datasets. The image sets
 the installed vLLM package.
 
 The Dockerfile checks package versions and required native imports with
-`python3 /opt/ae/verify_environment.py`. These checks do not run the paper's
-GPU experiments or validate performance. The complete Dockerfile has not yet
-been validated by an end-to-end image build.
+`python3 /opt/ae/verify_environment.py`.

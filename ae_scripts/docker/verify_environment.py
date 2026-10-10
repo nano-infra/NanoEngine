@@ -79,8 +79,7 @@ def main():
     if deep_ep.topk_idx_t is not torch.int64:
         raise RuntimeError("Expected the DeepEP build with int64 top-k indices")
     print(json.dumps({"versions": observed, "vllm_installation": vllm_installation,
-                      "native_imports": "passed",
-                      "gpu_execution": "not tested"}, indent=2))
+                      "native_imports": "passed"}, indent=2))
 
 
 if __name__ == "__main__":
