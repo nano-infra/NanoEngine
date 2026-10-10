@@ -29,24 +29,6 @@ def revision(name):
     return match.group(1)
 
 
-def export_worktree(source, destination, expected):
-    destination.mkdir(parents=True)
-    for raw in git(source, "ls-files", "-z").split(b"\0"):
-        if not raw:
-            continue
-        relative = Path(raw.decode())
-        original, target = source / relative, destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if original.is_symlink():
-            target.symlink_to(original.readlink())
-        else:
-            shutil.copy2(original, target)
-    (destination / "SOURCE_COMMIT").write_text(expected + "\n")
-    (destination / "SOURCE_WORKTREE.patch").write_bytes(
-        git(source, "diff", "--no-ext-diff", "HEAD")
-    )
-
-
 def export_commit(source, destination, expected):
     destination.mkdir(parents=True)
     with subprocess.Popen(
@@ -65,28 +47,17 @@ def export_commit(source, destination, expected):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nanodeploy", type=Path, default=RECIPE_DIR.parents[1])
-    parser.add_argument("--nano-intra-alltoall", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     output = args.output.expanduser().resolve()
     if output.exists():
         raise SystemExit(f"Build context already exists; choose a fresh directory: {output}")
-    sources = (
-        (args.nano_intra_alltoall.expanduser().resolve(), "nano_intra_alltoall",
-         revision("NANO_INTRA")),
-    )
-    for source, name, expected in sources:
-        actual = git(source, "rev-parse", "HEAD").decode().strip()
-        if actual != expected:
-            raise SystemExit(f"{name}: expected {expected}, found {actual}")
     nanodeploy = args.nanodeploy.expanduser().resolve()
     nano_revision = revision("NANODEPLOY")
     git(nanodeploy, "cat-file", "-e", nano_revision + "^{commit}")
     output.mkdir(parents=True)
     for name in BUILD_FILES:
         shutil.copy2(RECIPE_DIR / name, output / name)
-    for source, name, expected in sources:
-        export_worktree(source, output / "sources" / name, expected)
     export_commit(nanodeploy, output / "sources/NanoDeploy", nano_revision)
     print(f"Build context ready: {output}")
 

@@ -1,4 +1,4 @@
-# ae_merged / NanoDeploy environment, sampled on 2026-10-09.
+# NanoDeploy AE environment, based on ae_merged sampled on 2026-10-09.
 # linux/amd64; H200 / SM90. See README.md before building.
 ARG BASE_IMAGE=vllm/vllm-openai:v0.18.0@sha256:96c7e88811a07030f27bc44cd71b9007258a15f130cfec2bb4ab057512238b05
 FROM ${BASE_IMAGE}
@@ -87,14 +87,6 @@ RUN git clone --depth 1 --single-branch --branch "${DLSLIME_BRANCH}" \
     && CMAKE_ARGS="-DBUILD_INTRA_OPS=ON" \
         python3 -m pip install --verbose --no-cache-dir --no-build-isolation \
         --no-deps --editable /opt/src/DLSlime
-
-# Fig. 17's standalone extension; included in the observed environment.
-ARG NANO_INTRA_COMMIT=e070174a7e4b2c412bd9c78beafaa489df2720de
-COPY sources/nano_intra_alltoall/ /opt/src/nano_intra_alltoall/
-RUN test "$(cat /opt/src/nano_intra_alltoall/SOURCE_COMMIT)" = "${NANO_INTRA_COMMIT}" \
-    && CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=90" \
-        python3 -m pip install --verbose --no-cache-dir --no-build-isolation \
-        --no-deps /opt/src/nano_intra_alltoall
 
 ARG NANODEPLOY_COMMIT=a0752b7b0eb6d08b69cf4c9962552650c742529b
 COPY sources/NanoDeploy/ /opt/src/NanoDeploy/

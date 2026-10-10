@@ -21,7 +21,6 @@ EXPECTED = {
     "deep_gemm": "2.3.0+477618c",
     "flash_mla": "1.0.0+1408756",
     "flash-attn-3": "3.0.0+20260316.cu129torch2100cxx11abitrue.71bf77",
-    "nano-intra-alltoall": "0.1.0",
     "flashinfer-python": "0.6.6",
     "nvidia-nccl-cu12": "2.27.5",
 }
@@ -67,7 +66,7 @@ def main():
     if torch.version.cuda != "12.9" or not torch.compiled_with_cxx11_abi():
         raise RuntimeError("Expected CUDA 12.9 Torch with the C++11 ABI")
     for module in ["nanodeploy._nanodeploy_cpp", "flash_mla.cuda",
-                   "flash_attn_3._C", "intra_alltoall._intra_alltoall", "flashinfer"]:
+                   "flash_attn_3._C", "flashinfer"]:
         importlib.import_module(module)
     for owner, symbol in [(dlslime, "AllToAllBuffer"), (dlslime, "KernelImpl"),
                           (deep_ep, "Buffer"), (deep_gemm, "fp8_gemm_nt"),
