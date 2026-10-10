@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+**/.git
+**/.codex*
+**/.agents
+**/.DS_Store
+**/build
+**/dist
+**/bench_logs
+*.zip

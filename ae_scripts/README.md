@@ -43,7 +43,9 @@ and profiling changes used by the AE scripts:
 - Branch: [`ae-repro-clean`](https://github.com/FirwoodLin/vllm/tree/ae-repro-clean).
 - Pinned commit: [`5dcf9eec3c55309824a89b996bc57687d4aa4ac8`](https://github.com/FirwoodLin/vllm/commit/5dcf9eec3c55309824a89b996bc57687d4aa4ac8).
 
-Run the following inside the prepared AE container using `zsh`. The installation
+The [AE Dockerfile](docker/Dockerfile) installs this pinned revision
+automatically. The following manual steps are for an existing compatible
+environment. Run them inside that environment using `zsh`. The installation
 below targets Linux x86_64 with Python 3.12, PyTorch 2.10.0+cu129, and CUDA 12.9,
 matching the `vllm/vllm-openai:v0.18.0` base environment. The build dependencies
 listed in the fork's `pyproject.toml` must already be installed.
@@ -102,11 +104,19 @@ python3 -c "import vllm; print(vllm.__version__); print(vllm.__file__)"
 ```
 
 The version should be `0.18.0`, and the imported module should be in the active
-environment's installed packages. In `ae_scripts/paths.env`, set the source
-checkout location as a literal absolute path:
+environment's installed packages. Create a separate runtime working directory
+at the same absolute path on every worker, so the source checkout does not
+shadow the installed package:
+
+```zsh
+mkdir -p /absolute/path/to/vllm-workdir
+export VLLM_WORKDIR=/absolute/path/to/vllm-workdir
+```
+
+Set the same literal absolute path in `ae_scripts/paths.env`:
 
 ```text
-AE_VLLM_ROOT=/absolute/path/to/vllm-ae
+AE_VLLM_ROOT=/absolute/path/to/vllm-workdir
 ```
 
 ## Shared model and dataset paths
@@ -123,7 +133,7 @@ it in). The keys used by the scripts are:
 | `AE_DATASET_SHAREGPT4O` | directory containing the ShareGPT-4o CSV |
 | `AE_DATASET_MIXLONG_0326` | directory containing the Issue 1% and Issue 5% CSVs |
 | `AE_DATASET_MADHA` | full path to the GitHub Issues CSV |
-| `AE_VLLM_ROOT` | vLLM checkout |
+| `AE_VLLM_ROOT` | vLLM working directory; `/opt/ae/vllm-workdir` in the AE image |
 
 Configure only the model and dataset paths needed by the selected experiments.
 The shared vLLM runner and Fig. 12 resolve paths for selected workloads only;
@@ -197,21 +207,69 @@ entry above cover these four supplied traces. Other optional workloads in
 
 ## AE container
 
-Run the artifact commands inside the pre-created `ae_merged` container. From
-the `ae_scripts` directory on an allocated host, enter the container at the
-working directory with:
+Build the environment from the supplied [Dockerfile](docker/Dockerfile).
+See [docker/README.md](docker/README.md) for the pinned source inputs and build
+prerequisites. From `ae_scripts/` on the host, prepare a fresh build context
+and build the image:
 
-```bash
-docker exec -it --workdir "$PWD" ae_merged zsh
+```zsh
+python3 docker/prepare_context.py \
+  --dlslime /absolute/path/to/DLSlime \
+  --nano-intra-alltoall /absolute/path/to/nano_intra_alltoall \
+  --output /absolute/path/to/ae-image-context
+
+docker build --platform linux/amd64 \
+  -t nanodeploy-ae:vllm0180 /absolute/path/to/ae-image-context
+```
+
+Build once and distribute the same image to every allocated node through a
+registry or `docker save` / `docker load`. Each host needs NVIDIA Container
+Toolkit, a compatible NVIDIA driver, and the allocation's RDMA devices.
+
+Create an `ae_merged` container on each host. Replace the three paths below:
+`SHARED_ROOT` must contain the experiment checkout, datasets, and writable
+results directory; `MODEL_ROOT` contains the checkpoints. Add mounts for any
+other paths used by `paths.env` or the worker SSH setup. Use identical absolute
+paths on every node. The launch options below target the supplied AE cluster:
+
+```zsh
+SHARED_ROOT=/absolute/path/to/shared-workspace
+MODEL_ROOT=/absolute/path/to/model-storage
+AE_SCRIPTS_DIR=/absolute/path/to/NanoDeploy/ae_scripts
+
+docker run -d --name ae_merged \
+  --gpus all --network host --ipc host --privileged \
+  --cap-add SYS_ADMIN --cap-add SYS_PTRACE --ulimit memlock=-1:-1 \
+  --mount "type=bind,src=$SHARED_ROOT,dst=$SHARED_ROOT" \
+  --mount "type=bind,src=$MODEL_ROOT,dst=$MODEL_ROOT,readonly" \
+  --workdir "$AE_SCRIPTS_DIR" \
+  --entrypoint /usr/bin/tail nanodeploy-ae:vllm0180 -f /dev/null
+
+docker exec -it --workdir "$AE_SCRIPTS_DIR" ae_merged zsh
+```
+
+The image installs NanoDeploy and the pinned modified vLLM automatically.
+For this image, set `AE_VLLM_ROOT=/opt/ae/vllm-workdir` in `paths.env`;
+`VLLM_WORKDIR` is already set to that directory in the image. Keep runtime
+working directories separate from vLLM source checkouts. Inside each
+container, check the package versions and required native imports with:
+
+```zsh
+python3 /opt/ae/verify_environment.py
 ```
 
 For an SSH-launched multi-node workflow, configure an endpoint for every
-worker that enters its container directly. From node 0, verify each worker
-endpoint with:
+worker that runs commands inside its container, with the same mounted paths
+and Python environment. A host SSH login alone does not enter the container.
+From node 0's container, verify each configured worker endpoint with:
 
-```bash
+```zsh
 ssh -t <worker-ssh-host> zsh
 ```
+
+Confirm that the resulting shell is inside the intended worker's `ae_merged`
+container. The image does not configure worker SSH access or start Ray;
+prepare SSH access for your allocation and follow the next section for Ray.
 
 ## NanoDeploy Ray cluster
 
@@ -267,7 +325,7 @@ operator provides different interface or GID settings.
 
 ## Multi-node service requirements
 
-The Figure 5 E2E paths require the same repository, vLLM checkout, model,
+The Figure 5 E2E paths require the same repository, vLLM working directory, model,
 request-length dataset, and Python environment at the same paths on every
 node. Node 0 must be able to reach every worker over SSH, and the address
 passed as `MASTER_ADDR` must be reachable from the worker containers. The
@@ -275,10 +333,11 @@ two-node quick test uses 8 GPUs per node. Its postprocessing additionally
 requires CUDA PyTorch, Triton, `flash_mla`, and the pinned `deep_ep` build
 described above.
 
-All four machines in the AE allocation share the `/vllm` mount and the shared
-research filesystem. Repository changes, generated environment files,
-snapshots, logs, and results written below these paths are immediately
-visible on every node; no manual synchronization is required.
+Mount the shared research filesystem at the same absolute paths on every
+worker. Repository changes, generated environment files, snapshots, logs,
+and results written there are then visible on every node. If using node-local
+storage, synchronize the required inputs and configuration before launching
+a multi-node run.
 
 The repository separates service experiments, reusable operator measurements,
 and figure-specific processing:
