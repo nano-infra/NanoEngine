@@ -74,10 +74,16 @@ RUN mkdir -p /opt/src/FlashMLA/csrc/cutlass \
         python3 -m pip install --verbose --no-cache-dir --no-build-isolation \
         --no-deps /opt/src/FlashMLA
 
-# Export these local, potentially private checkouts using prepare_context.py.
+# Fetch the DLSlime repository and branch documented in the root README.
+ARG DLSLIME_REPOSITORY=https://github.com/nano-infra/DLSlime.git
+ARG DLSLIME_BRANCH=feat/hao-basic-alltoall-offsets
 ARG DLSLIME_COMMIT=4f1fce6a45e3310cbc80f474f0264e4fa88b1f5e
-COPY sources/DLSlime/ /opt/src/DLSlime/
-RUN test "$(cat /opt/src/DLSlime/SOURCE_COMMIT)" = "${DLSLIME_COMMIT}" \
+RUN git clone --depth 1 --single-branch --branch "${DLSLIME_BRANCH}" \
+        "${DLSLIME_REPOSITORY}" /opt/src/DLSlime \
+    && git -C /opt/src/DLSlime fetch --depth 1 origin "${DLSLIME_COMMIT}" \
+    && git -C /opt/src/DLSlime checkout --detach "${DLSLIME_COMMIT}" \
+    && test "$(git -C /opt/src/DLSlime rev-parse HEAD)" = "${DLSLIME_COMMIT}" \
+    && print -r -- "${DLSLIME_COMMIT}" > /opt/src/DLSlime/SOURCE_COMMIT \
     && CMAKE_ARGS="-DBUILD_INTRA_OPS=ON" \
         python3 -m pip install --verbose --no-cache-dir --no-build-isolation \
         --no-deps --editable /opt/src/DLSlime

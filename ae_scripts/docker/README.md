@@ -9,23 +9,28 @@ The base image supplies Python 3.12, PyTorch 2.10.0+cu129, and CUDA 12.9.
 ## Source inputs
 
 Preparing the build context requires Python 3, Git, and `tar` on a Linux host.
-It does not require an existing Docker container. Obtain the two native
-source checkouts from the artifact maintainers; these checkouts are separate
-build inputs and are not bundled in this directory.
+It does not require an existing Docker container. DLSlime is fetched by the
+Dockerfile from the repository listed in the
+[root README](../../README.md#pinned-dependencies). The Dockerfile uses HTTPS
+for the same repository, so this download does not require an SSH key.
 
-| Input | Required revision |
-|---|---|
-| NanoDeploy (this repository) | `a0752b7b0eb6d08b69cf4c9962552650c742529b` |
-| DLSlime | `4f1fce6a45e3310cbc80f474f0264e4fa88b1f5e` |
-| `nano_intra_alltoall` | `e070174a7e4b2c412bd9c78beafaa489df2720de` |
+| Input | Required revision | Source |
+|---|---|---|
+| NanoDeploy | `a0752b7b0eb6d08b69cf4c9962552650c742529b` | This repository |
+| DLSlime | `4f1fce6a45e3310cbc80f474f0264e4fa88b1f5e` | [nano-infra/DLSlime](https://github.com/nano-infra/DLSlime), branch `feat/hao-basic-alltoall-offsets` |
+| `nano_intra_alltoall` | `e070174a7e4b2c412bd9c78beafaa489df2720de` | Separate source checkout |
 
-`prepare_context.py` checks each native checkout's HEAD, copies its tracked
-working-tree files, and records tracked local changes in
-`SOURCE_WORKTREE.patch`. Preserve the supplied native checkouts' build fixes;
-for `nano_intra_alltoall`, the supplied CMake file also installs
-`intra_alltoall/__init__.py`. The helper exports NanoDeploy at its pinned
-commit even when this README comes from a newer documentation revision.
-Git metadata and untracked local files are excluded.
+The pinned DLSlime commit belongs to `feat/hao-basic-alltoall-offsets`, rather
+than `main`. The Dockerfile clones that branch, checks out the fixed commit,
+and verifies the source revision before installation.
+
+Obtain the `nano_intra_alltoall` checkout from the artifact maintainers.
+`prepare_context.py` checks its HEAD, copies its tracked working-tree files,
+and records tracked local changes in `SOURCE_WORKTREE.patch`. Preserve its
+supplied CMake build fix, which also installs `intra_alltoall/__init__.py`.
+The helper exports NanoDeploy at its pinned commit even when this README
+comes from a newer documentation revision. Git metadata and untracked local
+files are excluded from the prepared source inputs.
 
 The NanoDeploy commit must be available locally. If using a shallow clone
 that lacks it, fetch the `asplos27-ae-v1` release tag first:
@@ -40,7 +45,6 @@ From `ae_scripts/` on the host, select a new output directory:
 
 ```zsh
 python3 docker/prepare_context.py \
-  --dlslime /absolute/path/to/DLSlime \
   --nano-intra-alltoall /absolute/path/to/nano_intra_alltoall \
   --output /absolute/path/to/ae-image-context
 

@@ -65,7 +65,6 @@ def export_commit(source, destination, expected):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nanodeploy", type=Path, default=RECIPE_DIR.parents[1])
-    parser.add_argument("--dlslime", type=Path, required=True)
     parser.add_argument("--nano-intra-alltoall", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -73,7 +72,6 @@ def main():
     if output.exists():
         raise SystemExit(f"Build context already exists; choose a fresh directory: {output}")
     sources = (
-        (args.dlslime.expanduser().resolve(), "DLSlime", revision("DLSLIME")),
         (args.nano_intra_alltoall.expanduser().resolve(), "nano_intra_alltoall",
          revision("NANO_INTRA")),
     )

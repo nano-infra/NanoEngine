@@ -214,7 +214,6 @@ and build the image:
 
 ```zsh
 python3 docker/prepare_context.py \
-  --dlslime /absolute/path/to/DLSlime \
   --nano-intra-alltoall /absolute/path/to/nano_intra_alltoall \
   --output /absolute/path/to/ae-image-context
 
