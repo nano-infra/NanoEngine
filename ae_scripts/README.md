@@ -34,6 +34,81 @@ Verify the exact API required by the AE scripts with:
 python3 -c "import dlslime; print(dlslime.__file__); print(dlslime.AllToAllBuffer, dlslime.KernelImpl.Basic)"
 ```
 
+## Modified vLLM baseline
+
+The vLLM baselines require our modified **vLLM 0.18.0**, including the dispatch
+and profiling changes used by the AE scripts:
+
+- Repository: [FirwoodLin/vllm](https://github.com/FirwoodLin/vllm).
+- Branch: [`ae-repro-clean`](https://github.com/FirwoodLin/vllm/tree/ae-repro-clean).
+- Pinned commit: [`5dcf9eec3c55309824a89b996bc57687d4aa4ac8`](https://github.com/FirwoodLin/vllm/commit/5dcf9eec3c55309824a89b996bc57687d4aa4ac8).
+
+Run the following inside the prepared AE container using `zsh`. The installation
+below targets Linux x86_64 with Python 3.12, PyTorch 2.10.0+cu129, and CUDA 12.9,
+matching the `vllm/vllm-openai:v0.18.0` base environment. The build dependencies
+listed in the fork's `pyproject.toml` must already be installed.
+
+### Obtain the pinned source
+
+Choose a fresh checkout path visible at the same absolute location on every
+worker. Clone and check out the fixed commit once on the shared filesystem:
+
+```zsh
+VLLM_SRC=/absolute/path/to/vllm-ae
+VLLM_COMMIT=5dcf9eec3c55309824a89b996bc57687d4aa4ac8
+
+git clone --depth 1 --single-branch --branch ae-repro-clean \
+  https://github.com/FirwoodLin/vllm.git "$VLLM_SRC"
+git -C "$VLLM_SRC" fetch --depth 1 origin "$VLLM_COMMIT"
+git -C "$VLLM_SRC" checkout --detach "$VLLM_COMMIT"
+test "$(git -C "$VLLM_SRC" rev-parse HEAD)" = "$VLLM_COMMIT"
+```
+
+### Build and install a normal wheel
+
+Reuse the matching native components from the official vLLM 0.18.0 CUDA wheel
+while packaging the modified Python source. This uses the fork's
+`VLLM_USE_PRECOMPILED` build support and avoids recompiling CUDA kernels.
+Download the base wheel once, then build the modified wheel:
+
+```zsh
+VLLM_BUILD_DIR="$(mktemp -d)"
+curl --fail --location --retry 3 \
+  https://github.com/vllm-project/vllm/releases/download/v0.18.0/vllm-0.18.0-cp38-abi3-manylinux_2_31_x86_64.whl \
+  --output "$VLLM_BUILD_DIR/vllm-base-precompiled.whl"
+
+VLLM_USE_PRECOMPILED=1 \
+VLLM_PRECOMPILED_WHEEL_LOCATION="$VLLM_BUILD_DIR/vllm-base-precompiled.whl" \
+VLLM_TARGET_DEVICE=cuda \
+VLLM_VERSION_OVERRIDE=0.18.0 \
+python3 -m pip wheel --no-index --no-build-isolation --no-deps \
+  --wheel-dir "$VLLM_BUILD_DIR" "$VLLM_SRC"
+
+python3 -m pip install --no-index --no-deps --force-reinstall \
+  "$VLLM_BUILD_DIR"/vllm-0.18.0-*.whl
+```
+
+This installs a regular package and replaces the existing vLLM without changing
+its dependencies; it does not use editable installation. Build once, then run
+the final installation command in the active Python environment of **every
+worker container**. If `VLLM_BUILD_DIR` is local to the build node, copy the
+generated wheel to a shared directory or to each worker, and set
+`VLLM_BUILD_DIR` to the directory containing that wheel before installing.
+
+Run this check from `ae_scripts/`, outside the vLLM source checkout:
+
+```zsh
+python3 -c "import vllm; print(vllm.__version__); print(vllm.__file__)"
+```
+
+The version should be `0.18.0`, and the imported module should be in the active
+environment's installed packages. In `ae_scripts/paths.env`, set the source
+checkout location as a literal absolute path:
+
+```text
+AE_VLLM_ROOT=/absolute/path/to/vllm-ae
+```
+
 ## Shared model and dataset paths
 
 Model checkpoints, datasets, and external checkouts are configured in
